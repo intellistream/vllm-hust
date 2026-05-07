@@ -50,12 +50,8 @@ def build_sparsifier(
         device=str(device),
     )
 
-    sparsify_fn = SparsifyFn(
-        threshold=threshold,
-        apply_all_tokens=sparsity_config.apply_all_tokens,
-    )
-
-    # La RoSA: wrap with rotation if D/inv_D exist
+    # La RoSA: load rotation if D/inv_D exist
+    rotation = None
     if sparsity_config.method == "larosa":
         rotation_dir = os.path.join(
             sparsity_config.calibration_path,
@@ -65,21 +61,16 @@ def build_sparsifier(
         inv_d_path = os.path.join(rotation_dir, "inv_D.pt")
         if os.path.exists(d_path) and os.path.exists(inv_d_path):
             rotation = RotationTransform(d_path=d_path, inv_d_path=inv_d_path)
-            # Attach rotation to the sparsify_fn module so it moves together
-            sparsify_fn.rotation = rotation  # type: ignore[attr-defined]
-            # Monkey-patch forward to include rotation
-            _orig_forward = sparsify_fn.forward
-
-            def _rotated_forward(x: torch.Tensor) -> torch.Tensor:
-                x_rot = rotation(x)
-                x_sparse = _orig_forward(x_rot)
-                return rotation.inverse(x_sparse).to(x.dtype)
-
-            sparsify_fn.forward = _rotated_forward  # type: ignore[method-assign]
             logger.debug(
                 "La RoSA rotation enabled for layer %d projection %s",
                 layer_idx,
                 proj_name,
             )
+
+    sparsify_fn = SparsifyFn(
+        threshold=threshold,
+        apply_all_tokens=sparsity_config.apply_all_tokens,
+        rotation=rotation,
+    )
 
     return sparsify_fn

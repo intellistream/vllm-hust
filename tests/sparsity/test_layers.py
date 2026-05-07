@@ -48,3 +48,32 @@ def test_build_sparsifier_success():
         out = sparsifier(x)
         # With threshold 0.5, some values should be zeroed
         assert (out == 0).any()
+
+
+def test_build_sparsifier_larosa():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Threshold
+        torch.save(torch.tensor(0.5), os.path.join(tmpdir, "layers.2.self_attn.qkv.threshold.pt"))
+        # Rotation matrices
+        os.makedirs(os.path.join(tmpdir, "layers.2.self_attn.qkv"))
+        hidden = 16
+        d = torch.eye(hidden)
+        inv_d = torch.eye(hidden)
+        torch.save(d, os.path.join(tmpdir, "layers.2.self_attn.qkv", "D.pt"))
+        torch.save(inv_d, os.path.join(tmpdir, "layers.2.self_attn.qkv", "inv_D.pt"))
+
+        cfg = ActivationSparsityConfig(
+            enable=True,
+            method="larosa",
+            calibration_path=tmpdir,
+            apply_all_tokens=True,
+        )
+        sparsifier = build_sparsifier(cfg, layer_idx=2, proj_name="self_attn.qkv")
+
+        assert sparsifier is not None
+        assert sparsifier.rotation is not None
+        x = torch.randn(4, hidden)
+        out = sparsifier(x)
+        assert out.shape == x.shape
+        # With identity rotation + threshold 0.5, some values should be zeroed
+        assert (out == 0).any()

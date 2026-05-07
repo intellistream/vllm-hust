@@ -73,3 +73,45 @@ def test_sparsify_fn_moved_threshold():
     sparsify = SparsifyFn(torch.tensor(0.5))
     sparsify.to("cpu")
     assert sparsify.threshold.device.type == "cpu"
+
+
+def test_sparsify_fn_with_rotation_roundtrip():
+    """With threshold=0, La RoSA should recover x (up to dtype)."""
+    hidden = 16
+    d = torch.randn(hidden, hidden)
+    inv_d = torch.linalg.inv(d)
+    from vllm.sparsity.rotation import RotationTransform
+
+    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
+    sparsify = SparsifyFn(threshold=torch.tensor(0.0), rotation=rot)
+
+    x = torch.randn(4, hidden)
+    out = sparsify(x)
+    assert torch.allclose(out, x.to(out.dtype), atol=1e-4)
+
+
+def test_sparsify_fn_with_rotation_sparsity():
+    """La RoSA should sparsify in rotated space and recover."""
+    hidden = 16
+    d = torch.eye(hidden)  # identity rotation for simplicity
+    inv_d = torch.eye(hidden)
+    from vllm.sparsity.rotation import RotationTransform
+
+    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
+    sparsify = SparsifyFn(threshold=torch.tensor(0.5), rotation=rot)
+
+    x = torch.randn(10, hidden)
+    out = sparsify(x)
+    # With identity rotation, behavior should match plain TEAL
+    expected = SparsifyFn(threshold=torch.tensor(0.5))(x)
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_sparsify_fn_rotation_device_movement():
+    """Rotation buffers should follow module.to(device)."""
+    hidden = 8
+    rot = RotationTransform(d_matrix=torch.eye(hidden), inv_d_matrix=torch.eye(hidden))
+    sparsify = SparsifyFn(threshold=torch.tensor(0.5), rotation=rot)
+    sparsify.to("cpu")
+    assert sparsify.rotation.D.device.type == "cpu"
+    assert sparsify.rotation.inv_D.device.type == "cpu"

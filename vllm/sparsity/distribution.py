@@ -75,28 +75,45 @@ class SparsifyFn(nn.Module):
 
     For Phase 0 this uses a dense ``torch.where`` so that correctness
     can be validated without requiring a sparse GEMV kernel.
+
+    When ``rotation`` is provided (La RoSA mode), the forward pass becomes:
+    ``x @ D -> sparsify -> x @ inv_D``.
     """
 
     def __init__(
         self,
         threshold: torch.Tensor,
         apply_all_tokens: bool = True,
+        rotation: "RotationTransform | None" = None,
     ) -> None:
         super().__init__()
         # Register as buffer so threshold moves with module.to(device/dtype)
         self.register_buffer("threshold", threshold)
         self.apply_all_tokens = apply_all_tokens
+        self.rotation = rotation
+        if rotation is not None:
+            # Register rotation as a submodule so it follows .to(device/dtype)
+            self.add_module("_rotation", rotation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Phase 0: apply to all tokens by default.
         # Phase 1 will add decode-only detection here.
         if not self.apply_all_tokens and not self._is_decode_only_batch():
             return x
-        return torch.where(
+
+        if self.rotation is not None:
+            x = self.rotation(x)
+
+        x = torch.where(
             x.abs() > self.threshold.to(dtype=x.dtype, device=x.device),
             x,
             torch.zeros_like(x),
         )
+
+        if self.rotation is not None:
+            x = self.rotation.inverse(x).to(x.dtype)
+
+        return x
 
     def _is_decode_only_batch(self) -> bool:
         """Return True if the current forward batch is decode-only.
@@ -110,4 +127,9 @@ class SparsifyFn(nn.Module):
         return False
 
     def extra_repr(self) -> str:
-        return f"threshold={self.threshold.item():.4f}, apply_all_tokens={self.apply_all_tokens}"
+        has_rot = self.rotation is not None
+        return (
+            f"threshold={self.threshold.item():.4f}, "
+            f"apply_all_tokens={self.apply_all_tokens}, "
+            f"has_rotation={has_rot}"
+        )
