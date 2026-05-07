@@ -51,6 +51,9 @@ from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
 
+# Avoid circular import: ActivationSparsityConfig lives in vllm.sparsity.config
+from vllm.sparsity.config import ActivationSparsityConfig
+
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
@@ -374,6 +377,9 @@ class VllmConfig:
     weight_transfer_config: WeightTransferConfig | None = None
     """The configurations for weight transfer during RL training."""
 
+    activation_sparsity_config: ActivationSparsityConfig | None = None
+    """Activation sparsity configuration (TEAL / La RoSA)."""
+
     shutdown_timeout: int = Field(default=0, ge=0)
     """Shutdown grace period for in-flight requests. Shutdown will be delayed for
     up to this amount of time to allow already-running requests to complete. Any
@@ -479,6 +485,10 @@ class VllmConfig:
             else:
                 additional_config_hash = additional_config.compute_hash()
             vllm_factors.append(additional_config_hash)
+        else:
+            vllm_factors.append("None")
+        if self.activation_sparsity_config:
+            vllm_factors.append(self.activation_sparsity_config.compute_hash())
         else:
             vllm_factors.append("None")
         factors.append(vllm_factors)
@@ -1588,6 +1598,53 @@ class VllmConfig:
                 custom_ops.append("+quant_fp8")
 
         self._verify_kv_transfer_compat()
+
+        # Auto-discover activation sparsity config from model directory
+        if (
+            self.activation_sparsity_config is None
+            and self.model_config is not None
+            and self.load_config is not None
+        ):
+            from vllm.model_executor.model_loader.weight_utils import (
+                get_activation_sparsity_config,
+            )
+
+            sparsity_json = get_activation_sparsity_config(
+                self.model_config, self.load_config
+            )
+            if sparsity_json:
+                self.activation_sparsity_config = ActivationSparsityConfig(
+                    **sparsity_json
+                )
+
+        # Activation sparsity unsupported-combination guard
+        if (
+            self.activation_sparsity_config is not None
+            and self.activation_sparsity_config.enable
+            and self.activation_sparsity_config.strict_unsupported_check
+        ):
+            if (
+                self.parallel_config is not None
+                and self.parallel_config.tensor_parallel_size > 1
+            ):
+                raise ValueError(
+                    "Activation sparsity (TEAL / La RoSA) does not yet support "
+                    "tensor parallelism (tp_size > 1). Please set tp_size=1 or "
+                    "disable strict_unsupported_check."
+                )
+            if self.quant_config is not None:
+                raise ValueError(
+                    "Activation sparsity (TEAL / La RoSA) does not yet support "
+                    "quantization. Please use an unquantized model or disable "
+                    "strict_unsupported_check."
+                )
+            if self.lora_config is not None:
+                raise ValueError(
+                    "Activation sparsity (TEAL / La RoSA) does not yet support "
+                    "LoRA. Please disable LoRA or disable "
+                    "strict_unsupported_check."
+                )
+
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
 
