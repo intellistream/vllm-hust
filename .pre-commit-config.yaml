@@ -208,6 +208,24 @@ repos:
     language: system
     always_run: true
     pass_filenames: false
+  - id: block-local-env-artifacts
+    name: Block local virtualenv and cache artifacts
+    entry: bash
+    args:
+      - -c
+      - |
+        blocked="$(git ls-files --cached --full-name | grep -E '^(\.venv/|\.uv-cache/|venv/|env/|ENV/)' || true)"
+        if [[ -z "$blocked" ]]; then
+          blocked="$(git diff --cached --name-only | grep -E '^(\.venv/|\.uv-cache/|venv/|env/|ENV/)' || true)"
+        fi
+        if [[ -n "$blocked" ]]; then
+          echo "Do not commit local virtualenv or cache artifacts:" >&2
+          echo "$blocked" >&2
+          exit 1
+        fi
+    language: system
+    always_run: true
+    pass_filenames: false
   - id: update-dockerfile-graph
     name: Update Dockerfile dependency graph
     entry: tools/pre_commit/update-dockerfile-graph.sh
