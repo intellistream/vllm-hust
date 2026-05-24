@@ -1,0 +1,407 @@
+name: Linux Ascend Perf Smoke
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+  workflow_dispatch:
+    inputs:
+      peer_ref:
+        description: vllm-ascend-hust ref to pair with the current vllm-hust checkout
+        required: false
+        type: string
+        default: main
+      benchmark_repo_ref:
+        description: vllm-hust-benchmark ref containing the perf smoke runner
+        required: false
+        type: string
+        default: main
+      latest_protected_result:
+        description: Optional runner-local JSON result path for the latest protected combo baseline
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  fork-pr-security-note:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain fork PR restriction
+        run: |
+          echo "Skipping perf smoke on fork PRs because this workflow requires a trusted self-hosted Ascend runner." >> "$GITHUB_STEP_SUMMARY"
+
+  selector:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      skip_reason: ${{ steps.decide.outputs.skip_reason }}
+      base_ref: ${{ steps.decide.outputs.base_ref }}
+      trigger_sha: ${{ steps.decide.outputs.trigger_sha }}
+      peer_ref: ${{ steps.decide.outputs.peer_ref }}
+      benchmark_repo_ref: ${{ steps.decide.outputs.benchmark_repo_ref }}
+      latest_protected_result: ${{ steps.decide.outputs.latest_protected_result }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether this PR needs perf smoke
+        id: decide
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+          PEER_REF_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.peer_ref || '' }}
+          BENCHMARK_REPO_REF_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_repo_ref || '' }}
+          LATEST_PROTECTED_RESULT_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.latest_protected_result || vars.VLLM_HUST_LATEST_PROTECTED_COMBO_RESULT || '' }}
+        run: |
+          set -euo pipefail
+
+          should_run=0
+          skip_reason=path-unmatched
+          trigger_sha="$PR_HEAD_SHA"
+          base_ref="$PR_BASE_REF"
+          peer_ref="${PEER_REF_INPUT:-main}"
+          benchmark_repo_ref="${BENCHMARK_REPO_REF_INPUT:-main}"
+          latest_protected_result="$LATEST_PROTECTED_RESULT_INPUT"
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            should_run=1
+            skip_reason=manual-dispatch
+          else
+            if python3 - "$LABELS_JSON" <<'PY'
+              import json
+              import sys
+
+              labels = json.loads(sys.argv[1] or "[]")
+              raise SystemExit(0 if "run-ascend-perf-smoke" in labels else 1)
+            PY
+            then
+              should_run=1
+              skip_reason=label-override
+            else
+              mapfile -t changed_files < <(git diff --name-only "$PR_BASE_SHA" "$PR_HEAD_SHA")
+              if [[ ${#changed_files[@]} -eq 0 ]]; then
+                skip_reason=no-changes
+              else
+                relevant=0
+                non_docs=0
+                for file in "${changed_files[@]}"; do
+                  case "$file" in
+                    *.md|docs/*)
+                      ;;
+                    *)
+                      non_docs=1
+                      ;;
+                  esac
+                  case "$file" in
+                    .github/workflows/ascend-benchmark-leaderboard.yml|.github/workflows/linux-ascend-perf-smoke.yml|.github/workflows/scripts/run_ascend_benchmark_ci.sh|benchmarks/*|csrc/*|requirements/*|vllm/*|collect_env.py|CMakeLists.txt|pyproject.toml|setup.py)
+                      relevant=1
+                      ;;
+                  esac
+                done
+                if [[ "$relevant" == "1" ]]; then
+                  should_run=1
+                  skip_reason=path-match
+                elif [[ "$non_docs" == "0" ]]; then
+                  skip_reason=docs-only
+                fi
+              fi
+            fi
+          fi
+
+          {
+            echo "should_run=$should_run"
+            echo "skip_reason=$skip_reason"
+            echo "base_ref=$base_ref"
+            echo "trigger_sha=$trigger_sha"
+            echo "peer_ref=$peer_ref"
+            echo "benchmark_repo_ref=$benchmark_repo_ref"
+            echo "latest_protected_result=$latest_protected_result"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$should_run" != "1" ]]; then
+            {
+              echo "## Perf Smoke Selector"
+              echo "- Decision: skip"
+              echo "- Reason: $skip_reason"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  freshness:
+    needs: selector
+    if: ${{ needs.selector.outputs.should_run == '1' }}
+    runs-on: ubuntu-latest
+    outputs:
+      merge_base_sha: ${{ steps.export.outputs.merge_base_sha }}
+      freshness_status: ${{ steps.export.outputs.freshness_status }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "${{ needs.selector.outputs.base_ref }}" --depth=1
+
+      - name: Checkout benchmark runner repo
+        uses: actions/checkout@v4
+        with:
+          repository: vLLM-HUST/vllm-hust-benchmark
+          ref: ${{ needs.selector.outputs.benchmark_repo_ref }}
+          path: vllm-hust-benchmark
+          fetch-depth: 0
+          ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
+
+      - name: Run branch freshness precheck
+        id: freshness
+        continue-on-error: true
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vllm-hust-benchmark/src
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/freshness
+          status=0
+          python3 -m vllm_hust_benchmark.cli check-branch-freshness \
+            --repo "$GITHUB_WORKSPACE" \
+            --base-ref "origin/${{ needs.selector.outputs.base_ref }}" \
+            --head-ref "${{ needs.selector.outputs.trigger_sha }}" \
+            --output artifacts/freshness/branch_freshness.json \
+            --summary-file artifacts/freshness/branch_freshness.md || status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Export freshness outputs
+        id: export
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+            import json
+            import os
+            from pathlib import Path
+
+            payload = json.loads(Path("artifacts/freshness/branch_freshness.json").read_text(encoding="utf-8"))
+            with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+                handle.write(f"merge_base_sha={payload['merge_base_sha']}\n")
+                handle.write(f"freshness_status={payload['status']}\n")
+          PY
+
+      - name: Upload freshness artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: branch-freshness
+          path: artifacts/freshness
+
+      - name: Enforce freshness precheck
+        if: ${{ steps.freshness.outputs.exit_code == '3' }}
+        shell: bash
+        run: |
+          echo "Branch freshness requires rebase before perf smoke can proceed." >&2
+          exit 3
+
+  perf-smoke:
+    needs: [selector, freshness]
+    if: ${{ needs.selector.outputs.should_run == '1' && needs.freshness.result == 'success' }}
+    runs-on:
+      - self-hosted
+      - linux-aarch64-a2b3-0
+      - docker
+    timeout-minutes: 90
+    env:
+      DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
+      HF_HOME: ${{ github.workspace }}/../.hf-cache
+      HUGGINGFACE_HUB_CACHE: ${{ github.workspace }}/../.hf-cache/hub
+      TRANSFORMERS_CACHE: ${{ github.workspace }}/../.hf-cache/transformers
+      ASCEND_BENCHMARK_USE_SUDO: ${{ vars.VLLM_HUST_BENCHMARK_USE_SUDO || '1' }}
+      ASCEND_BENCHMARK_ROOT_HELPER: ${{ vars.VLLM_HUST_BENCHMARK_ROOT_HELPER || '' }}
+      RUNNER_CLASS: linux-aarch64-a2b3-0
+      SOC_VERSION: ascend910b3
+    steps:
+      - name: Pre-clean stale checkout state
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup_paths=(
+            "$GITHUB_WORKSPACE/vllm-hust"
+            "$GITHUB_WORKSPACE/vllm-ascend-hust"
+            "$GITHUB_WORKSPACE/vllm-hust-benchmark"
+            "$GITHUB_WORKSPACE/vllm-hust-website"
+            "$GITHUB_WORKSPACE/artifacts"
+          )
+
+          if [[ "${ASCEND_BENCHMARK_USE_SUDO}" == "1" ]] \
+            && command -v sudo >/dev/null 2>&1 \
+            && [[ -x "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" ]]; then
+            sudo -n "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" cleanup-paths "${cleanup_paths[@]}" || true
+          fi
+
+          rm -rf "${cleanup_paths[@]}"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Checkout vllm-hust at trigger SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.selector.outputs.trigger_sha }}
+          path: vllm-hust
+          fetch-depth: 0
+          ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
+
+      - name: Checkout peer repo
+        uses: actions/checkout@v4
+        with:
+          repository: vLLM-HUST/vllm-ascend-hust
+          ref: ${{ needs.selector.outputs.peer_ref }}
+          path: vllm-ascend-hust
+          fetch-depth: 0
+          ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
+
+      - name: Checkout benchmark runner repo
+        uses: actions/checkout@v4
+        with:
+          repository: vLLM-HUST/vllm-hust-benchmark
+          ref: ${{ needs.selector.outputs.benchmark_repo_ref }}
+          path: vllm-hust-benchmark
+          fetch-depth: 0
+          ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
+
+      - name: Checkout website repo
+        uses: actions/checkout@v4
+        with:
+          repository: vLLM-HUST/vllm-hust-website
+          ref: main
+          path: vllm-hust-website
+          fetch-depth: 0
+          ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
+
+      - name: Download freshness artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: branch-freshness
+          path: artifacts/freshness
+
+      - name: Resolve pinned SHAs
+        id: refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "trigger_sha=$(git -C vllm-hust rev-parse HEAD)"
+            echo "peer_sha=$(git -C vllm-ascend-hust rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write combo manifests
+        working-directory: vllm-hust-benchmark
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vllm-hust-benchmark/src
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts/manifests"
+
+          python3 -m vllm_hust_benchmark.cli write-combo-manifest \
+            --output "$GITHUB_WORKSPACE/artifacts/manifests/head.json" \
+            --trigger-repo vllm-hust \
+            --trigger-ref "${{ steps.refs.outputs.trigger_sha }}" \
+            --trigger-commit "${{ steps.refs.outputs.trigger_sha }}" \
+            --peer-ref "${{ steps.refs.outputs.peer_sha }}" \
+            --peer-commit "${{ steps.refs.outputs.peer_sha }}"
+
+          python3 -m vllm_hust_benchmark.cli write-combo-manifest \
+            --output "$GITHUB_WORKSPACE/artifacts/manifests/same-peer-ancestor.json" \
+            --trigger-repo vllm-hust \
+            --trigger-ref "${{ needs.freshness.outputs.merge_base_sha }}" \
+            --trigger-commit "${{ needs.freshness.outputs.merge_base_sha }}" \
+            --peer-ref "${{ steps.refs.outputs.peer_sha }}" \
+            --peer-commit "${{ steps.refs.outputs.peer_sha }}"
+
+      - name: Run head perf smoke
+        working-directory: vllm-hust-benchmark
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vllm-hust-benchmark/src
+        run: |
+          set -euo pipefail
+          python3 -m vllm_hust_benchmark.cli run-ascend-perf-smoke \
+            --combo-manifest "$GITHUB_WORKSPACE/artifacts/manifests/head.json" \
+            --result-root "$GITHUB_WORKSPACE/artifacts/results/head" \
+            --output "$GITHUB_WORKSPACE/artifacts/results/head/perf_smoke_result.json" \
+            --execute
+
+      - name: Run same-peer ancestor perf smoke
+        working-directory: vllm-hust-benchmark
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vllm-hust-benchmark/src
+        run: |
+          set -euo pipefail
+          python3 -m vllm_hust_benchmark.cli run-ascend-perf-smoke \
+            --combo-manifest "$GITHUB_WORKSPACE/artifacts/manifests/same-peer-ancestor.json" \
+            --result-root "$GITHUB_WORKSPACE/artifacts/results/same-peer-ancestor" \
+            --output "$GITHUB_WORKSPACE/artifacts/results/same-peer-ancestor/perf_smoke_result.json" \
+            --execute
+
+      - name: Compare combo baselines
+        if: ${{ always() }}
+        working-directory: vllm-hust-benchmark
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vllm-hust-benchmark/src
+          LATEST_PROTECTED_RESULT: ${{ needs.selector.outputs.latest_protected_result }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts/compare"
+
+          if [[ ! -f "$GITHUB_WORKSPACE/artifacts/results/head/perf_smoke_result.json" ]]; then
+            {
+              echo "# Ascend L1 Perf Smoke Summary"
+              echo "- Head perf smoke result is missing; compare step skipped."
+            } > "$GITHUB_WORKSPACE/artifacts/compare/summary.md"
+            cat "$GITHUB_WORKSPACE/artifacts/compare/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          compare_args=(
+            --head-result "$GITHUB_WORKSPACE/artifacts/results/head/perf_smoke_result.json"
+            --branch-freshness-json "$GITHUB_WORKSPACE/artifacts/freshness/branch_freshness.json"
+            --summary-file "$GITHUB_WORKSPACE/artifacts/compare/summary.md"
+            --summary-json "$GITHUB_WORKSPACE/artifacts/compare/summary.json"
+          )
+
+          if [[ -f "$GITHUB_WORKSPACE/artifacts/results/same-peer-ancestor/perf_smoke_result.json" ]]; then
+            compare_args+=(
+              --same-peer-ancestor-result "$GITHUB_WORKSPACE/artifacts/results/same-peer-ancestor/perf_smoke_result.json"
+            )
+          fi
+
+          if [[ -n "$LATEST_PROTECTED_RESULT" && -f "$LATEST_PROTECTED_RESULT" ]]; then
+            compare_args+=(--latest-protected-result "$LATEST_PROTECTED_RESULT")
+          fi
+
+          python3 -m vllm_hust_benchmark.cli compare-combo-baseline "${compare_args[@]}"
+
+      - name: Upload perf smoke artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascend-perf-smoke-artifacts
+          path: artifacts

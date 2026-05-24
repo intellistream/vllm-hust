@@ -30,6 +30,7 @@ ALLOW_RANDOM_HF_PUBLISH=${ALLOW_RANDOM_HF_PUBLISH:-0}
 MODEL_NAME=${MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}
 MODEL_PARAMETERS=${MODEL_PARAMETERS:-0.5B}
 MODEL_PRECISION=${MODEL_PRECISION:-BF16}
+LOAD_FORMAT=${LOAD_FORMAT:-}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-}
 DTYPE=${DTYPE:-bfloat16}
@@ -334,6 +335,7 @@ SUDO_PRESERVE_ENV_VARS=(
   CURRENT_VLLM_CACHE_ROOT
   CURRENT_VLLM_HUST_REPO
   DTYPE
+  LOAD_FORMAT
   GITHUB_ACTOR
   GITHUB_EVENT_NAME
   HCCL_CONNECT_TIMEOUT
@@ -1015,6 +1017,11 @@ run_same_spec_current_benchmark() {
 }
 
 start_server() {
+  local load_format_args=()
+  if [[ -n "$LOAD_FORMAT" ]]; then
+    load_format_args=(--load-format "$LOAD_FORMAT")
+  fi
+
   if command -v setsid >/dev/null 2>&1; then
     if [[ "$ASCEND_BENCHMARK_USE_SUDO" == "1" ]]; then
       local preserve_list
@@ -1031,6 +1038,7 @@ start_server() {
       setsid "${VLLM_CLI[@]}" serve "$MODEL_NAME" \
         --host "$HOST" \
         --port "$PORT" \
+        "${load_format_args[@]}" \
         --dtype "$DTYPE" \
         --max-model-len "$MAX_MODEL_LEN" \
         --max-num-seqs "$MAX_NUM_SEQS" \
@@ -1045,6 +1053,7 @@ start_server() {
       "${VLLM_CLI[@]}" serve "$MODEL_NAME" \
         --host "$HOST" \
         --port "$PORT" \
+        "${load_format_args[@]}" \
         --dtype "$DTYPE" \
         --max-model-len "$MAX_MODEL_LEN" \
         --max-num-seqs "$MAX_NUM_SEQS" \
