@@ -83,13 +83,7 @@ jobs:
             should_run=1
             skip_reason=manual-dispatch
           else
-            if python3 - "$LABELS_JSON" <<'PY'
-              import json
-              import sys
-
-              labels = json.loads(sys.argv[1] or "[]")
-              raise SystemExit(0 if "run-ascend-perf-smoke" in labels else 1)
-            PY
+            if python3 -c 'import json, sys; raise SystemExit(0 if "run-ascend-perf-smoke" in json.loads(sys.argv[1] or "[]") else 1)' "$LABELS_JSON"
             then
               should_run=1
               skip_reason=label-override
@@ -194,16 +188,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-            import json
-            import os
-            from pathlib import Path
-
-            payload = json.loads(Path("artifacts/freshness/branch_freshness.json").read_text(encoding="utf-8"))
-            with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
-                handle.write(f"merge_base_sha={payload['merge_base_sha']}\n")
-                handle.write(f"freshness_status={payload['status']}\n")
-          PY
+          python3 -c 'import json, os; from pathlib import Path; payload = json.loads(Path("artifacts/freshness/branch_freshness.json").read_text(encoding="utf-8")); output = Path(os.environ["GITHUB_OUTPUT"]); output.open("a", encoding="utf-8").write("merge_base_sha=" + payload["merge_base_sha"] + "\n"); output.open("a", encoding="utf-8").write("freshness_status=" + payload["status"] + "\n")'
 
       - name: Upload freshness artifacts
         uses: actions/upload-artifact@v4
