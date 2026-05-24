@@ -66,6 +66,7 @@ jobs:
           LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
           PEER_REF_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.peer_ref || '' }}
           BENCHMARK_REPO_REF_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_repo_ref || '' }}
+          BENCHMARK_REPO_REF_FALLBACK: ws/ascend-perf-smoke-pr1-benchmark-dryrun
           LATEST_PROTECTED_RESULT_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.latest_protected_result || vars.VLLM_HUST_LATEST_PROTECTED_COMBO_RESULT || '' }}
         run: |
           set -euo pipefail
@@ -75,7 +76,7 @@ jobs:
           trigger_sha="$PR_HEAD_SHA"
           base_ref="$PR_BASE_REF"
           peer_ref="${PEER_REF_INPUT:-main}"
-          benchmark_repo_ref="${BENCHMARK_REPO_REF_INPUT:-main}"
+          benchmark_repo_ref="${BENCHMARK_REPO_REF_INPUT:-$BENCHMARK_REPO_REF_FALLBACK}"
           latest_protected_result="$LATEST_PROTECTED_RESULT_INPUT"
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
