@@ -161,7 +161,8 @@ jobs:
           repository: vLLM-HUST/vllm-hust-benchmark
           ref: ${{ needs.selector.outputs.benchmark_repo_ref }}
           path: vllm-hust-benchmark
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
           ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
 
       - name: Run branch freshness precheck
@@ -249,7 +250,8 @@ jobs:
         with:
           ref: ${{ needs.selector.outputs.trigger_sha }}
           path: vllm-hust
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
           ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
 
       - name: Checkout peer repo
@@ -258,7 +260,8 @@ jobs:
           repository: vLLM-HUST/vllm-ascend-hust
           ref: ${{ needs.selector.outputs.peer_ref }}
           path: vllm-ascend-hust
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
           ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
 
       - name: Checkout benchmark runner repo
@@ -267,7 +270,8 @@ jobs:
           repository: vLLM-HUST/vllm-hust-benchmark
           ref: ${{ needs.selector.outputs.benchmark_repo_ref }}
           path: vllm-hust-benchmark
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
           ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
 
       - name: Checkout website repo
@@ -276,7 +280,8 @@ jobs:
           repository: vLLM-HUST/vllm-hust-website
           ref: main
           path: vllm-hust-website
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
           ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
 
       - name: Download freshness artifacts
