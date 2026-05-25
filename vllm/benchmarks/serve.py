@@ -271,6 +271,7 @@ class BenchmarkLoadMetricsSnapshot:
     num_requests_running: float | None = None
     num_requests_waiting: float | None = None
     kv_cache_usage_perc: float | None = None
+    available_kv_cache_memory_bytes: float | None = None
     prefix_cache_queries: float | None = None
     prefix_cache_hits: float | None = None
     external_prefix_cache_queries: float | None = None
@@ -325,6 +326,7 @@ def parse_benchmark_load_metrics(
         "vllm:num_requests_running": [],
         "vllm:num_requests_waiting": [],
         "vllm:kv_cache_usage_perc": [],
+        "vllm:available_kv_cache_memory_bytes": [],
         "vllm:prefix_cache_queries": [],
         "vllm:prefix_cache_hits": [],
         "vllm:external_prefix_cache_queries": [],
@@ -355,6 +357,10 @@ def parse_benchmark_load_metrics(
         ),
         kv_cache_usage_perc=_aggregate_prometheus_samples(
             tracked_metrics["vllm:kv_cache_usage_perc"], aggregate="max"
+        ),
+        available_kv_cache_memory_bytes=_aggregate_prometheus_samples(
+            tracked_metrics["vllm:available_kv_cache_memory_bytes"],
+            aggregate="max",
         ),
         prefix_cache_queries=_aggregate_prometheus_samples(
             tracked_metrics["vllm:prefix_cache_queries"], aggregate="sum"
@@ -413,6 +419,7 @@ def build_benchmark_load_result(
         "num_requests_running": after.num_requests_running,
         "num_requests_waiting": after.num_requests_waiting,
         "kv_cache_usage_perc": after.kv_cache_usage_perc,
+        "available_kv_cache_memory_bytes": after.available_kv_cache_memory_bytes,
         "prefix_cache_hit_rate": prefix_cache_hit_rate,
         "external_prefix_cache_hit_rate": external_prefix_cache_hit_rate,
     }
@@ -1108,7 +1115,9 @@ async def benchmark(
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
-    benchmark_load_metrics_before = await fetch_benchmark_load_metrics(base_url, session)
+    benchmark_load_metrics_before = await fetch_benchmark_load_metrics(
+        base_url, session
+    )
     spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))

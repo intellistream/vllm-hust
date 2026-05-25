@@ -26,7 +26,6 @@ from vllm.v1.metrics.stats import (
     MultiModalCacheStats,
     PromptTokenStats,
     SchedulerStats,
-    StructuredOutputCacheStats,
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
@@ -534,6 +533,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.gauge_kv_cache_usage = create_metric_per_engine(
             gauge_kv_cache_usage, per_engine_labelvalues
+        )
+
+        gauge_available_kv_cache_memory = self._gauge_cls(
+            name="vllm:available_kv_cache_memory_bytes",
+            documentation=(
+                "Available device memory budget for KV cache allocation in bytes."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_available_kv_cache_memory = create_metric_per_engine(
+            gauge_available_kv_cache_memory, per_engine_labelvalues
         )
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -1113,6 +1124,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            if scheduler_stats.available_kv_cache_memory_bytes is not None:
+                self.gauge_available_kv_cache_memory[engine_idx].set(
+                    scheduler_stats.available_kv_cache_memory_bytes
+                )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries
