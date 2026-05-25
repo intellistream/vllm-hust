@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     KVConnectorRole,
     MooncakeConnector,
     MooncakeConnectorMetadata,
+    MooncakeKVConnectorStats,
     MooncakeXferMetadata,
     MooncakeXferResponse,
     MooncakeXferResponseStatus,
@@ -244,6 +245,39 @@ def test_scheduler_request_finished():
     assert "id-1" in scheduler_connector._reqs_not_processed
 
 
+def test_mooncake_stats_reduce_and_aggregate():
+    stats = MooncakeConnector.build_kv_connector_stats(
+        {
+            "transfer_duration": [0.1, 0.2],
+            "bytes_transferred": [2**20, 3 * 2**20],
+            "num_descriptors": [1, 2],
+            "num_failed_transfers": [1],
+        }
+    )
+
+    assert isinstance(stats, MooncakeKVConnectorStats)
+    reduced = stats.reduce()
+    assert reduced["Num successful transfers"] == 2
+    assert reduced["Num failed transfers"] == 1
+    assert reduced["Avg xfer time (ms)"] == 150.0
+    assert reduced["P90 xfer time (ms)"] == 190.0
+    assert reduced["Avg MB per transfer"] == 2.0
+    assert reduced["Throughput (MB/s)"] == 13.333
+    assert reduced["Avg number of descriptors"] == 1.5
+
+    other = MooncakeKVConnectorStats()
+    other.record_transfer(
+        duration=0.3,
+        bytes_transferred=4 * 2**20,
+        num_descriptors=4,
+    )
+    stats.aggregate(other)
+    assert stats.data["transfer_duration"] == [0.1, 0.2, 0.3]
+    assert stats.data["bytes_transferred"] == [2**20, 3 * 2**20, 4 * 2**20]
+    assert stats.data["num_descriptors"] == [1, 2, 4]
+    assert stats.data["num_failed_transfers"] == [1]
+
+
 @contextlib.contextmanager
 def patch_worker_dependencies():
     """Helper to mock all distributed and network dependencies for Worker tests."""
@@ -300,6 +334,77 @@ def patch_worker_dependencies():
             "mock_async_client": mock_async_client,
             "mock_http_client": mock_http_client_instance,
         }
+
+
+def test_mooncake_send_blocks_records_success_stats():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        prefill_connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
+        prefill_worker = prefill_connector.connector_worker
+        assert prefill_worker is not None
+
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.time.perf_counter",
+            side_effect=[1.0, 1.25],
+        ):
+            ret = prefill_worker._send_blocks(
+                "consumer-host:12345",
+                [0x1000, 0x2000],
+                [0x3000, 0x4000],
+                [1024, 2048],
+            )
+
+        assert ret == 0
+        stats = prefill_connector.get_kv_connector_stats()
+        assert isinstance(stats, MooncakeKVConnectorStats)
+        assert stats.data["transfer_duration"] == [0.25]
+        assert stats.data["bytes_transferred"] == [3072]
+        assert stats.data["num_descriptors"] == [2]
+        assert stats.data["num_failed_transfers"] == []
+        assert prefill_connector.get_kv_connector_stats() is None
+
+        with contextlib.suppress(Exception):
+            prefill_worker.shutdown()
+
+
+def test_mooncake_send_blocks_records_failed_stats():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        prefill_connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
+        prefill_worker = prefill_connector.connector_worker
+        assert prefill_worker is not None
+        prefill_worker.engine.batch_transfer_sync_write = MagicMock(return_value=7)
+
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.time.perf_counter",
+            side_effect=[2.0, 2.1],
+        ):
+            ret = prefill_worker._send_blocks(
+                "consumer-host:12345",
+                [0x1000],
+                [0x3000],
+                [1024],
+            )
+
+        assert ret == 7
+        stats = prefill_worker.get_kv_connector_stats()
+        assert isinstance(stats, MooncakeKVConnectorStats)
+        assert stats.data["transfer_duration"] == []
+        assert stats.data["bytes_transferred"] == []
+        assert stats.data["num_descriptors"] == []
+        assert stats.data["num_failed_transfers"] == [1]
+        assert prefill_worker.get_kv_connector_stats() is None
+
+        with contextlib.suppress(Exception):
+            prefill_worker.shutdown()
 
 
 @pytest.mark.asyncio

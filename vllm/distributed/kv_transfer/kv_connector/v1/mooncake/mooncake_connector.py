@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import copy
 import logging
 import threading
 import time
@@ -31,6 +32,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
@@ -50,6 +57,7 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm.v1.request import RequestStatus
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -280,6 +288,192 @@ class MooncakeXferResponse(
 
 
 @dataclass
+class MooncakeKVConnectorStats(KVConnectorStats):
+    """Container for Mooncake transfer performance metrics."""
+
+    def __post_init__(self):
+        if not self.data:
+            self.reset()
+
+    def reset(self):
+        self.data: dict[str, list[float | int]] = {
+            "transfer_duration": [],
+            "bytes_transferred": [],
+            "num_descriptors": [],
+            "num_failed_transfers": [],
+        }
+
+    def record_transfer(
+        self, duration: float, bytes_transferred: int, num_descriptors: int
+    ) -> None:
+        self.data["transfer_duration"].append(duration)
+        self.data["bytes_transferred"].append(bytes_transferred)
+        self.data["num_descriptors"].append(num_descriptors)
+
+    def record_failed_transfer(self) -> None:
+        self.data["num_failed_transfers"].append(1)
+
+    def clone_and_reset(self) -> "MooncakeKVConnectorStats":
+        old = copy.copy(self)
+        self.reset()
+        return old
+
+    def is_empty(self) -> bool:
+        return (
+            self.num_successful_transfers == 0
+            and len(self.data["num_failed_transfers"]) == 0
+        )
+
+    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        if not other.is_empty():
+            for key, value in other.data.items():
+                accumulator = self.data[key]
+                assert isinstance(accumulator, list)
+                accumulator.extend(value)
+        return self
+
+    def reduce(self) -> dict[str, int | float]:
+        num_failed = int(sum(self.data["num_failed_transfers"]))
+        if self.num_successful_transfers == 0:
+            return {
+                "Num successful transfers": 0,
+                "Num failed transfers": num_failed,
+                "Avg xfer time (ms)": 0,
+                "P90 xfer time (ms)": 0,
+                "Avg MB per transfer": 0,
+                "Throughput (MB/s)": 0,
+                "Avg number of descriptors": 0,
+            }
+
+        xfer_time = np.asarray(self.data["transfer_duration"])
+        mb = np.asarray(self.data["bytes_transferred"]) / 2**20
+        descs = np.asarray(self.data["num_descriptors"], dtype=np.uint32)
+        n = len(descs)
+        assert n == self.num_successful_transfers
+
+        total_mb = mb.sum()
+        avg_mb = total_mb / n
+        total_time_seconds = xfer_time.sum()
+        throughput_mb_s = (
+            total_mb / total_time_seconds if total_time_seconds > 0 else 0
+        )
+
+        return {
+            "Num successful transfers": n,
+            "Num failed transfers": num_failed,
+            "Avg xfer time (ms)": round(xfer_time.mean() * 1e3, 3),
+            "P90 xfer time (ms)": round(np.percentile(xfer_time, 90).item() * 1e3, 3),
+            "Avg MB per transfer": round(avg_mb, 3),
+            "Throughput (MB/s)": round(throughput_mb_s, 3),
+            "Avg number of descriptors": round(descs.mean(), 1),
+        }
+
+    @property
+    def num_successful_transfers(self) -> int:
+        return len(self.data["transfer_duration"])
+
+
+class MooncakePromMetrics(KVConnectorPromMetrics):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+
+        duration_buckets = [
+            0.001,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.075,
+            0.1,
+            0.2,
+            0.3,
+            0.5,
+            0.75,
+            1.0,
+            5.0,
+        ]
+        mooncake_histogram_xfer_time = self._histogram_cls(
+            name="vllm:mooncake_xfer_time_seconds",
+            documentation=(
+                "Histogram of transfer duration for Mooncake KV cache transfers."
+            ),
+            buckets=duration_buckets,
+            labelnames=labelnames,
+        )
+        self.mooncake_histogram_xfer_time = create_metric_per_engine(
+            mooncake_histogram_xfer_time, self.per_engine_labelvalues
+        )
+
+        bytes_buckets = [2 ** (10 + i) for i in range(1, 25, 2)]
+        mooncake_histogram_bytes_transferred = self._histogram_cls(
+            name="vllm:mooncake_bytes_transferred",
+            documentation=(
+                "Histogram of bytes transferred per Mooncake KV cache transfer."
+            ),
+            buckets=bytes_buckets,
+            labelnames=labelnames,
+        )
+        self.mooncake_histogram_bytes_transferred = create_metric_per_engine(
+            mooncake_histogram_bytes_transferred, self.per_engine_labelvalues
+        )
+
+        descriptor_buckets = [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1000,
+            2000,
+            4000,
+            10000,
+        ]
+        mooncake_histogram_num_descriptors = self._histogram_cls(
+            name="vllm:mooncake_num_descriptors",
+            documentation=(
+                "Histogram of descriptor count per Mooncake KV cache transfer."
+            ),
+            buckets=descriptor_buckets,
+            labelnames=labelnames,
+        )
+        self.mooncake_histogram_num_descriptors = create_metric_per_engine(
+            mooncake_histogram_num_descriptors, self.per_engine_labelvalues
+        )
+
+        mooncake_num_failed_transfers = self._counter_cls(
+            name="vllm:mooncake_num_failed_transfers",
+            documentation="Number of failed Mooncake KV cache transfers.",
+            labelnames=labelnames,
+        )
+        self.mooncake_num_failed_transfers = create_metric_per_engine(
+            mooncake_num_failed_transfers, self.per_engine_labelvalues
+        )
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        for metric, key in (
+            (self.mooncake_histogram_xfer_time, "transfer_duration"),
+            (self.mooncake_histogram_bytes_transferred, "bytes_transferred"),
+            (self.mooncake_histogram_num_descriptors, "num_descriptors"),
+        ):
+            for value in transfer_stats_data[key]:
+                metric[engine_idx].observe(value)
+
+        for value in transfer_stats_data["num_failed_transfers"]:
+            self.mooncake_num_failed_transfers[engine_idx].inc(value)
+
+
+@dataclass
 class PullReqMeta:
     d_req_id: ReqId
     transfer_id: TransferId
@@ -378,6 +572,28 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         )
         return "HND"
 
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        return (
+            MooncakeKVConnectorStats(data=data)
+            if data is not None
+            else MooncakeKVConnectorStats()
+        )
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics | None:
+        return MooncakePromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
+
     ############################################################
     # Scheduler Side Methods
     ############################################################
@@ -434,6 +650,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.get_kv_connector_stats()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -775,6 +996,8 @@ class MooncakeConnectorWorker:
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
+        self.xfer_stats = MooncakeKVConnectorStats()
+        self._xfer_stats_lock = threading.Lock()
 
         # For kv_both, we will act both prefiller and decoder.
         if not self.is_kv_consumer:
@@ -1337,15 +1560,32 @@ class MooncakeConnectorWorker:
         lengths: list[int],
     ) -> int:
         start_time = time.perf_counter()
-        ret_value = self.engine.batch_transfer_sync_write(
-            remote_session, src_ptrs, dst_ptrs, lengths
-        )
+        try:
+            ret_value = self.engine.batch_transfer_sync_write(
+                remote_session, src_ptrs, dst_ptrs, lengths
+            )
+        except Exception:
+            with self._xfer_stats_lock:
+                self.xfer_stats.record_failed_transfer()
+            raise
+        duration = time.perf_counter() - start_time
         if ret_value == 0:
+            bytes_transferred = sum(lengths)
+            num_descriptors = len(lengths)
+            with self._xfer_stats_lock:
+                self.xfer_stats.record_transfer(
+                    duration=duration,
+                    bytes_transferred=bytes_transferred,
+                    num_descriptors=num_descriptors,
+                )
             logger.debug(
                 "Sending to %s done, took %s",
                 remote_session,
-                time.perf_counter() - start_time,
+                duration,
             )
+        else:
+            with self._xfer_stats_lock:
+                self.xfer_stats.record_failed_transfer()
         return ret_value
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -1484,6 +1724,12 @@ class MooncakeConnectorWorker:
             )
 
         return finished_sending_reqs or None, finished_recving_reqs or None
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        with self._xfer_stats_lock:
+            if not self.xfer_stats.is_empty():
+                return self.xfer_stats.clone_and_reset()
+        return None
 
     async def receive_kv_from_single_worker(
         self,
