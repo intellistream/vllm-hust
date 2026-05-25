@@ -45,6 +45,6 @@ vllm:external_prefix_cache_hits{engine="0",model_name="qwen"} 8
         "num_requests_running": 8.0,
         "num_requests_waiting": 6.0,
         "kv_cache_usage_perc": 0.72,
-        "prefix_cache_hit_rate": 80.0 / 110.0,
+        "prefix_cache_hit_rate": 80.0 / 120.0,
         "external_prefix_cache_hit_rate": 6.0 / 15.0,
     }
