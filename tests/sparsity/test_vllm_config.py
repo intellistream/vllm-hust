@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.sparsity.config import ActivationSparsityConfig
 
@@ -29,5 +30,5 @@ def test_activation_sparsity_in_vllm_config_hash():
 
 def test_activation_sparsity_config_validation():
     """Pydantic extra=forbid should reject unknown keys."""
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, ValidationError)):
         ActivationSparsityConfig(unknown_field=123)

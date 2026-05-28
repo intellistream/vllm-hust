@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """La RoSA rotation matrix support."""
 
+import os
+from collections.abc import Callable
+
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class RotationTransform(nn.Module):
-    """Wrapper for La RoSA rotation matrix ``D`` and its inverse ``inv_D``.
+    """Legacy wrapper for explicit La RoSA online rotation.
 
-    Applies ``x @ D`` before sparsification and ``x @ inv_D`` after.
-    Both matrices are registered as buffers so they follow the module's
-    device/dtype automatically.
-
-    Phase 3 only: La RoSA is not part of the Phase 0 MVP.
+    The vLLM inference path should prefer load-time weight merging via
+    :func:`merge_rotation_into_weight_loader` to avoid runtime rotation FLOPs.
     """
 
     def __init__(
@@ -61,3 +65,89 @@ class RotationTransform(nn.Module):
 
     def extra_repr(self) -> str:
         return f"D_shape={tuple(self.D.shape)}, inv_D_shape={tuple(self.inv_D.shape)}"
+
+
+def find_rotation_matrix_path(
+    calibration_path: str,
+    layer_idx: int,
+    proj_name: str,
+) -> str | None:
+    """Return the La RoSA rotation matrix path for a layer/projection."""
+    rotation_dir = os.path.join(
+        calibration_path,
+        f"layers.{layer_idx}.{proj_name}",
+    )
+    for filename in ("D.pt", "Q.pt", "rotation.pt"):
+        path = os.path.join(rotation_dir, filename)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_rotation_matrix(
+    path: str,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Load a square offline La RoSA rotation matrix."""
+    rotation = torch.load(path, map_location=device, weights_only=True)
+    if not isinstance(rotation, torch.Tensor):
+        raise TypeError(f"Rotation matrix at {path} is not a torch.Tensor")
+    if rotation.dim() != 2 or rotation.shape[0] != rotation.shape[1]:
+        raise ValueError(
+            "La RoSA rotation matrix must be square, got "
+            f"shape={tuple(rotation.shape)} from {path}"
+        )
+    return rotation
+
+
+def merge_rotation_into_weight(
+    weight: torch.Tensor,
+    rotation: torch.Tensor,
+) -> torch.Tensor:
+    """Right-multiply a linear weight by a La RoSA rotation matrix.
+
+    vLLM linear weights are stored as ``[out_features, in_features]`` and
+    applied as ``x @ weight.T``. Merging ``Q`` therefore uses ``W <- W @ Q``.
+    """
+    if weight.dim() != 2:
+        return weight
+
+    input_size = weight.shape[-1]
+    if rotation.shape != (input_size, input_size):
+        raise ValueError(
+            "La RoSA rotation shape mismatch: "
+            f"weight input size={input_size}, rotation shape={tuple(rotation.shape)}"
+        )
+
+    compute_dtype = torch.float32 if weight.device.type == "cpu" else weight.dtype
+    rotated_weight = torch.matmul(
+        weight.to(dtype=compute_dtype),
+        rotation.to(device=weight.device, dtype=compute_dtype),
+    )
+    return rotated_weight.to(dtype=weight.dtype)
+
+
+def merge_rotation_into_weight_loader(
+    linear_layer: nn.Module,
+    rotation: torch.Tensor,
+    *,
+    proj_name: str,
+) -> bool:
+    """Wrap a vLLM linear layer's weight loader to merge rotation at load time."""
+    weight = getattr(linear_layer, "weight", None)
+    if weight is None or not hasattr(weight, "weight_loader"):
+        return False
+
+    if getattr(weight, "_larosa_rotation_merged", False):
+        return False
+
+    original_loader: Callable = weight.weight_loader
+
+    def weight_loader(param, loaded_weight, *args, **kwargs):
+        merged_weight = merge_rotation_into_weight(loaded_weight, rotation)
+        return original_loader(param, merged_weight, *args, **kwargs)
+
+    weight.weight_loader = weight_loader
+    weight._larosa_rotation_merged = True
+    logger.debug("Merged La RoSA rotation into loader for %s", proj_name)
+    return True

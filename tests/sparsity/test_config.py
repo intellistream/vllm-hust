@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.sparsity.config import ActivationSparsityConfig
 
@@ -12,7 +13,8 @@ def test_activation_sparsity_config_defaults():
     assert cfg.uniform_sparsity == 0.0
     assert cfg.calibration_path is None
     assert cfg.decode_only is False
-    assert cfg.apply_all_tokens is True
+    assert cfg.apply_all_tokens is False
+    assert cfg.prefill_sparsify == "half"
     assert cfg.strict_unsupported_check is True
     assert cfg.use_sparse_gemv is False
 
@@ -32,5 +34,8 @@ def test_activation_sparsity_config_hash():
 
 def test_activation_sparsity_config_invalid_method():
     # Pydantic dataclass with extra="forbid" should reject unknown fields
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, ValidationError)):
         ActivationSparsityConfig(unknown_field=True)
+
+    with pytest.raises((ValueError, ValidationError)):
+        ActivationSparsityConfig(prefill_sparsify="last_token")

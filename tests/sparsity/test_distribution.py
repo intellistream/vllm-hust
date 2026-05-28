@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import pytest
+from types import SimpleNamespace
+
 import torch
 
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.sparsity.distribution import Distribution, SparsifyFn
 
 
@@ -75,43 +77,67 @@ def test_sparsify_fn_moved_threshold():
     assert sparsify.threshold.device.type == "cpu"
 
 
-def test_sparsify_fn_with_rotation_roundtrip():
-    """With threshold=0, La RoSA should recover x (up to dtype)."""
-    hidden = 16
-    d = torch.randn(hidden, hidden)
-    inv_d = torch.linalg.inv(d)
-    from vllm.sparsity.rotation import RotationTransform
+def test_sparsify_fn_prefill_half_3d_matches_official_behavior():
+    threshold = torch.tensor(1e6)
+    sparsify = SparsifyFn(threshold)
 
-    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
-    sparsify = SparsifyFn(threshold=torch.tensor(0.0), rotation=rot)
-
-    x = torch.randn(4, hidden)
+    x = torch.ones(1, 4, 3)
     out = sparsify(x)
-    assert torch.allclose(out, x.to(out.dtype), atol=1e-4)
+    assert torch.allclose(out[:, :2, :], x[:, :2, :])
+    assert out[:, 2:, :].abs().max() == 0.0
+
+    decode_x = torch.ones(2, 1, 3)
+    decode_out = sparsify(decode_x)
+    assert decode_out.abs().max() == 0.0
 
 
-def test_sparsify_fn_with_rotation_sparsity():
-    """La RoSA should sparsify in rotated space and recover."""
-    hidden = 16
-    d = torch.eye(hidden)  # identity rotation for simplicity
-    inv_d = torch.eye(hidden)
-    from vllm.sparsity.rotation import RotationTransform
+def test_sparsify_fn_prefill_half_2d_fallback_masks_last_half():
+    threshold = torch.tensor(1e6)
+    sparsify = SparsifyFn(threshold)
 
-    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
-    sparsify = SparsifyFn(threshold=torch.tensor(0.5), rotation=rot)
-
-    x = torch.randn(10, hidden)
+    x = torch.ones(4, 3)
     out = sparsify(x)
-    # With identity rotation, behavior should match plain TEAL
-    expected = SparsifyFn(threshold=torch.tensor(0.5))(x)
-    assert torch.allclose(out, expected, atol=1e-6)
+    assert torch.allclose(out[:2], x[:2])
+    assert out[2:].abs().max() == 0.0
+
+    decode_x = torch.ones(1, 3)
+    decode_out = sparsify(decode_x)
+    assert decode_out.abs().max() == 0.0
 
 
-def test_sparsify_fn_rotation_device_movement():
-    """Rotation buffers should follow module.to(device)."""
-    hidden = 8
-    rot = RotationTransform(d_matrix=torch.eye(hidden), inv_d_matrix=torch.eye(hidden))
-    sparsify = SparsifyFn(threshold=torch.tensor(0.5), rotation=rot)
-    sparsify.to("cpu")
-    assert sparsify.rotation.D.device.type == "cpu"
-    assert sparsify.rotation.inv_D.device.type == "cpu"
+def test_sparsify_fn_prefill_half_2d_uses_vllm_query_slices():
+    threshold = torch.tensor(1e6)
+    sparsify = SparsifyFn(threshold)
+    metadata = {
+        "layer.0": SimpleNamespace(
+            query_start_loc=torch.tensor([0, 4, 5]),
+            num_actual_tokens=5,
+        )
+    }
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata=metadata,
+        slot_mapping={},
+    )
+
+    x = torch.ones(5, 3)
+    with override_forward_context(context):
+        out = sparsify(x)
+
+    assert torch.allclose(out[:2], x[:2])
+    assert out[2:4].abs().max() == 0.0
+    assert out[4:].abs().max() == 0.0
+
+
+def test_sparsify_fn_prefill_none_is_decode_only():
+    threshold = torch.tensor(1e6)
+    sparsify = SparsifyFn(
+        threshold,
+        apply_all_tokens=False,
+        prefill_sparsify="none",
+    )
+
+    prefill_x = torch.ones(1, 4, 3)
+    decode_x = torch.ones(1, 1, 3)
+    assert torch.allclose(sparsify(prefill_x), prefill_x)
+    assert sparsify(decode_x).abs().max() == 0.0

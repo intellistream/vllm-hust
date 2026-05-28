@@ -4,8 +4,6 @@
 import torch
 from torch import nn
 
-from vllm.forward_context import get_forward_context
-
 
 class Distribution:
     """Histogram-based distribution for threshold calibration.
@@ -16,8 +14,8 @@ class Distribution:
 
     def __init__(self, histogram: torch.Tensor, bin_edges: torch.Tensor) -> None:
         """Args:
-            histogram: 1-D tensor of counts per bin.
-            bin_edges: 1-D tensor of bin boundaries (length = histogram + 1).
+        histogram: 1-D tensor of counts per bin.
+        bin_edges: 1-D tensor of bin boundaries (length = histogram + 1).
         """
         if histogram.dim() != 1:
             raise ValueError(f"histogram must be 1-D, got {histogram.dim()}-D")
@@ -64,10 +62,7 @@ class Distribution:
         cls, histograms: dict[str, torch.Tensor], bin_edges: torch.Tensor
     ) -> dict[str, "Distribution"]:
         """Build a dict of Distributions from a histogram dict."""
-        return {
-            name: cls(hist, bin_edges)
-            for name, hist in histograms.items()
-        }
+        return {name: cls(hist, bin_edges) for name, hist in histograms.items()}
 
 
 class SparsifyFn(nn.Module):
@@ -75,61 +70,222 @@ class SparsifyFn(nn.Module):
 
     For Phase 0 this uses a dense ``torch.where`` so that correctness
     can be validated without requiring a sparse GEMV kernel.
-
-    When ``rotation`` is provided (La RoSA mode), the forward pass becomes:
-    ``x @ D -> sparsify -> x @ inv_D``.
     """
 
     def __init__(
         self,
         threshold: torch.Tensor,
-        apply_all_tokens: bool = True,
-        rotation: "RotationTransform | None" = None,
+        decode_only: bool = False,
+        apply_all_tokens: bool = False,
+        prefill_sparsify: str = "half",
     ) -> None:
         super().__init__()
+        if prefill_sparsify not in {"half", "all", "none"}:
+            raise ValueError(
+                "prefill_sparsify must be one of 'half', 'all', or 'none', "
+                f"got {prefill_sparsify!r}."
+            )
         # Register as buffer so threshold moves with module.to(device/dtype)
         self.register_buffer("threshold", threshold)
+        self.decode_only = decode_only
         self.apply_all_tokens = apply_all_tokens
-        self.rotation = rotation
-        if rotation is not None:
-            # Register rotation as a submodule so it follows .to(device/dtype)
-            self.add_module("_rotation", rotation)
+        self.prefill_sparsify = prefill_sparsify
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Phase 0: apply to all tokens by default.
-        # Phase 1 will add decode-only detection here.
-        if not self.apply_all_tokens and not self._is_decode_only_batch():
-            return x
+        if self.apply_all_tokens:
+            return self._apply_mask(x)
 
-        if self.rotation is not None:
-            x = self.rotation(x)
+        if self.decode_only:
+            return self._apply_decode_only(x)
 
-        x = torch.where(
+        if self.prefill_sparsify == "all":
+            return self._apply_mask(x)
+
+        if self.prefill_sparsify == "none":
+            return self._apply_decode_only(x)
+
+        if self.prefill_sparsify == "half":
+            return self._apply_prefill_half(x)
+
+        raise ValueError(
+            "prefill_sparsify must be one of 'half', 'all', or 'none', "
+            f"got {self.prefill_sparsify!r}."
+        )
+
+    def _apply_mask(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.where(
             x.abs() > self.threshold.to(dtype=x.dtype, device=x.device),
             x,
             torch.zeros_like(x),
         )
 
-        if self.rotation is not None:
-            x = self.rotation.inverse(x).to(x.dtype)
+    def _apply_rows(self, x: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
+        if row_mask.numel() != x.shape[0]:
+            raise ValueError(
+                f"row_mask length ({row_mask.numel()}) must equal "
+                f"input rows ({x.shape[0]})."
+            )
+        masked = self._apply_mask(x)
+        view_shape = (row_mask.numel(),) + (1,) * (x.dim() - 1)
+        row_mask = row_mask.to(device=x.device).view(view_shape)
+        return torch.where(row_mask, masked, x)
 
-        return x
+    def _apply_prefill_half(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3:
+            seq_len = x.shape[1]
+            if seq_len == 1:
+                return self._apply_mask(x)
+            half_seq_len = seq_len // 2
+            if half_seq_len == 0:
+                return x
+            return torch.cat(
+                (
+                    x[:, :-half_seq_len, :],
+                    self._apply_mask(x[:, -half_seq_len:, :]),
+                ),
+                dim=1,
+            )
 
-    def _is_decode_only_batch(self) -> bool:
-        """Return True if the current forward batch is decode-only.
+        if x.dim() != 2:
+            return self._apply_mask(x)
 
-        Phase 1 implementation: inspect ForwardContext.attn_metadata.
-        For now always returns False so that ``apply_all_tokens`` controls
-        the behaviour.
-        """
-        # TODO(Phase 1): inspect get_forward_context().attn_metadata to
-        # determine whether every sequence in the batch has query_len == 1.
-        return False
+        row_mask = self._get_vllm_prefill_half_row_mask(x)
+        if row_mask is None:
+            if x.shape[0] == 1:
+                return self._apply_mask(x)
+            half_seq_len = x.shape[0] // 2
+            if half_seq_len == 0:
+                return x
+            row_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+            row_mask[-half_seq_len:] = True
+        return self._apply_rows(x, row_mask)
+
+    def _apply_decode_only(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3:
+            return self._apply_mask(x) if x.shape[1] == 1 else x
+
+        if x.dim() != 2:
+            return self._apply_mask(x)
+
+        row_mask = self._get_vllm_decode_row_mask(x)
+        if row_mask is None:
+            return self._apply_mask(x) if x.shape[0] == 1 else x
+        return self._apply_rows(x, row_mask)
+
+    def _get_vllm_decode_row_mask(self, x: torch.Tensor) -> torch.Tensor | None:
+        request_slices = self._get_vllm_request_slices(x)
+        if request_slices is None:
+            return None
+
+        cache_key = (
+            "decode",
+            x.device.type,
+            x.device.index,
+            x.shape[0],
+            tuple(request_slices),
+        )
+        cached = self._get_cached_forward_mask(cache_key)
+        if cached is not None:
+            return cached
+
+        row_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+        for start, end in request_slices:
+            if end - start == 1:
+                row_mask[start:end] = True
+        self._set_cached_forward_mask(cache_key, row_mask)
+        return row_mask
+
+    def _get_vllm_prefill_half_row_mask(self, x: torch.Tensor) -> torch.Tensor | None:
+        request_slices = self._get_vllm_request_slices(x)
+        if request_slices is None:
+            return None
+
+        cache_key = (
+            "prefill_half",
+            x.device.type,
+            x.device.index,
+            x.shape[0],
+            tuple(request_slices),
+        )
+        cached = self._get_cached_forward_mask(cache_key)
+        if cached is not None:
+            return cached
+
+        row_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+        for start, end in request_slices:
+            query_len = end - start
+            if query_len == 1:
+                row_mask[start:end] = True
+                continue
+            half_query_len = query_len // 2
+            if half_query_len > 0:
+                row_mask[end - half_query_len : end] = True
+
+        self._set_cached_forward_mask(cache_key, row_mask)
+        return row_mask
+
+    def _get_cached_forward_mask(self, cache_key: tuple) -> torch.Tensor | None:
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if not is_forward_context_available():
+            return None
+        context = get_forward_context()
+        cache = context.additional_kwargs.setdefault("teal_sparsify_masks", {})
+        return cache.get(cache_key)
+
+    def _set_cached_forward_mask(self, cache_key: tuple, mask: torch.Tensor) -> None:
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if not is_forward_context_available():
+            return
+        context = get_forward_context()
+        cache = context.additional_kwargs.setdefault("teal_sparsify_masks", {})
+        cache[cache_key] = mask
+
+    def _get_vllm_request_slices(self, x: torch.Tensor) -> list[tuple[int, int]] | None:
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if not is_forward_context_available():
+            return None
+
+        context = get_forward_context()
+        metadata = context.attn_metadata
+        if isinstance(metadata, list):
+            metadata = metadata[0] if metadata else None
+        if isinstance(metadata, dict):
+            metadata = next(iter(metadata.values()), None)
+        if metadata is None or not hasattr(metadata, "query_start_loc"):
+            return None
+
+        query_start_loc = metadata.query_start_loc
+        if query_start_loc is None or query_start_loc.numel() < 2:
+            return None
+
+        num_actual_tokens = getattr(metadata, "num_actual_tokens", x.shape[0])
+        num_actual_tokens = min(int(num_actual_tokens), x.shape[0])
+
+        starts = query_start_loc.detach().to("cpu").tolist()
+        request_slices: list[tuple[int, int]] = []
+        for start, end in zip(starts, starts[1:]):
+            start = max(0, min(int(start), num_actual_tokens))
+            end = max(start, min(int(end), num_actual_tokens))
+            if end > start:
+                request_slices.append((start, end))
+        return request_slices
 
     def extra_repr(self) -> str:
-        has_rot = self.rotation is not None
         return (
             f"threshold={self.threshold.item():.4f}, "
+            f"decode_only={self.decode_only}, "
             f"apply_all_tokens={self.apply_all_tokens}, "
-            f"has_rotation={has_rot}"
+            f"prefill_sparsify={self.prefill_sparsify}"
         )

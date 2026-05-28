@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Layer helpers for injecting activation sparsity."""
 
-import os
-from typing import Optional
-
 import torch
+from torch import nn
 
 from vllm.logger import init_logger
 from vllm.sparsity.config import ActivationSparsityConfig
 from vllm.sparsity.distribution import SparsifyFn
-from vllm.sparsity.rotation import RotationTransform
+from vllm.sparsity.rotation import (
+    find_rotation_matrix_path,
+    load_rotation_matrix,
+    merge_rotation_into_weight_loader,
+)
 from vllm.sparsity.utils import load_threshold
 
 logger = init_logger(__name__)
@@ -20,7 +22,7 @@ def build_sparsifier(
     layer_idx: int,
     proj_name: str,
     device: torch.device | str = "cpu",
-) -> Optional[SparsifyFn]:
+) -> SparsifyFn | None:
     """Build a :class:`SparsifyFn` for a given layer and projection.
 
     Args:
@@ -50,27 +52,55 @@ def build_sparsifier(
         device=str(device),
     )
 
-    # La RoSA: load rotation if D/inv_D exist
-    rotation = None
-    if sparsity_config.method == "larosa":
-        rotation_dir = os.path.join(
-            sparsity_config.calibration_path,
-            f"layers.{layer_idx}.{proj_name}",
-        )
-        d_path = os.path.join(rotation_dir, "D.pt")
-        inv_d_path = os.path.join(rotation_dir, "inv_D.pt")
-        if os.path.exists(d_path) and os.path.exists(inv_d_path):
-            rotation = RotationTransform(d_path=d_path, inv_d_path=inv_d_path)
-            logger.debug(
-                "La RoSA rotation enabled for layer %d projection %s",
-                layer_idx,
-                proj_name,
-            )
-
     sparsify_fn = SparsifyFn(
         threshold=threshold,
+        decode_only=sparsity_config.decode_only,
         apply_all_tokens=sparsity_config.apply_all_tokens,
-        rotation=rotation,
+        prefill_sparsify=sparsity_config.prefill_sparsify,
     )
 
     return sparsify_fn
+
+
+def merge_larosa_rotation_into_linear(
+    sparsity_config: ActivationSparsityConfig | None,
+    layer_idx: int,
+    proj_name: str,
+    linear_layer: nn.Module,
+) -> bool:
+    """Merge offline La RoSA rotation into a linear layer's load-time weight.
+
+    Calibration artifacts are expected under:
+    ``{calibration_path}/layers.{layer_idx}.{proj_name}/D.pt``.
+    ``Q.pt`` and ``rotation.pt`` are accepted aliases for exporter convenience.
+    """
+    if sparsity_config is None or sparsity_config.method != "larosa":
+        return False
+    if not sparsity_config.enable or not sparsity_config.calibration_path:
+        return False
+
+    rotation_path = find_rotation_matrix_path(
+        sparsity_config.calibration_path,
+        layer_idx,
+        proj_name,
+    )
+    if rotation_path is None:
+        logger.debug(
+            "No La RoSA rotation matrix for layer %d projection %s",
+            layer_idx,
+            proj_name,
+        )
+        return False
+
+    if getattr(linear_layer, "quant_config", None) is not None:
+        raise ValueError(
+            "La RoSA load-time rotation merge currently supports only "
+            f"unquantized linear layers; got quantized projection {proj_name}."
+        )
+
+    rotation = load_rotation_matrix(rotation_path)
+    return merge_rotation_into_weight_loader(
+        linear_layer,
+        rotation,
+        proj_name=f"layers.{layer_idx}.{proj_name}",
+    )
