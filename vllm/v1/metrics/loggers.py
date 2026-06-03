@@ -580,6 +580,42 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_prefix_cache_hits, per_engine_labelvalues
         )
 
+        counter_prefix_cache_block_queries = self._counter_cls(
+            name="vllm:prefix_cache_block_queries",
+            documentation=(
+                "Prefix cache block lookups, in terms of full prompt blocks "
+                "whose hashes were queried."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefix_cache_block_queries = create_metric_per_engine(
+            counter_prefix_cache_block_queries, per_engine_labelvalues
+        )
+
+        counter_prefix_cache_block_hits = self._counter_cls(
+            name="vllm:prefix_cache_block_hits",
+            documentation=(
+                "Prefix cache block hits, in terms of full prompt blocks "
+                "reused from cache."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefix_cache_block_hits = create_metric_per_engine(
+            counter_prefix_cache_block_hits, per_engine_labelvalues
+        )
+
+        counter_prefix_cache_blocks_cached = self._counter_cls(
+            name="vllm:prefix_cache_blocks_cached",
+            documentation=(
+                "Prefix cache block insertions, in terms of newly cached full "
+                "prompt blocks."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefix_cache_blocks_cached = create_metric_per_engine(
+            counter_prefix_cache_blocks_cached, per_engine_labelvalues
+        )
+
         #
         # External - KV connector prefix cache
         #
@@ -1134,6 +1170,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.counter_prefix_cache_hits[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.hits
+            )
+            self.counter_prefix_cache_block_queries[engine_idx].inc(
+                scheduler_stats.prefix_cache_stats.block_queries
+            )
+            self.counter_prefix_cache_block_hits[engine_idx].inc(
+                scheduler_stats.prefix_cache_stats.block_hits
+            )
+            self.counter_prefix_cache_blocks_cached[engine_idx].inc(
+                scheduler_stats.prefix_cache_stats.blocks_cached
             )
 
             if scheduler_stats.connector_prefix_cache_stats is not None:

@@ -128,6 +128,15 @@ class PrefixCacheStats(BaseCacheStats):
     preempted_hits: int = 0
     """The `hits` number for preempted requests."""
 
+    block_queries: int = 0
+    """The number of full prompt blocks whose hashes were queried."""
+
+    block_hits: int = 0
+    """The number of full prompt blocks reused from the prefix cache."""
+
+    blocks_cached: int = 0
+    """The number of newly cached full prompt blocks."""
+
     def record(self, num_tokens: int, num_hits: int, preempted: bool) -> None:
         """Aggregate request information into the stats."""
         if preempted:
@@ -140,6 +149,15 @@ class PrefixCacheStats(BaseCacheStats):
             self.requests += 1
             self.queries += num_tokens
             self.hits += num_hits
+
+    def record_block_lookup(self, num_queries: int, num_hits: int) -> None:
+        """Aggregate block-level prefix cache lookup information."""
+        self.block_queries += num_queries
+        self.block_hits += num_hits
+
+    def record_blocks_cached(self, num_blocks: int) -> None:
+        """Aggregate newly cached full prompt blocks."""
+        self.blocks_cached += num_blocks
 
 
 @dataclass
