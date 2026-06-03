@@ -6,7 +6,7 @@ from torch import nn
 
 from vllm.logger import init_logger
 from vllm.sparsity.config import ActivationSparsityConfig
-from vllm.sparsity.distribution import SparsifyFn
+from vllm.sparsity.distribution import LaRosaSparsifyFn, SparsifyFn
 from vllm.sparsity.rotation import (
     find_rotation_matrix_path,
     load_rotation_matrix,
@@ -44,7 +44,15 @@ def build_sparsifier(
         )
         return None
 
-    # Load pre-computed threshold for this layer/proj
+    if sparsity_config.method == "larosa":
+        return _build_larosa_sparsifier(
+            sparsity_config,
+            layer_idx,
+            proj_name,
+            device,
+        )
+
+    # Load pre-computed TEAL threshold for this layer/proj
     threshold = load_threshold(
         sparsity_config.calibration_path,
         layer_idx,
@@ -60,6 +68,57 @@ def build_sparsifier(
     )
 
     return sparsify_fn
+
+
+def _build_larosa_sparsifier(
+    sparsity_config: ActivationSparsityConfig,
+    layer_idx: int,
+    proj_name: str,
+    device: torch.device | str = "cpu",
+) -> LaRosaSparsifyFn | None:
+    """Build La RoSA's official runtime top-k sparsifier for a projection."""
+    first_site_projs = {"self_attn.qkv", "mlp.gate_up"}
+    second_site_projs = {"self_attn.o", "mlp.down"}
+
+    if proj_name in first_site_projs:
+        sparse_level = sparsity_config.uniform_sparsity * 0.8
+        rotation_path = find_rotation_matrix_path(
+            sparsity_config.calibration_path,
+            layer_idx,
+            proj_name,
+        )
+        if rotation_path is None:
+            raise FileNotFoundError(
+                "La RoSA rotation matrix not found for "
+                f"layer {layer_idx}, projection '{proj_name}'. Expected "
+                f"{sparsity_config.calibration_path}/histograms/"
+                f"layer-{layer_idx}/self_attn/D.pt or "
+                f"{sparsity_config.calibration_path}/layers."
+                f"{layer_idx}.{proj_name}/D.pt."
+            )
+        rotation = load_rotation_matrix(rotation_path, device=device)
+        return LaRosaSparsifyFn(
+            sparsity_level=sparse_level,
+            rotation=rotation,
+            rotate_input=True,
+            decode_only=sparsity_config.decode_only,
+            apply_all_tokens=True,
+            prefill_sparsify="all",
+        )
+
+    if proj_name in second_site_projs:
+        sparse_level = sparsity_config.uniform_sparsity * 1.2
+        return LaRosaSparsifyFn(
+            sparsity_level=sparse_level,
+            rotation=None,
+            rotate_input=False,
+            decode_only=sparsity_config.decode_only,
+            apply_all_tokens=True,
+            prefill_sparsify="all",
+        )
+
+    logger.warning_once("Unsupported La RoSA projection %s; skipping.", proj_name)
+    return None
 
 
 def merge_larosa_rotation_into_linear(

@@ -37,7 +37,7 @@ class ActivationSparsityConfig:
     calibration_path: str | None = None
     """Directory containing calibration artifacts:
     ``histograms.pt``, per-layer ``threshold.pt``, and (for La RoSA)
-    ``D.pt`` / ``inv_D.pt``."""
+    official ``histograms/layer-{idx}/self_attn/D.pt`` rotations."""
 
     # Decode-only guard
     decode_only: bool = False

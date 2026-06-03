@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import torch
 
 from vllm.forward_context import ForwardContext, override_forward_context
-from vllm.sparsity.distribution import Distribution, SparsifyFn
+from vllm.sparsity.distribution import (
+    Distribution,
+    LaRosaSparsifyFn,
+    SparsifyFn,
+    larosa_topk,
+)
 
 
 def test_distribution_icdf():
@@ -141,3 +146,43 @@ def test_sparsify_fn_prefill_none_is_decode_only():
     decode_x = torch.ones(1, 1, 3)
     assert torch.allclose(sparsify(prefill_x), prefill_x)
     assert sparsify(decode_x).abs().max() == 0.0
+
+
+def test_larosa_topk_matches_official_rule():
+    x = torch.tensor([[1.0, -4.0, 3.0, 2.0], [0.1, -0.2, 0.3, -0.4]])
+
+    out = larosa_topk(x, sparsity_level=0.5)
+
+    expected = torch.tensor([[0.0, -4.0, 3.0, 0.0], [0.0, 0.0, 0.3, -0.4]])
+    assert torch.allclose(out, expected)
+
+
+def test_larosa_sparsify_rotates_topk_and_unrotates():
+    rotation = torch.tensor(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.5,
+        rotation=rotation,
+        rotate_input=True,
+    )
+    x = torch.tensor([[1.0, -4.0, 3.0, 2.0]])
+
+    out = sparsify(x)
+
+    expected = larosa_topk(x.double() @ rotation.double(), 0.5) @ rotation.double().t()
+    assert torch.allclose(out, expected.to(dtype=x.dtype))
+
+
+def test_larosa_sparsify_second_site_topk_direct():
+    sparsify = LaRosaSparsifyFn(sparsity_level=0.5, rotate_input=False)
+    x = torch.tensor([[1.0, -4.0, 3.0, 2.0]])
+
+    out = sparsify(x)
+
+    assert torch.allclose(out, larosa_topk(x, 0.5))

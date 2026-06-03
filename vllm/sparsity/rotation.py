@@ -73,14 +73,28 @@ def find_rotation_matrix_path(
     proj_name: str,
 ) -> str | None:
     """Return the La RoSA rotation matrix path for a layer/projection."""
-    rotation_dir = os.path.join(
-        calibration_path,
-        f"layers.{layer_idx}.{proj_name}",
-    )
-    for filename in ("D.pt", "Q.pt", "rotation.pt"):
-        path = os.path.join(rotation_dir, filename)
-        if os.path.exists(path):
-            return path
+    candidate_dirs = [
+        os.path.join(calibration_path, f"layers.{layer_idx}.{proj_name}"),
+    ]
+
+    # Official La RoSA inference loads one per-layer Q from
+    # {Q_path}/histograms/layer-{idx}/self_attn/D.pt and reuses it for both
+    # attention and MLP first-site sparsification.
+    if proj_name in {"self_attn.qkv", "mlp.gate_up"}:
+        candidate_dirs.extend(
+            [
+                os.path.join(
+                    calibration_path, "histograms", f"layer-{layer_idx}", "self_attn"
+                ),
+                os.path.join(calibration_path, f"layer-{layer_idx}", "self_attn"),
+            ]
+        )
+
+    for rotation_dir in candidate_dirs:
+        for filename in ("D.pt", "Q.pt", "rotation.pt"):
+            path = os.path.join(rotation_dir, filename)
+            if os.path.exists(path):
+                return path
     return None
 
 

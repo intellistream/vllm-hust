@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.sparsity.config import ActivationSparsityConfig
+from vllm.sparsity.distribution import LaRosaSparsifyFn
 from vllm.sparsity.layers import build_sparsifier
 
 
@@ -63,28 +64,43 @@ def test_build_sparsifier_prefill_half_default():
 
 def test_build_sparsifier_larosa():
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Threshold
-        torch.save(
-            torch.tensor(0.5),
-            os.path.join(tmpdir, "layers.2.self_attn.qkv.threshold.pt"),
-        )
-        # Rotation matrices are load-time weight artifacts, not SparsifyFn modules.
-        os.makedirs(os.path.join(tmpdir, "layers.2.self_attn.qkv"))
+        os.makedirs(os.path.join(tmpdir, "histograms", "layer-2", "self_attn"))
         hidden = 16
         d = torch.eye(hidden)
-        torch.save(d, os.path.join(tmpdir, "layers.2.self_attn.qkv", "D.pt"))
+        torch.save(
+            d,
+            os.path.join(tmpdir, "histograms", "layer-2", "self_attn", "D.pt"),
+        )
 
         cfg = ActivationSparsityConfig(
             enable=True,
             method="larosa",
             calibration_path=tmpdir,
-            apply_all_tokens=True,
+            uniform_sparsity=0.5,
         )
         sparsifier = build_sparsifier(cfg, layer_idx=2, proj_name="self_attn.qkv")
 
         assert sparsifier is not None
+        assert isinstance(sparsifier, LaRosaSparsifyFn)
+        assert sparsifier.rotate_input is True
+        assert sparsifier.sparsity_level == 0.4
         x = torch.randn(4, hidden)
         out = sparsifier(x)
         assert out.shape == x.shape
-        # SparsifyFn itself remains a plain mask; rotations are merged into weights.
         assert (out == 0).any()
+
+
+def test_build_sparsifier_larosa_second_site_no_rotation_required():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ActivationSparsityConfig(
+            enable=True,
+            method="larosa",
+            calibration_path=tmpdir,
+            uniform_sparsity=0.5,
+        )
+
+        sparsifier = build_sparsifier(cfg, layer_idx=2, proj_name="mlp.down")
+
+        assert isinstance(sparsifier, LaRosaSparsifyFn)
+        assert sparsifier.rotate_input is False
+        assert sparsifier.sparsity_level == 0.6

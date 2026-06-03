@@ -4,6 +4,7 @@ import torch
 
 from vllm.sparsity.rotation import (
     RotationTransform,
+    find_rotation_matrix_path,
     merge_rotation_into_weight,
     merge_rotation_into_weight_loader,
 )
@@ -65,3 +66,15 @@ def test_merge_rotation_into_weight_loader():
     linear.weight.weight_loader(linear.weight, loaded_weight)
 
     assert torch.allclose(linear.weight.loaded, loaded_weight @ rotation)
+
+
+def test_find_rotation_matrix_path_accepts_official_larosa_layout(tmp_path):
+    rotation_dir = tmp_path / "histograms" / "layer-3" / "self_attn"
+    rotation_dir.mkdir(parents=True)
+    rotation_path = rotation_dir / "D.pt"
+    torch.save(torch.eye(4), rotation_path)
+
+    assert (
+        find_rotation_matrix_path(str(tmp_path), 3, "mlp.gate_up")
+        == str(rotation_path)
+    )

@@ -56,7 +56,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.sparsity import (
     ActivationSparsityConfig,
     build_sparsifier,
-    merge_larosa_rotation_into_linear,
 )
 from vllm.v1.attention.backend import AttentionType
 
@@ -123,12 +122,6 @@ class LlamaMLP(nn.Module):
             layer_idx = extract_layer_index(prefix)
         except Exception:
             layer_idx = 0
-        merge_larosa_rotation_into_linear(
-            sparsity_config, layer_idx, "mlp.gate_up", self.gate_up_proj
-        )
-        merge_larosa_rotation_into_linear(
-            sparsity_config, layer_idx, "mlp.down", self.down_proj
-        )
         self.sparsify_gate_up = (
             build_sparsifier(sparsity_config, layer_idx, "mlp.gate_up")
             if sparsity_config is not None
@@ -252,12 +245,6 @@ class LlamaAttention(nn.Module):
         )
 
         # TEAL / La RoSA injection points
-        merge_larosa_rotation_into_linear(
-            sparsity_config, layer_idx, "self_attn.qkv", self.qkv_proj
-        )
-        merge_larosa_rotation_into_linear(
-            sparsity_config, layer_idx, "self_attn.o", self.o_proj
-        )
         self.sparsify_qkv = (
             build_sparsifier(sparsity_config, layer_idx, "self_attn.qkv")
             if sparsity_config is not None

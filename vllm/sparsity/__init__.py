@@ -2,7 +2,12 @@
 """Activation sparsity support for vLLM (TEAL / La RoSA)."""
 
 from vllm.sparsity.config import ActivationSparsityConfig
-from vllm.sparsity.distribution import Distribution, SparsifyFn
+from vllm.sparsity.distribution import (
+    Distribution,
+    LaRosaSparsifyFn,
+    SparsifyFn,
+    larosa_topk,
+)
 from vllm.sparsity.rotation import RotationTransform
 
 __all__ = [
@@ -10,6 +15,8 @@ __all__ = [
     "build_sparsifier",
     "Distribution",
     "get_activation_sparsity_config",
+    "LaRosaSparsifyFn",
+    "larosa_topk",
     "load_threshold",
     "merge_larosa_rotation_into_linear",
     "RotationTransform",

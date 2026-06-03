@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TEAL distribution and sparsify function."""
+"""TEAL and La RoSA distribution/sparsify functions."""
 
 import torch
 from torch import nn
@@ -285,6 +285,99 @@ class SparsifyFn(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"threshold={self.threshold.item():.4f}, "
+            f"decode_only={self.decode_only}, "
+            f"apply_all_tokens={self.apply_all_tokens}, "
+            f"prefill_sparsify={self.prefill_sparsify}"
+        )
+
+
+def larosa_topk(x: torch.Tensor, sparsity_level: float) -> torch.Tensor:
+    """Apply La RoSA's per-token magnitude top-k sparsity on the last dim."""
+    if sparsity_level <= 0.0:
+        return x
+    if sparsity_level >= 1.0:
+        raise ValueError(
+            "La RoSA sparsity_level must be lower than 1.0, "
+            f"got {sparsity_level}."
+        )
+
+    keep = int((1.0 - sparsity_level) * x.shape[-1])
+    if keep < 1:
+        raise ValueError(
+            "La RoSA sparsity_level keeps fewer than one activation for "
+            f"hidden size {x.shape[-1]}: sparsity_level={sparsity_level}."
+        )
+
+    topk_values, _ = torch.topk(torch.abs(x), keep, dim=-1)
+    keep_threshold = topk_values[..., -1:]
+    return torch.where(torch.abs(x) >= keep_threshold, x, torch.zeros_like(x))
+
+
+class LaRosaSparsifyFn(SparsifyFn):
+    """La RoSA runtime sparsifier aligned with the official HF backend.
+
+    For the first hidden-state sparsification site (attention qkv input and
+    MLP gate/up input), La RoSA rotates activations by ``Q``, applies per-token
+    top-k sparsity, and rotates back by ``Q.T``. For the second site (attention
+    output and MLP intermediate), it applies top-k directly.
+    """
+
+    def __init__(
+        self,
+        sparsity_level: float,
+        rotation: torch.Tensor | None = None,
+        rotate_input: bool = False,
+        decode_only: bool = False,
+        apply_all_tokens: bool = True,
+        prefill_sparsify: str = "all",
+    ) -> None:
+        super().__init__(
+            threshold=torch.tensor(0.0),
+            decode_only=decode_only,
+            apply_all_tokens=apply_all_tokens,
+            prefill_sparsify=prefill_sparsify,
+        )
+        if rotate_input and rotation is None:
+            raise ValueError("La RoSA rotate_input=True requires a rotation matrix.")
+        if rotation is not None:
+            if rotation.dim() != 2 or rotation.shape[0] != rotation.shape[1]:
+                raise ValueError(
+                    "La RoSA rotation matrix must be square, got "
+                    f"shape={tuple(rotation.shape)}."
+                )
+            rotation = rotation.to(dtype=torch.float64)
+        self.sparsity_level = float(sparsity_level)
+        self.rotate_input = rotate_input
+        self.register_buffer("rotation", rotation)
+
+    def _apply_mask(self, x: torch.Tensor) -> torch.Tensor:
+        if self.sparsity_level <= 0.0:
+            return x
+
+        original_dtype = x.dtype
+        if not self.rotate_input:
+            return larosa_topk(x, self.sparsity_level)
+
+        if self.rotation is None:
+            raise ValueError("La RoSA rotation matrix is not initialized.")
+        if x.shape[-1] != self.rotation.shape[0]:
+            raise ValueError(
+                "La RoSA rotation hidden size mismatch: "
+                f"input hidden={x.shape[-1]}, rotation={tuple(self.rotation.shape)}."
+            )
+
+        rotation = self.rotation.to(device=x.device)
+        rotated_x = torch.matmul(x.to(dtype=torch.float64), rotation)
+        sparse_rotated_x = larosa_topk(rotated_x, self.sparsity_level)
+        unrotated_x = torch.matmul(sparse_rotated_x, rotation.t())
+        return unrotated_x.to(dtype=original_dtype)
+
+    def extra_repr(self) -> str:
+        rotation_shape = None if self.rotation is None else tuple(self.rotation.shape)
+        return (
+            f"sparsity_level={self.sparsity_level:.4f}, "
+            f"rotate_input={self.rotate_input}, "
+            f"rotation_shape={rotation_shape}, "
             f"decode_only={self.decode_only}, "
             f"apply_all_tokens={self.apply_all_tokens}, "
             f"prefill_sparsify={self.prefill_sparsify}"
