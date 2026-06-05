@@ -44,6 +44,9 @@ class BlockTable:
         self.pin_memory = pin_memory
         self.device = device
 
+        if kernel_block_size == 0:
+            kernel_block_size = block_size
+
         if kernel_block_size == block_size:
             # Standard case: allocation and computation use same block size
             # No block splitting needed, direct mapping

@@ -1,3 +1,39 @@
+
+def _causal_conv1d_ref_fallback(x, weight, bias=None, seq_idx=None, initial_states=None, return_final_states=False, final_states_out=None, activation=None):
+    import torch
+    import torch.nn.functional as F
+
+    if x.dim() == 2:
+        x_in = x.unsqueeze(0).transpose(1, 2)  # [1, D, T]
+        squeeze_back = True
+    elif x.dim() == 3:
+        x_in = x.transpose(1, 2)  # [B, D, T]
+        squeeze_back = False
+    else:
+        raise RuntimeError(f"unsupported causal_conv1d x shape: {tuple(x.shape)}")
+
+    d = x_in.shape[1]
+    w = weight
+    if w.dim() == 2:
+        w = w.unsqueeze(1)  # [D, 1, K]
+    y = F.conv1d(x_in, w.to(x_in.dtype), bias=None if bias is None else bias.to(x_in.dtype), padding=w.shape[-1] - 1, groups=d)
+    y = y[..., :x_in.shape[-1]]
+
+    if activation in ("silu", "swish"):
+        y = F.silu(y)
+
+    y = y.transpose(1, 2)
+    if squeeze_back:
+        y = y.squeeze(0)
+
+    if return_final_states:
+        final = x_in[..., -(w.shape[-1] - 1):].contiguous()
+        if final_states_out is not None:
+            final_states_out.copy_(final)
+        return y, final
+    return y
+
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -485,6 +521,12 @@ def causal_conv1d_fn(
     metadata=None,
     validate_data=False,
 ):
+    return _causal_conv1d_ref_fallback(
+        x, weight, bias=bias, seq_idx=seq_idx, initial_states=initial_states,
+        return_final_states=return_final_states, final_states_out=final_states_out,
+        activation=activation,
+    )
+
     """support varlen + continuous batching when x is 2D tensor
 
     x: (dim,cu_seq_len)

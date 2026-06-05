@@ -833,14 +833,52 @@ def create_kv_cache_group_specs(
         A list of KVCacheGroupSpec objects, one for each group.
     """
     kv_cache_groups = []
+
     for layer_names_one_group in grouped_layer_names:
-        layer_specs = [
-            kv_cache_spec[layer_name] for layer_name in layer_names_one_group
+
+        draft_layers = [
+            x for x in layer_names_one_group
+            if x.startswith("draft_model.")
         ]
-        merged_layer_spec = layer_specs[0].merge(layer_specs)
-        kv_cache_groups.append(
-            KVCacheGroupSpec(layer_names_one_group, merged_layer_spec)
-        )
+
+        normal_layers = [
+            x for x in layer_names_one_group
+            if not x.startswith("draft_model.")
+        ]
+
+        split_groups = []
+
+        if draft_layers and normal_layers:
+
+            print(
+                "[DRAFT_PATCH] REAL split kv groups:",
+                len(normal_layers),
+                len(draft_layers),
+            )
+
+            split_groups.append((normal_layers, False))
+            split_groups.append((draft_layers, True))
+
+        else:
+            split_groups.append((layer_names_one_group, False))
+
+        for cur_layers, is_draft_group in split_groups:
+
+            layer_specs = [
+                kv_cache_spec[layer_name]
+                for layer_name in cur_layers
+            ]
+
+            merged_layer_spec = layer_specs[0].merge(layer_specs)
+
+            kv_cache_groups.append(
+                KVCacheGroupSpec(
+                    cur_layers,
+                    merged_layer_spec,
+                    is_eagle_group=is_draft_group,
+                )
+            )
+
     return kv_cache_groups
 
 
@@ -978,16 +1016,52 @@ def _get_kv_cache_groups_uniform_type(
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache configuration for a model with one type of KV cache
-    but different hidden sizes. All layers are merged into one group.
-
-    Args:
-        spec: The UniformTypeKVCacheSpecs of the model
-
-    Returns:
-        The generated KVCacheGroupSpecs
+    but different hidden sizes.
     """
 
-    return [KVCacheGroupSpec(list(spec.kv_cache_specs.keys()), spec)]
+    all_layers = list(spec.kv_cache_specs.keys())
+
+    draft_layers = [
+        x for x in all_layers
+        if x.startswith("draft_model.")
+    ]
+
+    normal_layers = [
+        x for x in all_layers
+        if not x.startswith("draft_model.")
+    ]
+
+    if draft_layers and normal_layers:
+
+        print(
+            "[DRAFT_PATCH] split uniform kv groups:",
+            len(normal_layers),
+            len(draft_layers),
+        )
+
+        normal_spec = UniformTypeKVCacheSpecs.from_specs({
+            k: spec.kv_cache_specs[k]
+            for k in normal_layers
+        })
+
+        draft_spec = UniformTypeKVCacheSpecs.from_specs({
+            k: spec.kv_cache_specs[k]
+            for k in draft_layers
+        })
+
+        return [
+            KVCacheGroupSpec(
+                normal_layers,
+                normal_spec,
+            ),
+            KVCacheGroupSpec(
+                draft_layers,
+                draft_spec,
+                is_eagle_group=True,
+            ),
+        ]
+
+    return [KVCacheGroupSpec(all_layers, spec)]
 
 
 def is_kv_cache_page_size_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:

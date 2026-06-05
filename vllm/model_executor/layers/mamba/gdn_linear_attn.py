@@ -792,14 +792,22 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
+
+        # Ascend NPU path may wrap GDN states as [[conv_state, ssm_state]].
+        if isinstance(self_kv_cache, list) and len(self_kv_cache) == 1 and isinstance(self_kv_cache[0], list):
+            self_kv_cache = self_kv_cache[0]
+
+        conv_cache = self_kv_cache[0]
+        ssm_cache = self_kv_cache[1]
+
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         conv_state = (
-            self_kv_cache[0]
+            conv_cache
             if is_conv_state_dim_first()
-            else self_kv_cache[0].transpose(-1, -2)
+            else conv_cache.transpose(-1, -2)
         )
-        ssm_state = self_kv_cache[1]
+        ssm_state = ssm_cache
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 

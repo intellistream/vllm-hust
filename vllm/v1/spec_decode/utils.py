@@ -600,3 +600,25 @@ def unconditional_to_conditional_rates(rates: list[float]) -> list[float]:
     """Convert per-position unconditional rates to per-position conditional
     rates for the early-terminating rejection loop (c_i = p_i / p_{i-1})."""
     return [p / q if q > 0.0 else 0.0 for p, q in zip(rates, [1.0, *rates[:-1]])]
+
+def create_vllm_config_for_draft_model(
+    vllm_config,
+    draft_model_config,
+    draft_parallel_config,
+):
+    """
+    Compatibility helper for vllm-ascend speculative decoding.
+
+    Newer vllm-ascend expects this helper to exist in
+    vllm.v1.spec_decode.utils.
+    """
+
+    from copy import deepcopy
+
+    new_config = deepcopy(vllm_config)
+
+    new_config.model_config = draft_model_config
+    new_config.parallel_config = draft_parallel_config
+
+    return new_config
+

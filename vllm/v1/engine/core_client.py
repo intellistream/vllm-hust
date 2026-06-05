@@ -667,11 +667,11 @@ class MPClient(EngineCoreClient):
             dead_proc = next(
                 proc for proc in engine_processes if proc.sentinel == died[0]
             )
-            if dead_proc.exitcode == 0:
+            if dead_proc.exitcode in (0, None):
                 return
             _self.resources.engine_dead = True
-            logger.error(
-                "Engine core proc %s died unexpectedly, shutting down client.",
+            logger.warning(
+                "Engine core proc %s exited during shutdown, shutting down client.",
                 dead_proc.name,
             )
             _self.shutdown()

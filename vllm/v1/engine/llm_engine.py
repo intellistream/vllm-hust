@@ -438,5 +438,9 @@ class LLMEngine:
             self.dp_group = cast(Any, None)
 
     def __del__(self):
-        with suppress(Exception):
-            self.shutdown()
+        try:
+            shutdown = getattr(self, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+        except BaseException:
+            pass

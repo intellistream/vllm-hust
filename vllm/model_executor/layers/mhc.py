@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
 import math
 from functools import cache
 from typing import TYPE_CHECKING
@@ -21,12 +22,43 @@ if TYPE_CHECKING or current_platform.is_cuda_alike():
     import tilelang
     import tilelang.language as T
 else:
-    tilelang = None  # type: ignore[assignment]
-    T = None  # type: ignore[assignment]
+    class _FakePassConfigKey:
+        TL_DISABLE_WARP_SPECIALIZED = 0
+        TL_DISABLE_TMA_LOWER = 1
+        TL_PTXAS_REGISTER_USAGE_LEVEL = 2
+
+    class _FakeTileLang:
+        PassConfigKey = _FakePassConfigKey
+
+        class JITKernel:
+            pass
+
+        @staticmethod
+        def jit(*args, **kwargs):
+            def deco(fn):
+                return fn
+            return deco
+
+    class _FakeT:
+        float32 = torch.float32
+        bfloat16 = torch.bfloat16
+
+        def __getattr__(self, name):
+            def _missing(*args, **kwargs):
+                raise RuntimeError(
+                    "vllm.model_executor.layers.mhc is CUDA/tilelang-only; "
+                    f"T.{name} cannot run on non-CUDA platforms."
+                )
+            return _missing
+
+    tilelang = _FakeTileLang()  # type: ignore[assignment]
+    T = _FakeT()  # type: ignore[assignment]
 
 
 @cache
 def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
+    if not current_platform.is_cuda_alike():
+        return 1
     device_props = torch.cuda.get_device_properties(0)
     n_sms = device_props.multi_processor_count
     split_k = n_sms // grid_size
@@ -210,6 +242,9 @@ def mhc_pre(
         comb_mix: shape (..., hc_mult, hc_mult), dtype torch.float32
         layer_input: shape (..., hidden_size), dtype torch.bfloat16
     """
+
+    if not current_platform.is_cuda_alike():
+        raise RuntimeError("mhc_pre is CUDA/tilelang-only and cannot run on Ascend.")
 
     # Validate shapes
     assert residual.dtype == torch.bfloat16
@@ -414,6 +449,8 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    if not current_platform.is_cuda_alike():
+        raise RuntimeError("mhc_post is CUDA/tilelang-only and cannot run on Ascend.")
     out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,
@@ -563,6 +600,8 @@ def _hc_head_fused_kernel(
     hc_mult: int,
 ) -> None:
     """Fill pre-allocated `out` (T, H) in-place with the hc_head result."""
+    if not current_platform.is_cuda_alike():
+        raise RuntimeError("hc_head_fused_kernel is CUDA/tilelang-only and cannot run on Ascend.")
     if hs_flat.shape[0] > 0:
         hc_head_fuse_tilelang(
             hs_flat,

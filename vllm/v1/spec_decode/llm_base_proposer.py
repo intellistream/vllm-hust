@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import time
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -469,6 +470,9 @@ class SpecDecodeBaseProposer:
             num_tokens, num_input_tokens, mm_embed_inputs
         )
 
+        torch.npu.synchronize()
+        _draft_t0 = time.time()
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -480,11 +484,23 @@ class SpecDecodeBaseProposer:
             ),
         ):
             ret_hidden_states = self.model(**model_kwargs)
-            if not self.model_returns_tuple():
-                last_hidden_states = ret_hidden_states
-                hidden_states = last_hidden_states
-            else:
-                last_hidden_states, hidden_states = ret_hidden_states
+
+        torch.npu.synchronize()
+        _draft_t1 = time.time()
+
+        if not self.model_returns_tuple():
+            last_hidden_states = ret_hidden_states
+            hidden_states = last_hidden_states
+        else:
+            last_hidden_states, hidden_states = ret_hidden_states
+
+        print(
+            f"[DRAFT_FORWARD] "
+            f"{(_draft_t1 - _draft_t0)*1000:.3f} ms "
+            f"tokens={num_input_tokens} "
+            f"phase=first",
+            flush=True,
+        )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
@@ -631,6 +647,9 @@ class SpecDecodeBaseProposer:
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
 
+            torch.npu.synchronize()
+            _draft_t0 = time.time()
+
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -645,6 +664,16 @@ class SpecDecodeBaseProposer:
                     hidden_states = ret_hidden_states
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
+
+            torch.npu.synchronize()
+            _draft_t1 = time.time()
+            print(
+                f"[DRAFT_FORWARD] "
+                f"{(_draft_t1 - _draft_t0)*1000:.3f} ms "
+                f"tokens={input_batch_size} "
+                f"phase=next",
+                flush=True,
+            )
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
@@ -1682,6 +1711,10 @@ class SpecDecodeBaseProposer:
         )
 
         # Find which kv_cache_group the draft layers belong to
+        print("[DRAFT_DEBUG] entering validate_same_kv_cache_group")
+        print("[DRAFT_DEBUG] draft attn_layer_names:", getattr(self, "attn_layer_names", None))
+        print("[DRAFT_DEBUG] kv_cache_config type:", type(kv_cache_config))
+        print("[DRAFT_DEBUG] kv_cache_config:", kv_cache_config)
         self.validate_same_kv_cache_group(kv_cache_config)
         kv_cache_spec = None
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -1696,11 +1729,33 @@ class SpecDecodeBaseProposer:
                 attn_backend = all_attn_layers[layer_name].get_attn_backend()
                 backend_key = attn_backend.full_cls_name()
                 if backend_key not in attention_groups:
-                    layer_kv_cache_spec = kv_cache_spec
+                    # DRAFT PATCH: do not reuse target kv_cache_spec for draft_model.
+                    # For draft_model, draft layers may be inside the same KVCacheGroup
+                    # as target layers, but their KV shape should come from draft layer itself.
+                    draft_vllm_config = self._create_draft_vllm_config()
+                    layer_kv_cache_spec = all_attn_layers[layer_name].get_kv_cache_spec(
+                        draft_vllm_config
+                    )
+                    if layer_kv_cache_spec is None:
+                        layer_kv_cache_spec = kv_cache_spec
                     if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                         layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
                             layer_name
                         ]
+                    print("[DRAFT_PATCH] layer", layer_name, "kv_spec", layer_kv_cache_spec)
+
+                    layer_obj = all_attn_layers[layer_name]
+
+                    print(
+                        "[DRAFT_PATCH] layer_obj",
+                        layer_name,
+                        "num_heads=",
+                        getattr(layer_obj, "num_heads", None),
+                        "num_kv_heads=",
+                        getattr(layer_obj, "num_kv_heads", None),
+                        "head_size=",
+                        getattr(layer_obj, "head_size", None),
+                    )
 
                     kernel_block_size = (
                         kernel_block_sizes[self.kv_cache_gid]
