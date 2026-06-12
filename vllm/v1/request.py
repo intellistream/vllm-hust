@@ -206,6 +206,7 @@ class Request:
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
+            envelope_token_count=getattr(request, 'envelope_token_count', None),
         )
 
     def append_output_token_ids(

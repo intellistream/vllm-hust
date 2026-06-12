@@ -374,6 +374,7 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            envelope_token_count=decoder_inputs.get("envelope_token_count"),
         )
 
     def _validate_prompt_len(

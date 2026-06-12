@@ -518,7 +518,7 @@ class OpenAIServingRender:
             tok_params,
             prompt_extras={
                 k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
+                for k in ("mm_processor_kwargs", "cache_salt", "envelope_token_count")
                 if (v := getattr(request, k, None)) is not None
             },
             skip_mm_cache=skip_mm_cache,
@@ -567,7 +567,7 @@ class OpenAIServingRender:
             tok_params,
             prompt_extras={
                 k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
+                for k in ("mm_processor_kwargs", "cache_salt", "envelope_token_count")
                 if (v := getattr(request, k, None)) is not None
             },
             skip_mm_cache=skip_mm_cache,

@@ -25,6 +25,9 @@ class _InputOptions(TypedDict):
     cache_salt: NotRequired[str]
     """Optional cache salt to be used for prefix caching."""
 
+    envelope_token_count: NotRequired[int]
+    """Segment reuse: number of envelope tokens at the front of the prompt."""
+
 
 class TokensInput(_InputOptions):
     """Represents token-based input to the engine."""

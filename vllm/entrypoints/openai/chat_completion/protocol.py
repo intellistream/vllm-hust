@@ -384,6 +384,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "can detect such behavior and terminate early, saving time and tokens.",
     )
 
+
+    envelope_token_count: int | None = Field(
+        default=None,
+        description=(
+            "If specified, enables segment reuse (minimal stitch). "
+            "Indicates the number of envelope tokens at the front of the "
+            "prompt. The remaining tokens are treated as the shared body. "
+            "When multiple requests share the same body, the body's KV "
+            "cache is reused without recomputation."
+        ),
+    )
     # --8<-- [end:chat-completion-extra-params]
 
     @model_validator(mode="before")

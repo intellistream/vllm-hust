@@ -104,6 +104,10 @@ class EngineCore:
 
         load_general_plugins()
 
+        # Apply segment reuse (minimal stitch) patches if enabled.
+        from vllm.v1.segment_reuse.patch import apply_segment_reuse_patches
+        apply_segment_reuse_patches()
+
         self.vllm_config = vllm_config
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(

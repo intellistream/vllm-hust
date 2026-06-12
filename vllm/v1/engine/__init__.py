@@ -122,6 +122,9 @@ class EngineCoreRequest(
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
 
+    # Segment reuse (minimal stitch): envelope token count.
+    envelope_token_count: int | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
