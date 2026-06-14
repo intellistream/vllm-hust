@@ -15,6 +15,7 @@ vLLM supports a variety of methods of speculative decoding. Model-based methods 
 - [Multi-Layer Perceptron](mlp.md)
 - [N-Gram](n_gram.md)
 - [Suffix Decoding](suffix.md)
+- [Dynamic Speculative Decoding](dynamic_speculative_decoding.md)
 
 ## Method Selection at a Glance
 
@@ -30,6 +31,7 @@ depend on your model family, traffic pattern, hardware, and sampling settings.
 | MLP speculator | Medium to high gain | Medium gain | Good when compatible MLP speculators are available. |
 | N-gram | Low to medium gain | Medium gain | Lightweight and easy to enable. |
 | Suffix decoding | Low to medium gain | Medium gain | No extra draft model; dynamic speculation depth. |
+| Dynamic Speculative Decoding | High gain | Higher than base SD method | Useful for RL or workload with fluctuating QPS |
 
 For reproducible measurements in your environment, use
 [`examples/offline_inference/spec_decode.py`](../../../examples/offline_inference/spec_decode.py)
