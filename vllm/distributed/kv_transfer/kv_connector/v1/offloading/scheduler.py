@@ -65,6 +65,16 @@ class GroupOffloadConfig(NamedTuple):
     hash_block_size_factor: int
     # None below means full attention
     sliding_window_size_in_blocks: int | None
+    # Number of this group's offloaded blocks per full-attention alignment
+    # segment. Used to skip storing SWA blocks that can never serve a load
+    # hit (e.g. DeepSeek V4 where SWA groups have much smaller block sizes
+    # than the MLA full-attention group).
+    # None for full-attention groups or when the optimization doesn't apply.
+    alignment_block_count: int | None = None
+    # True for EAGLE/MTP draft-model attention groups. The trailing block
+    # of these groups is volatile and lacks a stable hash, so it must
+    # be excluded from store and load scheduling.
+    is_eagle_group: bool = False
 
 
 def get_sliding_window_size_in_blocks(
@@ -89,6 +99,61 @@ class SchedulerOffloadConfig(NamedTuple):
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
+        # Determine the alignment token count from the full-attention group(s).
+        # This is the offloaded_block_size of the full-attention group; load
+        # hits are always aligned to this boundary, so SWA blocks earlier in
+        # each segment can never serve a load hit. Relevant for hybrid
+        # architectures like DeepSeek V4 (MLA + SWA groups).
+        full_attn_offloaded_block_sizes: set[int] = set()
+        for idx, gpu_block_size in enumerate(spec.gpu_block_size):
+            kv_spec = spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            sw = get_sliding_window_size_in_blocks(
+                kv_spec, gpu_block_size * spec.block_size_factor
+            )
+            if sw is None:
+                full_attn_offloaded_block_sizes.add(
+                    gpu_block_size * spec.block_size_factor
+                )
+
+        # Only apply the optimization if there's a single consistent
+        # full-attention alignment size.
+        alignment_tokens: int | None = None
+        if len(full_attn_offloaded_block_sizes) == 1:
+            alignment_tokens = full_attn_offloaded_block_sizes.pop()
+
+        def _alignment_block_count(
+            offloaded_block_size: int,
+            sliding_window_size_in_blocks: int | None,
+        ) -> int | None:
+            if alignment_tokens is None or sliding_window_size_in_blocks is None:
+                return None
+            if alignment_tokens <= offloaded_block_size:
+                return None
+            per_segment = alignment_tokens // offloaded_block_size
+            if sliding_window_size_in_blocks >= per_segment:
+                return None
+            return per_segment
+
+        eagle_groups = {
+            idx
+            for idx, g in enumerate(spec.kv_cache_config.kv_cache_groups)
+            if g.is_eagle_group
+        }
+
+        use_eagle = (
+            spec.vllm_config.speculative_config is not None
+            and spec.vllm_config.speculative_config.use_eagle()
+        )
+        if use_eagle and not eagle_groups:
+            eagle_groups = set(range(len(spec.kv_cache_config.kv_cache_groups)))
+
+        if eagle_groups:
+            logger.info(
+                "KV offloading: EAGLE/MTP draft attention groups %s "
+                "detected. The trailing block of these groups will be "
+                "excluded from offloading due to volatility.",
+                sorted(eagle_groups),
+            )
         return cls(
             num_workers=spec.vllm_config.parallel_config.world_size,
             kv_group_configs=tuple(
@@ -100,10 +165,16 @@ class SchedulerOffloadConfig(NamedTuple):
                         (gpu_block_size * spec.block_size_factor)
                         // spec.hash_block_size
                     ),
-                    sliding_window_size_in_blocks=get_sliding_window_size_in_blocks(
-                        spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec,
-                        gpu_block_size * spec.block_size_factor,
+                    sliding_window_size_in_blocks=(
+                        sw := get_sliding_window_size_in_blocks(
+                            spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec,
+                            gpu_block_size * spec.block_size_factor,
+                        )
                     ),
+                    alignment_block_count=_alignment_block_count(
+                        gpu_block_size * spec.block_size_factor, sw
+                    ),
+                    is_eagle_group=idx in eagle_groups,
                 )
                 for idx, gpu_block_size in enumerate(spec.gpu_block_size)
             ),
@@ -321,6 +392,11 @@ class OffloadingConnectorScheduler:
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
+
+        # Tracks which eagle groups have already popped their volatile trailing block
+        # in the current convergence iteration. Reset when a non-eagle group
+        # tightens the hit boundary, requiring a fresh pop.
+        eagle_verified: set[int] = set()
         while lookup_groups:
             looked_up_sliding_window: bool = False
             groups_iter = iter(lookup_groups)
@@ -338,6 +414,10 @@ class OffloadingConnectorScheduler:
                     >= req_status.req.num_tokens // offloaded_block_size
                 )
 
+                is_eagle_unverified = (
+                    group_config.is_eagle_group and group_idx not in eagle_verified
+                )
+
                 # Constrain to block-aligned boundary for this group
                 max_hit_size_tokens = min(
                     max_hit_size_tokens, len(offload_keys) * offloaded_block_size
@@ -346,14 +426,24 @@ class OffloadingConnectorScheduler:
                     # we can only load less than a block, better skip
                     return 0
 
-                num_blocks = min(
-                    cdiv(max_hit_size_tokens, offloaded_block_size), len(offload_keys)
-                )
-                start_block_idx = num_computed_tokens // offloaded_block_size
-                offload_keys = offload_keys[start_block_idx:num_blocks]
                 sliding_window_size_in_blocks = (
                     group_config.sliding_window_size_in_blocks
                 )
+
+                # For eagle groups, query one extra block that will be popped.
+                # We only need to increase the query size for sliding window groups.
+                query_max = max_hit_size_tokens
+                if is_eagle_unverified and sliding_window_size_in_blocks is not None:
+                    query_max = min(
+                        max_hit_size_tokens + offloaded_block_size,
+                        len(offload_keys) * offloaded_block_size,
+                    )
+
+                num_blocks = min(
+                    cdiv(query_max, offloaded_block_size), len(offload_keys)
+                )
+                start_block_idx = num_computed_tokens // offloaded_block_size
+                offload_keys = offload_keys[start_block_idx:num_blocks]
 
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
@@ -363,9 +453,12 @@ class OffloadingConnectorScheduler:
                         offload_keys, req_status.req_context
                     )
                 else:
+                    required_window = sliding_window_size_in_blocks
+                    if is_eagle_unverified:
+                        required_window += 1
                     num_hit_blocks = self._sliding_window_lookup(
                         offload_keys,
-                        sliding_window_size_in_blocks,
+                        required_window,
                         req_status.req_context,
                     )
                 if num_hit_blocks == 0:
@@ -374,6 +467,10 @@ class OffloadingConnectorScheduler:
                 if num_hit_blocks is None:
                     defer_lookup = True
                 else:
+                    if is_eagle_unverified:
+                        num_hit_blocks -= 1
+                        eagle_verified.add(group_idx)
+
                     max_hit_size_tokens = min(
                         max_hit_size_tokens,
                         offloaded_block_size * (start_block_idx + num_hit_blocks),
@@ -385,6 +482,8 @@ class OffloadingConnectorScheduler:
                     return 0
 
                 if new_num_hit_tokens < num_hit_tokens:
+                    if not group_config.is_eagle_group:
+                        eagle_verified.clear()
                     if defer_lookup:
                         # make another iteration on all groups to check
                         # if we still need to defer lookup
@@ -635,6 +734,9 @@ class OffloadingConnectorScheduler:
                 self.config.kv_group_configs, req_status.group_states
             ):
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+                if group_config.is_eagle_group:
+                    num_blocks = max(0, num_blocks - 1)
+
                 start_block_idx = group_state.next_stored_block_idx
                 if num_blocks <= start_block_idx:
                     continue
