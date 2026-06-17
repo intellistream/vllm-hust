@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """TEAL and La RoSA distribution/sparsify functions."""
 
+import os
+
 import torch
 from torch import nn
 
@@ -161,6 +163,8 @@ class SparsifyFn(nn.Module):
         sparse_input = self._sparse_linear_input(x, linear_layer)
         if sparse_input is None:
             return None
+        if not self._should_use_sparse_linear_kernel(sparse_input, weight):
+            return None
 
         threshold, inclusive = self._sparse_linear_threshold(sparse_input)
         if threshold is None:
@@ -201,6 +205,26 @@ class SparsifyFn(nn.Module):
         linear_layer._activation_sparse_weight_t = weight_t
         linear_layer._activation_sparse_weight_t_key = cache_key
         return weight_t
+
+    def _should_use_sparse_linear_kernel(
+        self,
+        sparse_input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        mode = os.environ.get("VLLM_SPARSE_GEMV_LINEAR_POLICY", "auto").lower()
+        if mode in {"all", "always"}:
+            return True
+        if mode in {"none", "never"}:
+            return False
+        if mode != "auto":
+            return False
+        return (
+            sparse_input.dim() == 2
+            and sparse_input.shape[0] == 1
+            and sparse_input.shape[1] <= 4096
+            and weight.dim() == 2
+            and weight.shape[0] >= 32768
+        )
 
     def _sparse_linear_applies_to_all_rows(self, x: torch.Tensor) -> bool:
         if self.apply_all_tokens or self.prefill_sparsify == "all":

@@ -425,6 +425,7 @@ def main() -> int:
         "output_len": args.output_len,
         "num_prompts": args.num_prompts,
         "dtype": args.dtype,
+        "sparse_linear_policy": os.environ.get("VLLM_SPARSE_GEMV_LINEAR_POLICY"),
         "require_sparse_gemv_kernel": not args.allow_sparse_gemv_fallback,
         "dense": dense,
         "sparse": sparse,
