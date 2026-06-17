@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from types import SimpleNamespace
 
 import torch
 
-from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.sparsity.distribution import (
     Distribution,
     LaRosaSparsifyFn,
     SparsifyFn,
     larosa_topk,
 )
+from vllm.sparsity.rotation import merge_rotation_into_weight
 
 
 def test_distribution_icdf():
@@ -111,6 +112,8 @@ def test_sparsify_fn_prefill_half_2d_fallback_masks_last_half():
 
 
 def test_sparsify_fn_prefill_half_2d_uses_vllm_query_slices():
+    from vllm.forward_context import ForwardContext, override_forward_context
+
     threshold = torch.tensor(1e6)
     sparsify = SparsifyFn(threshold)
     metadata = {
@@ -175,8 +178,157 @@ def test_larosa_sparsify_rotates_topk_and_unrotates():
 
     out = sparsify(x)
 
-    expected = larosa_topk(x.double() @ rotation.double(), 0.5) @ rotation.double().t()
+    expected = larosa_topk(x.float() @ rotation.float(), 0.5) @ rotation.float().t()
     assert torch.allclose(out, expected.to(dtype=x.dtype))
+
+
+def test_larosa_sparsify_uses_fp32_rotation_math():
+    rotation = torch.eye(4, dtype=torch.float64)
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.5,
+        rotation=rotation,
+        rotate_input=True,
+    )
+
+    assert sparsify.rotation.dtype == torch.float32
+
+    x = torch.tensor([[1.0, -4.0, 3.0, 2.0]], dtype=torch.bfloat16)
+    out = sparsify(x)
+
+    assert out.dtype == x.dtype
+
+
+def test_larosa_sparse_linear_rotated_input_matches_unrotation_math():
+    weight = torch.randn(6, 4)
+    q, _ = torch.linalg.qr(torch.randn(4, 4))
+    x = torch.randn(3, 4)
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.5,
+        rotation=q,
+        rotate_input=True,
+        use_sparse_gemv=True,
+    )
+    linear = SimpleNamespace(_larosa_sparse_weight_merged=True)
+    merged_weight = merge_rotation_into_weight(weight, q)
+
+    rotated_x = sparsify._sparse_linear_input(x, linear)
+    threshold, inclusive = sparsify._sparse_linear_threshold(rotated_x)
+    sparse_rotated_x = torch.where(
+        torch.ge(rotated_x.abs(), threshold.reshape(x.shape[0], 1)),
+        rotated_x,
+        torch.zeros_like(rotated_x),
+    )
+
+    actual = sparse_rotated_x @ merged_weight.t()
+    expected = (larosa_topk(x.float() @ q.float(), 0.5) @ q.float().t()) @ weight.t()
+
+    assert inclusive is True
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
+def test_larosa_sparse_linear_rotated_input_matches_bf16_unrotation_math():
+    torch.manual_seed(0)
+    weight = torch.randn(6, 4, dtype=torch.bfloat16)
+    q, _ = torch.linalg.qr(torch.randn(4, 4))
+    x = torch.randn(3, 4, dtype=torch.bfloat16)
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.5,
+        rotation=q,
+        rotate_input=True,
+        use_sparse_gemv=True,
+    )
+    linear = SimpleNamespace(_larosa_sparse_weight_merged=True)
+    merged_weight = merge_rotation_into_weight(weight, q)
+
+    rotated_x = sparsify._sparse_linear_input(x, linear)
+    threshold, inclusive = sparsify._sparse_linear_threshold(rotated_x)
+    sparse_rotated_x = torch.where(
+        torch.ge(rotated_x.abs().to(dtype=torch.float32), threshold.reshape(3, 1)),
+        rotated_x,
+        torch.zeros_like(rotated_x),
+    )
+
+    actual = sparse_rotated_x @ merged_weight.t()
+    dense_sparse_x = larosa_topk(x.float() @ q.float(), 0.5) @ q.float().t()
+    expected = dense_sparse_x.to(dtype=x.dtype) @ weight.t()
+
+    assert rotated_x.dtype == x.dtype
+    assert threshold.dtype == torch.float32
+    assert inclusive is True
+    assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_larosa_rotated_sparse_linear_requires_merged_weight():
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.5,
+        rotation=torch.eye(4),
+        rotate_input=True,
+        use_sparse_gemv=True,
+    )
+
+    assert sparsify._sparse_linear_input(torch.randn(1, 4), SimpleNamespace()) is None
+
+
+def test_sparse_linear_weight_t_cache_invalidates_after_weight_mutation():
+    linear = torch.nn.Linear(4, 3, bias=False)
+    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
+
+    first = sparsify._get_sparse_linear_weight_t(linear, linear.weight)
+    cached = sparsify._get_sparse_linear_weight_t(linear, linear.weight)
+
+    assert cached.data_ptr() == first.data_ptr()
+    assert torch.allclose(first, linear.weight.t())
+
+    with torch.no_grad():
+        linear.weight.add_(1.0)
+
+    updated = sparsify._get_sparse_linear_weight_t(linear, linear.weight)
+
+    assert updated.data_ptr() != first.data_ptr()
+    assert torch.allclose(updated, linear.weight.t())
+    assert not torch.allclose(first, linear.weight.t())
+
+
+def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):
+    from vllm.sparsity.kernels.sparse_gemv import (
+        _record_sparse_gemv_invocation,
+        reset_sparse_gemv_invocation_count,
+    )
+
+    marker_path = tmp_path / "sparse_gemv_marker.jsonl"
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_MARKER_PATH", str(marker_path))
+
+    reset_sparse_gemv_invocation_count()
+    _record_sparse_gemv_invocation(
+        x=torch.ones(1, 4, dtype=torch.float16),
+        threshold=torch.tensor(0.5, dtype=torch.float32),
+        inclusive=False,
+        weight_t=torch.ones(4, 3, dtype=torch.float16),
+    )
+    reset_sparse_gemv_invocation_count()
+    _record_sparse_gemv_invocation(
+        x=torch.ones(3, 4, dtype=torch.bfloat16),
+        threshold=torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+        inclusive=True,
+    )
+
+    records = [
+        json.loads(line)
+        for line in marker_path.read_text(encoding="utf-8").splitlines()
+    ]
+    reset_sparse_gemv_invocation_count()
+
+    assert len(records) == 2
+    assert records[0]["x_shape"] == [1, 4]
+    assert records[0]["threshold_shape"] == []
+    assert records[0]["threshold_numel"] == 1
+    assert records[0]["inclusive"] is False
+    assert records[0]["weight_t_provided"] is True
+    assert records[1]["x_shape"] == [3, 4]
+    assert records[1]["threshold_shape"] == [3]
+    assert records[1]["threshold_numel"] == 3
+    assert records[1]["inclusive"] is True
+    assert records[1]["weight_t_provided"] is False
 
 
 def test_larosa_sparsify_second_site_topk_direct():

@@ -5,6 +5,7 @@ import torch
 from vllm.sparsity.rotation import (
     RotationTransform,
     find_rotation_matrix_path,
+    load_rotation_matrix,
     merge_rotation_into_weight,
     merge_rotation_into_weight_loader,
 )
@@ -41,6 +42,27 @@ def test_merge_rotation_into_weight():
     merged = merge_rotation_into_weight(weight, rotation)
 
     assert torch.allclose(merged, weight @ rotation, atol=1e-5)
+
+
+def test_merge_rotation_into_weight_absorbs_unrotation():
+    weight = torch.randn(4, 8)
+    q, _ = torch.linalg.qr(torch.randn(8, 8))
+    rotated_x = torch.randn(3, 8)
+
+    merged = merge_rotation_into_weight(weight, q)
+
+    runtime_unrotate = (rotated_x @ q.t()) @ weight.t()
+    absorbed = rotated_x @ merged.t()
+    assert torch.allclose(absorbed, runtime_unrotate, atol=1e-5)
+
+
+def test_load_rotation_matrix_defaults_to_fp32(tmp_path):
+    rotation_path = tmp_path / "D.pt"
+    torch.save(torch.eye(4, dtype=torch.float64), rotation_path)
+
+    rotation = load_rotation_matrix(str(rotation_path))
+
+    assert rotation.dtype == torch.float32
 
 
 def test_merge_rotation_into_weight_loader():

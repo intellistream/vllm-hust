@@ -58,6 +58,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.sparsity import (
     ActivationSparsityConfig,
     build_sparsifier,
+    merge_larosa_rotation_into_linear,
 )
 from vllm.transformers_utils.config import is_interleaved, set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
@@ -121,6 +122,13 @@ class Qwen2MLP(nn.Module):
             if sparsity_config is not None
             else None
         )
+        if sparsity_config is not None and sparsity_config.use_sparse_gemv:
+            merge_larosa_rotation_into_linear(
+                sparsity_config,
+                layer_idx,
+                "mlp.gate_up",
+                self.gate_up_proj,
+            )
         self.sparsify_down = (
             build_sparsifier(sparsity_config, layer_idx, "mlp.down")
             if sparsity_config is not None
@@ -128,10 +136,26 @@ class Qwen2MLP(nn.Module):
         )
 
     def forward(self, x):
-        if self.sparsify_gate_up is not None:
-            x = self.sparsify_gate_up(x)
-        gate_up, _ = self.gate_up_proj(x)
+        sparse_gate_up = (
+            self.sparsify_gate_up.try_apply_linear(x, self.gate_up_proj)
+            if self.sparsify_gate_up is not None
+            else None
+        )
+        if sparse_gate_up is not None:
+            gate_up, _ = sparse_gate_up
+        else:
+            if self.sparsify_gate_up is not None:
+                x = self.sparsify_gate_up(x)
+            gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        sparse_down = (
+            self.sparsify_down.try_apply_linear(x, self.down_proj)
+            if self.sparsify_down is not None
+            else None
+        )
+        if sparse_down is not None:
+            x, _ = sparse_down
+            return x
         if self.sparsify_down is not None:
             x = self.sparsify_down(x)
         x, _ = self.down_proj(x)
@@ -234,6 +258,13 @@ class Qwen2Attention(nn.Module):
             if sparsity_config is not None
             else None
         )
+        if sparsity_config is not None and sparsity_config.use_sparse_gemv:
+            merge_larosa_rotation_into_linear(
+                sparsity_config,
+                layer_idx,
+                "self_attn.qkv",
+                self.qkv_proj,
+            )
         self.sparsify_o = (
             build_sparsifier(sparsity_config, layer_idx, "self_attn.o")
             if sparsity_config is not None
@@ -245,9 +276,17 @@ class Qwen2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        if self.sparsify_qkv is not None:
-            hidden_states = self.sparsify_qkv(hidden_states)
-        qkv, _ = self.qkv_proj(hidden_states)
+        sparse_qkv = (
+            self.sparsify_qkv.try_apply_linear(hidden_states, self.qkv_proj)
+            if self.sparsify_qkv is not None
+            else None
+        )
+        if sparse_qkv is not None:
+            qkv, _ = sparse_qkv
+        else:
+            if self.sparsify_qkv is not None:
+                hidden_states = self.sparsify_qkv(hidden_states)
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Apply QK normalization if enabled (before RoPE)
@@ -268,6 +307,14 @@ class Qwen2Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        sparse_o = (
+            self.sparsify_o.try_apply_linear(attn_output, self.o_proj)
+            if self.sparsify_o is not None
+            else None
+        )
+        if sparse_o is not None:
+            output, _ = sparse_o
+            return output
         if self.sparsify_o is not None:
             attn_output = self.sparsify_o(attn_output)
         output, _ = self.o_proj(attn_output)

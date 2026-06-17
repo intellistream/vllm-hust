@@ -65,6 +65,7 @@ def build_sparsifier(
         decode_only=sparsity_config.decode_only,
         apply_all_tokens=sparsity_config.apply_all_tokens,
         prefill_sparsify=sparsity_config.prefill_sparsify,
+        use_sparse_gemv=sparsity_config.use_sparse_gemv,
     )
 
     return sparsify_fn
@@ -102,8 +103,9 @@ def _build_larosa_sparsifier(
             rotation=rotation,
             rotate_input=True,
             decode_only=sparsity_config.decode_only,
-            apply_all_tokens=True,
-            prefill_sparsify="all",
+            apply_all_tokens=sparsity_config.apply_all_tokens,
+            prefill_sparsify=sparsity_config.prefill_sparsify,
+            use_sparse_gemv=sparsity_config.use_sparse_gemv,
         )
 
     if proj_name in second_site_projs:
@@ -113,8 +115,9 @@ def _build_larosa_sparsifier(
             rotation=None,
             rotate_input=False,
             decode_only=sparsity_config.decode_only,
-            apply_all_tokens=True,
-            prefill_sparsify="all",
+            apply_all_tokens=sparsity_config.apply_all_tokens,
+            prefill_sparsify=sparsity_config.prefill_sparsify,
+            use_sparse_gemv=sparsity_config.use_sparse_gemv,
         )
 
     logger.warning_once("Unsupported La RoSA projection %s; skipping.", proj_name)
@@ -158,8 +161,11 @@ def merge_larosa_rotation_into_linear(
         )
 
     rotation = load_rotation_matrix(rotation_path)
-    return merge_rotation_into_weight_loader(
+    merged = merge_rotation_into_weight_loader(
         linear_layer,
         rotation,
         proj_name=f"layers.{layer_idx}.{proj_name}",
     )
+    if merged:
+        linear_layer._larosa_sparse_weight_merged = True
+    return merged

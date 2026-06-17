@@ -17,7 +17,8 @@ class ActivationSparsityConfig:
     - ``prefill_sparsify="half"`` sparsifies only the last half of prefill
       activations while still sparsifying single-token decode activations.
     - ``strict_unsupported_check=True`` to fail fast on TP/quant/LoRA.
-    - ``use_sparse_gemv=False`` because sparse GEMV is a Phase 2 experiment.
+    - ``use_sparse_gemv=False`` because sparse GEMV is an experimental
+      backend-specific path.
     """
 
     # Master switch
@@ -64,7 +65,7 @@ class ActivationSparsityConfig:
 
     # Phase 2 experimental flag
     use_sparse_gemv: bool = False
-    """Enable Triton sparse GEMV custom op. Phase 2 experimental feature."""
+    """Enable backend sparse GEMV custom op. Experimental feature."""
 
     def __post_init__(self) -> None:
         if self.method not in {"teal", "larosa"}:

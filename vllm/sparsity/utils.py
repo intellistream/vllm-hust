@@ -9,11 +9,6 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.weight_utils import (
-    DisabledTqdm,
-    get_lock,
-    maybe_download_from_modelscope,
-)
 from vllm.sparsity.config import ActivationSparsityConfig
 from vllm.sparsity.distribution import Distribution
 
@@ -124,6 +119,11 @@ def get_activation_sparsity_config(
     """
     import huggingface_hub
     from huggingface_hub import snapshot_download
+    from vllm.model_executor.model_loader.weight_utils import (
+        DisabledTqdm,
+        get_lock,
+        maybe_download_from_modelscope,
+    )
 
     model_name_or_path = getattr(model_config, "model", None)
     if model_name_or_path is None:

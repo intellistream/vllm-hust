@@ -23,7 +23,9 @@ import argparse
 import gc
 import json
 import math
+import os
 import sys
+import tempfile
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -57,6 +59,7 @@ class BackendComparison:
     backend: str
     dense: PPLStats
     sparse: PPLStats
+    sparse_kernel_markers: dict[str, Any] | None = None
 
     @property
     def delta_nll(self) -> float:
@@ -120,13 +123,20 @@ def parse_args() -> argparse.Namespace:
         "--dataset-name",
         default=None,
         help=(
-            "HF dataset name. For the official paper-style smoke, use tatsu-lab/alpaca."
+            "HF dataset name. For a paper-style sampled subset, use tatsu-lab/alpaca."
         ),
     )
     dataset.add_argument("--dataset-subset", default=None)
     dataset.add_argument("--dataset-split", default="train")
     dataset.add_argument("--dataset-text-field", default="text")
     dataset.add_argument("--dataset-size", type=int, default=250)
+    dataset.add_argument(
+        "--dataset-sample",
+        choices=["first", "random"],
+        default="first",
+        help="Select the first N rows or a seeded random subset for evaluation.",
+    )
+    dataset.add_argument("--dataset-seed", type=int, default=0)
     dataset.add_argument(
         "--text-file",
         type=Path,
@@ -147,7 +157,10 @@ def parse_args() -> argparse.Namespace:
         "--max-windows",
         type=int,
         default=None,
-        help="Limit windows for smoke tests. Full eval should leave this unset.",
+        help=(
+            "Limit windows for sampled subset checks. Full eval should leave "
+            "this unset."
+        ),
     )
 
     backends = parser.add_argument_group("backends")
@@ -183,6 +196,25 @@ def parse_args() -> argparse.Namespace:
         help=(
             "vLLM prefill policy: half matches FasterDecoding/TEAL, all "
             "sparsifies every token, none sparsifies decode tokens only."
+        ),
+    )
+    backends.add_argument(
+        "--vllm-use-sparse-gemv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable the backend sparse GEMV kernel in the vLLM sparse run. "
+            "This should be used only when the target plugin provides the "
+            "activation_sparse_linear custom op."
+        ),
+    )
+    backends.add_argument(
+        "--vllm-allow-sparse-gemv-fallback",
+        action="store_true",
+        help=(
+            "Allow dense masked fallback when --vllm-use-sparse-gemv is set "
+            "but the backend kernel is unavailable. Leave unset for "
+            "kernel-backed evidence runs."
         ),
     )
     backends.add_argument(
@@ -243,6 +275,19 @@ def torch_dtype(name: str) -> torch.dtype:
     }[name]
 
 
+def empty_backend_cache() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        return
+    try:
+        if npu.is_available():
+            npu.empty_cache()
+    except RuntimeError:
+        pass
+
+
 def load_tokenizer(model: str):
     from transformers import AutoTokenizer
 
@@ -281,7 +326,13 @@ def load_texts(args: argparse.Namespace) -> list[str]:
             split=args.dataset_split,
         )
         if args.dataset_size is not None:
-            dataset = dataset.select(range(min(args.dataset_size, len(dataset))))
+            size = min(args.dataset_size, len(dataset))
+            if getattr(args, "dataset_sample", "first") == "random":
+                dataset = dataset.shuffle(
+                    seed=getattr(args, "dataset_seed", 0)
+                ).select(range(size))
+            else:
+                dataset = dataset.select(range(size))
         return [str(sample[args.dataset_text_field]) for sample in dataset]
 
     return [
@@ -736,8 +787,7 @@ def run_hf_reference(
 
     del model
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    empty_backend_cache()
     return BackendComparison(
         backend=f"hf_reference:{args.hf_reference_impl}:{args.hf_reference_mode}",
         dense=dense,
@@ -826,6 +876,128 @@ def build_vllm(
     return LLM(**kwargs)
 
 
+def read_marker_records(marker_path: Path) -> list[dict[str, Any]]:
+    if not marker_path.exists():
+        return []
+    records = []
+    for line in marker_path.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        records.append(json.loads(line))
+    return records
+
+
+def unique_marker_values(
+    records: list[dict[str, Any]],
+    key: str,
+) -> list[Any]:
+    values: list[Any] = []
+    seen: set[str] = set()
+    for record in records:
+        if key not in record:
+            continue
+        value = record[key]
+        marker = json.dumps(value, sort_keys=True)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        values.append(value)
+    return values
+
+
+def summarize_sparse_kernel_markers(
+    sparse_marker_path: Path,
+    ascend_marker_path: Path,
+) -> dict[str, Any]:
+    sparse_records = read_marker_records(sparse_marker_path)
+    ascend_records = read_marker_records(ascend_marker_path)
+    summary: dict[str, Any] = {
+        "sparse_gemv_marker_records": len(sparse_records),
+        "sparse_gemv_marker_pids": sorted(
+            {
+                int(record["pid"])
+                for record in sparse_records
+                if "pid" in record
+            }
+        ),
+        "sparse_gemv_marker_x_shapes": unique_marker_values(
+            sparse_records,
+            "x_shape",
+        ),
+        "sparse_gemv_marker_threshold_shapes": unique_marker_values(
+            sparse_records,
+            "threshold_shape",
+        ),
+        "sparse_gemv_marker_threshold_numels": unique_marker_values(
+            sparse_records,
+            "threshold_numel",
+        ),
+        "sparse_gemv_marker_inclusive": unique_marker_values(
+            sparse_records,
+            "inclusive",
+        ),
+        "sparse_gemv_marker_weight_t_provided": unique_marker_values(
+            sparse_records,
+            "weight_t_provided",
+        ),
+        "ascend_sparse_linear_marker_records": len(ascend_records),
+        "ascend_sparse_linear_marker_pids": sorted(
+            {
+                int(record["pid"])
+                for record in ascend_records
+                if "pid" in record
+            }
+        ),
+        "ascend_sparse_linear_marker_ops": sorted(
+            {
+                str(record["op"])
+                for record in ascend_records
+                if "op" in record
+            }
+        ),
+        "ascend_sparse_linear_marker_x_shapes": unique_marker_values(
+            ascend_records,
+            "x_shape",
+        ),
+        "ascend_sparse_linear_marker_threshold_shapes": unique_marker_values(
+            ascend_records,
+            "threshold_shape",
+        ),
+        "ascend_sparse_linear_marker_threshold_numels": unique_marker_values(
+            ascend_records,
+            "threshold_numel",
+        ),
+        "ascend_sparse_linear_marker_inclusive": unique_marker_values(
+            ascend_records,
+            "inclusive",
+        ),
+        "ascend_sparse_linear_marker_weight_t_provided": unique_marker_values(
+            ascend_records,
+            "weight_t_provided",
+        ),
+    }
+    return summary
+
+
+def validate_required_sparse_kernel_markers(
+    marker_summary: dict[str, Any] | None,
+) -> None:
+    if marker_summary is None:
+        raise RuntimeError("sparse kernel marker summary was not collected.")
+    if marker_summary["sparse_gemv_marker_records"] <= 0:
+        raise RuntimeError("vLLM sparse GEMV marker records are missing.")
+    if marker_summary["ascend_sparse_linear_marker_records"] <= 0:
+        raise RuntimeError("Ascend sparse linear marker records are missing.")
+    if (
+        "activation_sparse_linear_packed_t"
+        not in marker_summary["ascend_sparse_linear_marker_ops"]
+    ):
+        raise RuntimeError(
+            "Ascend sparse linear marker did not record "
+            "activation_sparse_linear_packed_t."
+        )
+
+
 def run_vllm_reference(
     args: argparse.Namespace,
     windows: list[list[int]],
@@ -840,8 +1012,7 @@ def run_vllm_reference(
     )
     del dense_llm
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    empty_backend_cache()
 
     sparsity_config = {
         "enable": True,
@@ -852,23 +1023,69 @@ def run_vllm_reference(
         "apply_all_tokens": False,
         "prefill_sparsify": args.vllm_prefill_sparsify,
         "strict_unsupported_check": True,
-        "use_sparse_gemv": False,
+        "use_sparse_gemv": args.vllm_use_sparse_gemv,
     }
-    sparse_llm = build_vllm(args, sparsity_config)
-    sparse = score_vllm_windows(
-        sparse_llm,
-        windows,
-        args.window_size,
-        desc=f"vLLM sparse s={args.sparsity}",
+    previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
+    previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
+    previous_ascend_marker_path = os.environ.get(
+        "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
     )
-    del sparse_llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    marker_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+    marker_summary: dict[str, Any] | None = None
+    if args.vllm_use_sparse_gemv:
+        os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
+            "0" if args.vllm_allow_sparse_gemv_fallback else "1"
+        )
+        marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_ppl_sparse_gemv_")
+        sparse_marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
+        ascend_marker_path = Path(marker_tmpdir.name) / "ascend_custom_ops.jsonl"
+        os.environ["VLLM_SPARSE_GEMV_MARKER_PATH"] = str(sparse_marker_path)
+        os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = str(ascend_marker_path)
+    try:
+        sparse_llm = build_vllm(args, sparsity_config)
+        sparse = score_vllm_windows(
+            sparse_llm,
+            windows,
+            args.window_size,
+            desc=f"vLLM sparse s={args.sparsity}",
+        )
+        del sparse_llm
+        gc.collect()
+        empty_backend_cache()
+        if marker_tmpdir is not None:
+            marker_summary = summarize_sparse_kernel_markers(
+                sparse_marker_path,
+                ascend_marker_path,
+            )
+            if not args.vllm_allow_sparse_gemv_fallback:
+                validate_required_sparse_kernel_markers(marker_summary)
+    finally:
+        if previous_require_kernel is None:
+            os.environ.pop("VLLM_SPARSE_GEMV_REQUIRE_KERNEL", None)
+        else:
+            os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
+                previous_require_kernel
+            )
+        if previous_sparse_marker_path is None:
+            os.environ.pop("VLLM_SPARSE_GEMV_MARKER_PATH", None)
+        else:
+            os.environ["VLLM_SPARSE_GEMV_MARKER_PATH"] = previous_sparse_marker_path
+        if previous_ascend_marker_path is None:
+            os.environ.pop("VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH", None)
+        else:
+            os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
+                previous_ascend_marker_path
+            )
+        if marker_tmpdir is not None:
+            marker_tmpdir.cleanup()
     return BackendComparison(
-        backend=f"vllm:prefill_sparsify={args.vllm_prefill_sparsify}",
+        backend=(
+            f"vllm:prefill_sparsify={args.vllm_prefill_sparsify}:"
+            f"use_sparse_gemv={args.vllm_use_sparse_gemv}"
+        ),
         dense=dense,
         sparse=sparse,
+        sparse_kernel_markers=marker_summary,
     )
 
 

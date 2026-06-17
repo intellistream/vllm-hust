@@ -52,8 +52,8 @@ class RotationTransform(nn.Module):
                 "One of inv_d_path or inv_d_matrix must be provided"
             )
 
-        self.register_buffer("D", d)
-        self.register_buffer("inv_D", inv_d)
+        self.register_buffer("D", d.to(dtype=torch.float32))
+        self.register_buffer("inv_D", inv_d.to(dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply rotation: ``x @ D``."""
@@ -101,6 +101,7 @@ def find_rotation_matrix_path(
 def load_rotation_matrix(
     path: str,
     device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Load a square offline La RoSA rotation matrix."""
     rotation = torch.load(path, map_location=device, weights_only=True)
@@ -111,7 +112,7 @@ def load_rotation_matrix(
             "La RoSA rotation matrix must be square, got "
             f"shape={tuple(rotation.shape)} from {path}"
         )
-    return rotation
+    return rotation.to(dtype=dtype)
 
 
 def merge_rotation_into_weight(
@@ -133,7 +134,7 @@ def merge_rotation_into_weight(
             f"weight input size={input_size}, rotation shape={tuple(rotation.shape)}"
         )
 
-    compute_dtype = torch.float32 if weight.device.type == "cpu" else weight.dtype
+    compute_dtype = torch.float32
     rotated_weight = torch.matmul(
         weight.to(dtype=compute_dtype),
         rotation.to(device=weight.device, dtype=compute_dtype),
