@@ -127,6 +127,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     backends.add_argument(
+        "--target-projection",
+        action="append",
+        choices=["self_attn.qkv", "self_attn.o", "mlp.gate_up", "mlp.down"],
+        default=None,
+        help=(
+            "Restrict sparse HF hooks and vLLM activation sparsity to this "
+            "projection. Can be repeated."
+        ),
+    )
+    backends.add_argument(
         "--vllm-allow-sparse-gemv-fallback",
         action="store_true",
         help=(
@@ -262,14 +272,19 @@ class HFLarosaReference:
         model: torch.nn.Module,
         calibration_path: Path,
         rotation_dtype: torch.dtype,
+        target_projections: list[str] | None,
     ) -> None:
         self.model = model
         self.calibration_path = calibration_path
         self.rotation_dtype = rotation_dtype
+        self.target_projections = target_projections
         self.sparsity = 0.0
         self.rotations: dict[int, torch.Tensor] = {}
         self.handles: list[Any] = []
         self._install_hooks()
+
+    def _targets(self, proj_name: str) -> bool:
+        return self.target_projections is None or proj_name in self.target_projections
 
     def set_sparsity(self, sparsity: float) -> None:
         self.sparsity = float(sparsity)
@@ -285,29 +300,45 @@ class HFLarosaReference:
     def _install_hooks(self) -> None:
         layers = self.model.model.layers
         for layer_idx, layer in enumerate(layers):
-            q = torch.load(
-                rotation_path(self.calibration_path, layer_idx),
-                map_location="cpu",
-                weights_only=True,
-            )
-            self.rotations[layer_idx] = q.to(dtype=self.rotation_dtype)
+            if self._targets("self_attn.qkv") or self._targets("mlp.gate_up"):
+                q = torch.load(
+                    rotation_path(self.calibration_path, layer_idx),
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                self.rotations[layer_idx] = q.to(dtype=self.rotation_dtype)
 
-            for module in (
-                layer.self_attn.q_proj,
-                layer.self_attn.k_proj,
-                layer.self_attn.v_proj,
-                layer.mlp.gate_proj,
-                layer.mlp.up_proj,
-            ):
+            if self._targets("self_attn.qkv"):
+                for module in (
+                    layer.self_attn.q_proj,
+                    layer.self_attn.k_proj,
+                    layer.self_attn.v_proj,
+                ):
+                    self.handles.append(
+                        module.register_forward_pre_hook(
+                            self._make_h1_hook(layer_idx),
+                        )
+                    )
+
+            if self._targets("mlp.gate_up"):
+                for module in (layer.mlp.gate_proj, layer.mlp.up_proj):
+                    self.handles.append(
+                        module.register_forward_pre_hook(
+                            self._make_h1_hook(layer_idx),
+                        )
+                    )
+
+            if self._targets("self_attn.o"):
                 self.handles.append(
-                    module.register_forward_pre_hook(
-                        self._make_h1_hook(layer_idx),
+                    layer.self_attn.o_proj.register_forward_pre_hook(
+                        self._make_h2_hook()
                     )
                 )
-
-            for module in (layer.self_attn.o_proj, layer.mlp.down_proj):
+            if self._targets("mlp.down"):
                 self.handles.append(
-                    module.register_forward_pre_hook(self._make_h2_hook())
+                    layer.mlp.down_proj.register_forward_pre_hook(
+                        self._make_h2_hook()
+                    )
                 )
 
     def _make_h1_hook(self, layer_idx: int):
@@ -414,6 +445,11 @@ def run_hf_reference(
     model_type: str,
 ) -> BackendComparison:
     if args.hf_reference_impl == "official_repo":
+        if args.target_projection:
+            raise ValueError(
+                "--target-projection is supported only with "
+                "--hf-reference-impl hooks."
+            )
         model = build_official_larosa_model(args, model_type)
         set_official_model_sparsity(model, 0.0)
         reference_name = "official_repo"
@@ -423,6 +459,7 @@ def run_hf_reference(
             model,
             args.calibration_path,
             torch_dtype(args.rotation_dtype),
+            args.target_projection,
         )
         larosa_ref.set_sparsity(0.0)
         reference_name = "hooks"
@@ -485,6 +522,8 @@ def run_vllm_reference(
         "strict_unsupported_check": True,
         "use_sparse_gemv": args.vllm_use_sparse_gemv,
     }
+    if args.target_projection:
+        sparsity_config["target_projections"] = args.target_projection
     previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
     previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
     previous_ascend_marker_path = os.environ.get(

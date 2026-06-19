@@ -199,6 +199,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     backends.add_argument(
+        "--target-projection",
+        action="append",
+        choices=["self_attn.qkv", "self_attn.o", "mlp.gate_up", "mlp.down"],
+        default=None,
+        help=(
+            "Restrict sparse HF hooks and vLLM activation sparsity to this "
+            "projection. Can be repeated."
+        ),
+    )
+    backends.add_argument(
         "--vllm-use-sparse-gemv",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -481,12 +491,17 @@ class HFTealReference:
         model: torch.nn.Module,
         histogram_path: Path,
         reference_mode: str,
+        target_projections: list[str] | None,
     ) -> None:
         self.model = model
         self.histogram_path = histogram_path
         self.reference_mode = reference_mode
+        self.target_projections = target_projections
         self.masks: dict[str, TealMask] = {}
         self._install_hooks()
+
+    def _targets(self, proj_name: str) -> bool:
+        return self.target_projections is None or proj_name in self.target_projections
 
     def _register_mask(
         self,
@@ -520,28 +535,32 @@ class HFTealReference:
             mlp_h1 = TealMask(self.reference_mode)
             mlp_h2 = TealMask(self.reference_mode)
 
-            for proj_name in ("q_proj", "k_proj", "v_proj"):
+            if self._targets("self_attn.qkv"):
+                for proj_name in ("q_proj", "k_proj", "v_proj"):
+                    self._register_mask(
+                        getattr(attn, proj_name),
+                        f"layers.{layer_idx}.self_attn.{proj_name}",
+                        attn_h1,
+                    )
+            if self._targets("self_attn.o"):
                 self._register_mask(
-                    getattr(attn, proj_name),
-                    f"layers.{layer_idx}.self_attn.{proj_name}",
-                    attn_h1,
+                    attn.o_proj,
+                    f"layers.{layer_idx}.self_attn.o_proj",
+                    attn_h2,
                 )
-            self._register_mask(
-                attn.o_proj,
-                f"layers.{layer_idx}.self_attn.o_proj",
-                attn_h2,
-            )
-            for proj_name in ("gate_proj", "up_proj"):
+            if self._targets("mlp.gate_up"):
+                for proj_name in ("gate_proj", "up_proj"):
+                    self._register_mask(
+                        getattr(mlp, proj_name),
+                        f"layers.{layer_idx}.mlp.{proj_name}",
+                        mlp_h1,
+                    )
+            if self._targets("mlp.down"):
                 self._register_mask(
-                    getattr(mlp, proj_name),
-                    f"layers.{layer_idx}.mlp.{proj_name}",
-                    mlp_h1,
+                    mlp.down_proj,
+                    f"layers.{layer_idx}.mlp.down_proj",
+                    mlp_h2,
                 )
-            self._register_mask(
-                mlp.down_proj,
-                f"layers.{layer_idx}.mlp.down_proj",
-                mlp_h2,
-            )
 
     def set_sparsity(self, sparsity: float) -> None:
         layers = self.model.model.layers
@@ -757,6 +776,11 @@ def run_hf_reference(
     histogram_path: Path,
 ) -> BackendComparison:
     if args.hf_reference_impl == "official_repo":
+        if args.target_projection:
+            raise ValueError(
+                "--target-projection is supported only with "
+                "--hf-reference-impl hooks."
+            )
         model = build_official_teal_model(args, histogram_path)
         model.set_uniform_sparsity(0.0)
     else:
@@ -782,6 +806,7 @@ def run_hf_reference(
             model=model,
             histogram_path=histogram_path,
             reference_mode=args.hf_reference_mode,
+            target_projections=args.target_projection,
         )
         teal_ref.set_sparsity(0.0)
 
@@ -1089,6 +1114,8 @@ def run_vllm_reference(
         "strict_unsupported_check": True,
         "use_sparse_gemv": args.vllm_use_sparse_gemv,
     }
+    if args.target_projection:
+        sparsity_config["target_projections"] = args.target_projection
     previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
     previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
     previous_ascend_marker_path = os.environ.get(

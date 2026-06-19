@@ -17,6 +17,14 @@ from vllm.sparsity.utils import load_threshold
 logger = init_logger(__name__)
 
 
+def targets_projection(
+    sparsity_config: ActivationSparsityConfig,
+    proj_name: str,
+) -> bool:
+    target_projections = sparsity_config.target_projections
+    return target_projections is None or proj_name in target_projections
+
+
 def build_sparsifier(
     sparsity_config: ActivationSparsityConfig,
     layer_idx: int,
@@ -35,6 +43,8 @@ def build_sparsifier(
         A :class:`SparsifyFn` instance, or ``None`` if sparsity is disabled.
     """
     if not sparsity_config.enable:
+        return None
+    if not targets_projection(sparsity_config, proj_name):
         return None
 
     if not sparsity_config.calibration_path:
@@ -142,6 +152,8 @@ def merge_larosa_rotation_into_linear(
     if sparsity_config is None or sparsity_config.method != "larosa":
         return False
     if not sparsity_config.enable or not sparsity_config.calibration_path:
+        return False
+    if not targets_projection(sparsity_config, proj_name):
         return False
 
     rotation_path = find_rotation_matrix_path(

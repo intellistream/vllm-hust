@@ -8,6 +8,13 @@ from dataclasses import fields
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
 
+_SUPPORTED_TARGET_PROJECTIONS = {
+    "self_attn.qkv",
+    "self_attn.o",
+    "mlp.gate_up",
+    "mlp.down",
+}
+
 
 @dataclass(config=ConfigDict(extra="forbid"))
 class ActivationSparsityConfig:
@@ -67,6 +74,11 @@ class ActivationSparsityConfig:
     use_sparse_gemv: bool = False
     """Enable backend sparse GEMV custom op. Experimental feature."""
 
+    # Optional projection filter
+    target_projections: list[str] | None = None
+    """If set, only apply activation sparsity to these projection names, e.g.
+    ``["mlp.gate_up"]`` for the Ascend-friendly fused-MLP path."""
+
     def __post_init__(self) -> None:
         if self.method not in {"teal", "larosa"}:
             raise ValueError(
@@ -78,6 +90,16 @@ class ActivationSparsityConfig:
                 "prefill_sparsify must be one of 'half', 'all', or 'none', "
                 f"got {self.prefill_sparsify!r}."
             )
+        if self.target_projections is not None:
+            unknown = sorted(
+                set(self.target_projections) - _SUPPORTED_TARGET_PROJECTIONS
+            )
+            if unknown:
+                raise ValueError(
+                    "target_projections contains unsupported projection(s): "
+                    f"{unknown}. Supported projections are "
+                    f"{sorted(_SUPPORTED_TARGET_PROJECTIONS)}."
+                )
 
     def compute_hash(self) -> str:
         """Return a hash that uniquely identifies this sparsity config.

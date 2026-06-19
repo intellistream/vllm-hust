@@ -42,6 +42,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shutdown-timeout", type=int, default=60)
     parser.add_argument("--vllm-prefill-sparsify", default="none")
     parser.add_argument(
+        "--target-projection",
+        action="append",
+        choices=["self_attn.qkv", "self_attn.o", "mlp.gate_up", "mlp.down"],
+        default=None,
+        help=(
+            "Restrict activation sparsity to a projection. Can be repeated. "
+            "Useful for Ascend-friendly gate/up-only throughput checks."
+        ),
+    )
+    parser.add_argument(
         "--sparse-gemv-dense-fallback-policy",
         choices=["mask", "identity"],
         default="mask",
@@ -145,6 +155,8 @@ def build_sparse_config(args: argparse.Namespace) -> dict[str, Any]:
                 "prefill_sparsify": args.vllm_prefill_sparsify,
             }
         )
+    if args.target_projection:
+        common["target_projections"] = args.target_projection
     return common
 
 

@@ -17,6 +17,7 @@ def test_activation_sparsity_config_defaults():
     assert cfg.prefill_sparsify == "half"
     assert cfg.strict_unsupported_check is True
     assert cfg.use_sparse_gemv is False
+    assert cfg.target_projections is None
 
 
 def test_activation_sparsity_config_hash():
@@ -31,6 +32,13 @@ def test_activation_sparsity_config_hash():
     h3 = cfg2.compute_hash()
     assert h3 != h1
 
+    cfg3 = ActivationSparsityConfig(
+        enable=True,
+        uniform_sparsity=0.4,
+        target_projections=["mlp.gate_up"],
+    )
+    assert cfg3.compute_hash() != h1
+
 
 def test_activation_sparsity_config_invalid_method():
     # Pydantic dataclass with extra="forbid" should reject unknown fields
@@ -39,3 +47,6 @@ def test_activation_sparsity_config_invalid_method():
 
     with pytest.raises((ValueError, ValidationError)):
         ActivationSparsityConfig(prefill_sparsify="last_token")
+
+    with pytest.raises((ValueError, ValidationError)):
+        ActivationSparsityConfig(target_projections=["mlp.gate"])
