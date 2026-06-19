@@ -279,6 +279,8 @@ class SparsifyFn(nn.Module):
     def _sparse_linear_applies_to_all_rows(self, x: torch.Tensor) -> bool:
         if self.apply_all_tokens or self.prefill_sparsify == "all":
             return True
+        if x.shape[0] == 1:
+            return True
         if self.decode_only or self.prefill_sparsify == "none":
             row_mask = self._get_vllm_decode_row_mask(x)
         else:
@@ -464,6 +466,20 @@ class SparsifyFn(nn.Module):
 
         num_actual_tokens = getattr(metadata, "num_actual_tokens", x.shape[0])
         num_actual_tokens = min(int(num_actual_tokens), x.shape[0])
+        request_slices_cache = context.additional_kwargs.setdefault(
+            "teal_request_slices",
+            {},
+        )
+        cache_key = (
+            id(metadata),
+            x.device.type,
+            x.device.index,
+            x.shape[0],
+            num_actual_tokens,
+        )
+        cached = request_slices_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         starts = query_start_loc.detach().to("cpu").tolist()
         request_slices: list[tuple[int, int]] = []
@@ -472,6 +488,7 @@ class SparsifyFn(nn.Module):
             end = max(start, min(int(end), num_actual_tokens))
             if end > start:
                 request_slices.append((start, end))
+        request_slices_cache[cache_key] = request_slices
         return request_slices
 
     def extra_repr(self) -> str:

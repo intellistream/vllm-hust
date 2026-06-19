@@ -53,6 +53,51 @@ def _tensor_marker_payload(name: str, tensor: torch.Tensor | None) -> dict[str, 
     }
 
 
+def _activity_marker_payload(
+    x: torch.Tensor | None,
+    threshold: torch.Tensor | None,
+    inclusive: bool | None,
+) -> dict[str, Any]:
+    if x is None or threshold is None or inclusive is None:
+        return {}
+    if x.dim() == 0:
+        return {"active_stats_error": "x must have at least one dimension"}
+    if x.numel() == 0 or x.shape[-1] == 0:
+        return {"active_row_count": 0, "active_hidden_size": int(x.shape[-1])}
+
+    with torch.no_grad():
+        threshold = threshold.detach().to(dtype=torch.float32, device=x.device)
+        if threshold.numel() == 1:
+            compare_threshold = threshold.reshape(1, 1)
+        elif x.dim() == 2 and threshold.numel() == x.shape[0]:
+            compare_threshold = threshold.reshape(x.shape[0], 1)
+        else:
+            return {
+                "active_stats_error": (
+                    "threshold must be scalar or have one value per input row"
+                )
+            }
+
+        compare = torch.ge if inclusive else torch.gt
+        active = compare(x.detach().abs().to(dtype=torch.float32), compare_threshold)
+        hidden_size = int(x.shape[-1])
+        active_counts = active.reshape(-1, hidden_size).sum(dim=1)
+        active_counts_cpu = active_counts.to(dtype=torch.float32, device="cpu")
+        densities = active_counts_cpu / float(hidden_size)
+
+    return {
+        "active_row_count": int(active_counts_cpu.numel()),
+        "active_hidden_size": hidden_size,
+        "active_count_min": int(active_counts_cpu.min().item()),
+        "active_count_max": int(active_counts_cpu.max().item()),
+        "active_count_mean": float(active_counts_cpu.mean().item()),
+        "active_density_min": float(densities.min().item()),
+        "active_density_max": float(densities.max().item()),
+        "active_density_mean": float(densities.mean().item()),
+        "active_sparsity_mean": float(1.0 - densities.mean().item()),
+    }
+
+
 def _record_sparse_gemv_invocation(
     *,
     x: torch.Tensor | None = None,
@@ -78,6 +123,10 @@ def _record_sparse_gemv_invocation(
         payload.update(_tensor_marker_payload("x", x))
         payload.update(_tensor_marker_payload("threshold", threshold))
         payload.update(_tensor_marker_payload("weight_t", weight_t))
+        try:
+            payload.update(_activity_marker_payload(x, threshold, inclusive))
+        except Exception as err:
+            payload["active_stats_error"] = f"{type(err).__name__}: {err}"
         if inclusive is not None:
             payload["inclusive"] = bool(inclusive)
         with open(marker_path, "a", encoding="utf-8") as marker_file:

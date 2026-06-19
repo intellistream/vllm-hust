@@ -401,6 +401,46 @@ def main() -> int:
                 sparse_marker_records,
                 "weight_t_provided",
             ),
+            "sparse_gemv_marker_active_row_counts": unique_marker_values(
+                sparse_marker_records,
+                "active_row_count",
+            ),
+            "sparse_gemv_marker_active_hidden_sizes": unique_marker_values(
+                sparse_marker_records,
+                "active_hidden_size",
+            ),
+            "sparse_gemv_marker_active_count_mins": unique_marker_values(
+                sparse_marker_records,
+                "active_count_min",
+            ),
+            "sparse_gemv_marker_active_count_maxes": unique_marker_values(
+                sparse_marker_records,
+                "active_count_max",
+            ),
+            "sparse_gemv_marker_active_count_means": unique_marker_values(
+                sparse_marker_records,
+                "active_count_mean",
+            ),
+            "sparse_gemv_marker_active_density_mins": unique_marker_values(
+                sparse_marker_records,
+                "active_density_min",
+            ),
+            "sparse_gemv_marker_active_density_maxes": unique_marker_values(
+                sparse_marker_records,
+                "active_density_max",
+            ),
+            "sparse_gemv_marker_active_density_means": unique_marker_values(
+                sparse_marker_records,
+                "active_density_mean",
+            ),
+            "sparse_gemv_marker_active_sparsity_means": unique_marker_values(
+                sparse_marker_records,
+                "active_sparsity_mean",
+            ),
+            "sparse_gemv_marker_active_stats_errors": unique_marker_values(
+                sparse_marker_records,
+                "active_stats_error",
+            ),
             "ascend_sparse_linear_marker_records": len(ascend_marker_records),
             "ascend_sparse_linear_marker_pids": ascend_marker_pids,
             "ascend_sparse_linear_marker_ops": ascend_marker_ops,

@@ -131,10 +131,13 @@ def test_sparsify_fn_prefill_half_2d_uses_vllm_query_slices():
     x = torch.ones(5, 3)
     with override_forward_context(context):
         out = sparsify(x)
+        cached = sparsify._get_vllm_request_slices(x)
 
     assert torch.allclose(out[:2], x[:2])
     assert out[2:4].abs().max() == 0.0
     assert out[4:].abs().max() == 0.0
+    assert cached == [(0, 4), (4, 5)]
+    assert len(context.additional_kwargs["teal_request_slices"]) == 1
 
 
 def test_sparsify_fn_prefill_none_is_decode_only():
@@ -420,6 +423,33 @@ def test_sparse_linear_identity_fallback_skips_all_row_mask(monkeypatch):
     assert out is x
 
 
+def test_sparse_linear_single_row_identity_fallback_skips_request_slices(
+    monkeypatch,
+):
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", "identity")
+    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
+    metadata = {
+        "layer.0": SimpleNamespace(
+            query_start_loc=torch.tensor([0, 1]),
+            num_actual_tokens=1,
+        )
+    }
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata=metadata,
+        slot_mapping={},
+    )
+    x = torch.tensor([[0.25, 1.0]])
+
+    with override_forward_context(context):
+        out = sparsify.apply_dense_fallback(x)
+
+    assert out is x
+    assert "teal_request_slices" not in context.additional_kwargs
+
+
 def test_sparse_linear_identity_fallback_keeps_mixed_prefill_mask(monkeypatch):
     monkeypatch.setenv("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", "identity")
     sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
@@ -448,8 +478,15 @@ def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):
     )
     reset_sparse_gemv_invocation_count()
     _record_sparse_gemv_invocation(
-        x=torch.ones(3, 4, dtype=torch.bfloat16),
-        threshold=torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+        x=torch.tensor(
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [0.0, 1.0, 2.0, 3.0],
+            ],
+            dtype=torch.bfloat16,
+        ),
+        threshold=torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
         inclusive=True,
     )
 
@@ -465,11 +502,27 @@ def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):
     assert records[0]["threshold_numel"] == 1
     assert records[0]["inclusive"] is False
     assert records[0]["weight_t_provided"] is True
+    assert records[0]["active_row_count"] == 1
+    assert records[0]["active_hidden_size"] == 4
+    assert records[0]["active_count_min"] == 4
+    assert records[0]["active_count_max"] == 4
+    assert records[0]["active_count_mean"] == 4.0
+    assert records[0]["active_density_mean"] == 1.0
+    assert records[0]["active_sparsity_mean"] == 0.0
     assert records[1]["x_shape"] == [3, 4]
     assert records[1]["threshold_shape"] == [3]
     assert records[1]["threshold_numel"] == 3
     assert records[1]["inclusive"] is True
     assert records[1]["weight_t_provided"] is False
+    assert records[1]["active_row_count"] == 3
+    assert records[1]["active_hidden_size"] == 4
+    assert records[1]["active_count_min"] == 1
+    assert records[1]["active_count_max"] == 3
+    assert records[1]["active_count_mean"] == 2.0
+    assert records[1]["active_density_min"] == 0.25
+    assert records[1]["active_density_max"] == 0.75
+    assert records[1]["active_density_mean"] == 0.5
+    assert records[1]["active_sparsity_mean"] == 0.5
 
 
 def test_larosa_sparsify_second_site_topk_direct():
