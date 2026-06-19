@@ -66,6 +66,7 @@ def build_sparsifier(
         apply_all_tokens=sparsity_config.apply_all_tokens,
         prefill_sparsify=sparsity_config.prefill_sparsify,
         use_sparse_gemv=sparsity_config.use_sparse_gemv,
+        expected_sparsity=sparsity_config.uniform_sparsity,
     )
 
     return sparsify_fn
@@ -106,6 +107,7 @@ def _build_larosa_sparsifier(
             apply_all_tokens=sparsity_config.apply_all_tokens,
             prefill_sparsify=sparsity_config.prefill_sparsify,
             use_sparse_gemv=sparsity_config.use_sparse_gemv,
+            expected_sparsity=sparse_level,
         )
 
     if proj_name in second_site_projs:
@@ -118,6 +120,7 @@ def _build_larosa_sparsifier(
             apply_all_tokens=sparsity_config.apply_all_tokens,
             prefill_sparsify=sparsity_config.prefill_sparsify,
             use_sparse_gemv=sparsity_config.use_sparse_gemv,
+            expected_sparsity=sparse_level,
         )
 
     logger.warning_once("Unsupported La RoSA projection %s; skipping.", proj_name)

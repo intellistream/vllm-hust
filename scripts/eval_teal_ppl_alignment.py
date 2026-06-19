@@ -218,6 +218,25 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     backends.add_argument(
+        "--vllm-sparse-gemv-dense-fallback-policy",
+        choices=["mask", "identity"],
+        default="mask",
+        help=(
+            "Policy for projections rejected by the sparse GEMV kernel policy. "
+            "'mask' preserves TEAL dense fallback semantics; 'identity' leaves "
+            "all-row rejected projections dense for kernel-only PPL probes."
+        ),
+    )
+    backends.add_argument(
+        "--vllm-sparse-gemv-min-sparsity",
+        type=float,
+        default=None,
+        help=(
+            "Minimum expected sparsity for auto sparse GEMV dispatch. If unset, "
+            "the runtime default is used."
+        ),
+    )
+    backends.add_argument(
         "--hf-attn-implementation",
         default="sdpa",
         help="HF attention implementation for the local reference model.",
@@ -988,13 +1007,18 @@ def validate_required_sparse_kernel_markers(
         raise RuntimeError("vLLM sparse GEMV marker records are missing.")
     if marker_summary["ascend_sparse_linear_marker_records"] <= 0:
         raise RuntimeError("Ascend sparse linear marker records are missing.")
-    if (
-        "activation_sparse_linear_packed_t"
-        not in marker_summary["ascend_sparse_linear_marker_ops"]
+    accepted_ops = {
+        "activation_sparse_linear",
+        "activation_sparse_linear_direct_t",
+        "activation_sparse_linear_packed_t",
+    }
+    if not any(
+        op in accepted_ops
+        for op in marker_summary["ascend_sparse_linear_marker_ops"]
     ):
         raise RuntimeError(
-            "Ascend sparse linear marker did not record "
-            "activation_sparse_linear_packed_t."
+            "Ascend sparse linear marker did not record a supported sparse "
+            "linear custom op."
         )
 
 
@@ -1030,11 +1054,27 @@ def run_vllm_reference(
     previous_ascend_marker_path = os.environ.get(
         "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
     )
+    previous_dense_fallback_policy = os.environ.get(
+        "VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"
+    )
+    previous_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY")
     marker_tmpdir: tempfile.TemporaryDirectory[str] | None = None
     marker_summary: dict[str, Any] | None = None
+    active_min_sparsity: str | None = None
     if args.vllm_use_sparse_gemv:
         os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
             "0" if args.vllm_allow_sparse_gemv_fallback else "1"
+        )
+        os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
+            args.vllm_sparse_gemv_dense_fallback_policy
+        )
+        if args.vllm_sparse_gemv_min_sparsity is not None:
+            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = str(
+                args.vllm_sparse_gemv_min_sparsity
+            )
+        active_min_sparsity = os.environ.get(
+            "VLLM_SPARSE_GEMV_MIN_SPARSITY",
+            "0.70",
         )
         marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_ppl_sparse_gemv_")
         sparse_marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
@@ -1076,12 +1116,25 @@ def run_vllm_reference(
             os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
                 previous_ascend_marker_path
             )
+        if previous_dense_fallback_policy is None:
+            os.environ.pop("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", None)
+        else:
+            os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
+                previous_dense_fallback_policy
+            )
+        if previous_min_sparsity is None:
+            os.environ.pop("VLLM_SPARSE_GEMV_MIN_SPARSITY", None)
+        else:
+            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = previous_min_sparsity
         if marker_tmpdir is not None:
             marker_tmpdir.cleanup()
     return BackendComparison(
         backend=(
             f"vllm:prefill_sparsify={args.vllm_prefill_sparsify}:"
-            f"use_sparse_gemv={args.vllm_use_sparse_gemv}"
+            f"use_sparse_gemv={args.vllm_use_sparse_gemv}:"
+            "sparse_gemv_dense_fallback="
+            f"{args.vllm_sparse_gemv_dense_fallback_policy}:"
+            f"sparse_gemv_min_sparsity={active_min_sparsity}"
         ),
         dense=dense,
         sparse=sparse,
@@ -1159,6 +1212,11 @@ def assert_alignment(
 
 def main() -> int:
     args = parse_args()
+    if (
+        args.vllm_sparse_gemv_min_sparsity is not None
+        and not 0.0 <= args.vllm_sparse_gemv_min_sparsity <= 1.0
+    ):
+        raise ValueError("--vllm-sparse-gemv-min-sparsity must be in [0, 1]")
     histogram_path, calibration_path = resolve_artifact_paths(args)
     tokenizer = load_tokenizer(args.model)
     texts = load_texts(args)
@@ -1214,6 +1272,12 @@ def main() -> int:
                 "hf_reference_impl": args.hf_reference_impl,
                 "hf_reference_mode": args.hf_reference_mode,
                 "vllm_prefill_sparsify": args.vllm_prefill_sparsify,
+                "vllm_sparse_gemv_dense_fallback_policy": (
+                    args.vllm_sparse_gemv_dense_fallback_policy
+                ),
+                "vllm_sparse_gemv_min_sparsity": (
+                    args.vllm_sparse_gemv_min_sparsity
+                ),
                 "histogram_path": str(histogram_path),
                 "vllm_calibration_path": str(calibration_path),
             },

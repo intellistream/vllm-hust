@@ -135,6 +135,26 @@ def parse_args() -> argparse.Namespace:
             "kernel-backed evidence runs."
         ),
     )
+    backends.add_argument(
+        "--vllm-sparse-gemv-dense-fallback-policy",
+        choices=["mask", "identity"],
+        default="mask",
+        help=(
+            "Policy for projections rejected by the sparse GEMV kernel policy. "
+            "'mask' preserves La RoSA dense fallback semantics; 'identity' "
+            "leaves all-row rejected projections dense for kernel-only PPL "
+            "probes."
+        ),
+    )
+    backends.add_argument(
+        "--vllm-sparse-gemv-min-sparsity",
+        type=float,
+        default=None,
+        help=(
+            "Minimum expected sparsity for auto sparse GEMV dispatch. If unset, "
+            "the runtime default is used."
+        ),
+    )
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument(
@@ -470,11 +490,27 @@ def run_vllm_reference(
     previous_ascend_marker_path = os.environ.get(
         "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
     )
+    previous_dense_fallback_policy = os.environ.get(
+        "VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"
+    )
+    previous_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY")
     marker_tmpdir: tempfile.TemporaryDirectory[str] | None = None
     marker_summary: dict[str, Any] | None = None
+    active_min_sparsity: str | None = None
     if args.vllm_use_sparse_gemv:
         os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
             "0" if args.vllm_allow_sparse_gemv_fallback else "1"
+        )
+        os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
+            args.vllm_sparse_gemv_dense_fallback_policy
+        )
+        if args.vllm_sparse_gemv_min_sparsity is not None:
+            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = str(
+                args.vllm_sparse_gemv_min_sparsity
+            )
+        active_min_sparsity = os.environ.get(
+            "VLLM_SPARSE_GEMV_MIN_SPARSITY",
+            "0.70",
         )
         marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_ppl_sparse_gemv_")
         sparse_marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
@@ -516,13 +552,26 @@ def run_vllm_reference(
             os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
                 previous_ascend_marker_path
             )
+        if previous_dense_fallback_policy is None:
+            os.environ.pop("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", None)
+        else:
+            os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
+                previous_dense_fallback_policy
+            )
+        if previous_min_sparsity is None:
+            os.environ.pop("VLLM_SPARSE_GEMV_MIN_SPARSITY", None)
+        else:
+            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = previous_min_sparsity
         if marker_tmpdir is not None:
             marker_tmpdir.cleanup()
 
     return BackendComparison(
         backend=(
             "vllm_larosa:official_topk:all_tokens:"
-            f"use_sparse_gemv={args.vllm_use_sparse_gemv}"
+            f"use_sparse_gemv={args.vllm_use_sparse_gemv}:"
+            "sparse_gemv_dense_fallback="
+            f"{args.vllm_sparse_gemv_dense_fallback_policy}:"
+            f"sparse_gemv_min_sparsity={active_min_sparsity}"
         ),
         dense=dense,
         sparse=sparse,
@@ -541,6 +590,11 @@ def main() -> int:
             "Official La RoSA h2 sparsity is sparsity * 1.2 and must be < 1. "
             f"Got sparsity={args.sparsity}."
         )
+    if (
+        args.vllm_sparse_gemv_min_sparsity is not None
+        and not 0.0 <= args.vllm_sparse_gemv_min_sparsity <= 1.0
+    ):
+        raise ValueError("--vllm-sparse-gemv-min-sparsity must be in [0, 1]")
 
     config = get_model_config(args)
     model_type = resolve_model_type(config)
@@ -588,6 +642,12 @@ def main() -> int:
                 "windows": len(windows),
                 "hf_reference_impl": args.hf_reference_impl,
                 "rotation_dtype": args.rotation_dtype,
+                "vllm_sparse_gemv_dense_fallback_policy": (
+                    args.vllm_sparse_gemv_dense_fallback_policy
+                ),
+                "vllm_sparse_gemv_min_sparsity": (
+                    args.vllm_sparse_gemv_min_sparsity
+                ),
                 "calibration_path": str(args.calibration_path),
             },
             "hf": comparison_payload(hf_result),

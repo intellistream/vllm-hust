@@ -7,6 +7,9 @@ import torch
 from torch import nn
 
 
+_DEFAULT_SPARSE_GEMV_MIN_SPARSITY = 0.70
+
+
 class Distribution:
     """Histogram-based distribution for threshold calibration.
 
@@ -81,6 +84,7 @@ class SparsifyFn(nn.Module):
         apply_all_tokens: bool = False,
         prefill_sparsify: str = "half",
         use_sparse_gemv: bool = False,
+        expected_sparsity: float | None = None,
     ) -> None:
         super().__init__()
         if prefill_sparsify not in {"half", "all", "none"}:
@@ -94,6 +98,7 @@ class SparsifyFn(nn.Module):
         self.apply_all_tokens = apply_all_tokens
         self.prefill_sparsify = prefill_sparsify
         self.use_sparse_gemv = use_sparse_gemv
+        self.expected_sparsity = expected_sparsity
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.apply_all_tokens:
@@ -122,6 +127,23 @@ class SparsifyFn(nn.Module):
             x,
             torch.zeros_like(x),
         )
+
+    def apply_dense_fallback(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the dense fallback for projections without a sparse kernel.
+
+        ``mask`` preserves TEAL/La RoSA semantics by applying the sparsifier
+        before the dense linear. ``identity`` is an explicit kernel-only
+        profiling policy: if the current forward would sparsify every row but
+        the sparse linear policy rejected this projection, leave it dense so
+        unprofitable dense masking does not dominate model throughput.
+        """
+        if (
+            self.use_sparse_gemv
+            and self._dense_fallback_policy() == "identity"
+            and self._sparse_linear_applies_to_all_rows(x)
+        ):
+            return x
+        return self(x)
 
     def try_apply_linear(
         self,
@@ -218,6 +240,8 @@ class SparsifyFn(nn.Module):
             return False
         if mode != "auto":
             return False
+        if not self._meets_sparse_linear_min_sparsity():
+            return False
         return (
             sparse_input.dim() == 2
             and sparse_input.shape[0] == 1
@@ -225,6 +249,32 @@ class SparsifyFn(nn.Module):
             and weight.dim() == 2
             and weight.shape[0] >= 32768
         )
+
+    def _meets_sparse_linear_min_sparsity(self) -> bool:
+        if self.expected_sparsity is None:
+            return False
+        return self.expected_sparsity >= self._sparse_linear_min_sparsity()
+
+    def _sparse_linear_min_sparsity(self) -> float:
+        value = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY")
+        if value is None:
+            return _DEFAULT_SPARSE_GEMV_MIN_SPARSITY
+        try:
+            parsed = float(value)
+        except ValueError:
+            return _DEFAULT_SPARSE_GEMV_MIN_SPARSITY
+        return min(1.0, max(0.0, parsed))
+
+    def _dense_fallback_policy(self) -> str:
+        mode = os.environ.get(
+            "VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY",
+            "mask",
+        ).lower()
+        if mode in {"mask", "masked"}:
+            return "mask"
+        if mode in {"identity", "dense", "kernel_only", "kernel-only"}:
+            return "identity"
+        return "mask"
 
     def _sparse_linear_applies_to_all_rows(self, x: torch.Tensor) -> bool:
         if self.apply_all_tokens or self.prefill_sparsify == "all":
@@ -358,10 +408,13 @@ class SparsifyFn(nn.Module):
         return row_mask
 
     def _get_cached_forward_mask(self, cache_key: tuple) -> torch.Tensor | None:
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
+        try:
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+        except Exception:
+            return None
 
         if not is_forward_context_available():
             return None
@@ -370,10 +423,13 @@ class SparsifyFn(nn.Module):
         return cache.get(cache_key)
 
     def _set_cached_forward_mask(self, cache_key: tuple, mask: torch.Tensor) -> None:
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
+        try:
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+        except Exception:
+            return
 
         if not is_forward_context_available():
             return
@@ -382,10 +438,13 @@ class SparsifyFn(nn.Module):
         cache[cache_key] = mask
 
     def _get_vllm_request_slices(self, x: torch.Tensor) -> list[tuple[int, int]] | None:
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
+        try:
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+        except Exception:
+            return None
 
         if not is_forward_context_available():
             return None
@@ -420,7 +479,8 @@ class SparsifyFn(nn.Module):
             f"threshold={self.threshold.item():.4f}, "
             f"decode_only={self.decode_only}, "
             f"apply_all_tokens={self.apply_all_tokens}, "
-            f"prefill_sparsify={self.prefill_sparsify}"
+            f"prefill_sparsify={self.prefill_sparsify}, "
+            f"expected_sparsity={self.expected_sparsity}"
         )
 
 
@@ -466,6 +526,7 @@ class LaRosaSparsifyFn(SparsifyFn):
         apply_all_tokens: bool = True,
         prefill_sparsify: str = "all",
         use_sparse_gemv: bool = False,
+        expected_sparsity: float | None = None,
     ) -> None:
         super().__init__(
             threshold=torch.tensor(0.0),
@@ -473,6 +534,9 @@ class LaRosaSparsifyFn(SparsifyFn):
             apply_all_tokens=apply_all_tokens,
             prefill_sparsify=prefill_sparsify,
             use_sparse_gemv=use_sparse_gemv,
+            expected_sparsity=(
+                sparsity_level if expected_sparsity is None else expected_sparsity
+            ),
         )
         if rotate_input and rotation is None:
             raise ValueError("La RoSA rotate_input=True requires a rotation matrix.")
@@ -552,5 +616,6 @@ class LaRosaSparsifyFn(SparsifyFn):
             f"rotation_shape={rotation_shape}, "
             f"decode_only={self.decode_only}, "
             f"apply_all_tokens={self.apply_all_tokens}, "
-            f"prefill_sparsify={self.prefill_sparsify}"
+            f"prefill_sparsify={self.prefill_sparsify}, "
+            f"expected_sparsity={self.expected_sparsity}"
         )

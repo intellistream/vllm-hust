@@ -41,6 +41,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--shutdown-timeout", type=int, default=60)
     parser.add_argument("--vllm-prefill-sparsify", default="none")
+    parser.add_argument(
+        "--sparse-gemv-dense-fallback-policy",
+        choices=["mask", "identity"],
+        default="mask",
+        help=(
+            "Policy for projections rejected by the sparse GEMV kernel policy. "
+            "'mask' preserves TEAL/La RoSA dense fallback semantics; 'identity' "
+            "leaves all-row rejected projections dense for kernel-only "
+            "throughput probes."
+        ),
+    )
+    parser.add_argument(
+        "--sparse-gemv-min-sparsity",
+        type=float,
+        default=None,
+        help=(
+            "Minimum expected sparsity for auto sparse GEMV dispatch. If unset, "
+            "the runtime default is used."
+        ),
+    )
     parser.add_argument("--allow-sparse-gemv-fallback", action="store_true")
     parser.add_argument(
         "--no-require-sparse-invocations",
@@ -259,6 +279,11 @@ def main() -> int:
         raise ValueError("--warmup-prompts must be in [0, num-prompts]")
     if args.sparsity < 0.0 or args.sparsity >= 1.0:
         raise ValueError("--sparsity must be in [0, 1)")
+    if (
+        args.sparse_gemv_min_sparsity is not None
+        and not 0.0 <= args.sparse_gemv_min_sparsity <= 1.0
+    ):
+        raise ValueError("--sparse-gemv-min-sparsity must be in [0, 1]")
     if args.method == "larosa" and args.sparsity * 1.2 >= 1.0:
         raise ValueError("La RoSA h2 sparsity is sparsity * 1.2 and must be < 1")
 
@@ -276,9 +301,21 @@ def main() -> int:
     previous_ascend_marker_path = os.environ.get(
         "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
     )
+    previous_dense_fallback_policy = os.environ.get(
+        "VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"
+    )
+    previous_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY")
     os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
         "0" if args.allow_sparse_gemv_fallback else "1"
     )
+    os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
+        args.sparse_gemv_dense_fallback_policy
+    )
+    if args.sparse_gemv_min_sparsity is not None:
+        os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = str(
+            args.sparse_gemv_min_sparsity
+        )
+    active_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY", "0.70")
     marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_sparse_gemv_")
     marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
     ascend_marker_path = Path(marker_tmpdir.name) / "ascend_custom_ops.jsonl"
@@ -302,6 +339,16 @@ def main() -> int:
             os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
                 previous_ascend_marker_path
             )
+        if previous_dense_fallback_policy is None:
+            os.environ.pop("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", None)
+        else:
+            os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
+                previous_dense_fallback_policy
+            )
+        if previous_min_sparsity is None:
+            os.environ.pop("VLLM_SPARSE_GEMV_MIN_SPARSITY", None)
+        else:
+            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = previous_min_sparsity
 
     sparse_invocations_current_process = get_sparse_invocation_counter()
     sparse_marker_records = read_marker_records(marker_path)
@@ -426,6 +473,10 @@ def main() -> int:
         "num_prompts": args.num_prompts,
         "dtype": args.dtype,
         "sparse_linear_policy": os.environ.get("VLLM_SPARSE_GEMV_LINEAR_POLICY"),
+        "sparse_gemv_dense_fallback_policy": (
+            args.sparse_gemv_dense_fallback_policy
+        ),
+        "sparse_gemv_min_sparsity": active_min_sparsity,
         "require_sparse_gemv_kernel": not args.allow_sparse_gemv_fallback,
         "dense": dense,
         "sparse": sparse,

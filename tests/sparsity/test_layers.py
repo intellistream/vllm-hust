@@ -36,13 +36,17 @@ def test_build_sparsifier_success():
         torch.save(torch.tensor(0.5), threshold_path)
 
         cfg = ActivationSparsityConfig(
-            enable=True, calibration_path=tmpdir, apply_all_tokens=True
+            enable=True,
+            calibration_path=tmpdir,
+            uniform_sparsity=0.7,
+            apply_all_tokens=True,
         )
         sparsifier = build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
 
         assert sparsifier is not None
         assert sparsifier.apply_all_tokens is True
         assert sparsifier.prefill_sparsify == "half"
+        assert sparsifier.expected_sparsity == 0.7
         x = torch.randn(4, 8)
         out = sparsifier(x)
         # With threshold 0.5, some values should be zeroed
@@ -84,6 +88,7 @@ def test_build_sparsifier_larosa():
         assert isinstance(sparsifier, LaRosaSparsifyFn)
         assert sparsifier.rotate_input is True
         assert sparsifier.sparsity_level == 0.4
+        assert sparsifier.expected_sparsity == 0.4
         assert sparsifier.apply_all_tokens is False
         assert sparsifier.prefill_sparsify == "half"
         x = torch.randn(4, hidden)
@@ -130,5 +135,6 @@ def test_build_sparsifier_larosa_second_site_no_rotation_required():
         assert isinstance(sparsifier, LaRosaSparsifyFn)
         assert sparsifier.rotate_input is False
         assert sparsifier.sparsity_level == 0.6
+        assert sparsifier.expected_sparsity == 0.6
         assert sparsifier.apply_all_tokens is False
         assert sparsifier.prefill_sparsify == "half"

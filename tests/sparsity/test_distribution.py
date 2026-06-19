@@ -291,16 +291,69 @@ def test_sparse_linear_weight_t_cache_invalidates_after_weight_mutation():
 
 def test_sparse_linear_auto_policy_keeps_single_batch_wide_output(monkeypatch):
     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
-    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
+    sparsify = SparsifyFn(
+        torch.tensor(0.5),
+        use_sparse_gemv=True,
+        expected_sparsity=0.7,
+    )
     x = torch.randn(1, 3584)
     weight = torch.randn(32768, 3584)
 
     assert sparsify._should_use_sparse_linear_kernel(x, weight) is True
 
 
+def test_sparse_linear_auto_policy_requires_expected_sparsity(monkeypatch):
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
+    x = torch.randn(1, 3584)
+    weight = torch.randn(32768, 3584)
+
+    unknown = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
+    low = SparsifyFn(
+        torch.tensor(0.5),
+        use_sparse_gemv=True,
+        expected_sparsity=0.4,
+    )
+    high = SparsifyFn(
+        torch.tensor(0.5),
+        use_sparse_gemv=True,
+        expected_sparsity=0.7,
+    )
+
+    assert unknown._should_use_sparse_linear_kernel(x, weight) is False
+    assert low._should_use_sparse_linear_kernel(x, weight) is False
+    assert high._should_use_sparse_linear_kernel(x, weight) is True
+
+
+def test_sparse_linear_auto_policy_honors_min_sparsity_env(monkeypatch):
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", "0.75")
+    x = torch.randn(1, 3584)
+    weight = torch.randn(32768, 3584)
+
+    below = SparsifyFn(
+        torch.tensor(0.5),
+        use_sparse_gemv=True,
+        expected_sparsity=0.7,
+    )
+    at_cutoff = SparsifyFn(
+        torch.tensor(0.5),
+        use_sparse_gemv=True,
+        expected_sparsity=0.75,
+    )
+
+    assert below._should_use_sparse_linear_kernel(x, weight) is False
+    assert at_cutoff._should_use_sparse_linear_kernel(x, weight) is True
+
+
 def test_sparse_linear_auto_policy_skips_losing_shapes(monkeypatch):
     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
-    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
+    sparsify = SparsifyFn(
+        torch.tensor(0.5),
+        use_sparse_gemv=True,
+        expected_sparsity=0.7,
+    )
 
     assert not sparsify._should_use_sparse_linear_kernel(
         torch.randn(2, 3584),
@@ -326,6 +379,36 @@ def test_sparse_linear_policy_overrides(monkeypatch):
 
     monkeypatch.setenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", "none")
     assert sparsify._should_use_sparse_linear_kernel(x, weight) is False
+
+
+def test_sparse_linear_dense_fallback_masks_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", raising=False)
+    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
+    x = torch.tensor([[0.25, 1.0]])
+
+    out = sparsify.apply_dense_fallback(x)
+
+    assert torch.equal(out, torch.tensor([[0.0, 1.0]]))
+
+
+def test_sparse_linear_identity_fallback_skips_all_row_mask(monkeypatch):
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", "identity")
+    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
+    x = torch.tensor([[0.25, 1.0]])
+
+    out = sparsify.apply_dense_fallback(x)
+
+    assert out is x
+
+
+def test_sparse_linear_identity_fallback_keeps_mixed_prefill_mask(monkeypatch):
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", "identity")
+    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
+    x = torch.tensor([[0.25, 1.0], [0.25, 1.0]])
+
+    out = sparsify.apply_dense_fallback(x)
+
+    assert torch.equal(out, torch.tensor([[0.25, 1.0], [0.0, 1.0]]))
 
 
 def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):

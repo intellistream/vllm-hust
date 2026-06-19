@@ -151,7 +151,7 @@ class LlamaMLP(nn.Module):
             x, _ = sparse_gate_up
         else:
             if self.sparsify_gate_up is not None:
-                x = self.sparsify_gate_up(x)
+                x = self.sparsify_gate_up.apply_dense_fallback(x)
             x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
         sparse_down = (
@@ -163,7 +163,7 @@ class LlamaMLP(nn.Module):
             x, _ = sparse_down
             return x
         if self.sparsify_down is not None:
-            x = self.sparsify_down(x)
+            x = self.sparsify_down.apply_dense_fallback(x)
         x, _ = self.down_proj(x)
         return x
 
@@ -301,7 +301,9 @@ class LlamaAttention(nn.Module):
             qkv, _ = sparse_qkv
         else:
             if self.sparsify_qkv is not None:
-                hidden_states = self.sparsify_qkv(hidden_states)
+                hidden_states = self.sparsify_qkv.apply_dense_fallback(
+                    hidden_states
+                )
             qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
@@ -315,7 +317,7 @@ class LlamaAttention(nn.Module):
             output, _ = sparse_o
             return output
         if self.sparsify_o is not None:
-            attn_output = self.sparsify_o(attn_output)
+            attn_output = self.sparsify_o.apply_dense_fallback(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
