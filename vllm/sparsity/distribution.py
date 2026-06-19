@@ -160,6 +160,8 @@ class SparsifyFn(nn.Module):
             return None
         if getattr(linear_layer, "quant_config", None) is not None:
             return None
+        if not self._should_use_sparse_linear_kernel(x, weight):
+            return None
 
         try:
             from vllm.distributed import get_tensor_model_parallel_world_size
@@ -184,8 +186,6 @@ class SparsifyFn(nn.Module):
 
         sparse_input = self._sparse_linear_input(x, linear_layer)
         if sparse_input is None:
-            return None
-        if not self._should_use_sparse_linear_kernel(sparse_input, weight):
             return None
 
         threshold, inclusive = self._sparse_linear_threshold(sparse_input)

@@ -269,6 +269,25 @@ def test_larosa_rotated_sparse_linear_requires_merged_weight():
     assert sparsify._sparse_linear_input(torch.randn(1, 4), SimpleNamespace()) is None
 
 
+def test_larosa_try_apply_linear_rejects_shape_before_rotation(monkeypatch):
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.7,
+        rotation=torch.eye(5),
+        rotate_input=True,
+        use_sparse_gemv=True,
+        expected_sparsity=0.7,
+    )
+    linear = SimpleNamespace(
+        weight=torch.randn(4608, 4).contiguous(),
+        quant_config=None,
+        _larosa_sparse_weight_merged=True,
+    )
+
+    assert sparsify.try_apply_linear(torch.randn(1, 4), linear) is None
+
+
 def test_sparse_linear_weight_t_cache_invalidates_after_weight_mutation():
     linear = torch.nn.Linear(4, 3, bias=False)
     sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
