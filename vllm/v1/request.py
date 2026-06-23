@@ -29,6 +29,15 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
+PREFIX_CACHE_ONLY_KV_TRANSFER_PARAM_KEY = "prefix_cache_only"
+
+
+def is_prefix_cache_only_kv_transfer_params(params: Any) -> bool:
+    if not isinstance(params, dict):
+        return False
+    return params.get(PREFIX_CACHE_ONLY_KV_TRANSFER_PARAM_KEY) is True
+
+
 @dataclass
 class StreamingUpdate:
     """Lightweight data for streaming session continuation.
@@ -99,6 +108,7 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.prefix_cache_materialization_params: dict[str, Any] | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -111,9 +121,11 @@ class Request:
                 self.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
 
             if sampling_params.extra_args is not None:
-                self.kv_transfer_params = sampling_params.extra_args.get(
-                    "kv_transfer_params"
-                )
+                kv_transfer_params = sampling_params.extra_args.get("kv_transfer_params")
+                if is_prefix_cache_only_kv_transfer_params(kv_transfer_params):
+                    self.prefix_cache_materialization_params = kv_transfer_params
+                else:
+                    self.kv_transfer_params = kv_transfer_params
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 

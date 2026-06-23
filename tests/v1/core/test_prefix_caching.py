@@ -108,6 +108,59 @@ def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
     )
 
 
+def test_fixed_prefix_materialization_hint_is_prefix_cache_only() -> None:
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        extra_args={
+            "kv_transfer_params": {
+                "prefix_cache_only": True,
+                "logical_request_id": "twin-session-1",
+                "anchor_id": "tenant-a:shared-doc:v1",
+            }
+        },
+    )
+
+    request = Request(
+        request_id="prefix-cache-only",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=sampling_params,
+        pooling_params=None,
+        cache_salt="tenant-a:shared-doc:v1",
+    )
+
+    assert request.kv_transfer_params is None
+    assert request.prefix_cache_materialization_params is not None
+    assert request.prefix_cache_materialization_params["prefix_cache_only"] is True
+    assert request.prefix_cache_materialization_params["anchor_id"] == (
+        "tenant-a:shared-doc:v1"
+    )
+
+
+def test_remote_kv_transfer_params_still_reach_connector_path() -> None:
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        extra_args={
+            "kv_transfer_params": {
+                "remote_engine_id": "prefill-0",
+                "remote_block_ids": [1, 2, 3],
+            }
+        },
+    )
+
+    request = Request(
+        request_id="remote-transfer",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=sampling_params,
+        pooling_params=None,
+    )
+
+    assert request.kv_transfer_params == {
+        "remote_engine_id": "prefill-0",
+        "remote_block_ids": [1, 2, 3],
+    }
+    assert request.prefix_cache_materialization_params is None
+
+
 def make_kv_cache_config_hybrid_model(
     block_size: int,
     num_blocks: int,
