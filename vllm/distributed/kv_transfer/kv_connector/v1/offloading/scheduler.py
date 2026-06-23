@@ -33,6 +33,9 @@ from vllm.v1.kv_offload.base import (
     get_offload_block_hash,
     make_offload_key,
 )
+from vllm.v1.kv_offload.hierarchical.config import HierarchicalShadowConfig
+from vllm.v1.kv_offload.hierarchical.metrics import HierarchicalKVCacheMetrics
+from vllm.v1.kv_offload.hierarchical.residency import BlockRef, ResidencyState
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -109,6 +112,19 @@ class SchedulerOffloadConfig(NamedTuple):
             ),
             block_size_factor=spec.block_size_factor,
         )
+
+
+def _default_kv_bytes_per_offloaded_block(spec: OffloadingSpec) -> int:
+    kv_cache_config = spec.kv_cache_config
+    if kv_cache_config.num_blocks <= 0:
+        return 0
+    total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+    if total_gpu_kv_bytes <= 0:
+        return 0
+    kv_bytes_per_gpu_block = (
+        total_gpu_kv_bytes // kv_cache_config.num_blocks
+    ) * spec.vllm_config.parallel_config.world_size
+    return kv_bytes_per_gpu_block * spec.block_size_factor
 
 
 @dataclass
@@ -188,6 +204,15 @@ class OffloadingConnectorScheduler:
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
+        shadow_config = HierarchicalShadowConfig.from_extra_config(
+            spec.extra_config,
+            default_kv_bytes_per_block=_default_kv_bytes_per_offloaded_block(spec),
+        )
+        self.hierarchical_metrics: HierarchicalKVCacheMetrics | None = (
+            HierarchicalKVCacheMetrics(shadow_config)
+            if shadow_config.enabled
+            else None
+        )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -301,6 +326,98 @@ class OffloadingConnectorScheduler:
                     - group_config.sliding_window_size_in_blocks,
                 )
                 self.manager.touch(group_state.offload_keys[blocks_to_skip:])
+
+    def _record_hierarchical_shadow_lookup(
+        self,
+        req_status: RequestOffloadState,
+        num_hit_tokens: int | None,
+    ) -> None:
+        metrics = self.hierarchical_metrics
+        if metrics is None:
+            return
+
+        req = req_status.req
+        total_blocks = 0
+        device_hit_blocks = 0
+        host_hit_blocks = 0
+        loading_blocks = 0
+        storing_blocks = 0
+        absent_blocks = 0
+        non_loadable_host_blocks = 0
+
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            offloaded_block_size = group_config.offloaded_block_size
+            group_total_blocks = min(
+                len(group_state.offload_keys),
+                req.num_tokens // offloaded_block_size,
+            )
+            if group_total_blocks == 0:
+                continue
+
+            group_refs = [
+                BlockRef.from_offload_key(key)
+                for key in group_state.offload_keys[:group_total_blocks]
+            ]
+
+            local_blocks = min(
+                group_total_blocks,
+                req_status.num_locally_computed_tokens // offloaded_block_size,
+            )
+            host_blocks = 0
+            if num_hit_tokens is not None:
+                host_blocks = min(
+                    group_total_blocks - local_blocks,
+                    num_hit_tokens // offloaded_block_size,
+                )
+
+            total_blocks += group_total_blocks
+            device_hit_blocks += local_blocks
+            host_hit_blocks += host_blocks
+
+            device_refs = group_refs[:local_blocks]
+            host_refs = group_refs[local_blocks : local_blocks + host_blocks]
+            metrics.residency.mark(device_refs, ResidencyState.READY_DEVICE)
+            metrics.residency.mark(host_refs, ResidencyState.READY_HOST)
+
+            for ref in group_refs[local_blocks + host_blocks :]:
+                state = metrics.residency.get(ref)
+                if state == ResidencyState.LOADING_H2D:
+                    loading_blocks += 1
+                elif state == ResidencyState.STORING_D2H:
+                    storing_blocks += 1
+                elif state == ResidencyState.READY_HOST:
+                    non_loadable_host_blocks += 1
+                else:
+                    absent_blocks += 1
+
+        compute_tokens = max(
+            0,
+            req.num_tokens
+            - req_status.num_locally_computed_tokens
+            - (num_hit_tokens or 0),
+        )
+        estimate = metrics.estimator.estimate(
+            request_id=req.request_id,
+            total_blocks=total_blocks,
+            device_hit_blocks=device_hit_blocks,
+            host_hit_blocks=host_hit_blocks,
+            loading_blocks=loading_blocks,
+            storing_blocks=storing_blocks,
+            absent_blocks=absent_blocks,
+            non_loadable_host_blocks=non_loadable_host_blocks,
+            compute_tokens=compute_tokens,
+        )
+        metrics.record_estimate(
+            estimate,
+            extra={
+                "num_tokens": req.num_tokens,
+                "num_local_cached_tokens": req_status.num_locally_computed_tokens,
+                "num_external_cached_tokens": num_hit_tokens,
+                "lookup_deferred": num_hit_tokens is None,
+            },
+        )
 
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         """
@@ -476,6 +593,7 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens = self._lookup(req_status)
+        self._record_hierarchical_shadow_lookup(req_status, num_hit_tokens)
         if is_new_request:
             req_status.update_num_hit_blocks(
                 num_computed_tokens + (num_hit_tokens or 0)
@@ -591,6 +709,10 @@ class OffloadingConnectorScheduler:
 
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
+        if self.hierarchical_metrics is not None:
+            self.hierarchical_metrics.residency.mark_keys(
+                keys_to_load, ResidencyState.LOADING_H2D
+            )
 
     def _build_store_jobs(
         self,
@@ -668,6 +790,10 @@ class OffloadingConnectorScheduler:
             if store_output is None:
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
+            if self.hierarchical_metrics is not None:
+                self.hierarchical_metrics.residency.mark_keys(
+                    store_output.evicted_keys, ResidencyState.ABSENT
+                )
 
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
@@ -676,6 +802,10 @@ class OffloadingConnectorScheduler:
             self._touch(req_status)
 
             keys_to_store = set(store_output.keys_to_store)
+            if self.hierarchical_metrics is not None:
+                self.hierarchical_metrics.residency.mark_keys(
+                    keys_to_store, ResidencyState.STORING_D2H
+                )
 
             group_sizes: list[int] = []
             block_indices: list[int] = []
@@ -804,10 +934,18 @@ class OffloadingConnectorScheduler:
 
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys)
+                if self.hierarchical_metrics is not None:
+                    self.hierarchical_metrics.residency.mark_keys(
+                        job_status.keys, ResidencyState.READY_HOST
+                    )
             else:
                 self.manager.complete_load(job_status.keys)
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
+                if self.hierarchical_metrics is not None:
+                    self.hierarchical_metrics.residency.mark_keys(
+                        job_status.keys, ResidencyState.READY_DEVICE
+                    )
 
             req_status = self._req_status[job_status.req_id]
             if self._block_id_to_pending_jobs:
