@@ -1405,17 +1405,6 @@ class GPUModelRunner(
 
                     if not hasattr(self, "_verify_dbg"):
                         self._verify_dbg = 0
-
-                    if self._verify_dbg < 30:
-                        self._verify_dbg += 1
-                        print(
-                            "[VERIFY]",
-                            "num_accepted=", int(num_accepted),
-                            "valid_sampled_token_count=",
-                            int(valid_sampled_token_count[prev_req_index]),
-                            "sampled=",
-                            sampled_token_ids_cpu.tolist()[:8],
-                        )
                     correction = optimistic_num_accepted - num_accepted
                     req_state.num_computed_tokens -= correction
                     cur_req_index = self.input_batch.req_id_to_index.get(req_id)
