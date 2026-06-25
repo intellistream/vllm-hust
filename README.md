@@ -282,3 +282,41 @@ If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs
 ## Media Kit
 
 - If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+
+## Generic dev-hub Validation
+
+Use this pattern to validate this plugin through the host-managed vLLM-HUST dev-hub launcher. Keep dev-hub generic: do not hardcode this repository name, plugin name, port, NPU IDs, or experiment container in dev-hub itself.
+
+Before launch:
+
+- confirm this repository is visible inside the container, usually under `/workspace/<repo-name>`;
+- check NPU occupancy with `npu-smi info`;
+- choose a unique experiment container name, systemd unit name, and free port;
+- use a real API key already configured for the manager, but never print or record it;
+- do not share the active twin container.
+
+Generic launch template:
+
+```bash
+export DEV_HUB_ROOT=${DEV_HUB_ROOT:-/home/shuhao/vllm-hust-dev-hub}
+
+export VLLM_ENGINE_CONTAINER=<unique-experiment-container>
+export VLLM_ENGINE_IMAGE=<known-good-vllm-ascend-image>
+export VLLM_ENGINE_AUTO_CREATE_CONTAINER=true
+export VLLM_ENGINE_MODEL_PATH=<model-path>
+export VLLM_ENGINE_SERVED_MODEL_NAME=<served-model-name>
+export VLLM_ENGINE_CONDA_ENV=<conda-env>
+export VLLM_ENGINE_PORT=<free-port>
+export VLLM_ENGINE_TP_SIZE=<tp-size>
+export VLLM_ENGINE_NPU_DEVICES=<dedicated-npu-ids>
+export VLLM_ENGINE_SYSTEMD_UNIT=<unique-unit-name>.service
+export VLLM_ENGINE_COMPILATION_CONFIG='<optional-json-compilation-config>'
+
+export VLLM_PLUGINS=<plugin-name-or-comma-list>
+export VLLM_ENGINE_PYTHONPATH=/workspace/<repo-name>/src:/workspace/<repo-name>:/workspace/vllm-hust:/workspace/vllm-ascend-hust
+
+"$DEV_HUB_ROOT/manage.sh" restart
+"$DEV_HUB_ROOT/manage.sh" status --json
+```
+
+Run A/B with only plugin-owned environment variables changed between baseline and experiment. Record command shape, devices, model, graph config, prompt, max tokens, output length, TTFT, TPOT, throughput, result paths, confirmed facts, hypotheses, rejected directions, and the next experiment. If startup fails, stop through the same manager and record the failure; do not switch to manual Docker startup.
