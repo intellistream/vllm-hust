@@ -437,6 +437,19 @@ class OpenAIServing:
             ):
                 error_response = load_result
 
+        logger.warning(
+            "Rejecting request during model validation: request_id=%s, "
+            "request_type=%s, request_model=%r, base_models=%s, loaded_loras=%s, "
+            "runtime_lora_updating=%s, prior_error=%s",
+            getattr(request, "request_id", None),
+            type(request).__name__,
+            request.model,
+            [model.name for model in self.models.base_model_paths],
+            list(self.models.lora_requests.keys()),
+            envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING,
+            error_response.error.message if error_response is not None else None,
+        )
+
         return error_response or self.create_error_response(
             message=f"The model `{request.model}` does not exist.",
             err_type="NotFoundError",

@@ -14,6 +14,7 @@ from pydantic import ValidationError
 import vllm.config.vllm as vllm_config_module
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
+    CacheConfig,
     CompilationConfig,
     KernelConfig,
     ModelConfig,
@@ -218,9 +219,25 @@ def test_auto_runner(model_id, expected_runner_type, expected_convert_type):
 )
 def test_pooling_runner(model_id, expected_runner_type, expected_convert_type):
     config = ModelConfig(model_id, runner="pooling")
-
     assert config.runner_type == expected_runner_type
     assert config.convert_type == expected_convert_type
+
+
+def test_kivi_cache_config_validation():
+    config = CacheConfig(cache_dtype="kivi_int4")
+
+    assert config.cache_dtype == "kivi_int4"
+    assert config.kivi_group_size == 32
+    assert config.kivi_residual_length == 32
+
+
+def test_kivi_cache_config_rejects_invalid_residual_length():
+    with pytest.raises(ValidationError):
+        CacheConfig(
+            cache_dtype="kivi_int4",
+            kivi_group_size=32,
+            kivi_residual_length=48,
+        )
 
 
 @pytest.mark.parametrize(

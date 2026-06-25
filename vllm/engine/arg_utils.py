@@ -425,6 +425,8 @@ class EngineArgs:
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    kivi_group_size: int = CacheConfig.kivi_group_size
+    kivi_residual_length: int = CacheConfig.kivi_residual_length
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -1077,6 +1079,12 @@ class EngineArgs:
         )
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
         cache_group.add_argument(
+            "--kivi-group-size", **cache_kwargs["kivi_group_size"]
+        )
+        cache_group.add_argument(
+            "--kivi-residual-length", **cache_kwargs["kivi_residual_length"]
+        )
+        cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
         cache_group.add_argument(
@@ -1683,6 +1691,8 @@ class EngineArgs:
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
+            kivi_group_size=self.kivi_group_size,
+            kivi_residual_length=self.kivi_residual_length,
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,

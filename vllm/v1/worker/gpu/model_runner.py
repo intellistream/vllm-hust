@@ -45,7 +45,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -121,10 +121,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
-            # Quantized KV cache.
-            self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
-                self.cache_config.cache_dtype
-            ]
+            self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+                self.cache_config.cache_dtype,
+                self.model_config,
+            )
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
