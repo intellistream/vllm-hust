@@ -299,6 +299,11 @@ class KIVIInt4FullAttentionSpec(FullAttentionSpec):
         if self.quant_bits != 4:
             raise ValueError("Current KIVI spec only supports 4-bit history cache.")
 
+        if self.head_size != self.head_size_v:
+            raise ValueError(
+                "KIVI INT4 does not support head_size != head_size_v yet."
+            )
+
         if self.block_size % self.kivi_group_size != 0:
             raise ValueError(
                 "For the MVP KIVI paged layout, block_size must be divisible by "

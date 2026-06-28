@@ -258,9 +258,8 @@ class CacheConfig:
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
         if cache_dtype == "kivi_int4":
             logger.info(
-                "Using %s fake quantization for kv cache. Storage stays in the "
-                "model dtype and only KIVI-style fake-quant/dequant is applied "
-                "during cache updates/reads.",
+                "Using %s kv cache. The concrete storage layout and "
+                "quant/dequant execution are backend-specific.",
                 str(cache_dtype),
             )
             return cache_dtype
