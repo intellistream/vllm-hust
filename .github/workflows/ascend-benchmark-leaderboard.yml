@@ -387,9 +387,9 @@ jobs:
           chmod 600 "$key_file"
 
           known_hosts_tmp="$(mktemp)"
-          ssh-keyscan -t rsa,ecdsa,ed25519 github.com > "$known_hosts_tmp" 2>/dev/null
+          ssh-keyscan -p 443 -t rsa,ecdsa,ed25519 ssh.github.com > "$known_hosts_tmp" 2>/dev/null
           if [[ ! -s "$known_hosts_tmp" ]]; then
-            echo "Unable to scan github.com host keys." >&2
+            echo "Unable to scan ssh.github.com host keys." >&2
             exit 2
           fi
           cat "$known_hosts_tmp" >> "$HOME/.ssh/known_hosts"
@@ -397,7 +397,8 @@ jobs:
 
           cat > "$HOME/.ssh/config" <<EOF
           Host github.com
-            HostName github.com
+            HostName ssh.github.com
+            Port 443
             User git
             IdentityFile $key_file
             IdentitiesOnly yes
@@ -479,8 +480,8 @@ jobs:
             local repo_url=$1
             local target_dir=$2
             local target_ref=${3:-}
-            local attempts=4
-            local delay_seconds=15
+            local attempts=6
+            local delay_seconds=20
             local try=1
             local parent_dir
             local temp_dir
@@ -510,13 +511,19 @@ jobs:
                 sleep "$delay_seconds"
               fi
               try=$((try + 1))
+              delay_seconds=$((delay_seconds * 2))
             done
 
             echo "Failed to clone $repo_url after ${attempts} attempts" >&2
             return 1
           }
 
-          clone_with_retry "$BENCHMARK_REPO_URL" "$GITHUB_WORKSPACE/vllm-hust-benchmark" "$BENCHMARK_REPO_REF"
+          benchmark_repo_url="$BENCHMARK_REPO_URL"
+          if [[ -z "${BENCHMARK_REPO_SSH_KEY:-}" ]]; then
+            benchmark_repo_url="https://github.com/${BENCHMARK_REPO_SLUG}.git"
+          fi
+
+          clone_with_retry "$benchmark_repo_url" "$GITHUB_WORKSPACE/vllm-hust-benchmark" "$BENCHMARK_REPO_REF"
 
       - name: Checkout website repo
         run: |
