@@ -24,6 +24,17 @@ logger = init_logger(__name__)
 
 _SPARSE_GEMV_INVOCATIONS = 0
 _SPARSE_GEMV_MARKED = False
+_SPARSE_GEMV_MARKER_RECORDS = 0
+_ASCEND_SPARSE_LINEAR_MARKED = False
+_ASCEND_SPARSE_LINEAR_MARKER_RECORDS = 0
+_ASCEND_SPARSE_LINEAR_IMPORT_ATTEMPTED = False
+_ASCEND_SPARSE_LINEAR = None
+_ASCEND_DIRECT_T_OP = None
+_ASCEND_SILU_AND_MUL_DIRECT_T_OP = None
+_ASCEND_PACK_OP = None
+_ASCEND_SILU_AND_MUL_PACKED_T_OP = None
+_ASCEND_CUSTOM_OP_IMPORT_ATTEMPTED = False
+_ASCEND_CUSTOM_OP_ENABLED = False
 
 
 def _requires_backend_kernel() -> bool:
@@ -33,12 +44,105 @@ def _requires_backend_kernel() -> bool:
 
 def reset_sparse_gemv_invocation_count() -> None:
     global _SPARSE_GEMV_INVOCATIONS, _SPARSE_GEMV_MARKED
+    global _SPARSE_GEMV_MARKER_RECORDS
+    global _ASCEND_SPARSE_LINEAR_MARKED, _ASCEND_SPARSE_LINEAR_MARKER_RECORDS
     _SPARSE_GEMV_INVOCATIONS = 0
     _SPARSE_GEMV_MARKED = False
+    _SPARSE_GEMV_MARKER_RECORDS = 0
+    _ASCEND_SPARSE_LINEAR_MARKED = False
+    _ASCEND_SPARSE_LINEAR_MARKER_RECORDS = 0
 
 
 def get_sparse_gemv_invocation_count() -> int:
     return _SPARSE_GEMV_INVOCATIONS
+
+
+def _get_ascend_sparse_linear():
+    global _ASCEND_SPARSE_LINEAR_IMPORT_ATTEMPTED, _ASCEND_SPARSE_LINEAR
+    if not _ASCEND_SPARSE_LINEAR_IMPORT_ATTEMPTED:
+        _ASCEND_SPARSE_LINEAR_IMPORT_ATTEMPTED = True
+        try:
+            from vllm_ascend.ops.sparse_linear import activation_sparse_linear
+        except (ImportError, ModuleNotFoundError):
+            _ASCEND_SPARSE_LINEAR = None
+        else:
+            _ASCEND_SPARSE_LINEAR = activation_sparse_linear
+    return _ASCEND_SPARSE_LINEAR
+
+
+def _ensure_ascend_custom_ops_registered() -> bool:
+    global _ASCEND_CUSTOM_OP_IMPORT_ATTEMPTED, _ASCEND_CUSTOM_OP_ENABLED
+    if not _ASCEND_CUSTOM_OP_IMPORT_ATTEMPTED:
+        _ASCEND_CUSTOM_OP_IMPORT_ATTEMPTED = True
+        try:
+            from vllm_ascend.utils import enable_custom_op
+        except (ImportError, ModuleNotFoundError):
+            _ASCEND_CUSTOM_OP_ENABLED = False
+        else:
+            _ASCEND_CUSTOM_OP_ENABLED = bool(enable_custom_op())
+    return _ASCEND_CUSTOM_OP_ENABLED
+
+
+def _get_ascend_direct_t_op():
+    global _ASCEND_DIRECT_T_OP
+    if _ASCEND_DIRECT_T_OP is None:
+        if not _ensure_ascend_custom_ops_registered():
+            return None
+        try:
+            _ASCEND_DIRECT_T_OP = torch.ops._C_ascend.activation_sparse_linear_direct_t
+        except (AttributeError, RuntimeError):
+            return None
+    return _ASCEND_DIRECT_T_OP
+
+
+def _get_ascend_silu_and_mul_direct_t_op():
+    global _ASCEND_SILU_AND_MUL_DIRECT_T_OP
+    if _ASCEND_SILU_AND_MUL_DIRECT_T_OP is None:
+        if not _ensure_ascend_custom_ops_registered():
+            return None
+        try:
+            _ASCEND_SILU_AND_MUL_DIRECT_T_OP = (
+                torch.ops._C_ascend.activation_sparse_silu_and_mul_direct_t
+            )
+        except (AttributeError, RuntimeError):
+            return None
+    return _ASCEND_SILU_AND_MUL_DIRECT_T_OP
+
+
+def _get_ascend_pack_op():
+    global _ASCEND_PACK_OP
+    if _ASCEND_PACK_OP is None:
+        if not _ensure_ascend_custom_ops_registered():
+            return None
+        try:
+            _ASCEND_PACK_OP = torch.ops._C_ascend.activation_sparse_pack
+        except (AttributeError, RuntimeError):
+            return None
+    return _ASCEND_PACK_OP
+
+
+def _get_ascend_silu_and_mul_packed_t_op():
+    global _ASCEND_SILU_AND_MUL_PACKED_T_OP
+    if _ASCEND_SILU_AND_MUL_PACKED_T_OP is None:
+        if not _ensure_ascend_custom_ops_registered():
+            return None
+        try:
+            _ASCEND_SILU_AND_MUL_PACKED_T_OP = (
+                torch.ops._C_ascend.activation_sparse_silu_and_mul_packed_t
+            )
+        except (AttributeError, RuntimeError):
+            return None
+    return _ASCEND_SILU_AND_MUL_PACKED_T_OP
+
+
+def _should_use_packed_silu_and_mul_t() -> bool:
+    mode = os.environ.get("VLLM_ASCEND_SPARSE_LINEAR_IMPL", "auto").lower()
+    return mode in {"packed", "packed_t", "silu_packed", "silu_packed_t"}
+
+
+def should_use_topk_matmul_silu() -> bool:
+    mode = os.environ.get("VLLM_ASCEND_SPARSE_LINEAR_IMPL", "auto").lower()
+    return mode in {"topk_matmul", "topk-matmul", "larosa_topk_matmul"}
 
 
 def _tensor_marker_payload(name: str, tensor: torch.Tensor | None) -> dict[str, Any]:
@@ -98,6 +202,45 @@ def _activity_marker_payload(
     }
 
 
+def _marker_record_limit() -> int:
+    value = os.environ.get("VLLM_SPARSE_GEMV_MARKER_LIMIT")
+    if value is None:
+        return 1
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 1
+
+
+def _is_torch_compiling() -> bool:
+    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
+    if is_compiling is None:
+        return False
+    try:
+        return bool(is_compiling())
+    except Exception:
+        return False
+
+
+def _is_npu_tensor(tensor: torch.Tensor) -> bool:
+    if getattr(tensor, "is_npu", False):
+        return True
+    if not _is_torch_compiling():
+        return False
+    return getattr(getattr(tensor, "device", None), "type", None) == "npu"
+
+
+def _threshold_numel_is_supported(
+    threshold: torch.Tensor,
+    x: torch.Tensor,
+) -> bool:
+    if threshold.numel() == 1:
+        return True
+    if _is_torch_compiling():
+        return True
+    return threshold.numel() == x.shape[0]
+
+
 def _record_sparse_gemv_invocation(
     *,
     x: torch.Tensor | None = None,
@@ -106,12 +249,19 @@ def _record_sparse_gemv_invocation(
     weight_t: torch.Tensor | None = None,
 ) -> None:
     global _SPARSE_GEMV_INVOCATIONS, _SPARSE_GEMV_MARKED
+    global _SPARSE_GEMV_MARKER_RECORDS
     _SPARSE_GEMV_INVOCATIONS += 1
 
-    marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
-    if not marker_path or _SPARSE_GEMV_MARKED:
+    if _is_torch_compiling():
         return
-    _SPARSE_GEMV_MARKED = True
+
+    marker_limit = _marker_record_limit()
+    if _SPARSE_GEMV_MARKER_RECORDS >= marker_limit:
+        _SPARSE_GEMV_MARKED = marker_limit > 0
+        return
+    marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
+    if not marker_path:
+        return
     try:
         marker_dir = os.path.dirname(marker_path)
         if marker_dir:
@@ -119,6 +269,7 @@ def _record_sparse_gemv_invocation(
         payload: dict[str, Any] = {
             "pid": os.getpid(),
             "invocations": _SPARSE_GEMV_INVOCATIONS,
+            "marker_record": _SPARSE_GEMV_MARKER_RECORDS + 1,
         }
         payload.update(_tensor_marker_payload("x", x))
         payload.update(_tensor_marker_payload("threshold", threshold))
@@ -131,8 +282,159 @@ def _record_sparse_gemv_invocation(
             payload["inclusive"] = bool(inclusive)
         with open(marker_path, "a", encoding="utf-8") as marker_file:
             marker_file.write(json.dumps(payload, sort_keys=True) + "\n")
+        _SPARSE_GEMV_MARKER_RECORDS += 1
+        _SPARSE_GEMV_MARKED = _SPARSE_GEMV_MARKER_RECORDS >= marker_limit
     except OSError:
         logger.warning("Failed to write sparse GEMV marker to %s", marker_path)
+
+
+def _record_ascend_sparse_linear_marker(
+    *,
+    x: torch.Tensor,
+    threshold: torch.Tensor,
+    inclusive: bool,
+    weight_t: torch.Tensor,
+    op_name: str = "activation_sparse_linear_direct_t",
+) -> None:
+    global _ASCEND_SPARSE_LINEAR_MARKED, _ASCEND_SPARSE_LINEAR_MARKER_RECORDS
+    if _is_torch_compiling():
+        return
+
+    marker_limit = _marker_record_limit()
+    if _ASCEND_SPARSE_LINEAR_MARKER_RECORDS >= marker_limit:
+        _ASCEND_SPARSE_LINEAR_MARKED = marker_limit > 0
+        return
+
+    marker_path = os.environ.get("VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH")
+    if not marker_path:
+        return
+    try:
+        marker_dir = os.path.dirname(marker_path)
+        if marker_dir:
+            os.makedirs(marker_dir, exist_ok=True)
+        payload: dict[str, Any] = {
+            "op": op_name,
+            "pid": os.getpid(),
+            "inclusive": bool(inclusive),
+            "marker_record": _ASCEND_SPARSE_LINEAR_MARKER_RECORDS + 1,
+        }
+        payload.update(_tensor_marker_payload("x", x))
+        payload.update(_tensor_marker_payload("threshold", threshold))
+        payload.update(_tensor_marker_payload("weight_t", weight_t))
+        with open(marker_path, "a", encoding="utf-8") as marker_file:
+            marker_file.write(json.dumps(payload, sort_keys=True) + "\n")
+        _ASCEND_SPARSE_LINEAR_MARKER_RECORDS += 1
+        _ASCEND_SPARSE_LINEAR_MARKED = (
+            _ASCEND_SPARSE_LINEAR_MARKER_RECORDS >= marker_limit
+        )
+    except OSError:
+        return
+
+
+def _try_ascend_direct_t_fast_path(
+    x: torch.Tensor,
+    weight_t: torch.Tensor | None,
+    threshold: torch.Tensor,
+    inclusive: bool,
+) -> torch.Tensor | None:
+    if weight_t is None:
+        return None
+    if not _is_npu_tensor(x):
+        return None
+    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
+        return None
+    if x.dim() != 2 or weight_t.dim() != 2:
+        return None
+    if x.shape[1] != weight_t.shape[0]:
+        return None
+    if not _threshold_numel_is_supported(threshold, x):
+        return None
+
+    op = _get_ascend_direct_t_op()
+    if op is None:
+        return None
+
+    if threshold.dtype != torch.float32 or threshold.device != x.device:
+        threshold = threshold.to(dtype=torch.float32, device=x.device)
+    if not threshold.is_contiguous():
+        threshold = threshold.contiguous()
+    _record_ascend_sparse_linear_marker(
+        x=x,
+        threshold=threshold,
+        inclusive=inclusive,
+        weight_t=weight_t,
+    )
+    return op(
+        x if x.is_contiguous() else x.contiguous(),
+        weight_t if weight_t.is_contiguous() else weight_t.contiguous(),
+        threshold,
+        inclusive,
+    )
+
+
+def _try_ascend_silu_and_mul_direct_t_fast_path(
+    x: torch.Tensor,
+    weight_t: torch.Tensor | None,
+    threshold: torch.Tensor,
+    inclusive: bool,
+) -> torch.Tensor | None:
+    if weight_t is None:
+        return None
+    if not _is_npu_tensor(x):
+        return None
+    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
+        return None
+    if x.dim() != 2 or weight_t.dim() != 2:
+        return None
+    if x.shape[1] != weight_t.shape[0] or weight_t.shape[1] % 2 != 0:
+        return None
+    if not _threshold_numel_is_supported(threshold, x):
+        return None
+
+    op = _get_ascend_silu_and_mul_direct_t_op()
+    if op is None:
+        return None
+
+    if threshold.dtype != torch.float32 or threshold.device != x.device:
+        threshold = threshold.to(dtype=torch.float32, device=x.device)
+    if not threshold.is_contiguous():
+        threshold = threshold.contiguous()
+    if _should_use_packed_silu_and_mul_t():
+        pack_op = _get_ascend_pack_op()
+        packed_op = _get_ascend_silu_and_mul_packed_t_op()
+        if pack_op is not None and packed_op is not None:
+            _record_ascend_sparse_linear_marker(
+                x=x,
+                threshold=threshold,
+                inclusive=inclusive,
+                weight_t=weight_t,
+                op_name="activation_sparse_silu_and_mul_packed_t",
+            )
+            values, indices, counts = pack_op(
+                x if x.is_contiguous() else x.contiguous(),
+                threshold,
+                inclusive,
+            )
+            return packed_op(
+                values,
+                indices,
+                counts,
+                weight_t if weight_t.is_contiguous() else weight_t.contiguous(),
+            )
+
+    _record_ascend_sparse_linear_marker(
+        x=x,
+        threshold=threshold,
+        inclusive=inclusive,
+        weight_t=weight_t,
+        op_name="activation_sparse_silu_and_mul_direct_t",
+    )
+    return op(
+        x if x.is_contiguous() else x.contiguous(),
+        weight_t if weight_t.is_contiguous() else weight_t.contiguous(),
+        threshold,
+        inclusive,
+    )
 
 
 def sparse_gemv_impl(
@@ -151,11 +453,16 @@ def sparse_gemv_impl(
         inclusive=inclusive,
         weight_t=weight_t,
     )
-    try:
-        from vllm_ascend.ops.sparse_linear import activation_sparse_linear
-    except (ImportError, ModuleNotFoundError):
-        activation_sparse_linear = None
+    fast_output = _try_ascend_direct_t_fast_path(
+        x,
+        weight_t,
+        threshold,
+        inclusive,
+    )
+    if fast_output is not None:
+        return fast_output
 
+    activation_sparse_linear = _get_ascend_sparse_linear()
     if activation_sparse_linear is not None:
         return activation_sparse_linear(
             x,
@@ -177,7 +484,8 @@ def sparse_gemv_impl(
         "Ascend activation_sparse_linear is unavailable; using dense masked "
         "fallback. Set use_sparse_gemv=False to silence this warning."
     )
-    threshold = threshold.to(dtype=torch.float32, device=x.device)
+    if threshold.dtype != torch.float32 or threshold.device != x.device:
+        threshold = threshold.to(dtype=torch.float32, device=x.device)
     if threshold.numel() == 1:
         threshold = threshold.reshape(1, 1)
     else:
@@ -189,6 +497,112 @@ def sparse_gemv_impl(
         torch.zeros_like(x),
     )
     return torch.matmul(sparse_x, weight.t())
+
+
+def sparse_gemv_silu_and_mul_direct_t_cached_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_t: torch.Tensor,
+    threshold: torch.Tensor,
+    *,
+    inclusive: bool = False,
+) -> torch.Tensor | None:
+    """Apply fused sparse gate/up projection plus SiLU*up on Ascend."""
+    del weight
+    _record_sparse_gemv_invocation(
+        x=x,
+        threshold=threshold,
+        inclusive=inclusive,
+        weight_t=weight_t,
+    )
+    return _try_ascend_silu_and_mul_direct_t_fast_path(
+        x,
+        weight_t,
+        threshold,
+        inclusive,
+    )
+
+
+def sparse_gemv_topk_matmul_silu_impl(
+    x: torch.Tensor,
+    weight_t: torch.Tensor,
+    keep: int,
+) -> torch.Tensor | None:
+    """Apply La RoSA top-k sparse gate/up via selected-weight matmul on NPU."""
+    if not _is_npu_tensor(x):
+        return None
+    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
+        return None
+    if x.dim() != 2 or x.shape[0] != 1:
+        return None
+    if weight_t.dim() != 2 or x.shape[1] != weight_t.shape[0]:
+        return None
+    if weight_t.shape[1] % 2 != 0:
+        return None
+    if keep <= 0 or keep > x.shape[1]:
+        return None
+
+    magnitudes = x.abs().to(dtype=torch.float32)
+    topk_values, topk_indices = torch.topk(magnitudes, keep, dim=-1)
+    threshold = topk_values[..., -1].contiguous()
+    _record_sparse_gemv_invocation(
+        x=x,
+        threshold=threshold,
+        inclusive=True,
+        weight_t=weight_t,
+    )
+    _record_ascend_sparse_linear_marker(
+        x=x,
+        threshold=threshold,
+        inclusive=True,
+        weight_t=weight_t,
+        op_name="activation_sparse_topk_matmul_silu",
+    )
+
+    selected_indices = topk_indices[0].to(dtype=torch.long).contiguous()
+    selected_x = x[:, selected_indices].contiguous()
+    selected_weight_t = weight_t.index_select(0, selected_indices)
+    gate_up = torch.matmul(selected_x, selected_weight_t)
+    gate, up = gate_up.chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate) * up
+
+
+def sparse_gemv_direct_t_cached_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_t: torch.Tensor,
+    threshold: torch.Tensor,
+    *,
+    inclusive: bool = False,
+) -> torch.Tensor | None:
+    """Fastest cached-plan path for already validated Ascend direct-T calls."""
+    if not _is_npu_tensor(x):
+        return None
+    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
+        return None
+    if threshold.dtype != torch.float32 or threshold.device != x.device:
+        return None
+    if not x.is_contiguous() or not weight_t.is_contiguous():
+        return None
+    if not threshold.is_contiguous():
+        return None
+    op = _get_ascend_direct_t_op()
+    if op is None:
+        return None
+
+    _record_sparse_gemv_invocation(
+        x=x,
+        threshold=threshold,
+        inclusive=inclusive,
+        weight_t=weight_t,
+    )
+    _record_ascend_sparse_linear_marker(
+        x=x,
+        threshold=threshold,
+        inclusive=inclusive,
+        weight_t=weight_t,
+    )
+    return op(x, weight_t, threshold, inclusive)
 
 
 def can_use_sparse_gemv(

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Layer helpers for injecting activation sparsity."""
 
+import os
+
 import torch
 from torch import nn
 
@@ -17,12 +19,30 @@ from vllm.sparsity.utils import load_threshold
 logger = init_logger(__name__)
 
 
+def _threshold_load_device(
+    device: torch.device | str,
+    sparsity_config: ActivationSparsityConfig,
+) -> torch.device | str:
+    if not sparsity_config.use_sparse_gemv:
+        return device
+    override = os.environ.get("VLLM_SPARSE_GEMV_THRESHOLD_DEVICE")
+    return override or device
+
+
 def targets_projection(
     sparsity_config: ActivationSparsityConfig,
     proj_name: str,
 ) -> bool:
     target_projections = sparsity_config.target_projections
     return target_projections is None or proj_name in target_projections
+
+
+def targets_layer(
+    sparsity_config: ActivationSparsityConfig,
+    layer_idx: int,
+) -> bool:
+    target_layers = sparsity_config.target_layers
+    return target_layers is None or layer_idx in target_layers
 
 
 def build_sparsifier(
@@ -44,6 +64,8 @@ def build_sparsifier(
     """
     if not sparsity_config.enable:
         return None
+    if not targets_layer(sparsity_config, layer_idx):
+        return None
     if not targets_projection(sparsity_config, proj_name):
         return None
 
@@ -63,11 +85,12 @@ def build_sparsifier(
         )
 
     # Load pre-computed TEAL threshold for this layer/proj
+    threshold_device = _threshold_load_device(device, sparsity_config)
     threshold = load_threshold(
         sparsity_config.calibration_path,
         layer_idx,
         proj_name,
-        device=str(device),
+        device=str(threshold_device),
     )
 
     sparsify_fn = SparsifyFn(
@@ -152,6 +175,8 @@ def merge_larosa_rotation_into_linear(
     if sparsity_config is None or sparsity_config.method != "larosa":
         return False
     if not sparsity_config.enable or not sparsity_config.calibration_path:
+        return False
+    if not targets_layer(sparsity_config, layer_idx):
         return False
     if not targets_projection(sparsity_config, proj_name):
         return False

@@ -4,13 +4,17 @@ import json
 from types import SimpleNamespace
 
 import torch
+import pytest
 
+import vllm.sparsity.distribution as distribution_module
+from vllm.sparsity.config import ActivationSparsityConfig
 from vllm.sparsity.distribution import (
     Distribution,
     LaRosaSparsifyFn,
     SparsifyFn,
     larosa_topk,
 )
+from vllm.sparsity.layers import build_sparsifier, targets_layer
 from vllm.sparsity.rotation import merge_rotation_into_weight
 
 
@@ -81,6 +85,44 @@ def test_sparsify_fn_moved_threshold():
     sparsify = SparsifyFn(torch.tensor(0.5))
     sparsify.to("cpu")
     assert sparsify.threshold.device.type == "cpu"
+
+
+def test_activation_sparsity_config_validates_target_layers():
+    cfg = ActivationSparsityConfig(enable=True, target_layers=[0, 3])
+    assert targets_layer(cfg, 0)
+    assert not targets_layer(cfg, 1)
+    assert targets_layer(cfg, 3)
+
+    with pytest.raises(ValueError, match="target_layers"):
+        ActivationSparsityConfig(enable=True, target_layers=[-1])
+
+
+def test_build_sparsifier_skips_non_target_layer_without_calibration():
+    cfg = ActivationSparsityConfig(
+        enable=True,
+        calibration_path=None,
+        target_layers=[1],
+        target_projections=["mlp.gate_up"],
+    )
+
+    assert build_sparsifier(cfg, 0, "mlp.gate_up") is None
+
+
+def test_sparsify_fn_threshold_cache_reuses_and_invalidates():
+    sparsify = SparsifyFn(torch.tensor(0.5, dtype=torch.float32))
+    x = torch.randn(1, 4)
+
+    first = sparsify._threshold_for(x, dtype=torch.float16)
+    second = sparsify._threshold_for(x, dtype=torch.float16)
+
+    assert first is second
+    assert first.dtype == torch.float16
+
+    sparsify.threshold.fill_(0.75)
+    updated = sparsify._threshold_for(x, dtype=torch.float16)
+
+    assert updated is not first
+    assert updated.item() == torch.tensor(0.75, dtype=torch.float16).item()
 
 
 def test_sparsify_fn_prefill_half_3d_matches_official_behavior():
@@ -272,6 +314,56 @@ def test_larosa_rotated_sparse_linear_requires_merged_weight():
     assert sparsify._sparse_linear_input(torch.randn(1, 4), SimpleNamespace()) is None
 
 
+def test_larosa_try_apply_gate_up_silu_uses_rotated_sparse_input(monkeypatch):
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", "all")
+    rotation = torch.tensor(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.5,
+        rotation=rotation,
+        rotate_input=True,
+        use_sparse_gemv=True,
+    )
+    sparsify._tensor_model_parallel_world_size_is_one = lambda: True
+    linear = SimpleNamespace(
+        weight=torch.randn(6, 4, dtype=torch.float16).contiguous(),
+        quant_config=None,
+        _larosa_sparse_weight_merged=True,
+    )
+    x = torch.tensor([[1.0, -4.0, 3.0, 2.0]], dtype=torch.float16)
+    captured = {}
+
+    def fake_fused_gate_up(x_arg, weight, weight_t, threshold, *, inclusive):
+        captured["x"] = x_arg
+        captured["weight_t"] = weight_t
+        captured["threshold"] = threshold
+        captured["inclusive"] = inclusive
+        return torch.empty(x_arg.shape[0], weight.shape[0] // 2, dtype=x_arg.dtype)
+
+    monkeypatch.setattr(
+        distribution_module,
+        "sparse_gemv_silu_and_mul_direct_t_cached_impl",
+        fake_fused_gate_up,
+    )
+
+    out = sparsify.try_apply_gate_up_silu(x, linear)
+
+    rotated_x = x.float() @ rotation
+    expected_threshold = torch.topk(rotated_x.abs(), 2, dim=-1).values[..., -1]
+    assert out is not None
+    assert torch.allclose(captured["x"].float(), rotated_x)
+    assert torch.allclose(captured["threshold"], expected_threshold)
+    assert captured["weight_t"].shape == (4, 6)
+    assert captured["inclusive"] is True
+
+
 def test_larosa_try_apply_linear_rejects_shape_before_rotation(monkeypatch):
     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
     monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
@@ -309,6 +401,44 @@ def test_sparse_linear_weight_t_cache_invalidates_after_weight_mutation():
     assert updated.data_ptr() != first.data_ptr()
     assert torch.allclose(updated, linear.weight.t())
     assert not torch.allclose(first, linear.weight.t())
+
+
+def test_sparse_linear_plan_reuses_cached_threshold_and_weight_t(monkeypatch):
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", "all")
+    linear = torch.nn.Linear(4, 3, bias=False).to(dtype=torch.float16)
+    sparsify = SparsifyFn(
+        torch.tensor(0.5),
+        apply_all_tokens=True,
+        use_sparse_gemv=True,
+    )
+    sparsify._tensor_model_parallel_world_size_is_one = lambda: True
+    calls = []
+
+    def fake_sparse_gemv_impl(x, weight, threshold, **kwargs):
+        calls.append((threshold, kwargs["weight_t"]))
+        return x @ weight.t()
+
+    monkeypatch.setattr(
+        distribution_module,
+        "sparse_gemv_impl",
+        fake_sparse_gemv_impl,
+    )
+    x = torch.randn(1, 4, dtype=torch.float16)
+
+    first, _ = sparsify.try_apply_linear(x, linear)
+    plan = sparsify._sparse_linear_plan
+    second, _ = sparsify.try_apply_linear(x, linear)
+
+    assert torch.allclose(first, second)
+    assert len(calls) == 2
+    assert calls[1][0] is calls[0][0]
+    assert calls[1][1] is calls[0][1]
+    assert sparsify._get_cached_sparse_linear_plan(x, linear, linear.weight) is plan
+
+    with torch.no_grad():
+        linear.weight.add_(1.0)
+
+    assert sparsify._get_cached_sparse_linear_plan(x, linear, linear.weight) is None
 
 
 def test_sparse_linear_auto_policy_keeps_single_batch_wide_output(monkeypatch):
@@ -523,6 +653,46 @@ def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):
     assert records[1]["active_density_max"] == 0.75
     assert records[1]["active_density_mean"] == 0.5
     assert records[1]["active_sparsity_mean"] == 0.5
+
+
+def test_ascend_direct_t_fast_path_marker_records_metadata(tmp_path, monkeypatch):
+    from vllm.sparsity.kernels.sparse_gemv import (
+        _record_ascend_sparse_linear_marker,
+        reset_sparse_gemv_invocation_count,
+    )
+
+    marker_path = tmp_path / "ascend_sparse_linear_marker.jsonl"
+    monkeypatch.setenv("VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH", str(marker_path))
+    reset_sparse_gemv_invocation_count()
+
+    _record_ascend_sparse_linear_marker(
+        x=torch.ones(1, 4, dtype=torch.float16),
+        threshold=torch.tensor(0.5, dtype=torch.float32),
+        inclusive=False,
+        weight_t=torch.ones(4, 3, dtype=torch.float16),
+    )
+    _record_ascend_sparse_linear_marker(
+        x=torch.ones(2, 4, dtype=torch.float16),
+        threshold=torch.tensor([0.5, 0.5], dtype=torch.float32),
+        inclusive=True,
+        weight_t=torch.ones(4, 3, dtype=torch.float16),
+    )
+
+    records = [
+        json.loads(line)
+        for line in marker_path.read_text(encoding="utf-8").splitlines()
+    ]
+    reset_sparse_gemv_invocation_count()
+
+    assert len(records) == 1
+    assert records[0]["op"] == "activation_sparse_linear_direct_t"
+    assert records[0]["pid"] > 0
+    assert records[0]["x_shape"] == [1, 4]
+    assert records[0]["threshold_shape"] == []
+    assert records[0]["threshold_numel"] == 1
+    assert records[0]["inclusive"] is False
+    assert records[0]["weight_t_provided"] is True
+    assert records[0]["weight_t_shape"] == [4, 3]
 
 
 def test_larosa_sparsify_second_site_topk_direct():

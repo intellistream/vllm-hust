@@ -79,6 +79,10 @@ class ActivationSparsityConfig:
     """If set, only apply activation sparsity to these projection names, e.g.
     ``["mlp.gate_up"]`` for the Ascend-friendly fused-MLP path."""
 
+    # Optional layer filter
+    target_layers: list[int] | None = None
+    """If set, only apply activation sparsity to these zero-based layer ids."""
+
     def __post_init__(self) -> None:
         if self.method not in {"teal", "larosa"}:
             raise ValueError(
@@ -99,6 +103,17 @@ class ActivationSparsityConfig:
                     "target_projections contains unsupported projection(s): "
                     f"{unknown}. Supported projections are "
                     f"{sorted(_SUPPORTED_TARGET_PROJECTIONS)}."
+                )
+        if self.target_layers is not None:
+            unknown_layers = [
+                layer_idx
+                for layer_idx in self.target_layers
+                if not isinstance(layer_idx, int) or layer_idx < 0
+            ]
+            if unknown_layers:
+                raise ValueError(
+                    "target_layers must contain non-negative integer layer ids, "
+                    f"got {unknown_layers}."
                 )
 
     def compute_hash(self) -> str:

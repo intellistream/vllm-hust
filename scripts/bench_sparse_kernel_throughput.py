@@ -19,6 +19,12 @@ from typing import Any
 import torch
 
 
+SPARSE_MARKER_ENV_NAMES = (
+    "VLLM_SPARSE_GEMV_MARKER_PATH",
+    "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH",
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -31,6 +37,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--text-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional plain-text prompt source. When set, prompts are "
+            "deterministic token windows from this text instead of random "
+            "token ids."
+        ),
+    )
+    parser.add_argument(
+        "--inline-text",
+        action="append",
+        default=None,
+        help=(
+            "Inline prompt source. Can be passed multiple times. Ignored when "
+            "--text-file is set."
+        ),
+    )
+    parser.add_argument(
         "--dtype",
         choices=["float16", "bfloat16"],
         default="bfloat16",
@@ -38,6 +63,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     parser.add_argument("--max-model-len", type=int, default=None)
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Optional vLLM scheduler max_num_batched_tokens override. This is "
+            "useful for single-batch kernel checks where the default scheduler "
+            "token buffer is much larger than the measured request."
+        ),
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--shutdown-timeout", type=int, default=60)
     parser.add_argument("--vllm-prefill-sparsify", default="none")
@@ -49,6 +84,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Restrict activation sparsity to a projection. Can be repeated. "
             "Useful for Ascend-friendly gate/up-only throughput checks."
+        ),
+    )
+    parser.add_argument(
+        "--target-layer",
+        action="append",
+        type=int,
+        default=None,
+        help=(
+            "Restrict activation sparsity to this zero-based layer id. "
+            "Can be repeated."
         ),
     )
     parser.add_argument(
@@ -97,22 +142,50 @@ def empty_backend_cache() -> None:
         torch.cuda.empty_cache()
 
 
-def build_prompts(
-    model: str,
-    num_prompts: int,
-    input_len: int,
-    seed: int,
-    trust_remote_code: bool,
-) -> list[dict[str, list[int]]]:
+def build_text_prompt_ids(args: argparse.Namespace, tokenizer: Any) -> list[int] | None:
+    if args.text_file is None and not args.inline_text:
+        return None
+    if args.text_file is not None:
+        text = args.text_file.read_text(encoding="utf-8")
+    else:
+        text = "\n\n".join(args.inline_text)
+    token_ids = tokenizer(text, add_special_tokens=False).input_ids
+    token_ids = [int(token_id) for token_id in token_ids]
+    if not token_ids:
+        raise ValueError("Text prompt source produced no tokens.")
+    return token_ids
+
+
+def build_prompts(args: argparse.Namespace) -> list[dict[str, list[int]]]:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model,
-        trust_remote_code=trust_remote_code,
+        args.model,
+        trust_remote_code=args.trust_remote_code,
     )
+    text_prompt_ids = build_text_prompt_ids(args, tokenizer)
+    if text_prompt_ids is not None:
+        if len(text_prompt_ids) < args.input_len:
+            repeats = (
+                args.input_len + len(text_prompt_ids) - 1
+            ) // len(text_prompt_ids)
+            text_prompt_ids = (text_prompt_ids * repeats)[: args.input_len]
+        prompts = []
+        for prompt_idx in range(args.num_prompts):
+            start = (prompt_idx * args.input_len) % len(text_prompt_ids)
+            prompt_token_ids = text_prompt_ids[start : start + args.input_len]
+            if len(prompt_token_ids) < args.input_len:
+                prompt_token_ids += text_prompt_ids[
+                    : args.input_len - len(prompt_token_ids)
+                ]
+            prompts.append({"prompt_token_ids": prompt_token_ids})
+        return prompts
+
     vocab_size = int(getattr(tokenizer, "vocab_size", 0))
     if vocab_size <= 0:
-        raise ValueError(f"Tokenizer for {model!r} has invalid vocab_size={vocab_size}")
+        raise ValueError(
+            f"Tokenizer for {args.model!r} has invalid vocab_size={vocab_size}"
+        )
 
     excluded_ids = {
         token_id
@@ -121,12 +194,12 @@ def build_prompts(
     }
     candidate_ids = [i for i in range(vocab_size) if i not in excluded_ids]
     if not candidate_ids:
-        raise ValueError(f"Tokenizer for {model!r} has no non-special token ids")
+        raise ValueError(f"Tokenizer for {args.model!r} has no non-special token ids")
 
-    rng = random.Random(seed)
+    rng = random.Random(args.seed)
     prompts: list[dict[str, list[int]]] = []
-    for _ in range(num_prompts):
-        prompt_token_ids = [rng.choice(candidate_ids) for _ in range(input_len)]
+    for _ in range(args.num_prompts):
+        prompt_token_ids = [rng.choice(candidate_ids) for _ in range(args.input_len)]
         prompts.append({"prompt_token_ids": prompt_token_ids})
     return prompts
 
@@ -157,6 +230,8 @@ def build_sparse_config(args: argparse.Namespace) -> dict[str, Any]:
         )
     if args.target_projection:
         common["target_projections"] = args.target_projection
+    if args.target_layer:
+        common["target_layers"] = args.target_layer
     return common
 
 
@@ -178,6 +253,8 @@ def build_llm(
     }
     if activation_sparsity_config is not None:
         kwargs["activation_sparsity_config"] = activation_sparsity_config
+    if args.max_num_batched_tokens is not None:
+        kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     return LLM(**kwargs)
 
 
@@ -186,6 +263,7 @@ def run_case(
     prompts: list[dict[str, list[int]]],
     activation_sparsity_config: dict[str, Any] | None,
     label: str,
+    disable_sparse_markers_during_timing: bool = False,
 ) -> dict[str, Any]:
     from vllm import SamplingParams
 
@@ -202,11 +280,37 @@ def run_case(
         llm.generate(warmup_prompts, sampling_params, use_tqdm=False)
         synchronize()
 
+    disabled_marker_env: dict[str, str | None] | None = None
+    if disable_sparse_markers_during_timing:
+        marker_paths = [
+            Path(os.environ[name])
+            for name in SPARSE_MARKER_ENV_NAMES
+            if os.environ.get(name)
+        ]
+        markers_ready = len(marker_paths) == len(SPARSE_MARKER_ENV_NAMES) and all(
+            marker_path.exists() and marker_path.stat().st_size > 0
+            for marker_path in marker_paths
+        )
+        if markers_ready:
+            disabled_marker_env = {
+                name: os.environ.get(name) for name in SPARSE_MARKER_ENV_NAMES
+            }
+            for name in SPARSE_MARKER_ENV_NAMES:
+                os.environ.pop(name, None)
+
     synchronize()
-    start = time.perf_counter()
-    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
-    synchronize()
-    elapsed = time.perf_counter() - start
+    try:
+        start = time.perf_counter()
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+        synchronize()
+        elapsed = time.perf_counter() - start
+    finally:
+        if disabled_marker_env is not None:
+            for name, value in disabled_marker_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
     prompt_tokens = sum(len(output.prompt_token_ids or []) for output in outputs)
     output_tokens = sum(
@@ -233,6 +337,7 @@ def run_case(
         "requests_per_second": len(prompts) / elapsed,
         "total_tokens_per_second": total_tokens / elapsed,
         "output_tokens_per_second": output_tokens / elapsed,
+        "sparse_markers_disabled_during_timing": disabled_marker_env is not None,
     }
 
 
@@ -299,13 +404,7 @@ def main() -> int:
     if args.method == "larosa" and args.sparsity * 1.2 >= 1.0:
         raise ValueError("La RoSA h2 sparsity is sparsity * 1.2 and must be < 1")
 
-    prompts = build_prompts(
-        args.model,
-        args.num_prompts,
-        args.input_len,
-        args.seed,
-        args.trust_remote_code,
-    )
+    prompts = build_prompts(args)
     dense = run_case(args, prompts, None, "dense")
 
     previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
@@ -335,7 +434,13 @@ def main() -> int:
     os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = str(ascend_marker_path)
     reset_sparse_invocation_counter()
     try:
-        sparse = run_case(args, prompts, build_sparse_config(args), "sparse")
+        sparse = run_case(
+            args,
+            prompts,
+            build_sparse_config(args),
+            "sparse",
+            disable_sparse_markers_during_timing=True,
+        )
     finally:
         if previous_require_kernel is None:
             os.environ.pop("VLLM_SPARSE_GEMV_REQUIRE_KERNEL", None)
@@ -498,6 +603,7 @@ def main() -> int:
         not args.no_require_sparse_invocations
         and sparse_invocations_current_process == 0
         and not sparse_marker_records
+        and not ascend_marker_records
     ):
         failures.append("sparse run did not invoke vLLM sparse GEMV shim")
     if not args.allow_sparse_gemv_fallback and not ascend_marker_records:
@@ -523,8 +629,13 @@ def main() -> int:
         "input_len": args.input_len,
         "output_len": args.output_len,
         "num_prompts": args.num_prompts,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "prompt_source": (
+            "text" if args.text_file is not None or args.inline_text else "random"
+        ),
         "dtype": args.dtype,
         "sparse_linear_policy": os.environ.get("VLLM_SPARSE_GEMV_LINEAR_POLICY"),
+        "target_layers": args.target_layer,
         "sparse_gemv_dense_fallback_policy": (
             args.sparse_gemv_dense_fallback_policy
         ),

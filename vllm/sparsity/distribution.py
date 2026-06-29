@@ -6,8 +6,27 @@ import os
 import torch
 from torch import nn
 
+from vllm.sparsity.kernels.sparse_gemv import (
+    can_use_sparse_gemv,
+    sparse_gemv_direct_t_cached_impl,
+    sparse_gemv_impl,
+    sparse_gemv_silu_and_mul_direct_t_cached_impl,
+    sparse_gemv_topk_matmul_silu_impl,
+    should_use_topk_matmul_silu,
+)
+
 
 _DEFAULT_SPARSE_GEMV_MIN_SPARSITY = 0.70
+
+
+def _is_torch_compiling() -> bool:
+    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
+    if is_compiling is None:
+        return False
+    try:
+        return bool(is_compiling())
+    except Exception:
+        return False
 
 
 class Distribution:
@@ -100,6 +119,50 @@ class SparsifyFn(nn.Module):
         self.use_sparse_gemv = use_sparse_gemv
         self.expected_sparsity = expected_sparsity
 
+    def _cached_tensor_to(
+        self,
+        cache_name: str,
+        tensor: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if _is_torch_compiling():
+            if tensor.dtype == dtype and tensor.device == device:
+                return tensor
+            return tensor.to(dtype=dtype, device=device)
+
+        cache_key = (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tensor.dtype,
+            dtype,
+            device.type,
+            device.index,
+            getattr(tensor, "_version", None),
+        )
+        cached_key = getattr(self, f"_{cache_name}_cache_key", None)
+        cached = getattr(self, f"_{cache_name}_cache", None)
+        if cached is not None and cached_key == cache_key:
+            return cached
+        moved = tensor.to(dtype=dtype, device=device)
+        setattr(self, f"_{cache_name}_cache_key", cache_key)
+        setattr(self, f"_{cache_name}_cache", moved)
+        return moved
+
+    def _threshold_for(
+        self,
+        x: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return self._cached_tensor_to(
+            "threshold",
+            self.threshold,
+            dtype=dtype,
+            device=x.device,
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.apply_all_tokens:
             return self._apply_mask(x)
@@ -123,7 +186,7 @@ class SparsifyFn(nn.Module):
 
     def _apply_mask(self, x: torch.Tensor) -> torch.Tensor:
         return torch.where(
-            x.abs() > self.threshold.to(dtype=x.dtype, device=x.device),
+            x.abs() > self._threshold_for(x, dtype=x.dtype),
             x,
             torch.zeros_like(x),
         )
@@ -158,23 +221,17 @@ class SparsifyFn(nn.Module):
         weight = getattr(linear_layer, "weight", None)
         if weight is None or not weight.is_contiguous():
             return None
+        cached_plan = self._get_cached_sparse_linear_plan(x, linear_layer, weight)
+        if cached_plan is not None:
+            return self._apply_sparse_linear_plan(x, cached_plan)
+
         if getattr(linear_layer, "quant_config", None) is not None:
             return None
         if not self._should_use_sparse_linear_kernel(x, weight):
             return None
 
-        try:
-            from vllm.distributed import get_tensor_model_parallel_world_size
-
-            if get_tensor_model_parallel_world_size() != 1:
-                return None
-        except Exception:
+        if not self._tensor_model_parallel_world_size_is_one():
             return None
-
-        from vllm.sparsity.kernels.sparse_gemv import (
-            can_use_sparse_gemv,
-            sparse_gemv_impl,
-        )
 
         if not can_use_sparse_gemv(
             tp_size=1,
@@ -193,6 +250,14 @@ class SparsifyFn(nn.Module):
             return None
 
         weight_t = self._get_sparse_linear_weight_t(linear_layer, weight)
+        self._set_cached_sparse_linear_plan(
+            x=x,
+            linear_layer=linear_layer,
+            weight=weight,
+            weight_t=weight_t,
+            threshold=threshold,
+            inclusive=inclusive,
+        )
         output = sparse_gemv_impl(
             sparse_input,
             weight,
@@ -207,11 +272,226 @@ class SparsifyFn(nn.Module):
             output = output + bias
         return output, output_bias
 
+    def try_apply_gate_up_silu(
+        self,
+        x: torch.Tensor,
+        linear_layer: nn.Module,
+    ) -> torch.Tensor | None:
+        if not self.use_sparse_gemv or x.dim() != 2:
+            return None
+        if not self._sparse_linear_applies_to_all_rows(x):
+            return None
+
+        weight = getattr(linear_layer, "weight", None)
+        if weight is None or not weight.is_contiguous():
+            return None
+        if weight.dim() != 2 or weight.shape[0] % 2 != 0:
+            return None
+
+        cached_plan = self._get_cached_sparse_linear_plan(x, linear_layer, weight)
+        if cached_plan is not None:
+            return self._apply_sparse_gate_up_silu_plan(x, cached_plan)
+
+        if getattr(linear_layer, "quant_config", None) is not None:
+            return None
+        if not self._should_use_sparse_linear_kernel(x, weight):
+            return None
+
+        if not self._tensor_model_parallel_world_size_is_one():
+            return None
+
+        if not can_use_sparse_gemv(
+            tp_size=1,
+            quant_config=getattr(linear_layer, "quant_config", None),
+            dtype=x.dtype,
+            use_sparse_gemv_flag=True,
+        ):
+            return None
+
+        sparse_input = self._sparse_linear_input(x, linear_layer)
+        if sparse_input is None:
+            return None
+
+        topk_output = self._try_apply_topk_matmul_gate_up_silu(
+            sparse_input,
+            linear_layer,
+            weight,
+        )
+        if topk_output is not None:
+            return topk_output
+
+        threshold, inclusive = self._sparse_linear_threshold(sparse_input)
+        if threshold is None:
+            return None
+
+        weight_t = self._get_sparse_linear_weight_t(linear_layer, weight)
+        output = sparse_gemv_silu_and_mul_direct_t_cached_impl(
+            sparse_input,
+            weight,
+            weight_t,
+            threshold,
+            inclusive=inclusive,
+        )
+        if output is None:
+            return None
+
+        self._set_cached_sparse_linear_plan(
+            x=x,
+            linear_layer=linear_layer,
+            weight=weight,
+            weight_t=weight_t,
+            threshold=threshold,
+            inclusive=inclusive,
+        )
+        return output
+
+    def _get_cached_sparse_linear_plan(
+        self,
+        x: torch.Tensor,
+        linear_layer: nn.Module,
+        weight: torch.Tensor,
+    ) -> dict | None:
+        if _is_torch_compiling():
+            return None
+
+        plan = getattr(self, "_sparse_linear_plan", None)
+        if plan is None:
+            return None
+        if plan.get("cache_key") != self._sparse_linear_plan_cache_key(
+            x,
+            linear_layer,
+            weight,
+        ):
+            return None
+        return plan
+
+    def _try_apply_topk_matmul_gate_up_silu(
+        self,
+        sparse_input: torch.Tensor,
+        linear_layer: nn.Module,
+        weight: torch.Tensor,
+    ) -> torch.Tensor | None:
+        del sparse_input, linear_layer, weight
+        return None
+
+    def _set_cached_sparse_linear_plan(
+        self,
+        *,
+        x: torch.Tensor,
+        linear_layer: nn.Module,
+        weight: torch.Tensor,
+        weight_t: torch.Tensor,
+        threshold: torch.Tensor,
+        inclusive: bool,
+    ) -> None:
+        if _is_torch_compiling():
+            return
+
+        # La RoSA can derive a per-row threshold from each input. Only cache
+        # the static-threshold TEAL-style plan in the base sparsifier.
+        if type(self) is not SparsifyFn:
+            return
+        if threshold.numel() not in {1, x.shape[0]}:
+            return
+        self._sparse_linear_plan = {
+            "cache_key": self._sparse_linear_plan_cache_key(
+                x,
+                linear_layer,
+                weight,
+            ),
+            "weight": weight,
+            "weight_t": weight_t,
+            "threshold": threshold,
+            "inclusive": inclusive,
+            "bias": getattr(linear_layer, "bias", None),
+            "skip_bias_add": getattr(linear_layer, "skip_bias_add", False),
+        }
+
+    def _sparse_linear_plan_cache_key(
+        self,
+        x: torch.Tensor,
+        linear_layer: nn.Module,
+        weight: torch.Tensor,
+    ) -> tuple:
+        return (
+            id(linear_layer),
+            tuple(x.shape),
+            x.dtype,
+            x.device.type,
+            x.device.index,
+            weight.data_ptr(),
+            tuple(weight.shape),
+            weight.dtype,
+            weight.device.type,
+            weight.device.index,
+            getattr(weight, "_version", None),
+            self.threshold.data_ptr(),
+            tuple(self.threshold.shape),
+            self.threshold.dtype,
+            getattr(self.threshold, "_version", None),
+        )
+
+    def _apply_sparse_linear_plan(
+        self,
+        x: torch.Tensor,
+        plan: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        output = sparse_gemv_direct_t_cached_impl(
+            x,
+            plan["weight"],
+            plan["weight_t"],
+            plan["threshold"],
+            inclusive=plan["inclusive"],
+        )
+        if output is None:
+            output = sparse_gemv_impl(
+                x,
+                plan["weight"],
+                plan["threshold"],
+                inclusive=plan["inclusive"],
+                weight_t=plan["weight_t"],
+            )
+        bias = plan["bias"]
+        skip_bias_add = plan["skip_bias_add"]
+        output_bias = bias if skip_bias_add else None
+        if bias is not None and not skip_bias_add:
+            output = output + bias
+        return output, output_bias
+
+    def _apply_sparse_gate_up_silu_plan(
+        self,
+        x: torch.Tensor,
+        plan: dict,
+    ) -> torch.Tensor | None:
+        return sparse_gemv_silu_and_mul_direct_t_cached_impl(
+            x,
+            plan["weight"],
+            plan["weight_t"],
+            plan["threshold"],
+            inclusive=plan["inclusive"],
+        )
+
+    def _tensor_model_parallel_world_size_is_one(self) -> bool:
+        cached = getattr(self, "_sparse_linear_tp_world_size_is_one", None)
+        if cached is not None:
+            return cached
+        try:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            is_one = get_tensor_model_parallel_world_size() == 1
+        except Exception:
+            is_one = False
+        self._sparse_linear_tp_world_size_is_one = is_one
+        return is_one
+
     def _get_sparse_linear_weight_t(
         self,
         linear_layer: nn.Module,
         weight: torch.Tensor,
     ) -> torch.Tensor:
+        if _is_torch_compiling():
+            return weight.t().contiguous()
+
         cache_key = (
             weight.data_ptr(),
             tuple(weight.shape),
@@ -301,8 +581,7 @@ class SparsifyFn(nn.Module):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor | None, bool]:
-        del x
-        return self.threshold.to(dtype=torch.float32), False
+        return self._threshold_for(x, dtype=torch.float32), False
 
     def _apply_rows(self, x: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
         if row_mask.numel() != x.shape[0]:
@@ -568,6 +847,16 @@ class LaRosaSparsifyFn(SparsifyFn):
         self.rotate_input = rotate_input
         self.register_buffer("rotation", rotation)
 
+    def _rotation_for(self, x: torch.Tensor) -> torch.Tensor:
+        if self.rotation is None:
+            raise ValueError("La RoSA rotation matrix is not initialized.")
+        return self._cached_tensor_to(
+            "rotation",
+            self.rotation,
+            dtype=torch.float32,
+            device=x.device,
+        )
+
     def _apply_mask(self, x: torch.Tensor) -> torch.Tensor:
         if self.sparsity_level <= 0.0:
             return x
@@ -584,7 +873,7 @@ class LaRosaSparsifyFn(SparsifyFn):
                 f"input hidden={x.shape[-1]}, rotation={tuple(self.rotation.shape)}."
             )
 
-        rotation = self.rotation.to(dtype=torch.float32, device=x.device)
+        rotation = self._rotation_for(x)
         rotated_x = torch.matmul(x.to(dtype=torch.float32), rotation)
         sparse_rotated_x = larosa_topk(rotated_x, self.sparsity_level)
         unrotated_x = torch.matmul(sparse_rotated_x, rotation.t())
@@ -606,7 +895,7 @@ class LaRosaSparsifyFn(SparsifyFn):
                 "La RoSA rotation hidden size mismatch: "
                 f"input hidden={x.shape[-1]}, rotation={tuple(self.rotation.shape)}."
             )
-        rotation = self.rotation.to(dtype=torch.float32, device=x.device)
+        rotation = self._rotation_for(x)
         rotated_x = torch.matmul(x.to(dtype=torch.float32), rotation)
         return rotated_x.to(dtype=x.dtype)
 
@@ -624,6 +913,30 @@ class LaRosaSparsifyFn(SparsifyFn):
             )
         topk_values, _ = torch.topk(x.abs().to(dtype=torch.float32), keep, dim=-1)
         return topk_values[..., -1].contiguous(), True
+
+    def _try_apply_topk_matmul_gate_up_silu(
+        self,
+        sparse_input: torch.Tensor,
+        linear_layer: nn.Module,
+        weight: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not should_use_topk_matmul_silu():
+            return None
+        if not self.rotate_input:
+            return None
+        if not getattr(linear_layer, "_larosa_sparse_weight_merged", False):
+            return None
+        if self.sparsity_level <= 0.0:
+            return None
+        keep = int((1.0 - self.sparsity_level) * sparse_input.shape[-1])
+        if keep < 1:
+            return None
+        weight_t = self._get_sparse_linear_weight_t(linear_layer, weight)
+        return sparse_gemv_topk_matmul_silu_impl(
+            sparse_input,
+            weight_t,
+            keep,
+        )
 
     def extra_repr(self) -> str:
         rotation_shape = None if self.rotation is None else tuple(self.rotation.shape)

@@ -136,18 +136,26 @@ class Qwen2MLP(nn.Module):
         )
 
     def forward(self, x):
-        sparse_gate_up = (
-            self.sparsify_gate_up.try_apply_linear(x, self.gate_up_proj)
+        sparse_gate_up_silu = (
+            self.sparsify_gate_up.try_apply_gate_up_silu(x, self.gate_up_proj)
             if self.sparsify_gate_up is not None
             else None
         )
-        if sparse_gate_up is not None:
-            gate_up, _ = sparse_gate_up
+        if sparse_gate_up_silu is not None:
+            x = sparse_gate_up_silu
         else:
-            if self.sparsify_gate_up is not None:
-                x = self.sparsify_gate_up.apply_dense_fallback(x)
-            gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+            sparse_gate_up = (
+                self.sparsify_gate_up.try_apply_linear(x, self.gate_up_proj)
+                if self.sparsify_gate_up is not None
+                else None
+            )
+            if sparse_gate_up is not None:
+                gate_up, _ = sparse_gate_up
+            else:
+                if self.sparsify_gate_up is not None:
+                    x = self.sparsify_gate_up.apply_dense_fallback(x)
+                gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         sparse_down = (
             self.sparsify_down.try_apply_linear(x, self.down_proj)
             if self.sparsify_down is not None

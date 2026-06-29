@@ -199,6 +199,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     backends.add_argument(
+        "--vllm-score-mode",
+        choices=["prompt_logprobs", "decode_next_token"],
+        default="prompt_logprobs",
+        help=(
+            "vLLM PPL scoring path. prompt_logprobs scores target tokens "
+            "during prefill. decode_next_token scores each target as a "
+            "one-token decode step using logprob_token_ids, matching "
+            "prefill_sparsify=none generation checks."
+        ),
+    )
+    backends.add_argument(
         "--target-projection",
         action="append",
         choices=["self_attn.qkv", "self_attn.o", "mlp.gate_up", "mlp.down"],
@@ -206,6 +217,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Restrict sparse HF hooks and vLLM activation sparsity to this "
             "projection. Can be repeated."
+        ),
+    )
+    backends.add_argument(
+        "--target-layer",
+        action="append",
+        type=int,
+        default=None,
+        help=(
+            "Restrict vLLM activation sparsity to this zero-based layer id. "
+            "Can be repeated."
         ),
     )
     backends.add_argument(
@@ -900,6 +921,91 @@ def score_vllm_windows(
     )
 
 
+def score_vllm_decode_next_token_windows(
+    llm: Any,
+    windows: list[list[int]],
+    window_size: int,
+    desc: str,
+) -> PPLStats:
+    """Score targets as generated decode steps.
+
+    ``prompt_logprobs`` measures prompt prefill logits. For decode-only sparse
+    generation, the relevant quality check is the next-token decode logits after
+    a dense prefix. ``logprob_token_ids`` lets each request ask for the target
+    token's logprob without full-vocabulary logprobs.
+    """
+    from vllm import SamplingParams
+
+    nlls: list[float] = []
+    weighted_nll_sum = 0.0
+    token_count = 0
+    for window in tqdm(windows, desc=desc):
+        start = target_start(len(window), window_size)
+        prompts: list[dict[str, list[int]]] = []
+        targets: list[int] = []
+        for position in range(start, len(window)):
+            if position <= 0:
+                continue
+            prompts.append({"prompt_token_ids": window[:position]})
+            targets.append(int(window[position]))
+        if not prompts:
+            continue
+
+        target_ids = sorted(set(targets))
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            ignore_eos=True,
+            logprob_token_ids=target_ids,
+            detokenize=False,
+        )
+        outputs = llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=False,
+        )
+        if len(outputs) != len(targets):
+            raise RuntimeError(
+                f"vLLM returned {len(outputs)} outputs for "
+                f"{len(targets)} decode scoring prompts."
+            )
+
+        nll = 0.0
+        count = 0
+        for output, target in zip(outputs, targets):
+            if not output.outputs:
+                raise RuntimeError("vLLM returned no decode output.")
+            logprobs = output.outputs[0].logprobs
+            if not logprobs:
+                raise RuntimeError("vLLM did not return decode logprobs.")
+            entry = logprobs[0]
+            item = entry.get(target)
+            if item is None:
+                raise KeyError(
+                    f"Target token id {target} missing from decode logprobs."
+                )
+            nll -= float(item.logprob)
+            count += 1
+
+        window_nll = nll / count
+        nlls.append(window_nll)
+        weighted_nll_sum += nll
+        token_count += count
+
+    if not nlls or token_count == 0:
+        raise ValueError("No decode PPL targets were scored.")
+    mean_nll = sum(nlls) / len(nlls)
+    token_weighted_nll = weighted_nll_sum / token_count
+    return PPLStats(
+        nll=mean_nll,
+        ppl=math.exp(mean_nll),
+        token_weighted_nll=token_weighted_nll,
+        token_weighted_ppl=math.exp(token_weighted_nll),
+        windows=len(nlls),
+        tokens=token_count,
+    )
+
+
 def build_vllm(
     args: argparse.Namespace,
     activation_sparsity_config: dict[str, Any] | None,
@@ -1075,7 +1181,10 @@ def validate_required_sparse_kernel_markers(
     accepted_ops = {
         "activation_sparse_linear",
         "activation_sparse_linear_direct_t",
+        "activation_sparse_silu_and_mul_direct_t",
+        "activation_sparse_silu_and_mul_packed_t",
         "activation_sparse_linear_packed_t",
+        "activation_sparse_topk_matmul_silu",
     }
     if not any(
         op in accepted_ops
@@ -1092,8 +1201,13 @@ def run_vllm_reference(
     windows: list[list[int]],
     calibration_path: Path,
 ) -> BackendComparison:
+    score_fn = (
+        score_vllm_decode_next_token_windows
+        if args.vllm_score_mode == "decode_next_token"
+        else score_vllm_windows
+    )
     dense_llm = build_vllm(args, None)
-    dense = score_vllm_windows(
+    dense = score_fn(
         dense_llm,
         windows,
         args.window_size,
@@ -1116,6 +1230,8 @@ def run_vllm_reference(
     }
     if args.target_projection:
         sparsity_config["target_projections"] = args.target_projection
+    if args.target_layer:
+        sparsity_config["target_layers"] = args.target_layer
     previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
     previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
     previous_ascend_marker_path = os.environ.get(
@@ -1150,7 +1266,7 @@ def run_vllm_reference(
         os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = str(ascend_marker_path)
     try:
         sparse_llm = build_vllm(args, sparsity_config)
-        sparse = score_vllm_windows(
+        sparse = score_fn(
             sparse_llm,
             windows,
             args.window_size,
@@ -1197,7 +1313,8 @@ def run_vllm_reference(
             marker_tmpdir.cleanup()
     return BackendComparison(
         backend=(
-            f"vllm:prefill_sparsify={args.vllm_prefill_sparsify}:"
+            f"vllm:score_mode={args.vllm_score_mode}:"
+            f"prefill_sparsify={args.vllm_prefill_sparsify}:"
             f"use_sparse_gemv={args.vllm_use_sparse_gemv}:"
             "sparse_gemv_dense_fallback="
             f"{args.vllm_sparse_gemv_dense_fallback_policy}:"
@@ -1339,6 +1456,8 @@ def main() -> int:
                 "hf_reference_impl": args.hf_reference_impl,
                 "hf_reference_mode": args.hf_reference_mode,
                 "vllm_prefill_sparsify": args.vllm_prefill_sparsify,
+                "vllm_score_mode": args.vllm_score_mode,
+                "vllm_target_layers": args.target_layer,
                 "vllm_sparse_gemv_dense_fallback_policy": (
                     args.vllm_sparse_gemv_dense_fallback_policy
                 ),
