@@ -151,6 +151,15 @@ def parse_args() -> argparse.Namespace:
             "runs that keep markers during timing."
         ),
     )
+    parser.add_argument(
+        "--sparse-marker-sequence-limit",
+        type=int,
+        default=512,
+        help=(
+            "Maximum number of sparse marker records to copy into the result "
+            "JSON as an ordered diagnostic sequence. Set to 0 to omit it."
+        ),
+    )
     parser.add_argument("--min-total-token-speedup", type=float, default=1.0)
     parser.add_argument("--min-output-token-speedup", type=float, default=1.0)
     parser.add_argument("--json-output", type=Path, default=None)
@@ -423,6 +432,42 @@ def unique_marker_values(
     return values
 
 
+MARKER_SEQUENCE_KEYS = (
+    "marker_record",
+    "invocations",
+    "op",
+    "layer_idx",
+    "projection",
+    "x_shape",
+    "threshold_numel",
+    "inclusive",
+    "weight_t_shape",
+    "active_hidden_size",
+    "active_count_min",
+    "active_count_max",
+    "active_count_mean",
+    "active_density_min",
+    "active_density_max",
+    "active_density_mean",
+    "active_sparsity_mean",
+    "active_stats_error",
+)
+
+
+def marker_record_sequence(
+    records: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    sequence = []
+    for record in records[:limit]:
+        sequence.append(
+            {key: record[key] for key in MARKER_SEQUENCE_KEYS if key in record}
+        )
+    return sequence
+
+
 def main() -> int:
     args = parse_args()
     if args.num_prompts <= 0:
@@ -438,6 +483,8 @@ def main() -> int:
         and not 0.0 <= args.sparse_gemv_min_sparsity <= 1.0
     ):
         raise ValueError("--sparse-gemv-min-sparsity must be in [0, 1]")
+    if args.sparse_marker_sequence_limit < 0:
+        raise ValueError("--sparse-marker-sequence-limit must be non-negative")
     if (
         args.method == "larosa"
         and targets_larosa_second_site(args.target_projection)
@@ -610,6 +657,13 @@ def main() -> int:
                 sparse_marker_records,
                 "active_stats_error",
             ),
+            "sparse_gemv_marker_sequence": marker_record_sequence(
+                sparse_marker_records,
+                args.sparse_marker_sequence_limit,
+            ),
+            "sparse_gemv_marker_sequence_truncated": (
+                len(sparse_marker_records) > args.sparse_marker_sequence_limit
+            ),
             "ascend_sparse_linear_marker_records": len(ascend_marker_records),
             "ascend_sparse_linear_marker_pids": ascend_marker_pids,
             "ascend_sparse_linear_marker_ops": ascend_marker_ops,
@@ -632,6 +686,13 @@ def main() -> int:
             "ascend_sparse_linear_marker_weight_t_provided": unique_marker_values(
                 ascend_marker_records,
                 "weight_t_provided",
+            ),
+            "ascend_sparse_linear_marker_sequence": marker_record_sequence(
+                ascend_marker_records,
+                args.sparse_marker_sequence_limit,
+            ),
+            "ascend_sparse_linear_marker_sequence_truncated": (
+                len(ascend_marker_records) > args.sparse_marker_sequence_limit
             ),
         }
     )
@@ -697,6 +758,7 @@ def main() -> int:
             args.keep_sparse_markers_during_timing
         ),
         "sparse_marker_limit": args.sparse_marker_limit,
+        "sparse_marker_sequence_limit": args.sparse_marker_sequence_limit,
         "dense": dense,
         "sparse": sparse,
         "total_token_speedup": total_token_speedup,

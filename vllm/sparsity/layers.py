@@ -77,12 +77,14 @@ def build_sparsifier(
         return None
 
     if sparsity_config.method == "larosa":
-        return _build_larosa_sparsifier(
+        sparsify_fn = _build_larosa_sparsifier(
             sparsity_config,
             layer_idx,
             proj_name,
             device,
         )
+        _attach_sparse_marker_metadata(sparsify_fn, layer_idx, proj_name)
+        return sparsify_fn
 
     # Load pre-computed TEAL threshold for this layer/proj
     threshold_device = _threshold_load_device(device, sparsity_config)
@@ -102,7 +104,21 @@ def build_sparsifier(
         expected_sparsity=sparsity_config.uniform_sparsity,
     )
 
+    _attach_sparse_marker_metadata(sparsify_fn, layer_idx, proj_name)
     return sparsify_fn
+
+
+def _attach_sparse_marker_metadata(
+    sparsify_fn: SparsifyFn | None,
+    layer_idx: int,
+    proj_name: str,
+) -> None:
+    if sparsify_fn is None:
+        return
+    sparsify_fn._sparse_gemv_marker_metadata = {
+        "layer_idx": int(layer_idx),
+        "projection": proj_name,
+    }
 
 
 def _build_larosa_sparsifier(

@@ -17,6 +17,7 @@ from vllm.sparsity.kernels.sparse_gemv import (
 
 
 _DEFAULT_SPARSE_GEMV_MIN_SPARSITY = 0.70
+_DEFAULT_SPARSE_GEMV_MIN_STATIC_THRESHOLD = 1e-6
 
 
 def _is_torch_compiling() -> bool:
@@ -202,6 +203,13 @@ class SparsifyFn(nn.Module):
         """
         if (
             self.use_sparse_gemv
+            and type(self) is SparsifyFn
+            and not self._static_threshold_allows_sparse_linear()
+        ):
+            return x
+
+        if (
+            self.use_sparse_gemv
             and self._dense_fallback_policy() == "identity"
             and self._sparse_linear_applies_to_all_rows(x)
         ):
@@ -264,6 +272,7 @@ class SparsifyFn(nn.Module):
             threshold,
             inclusive=inclusive,
             weight_t=weight_t,
+            **self._sparse_marker_kwargs(),
         )
         bias = getattr(linear_layer, "bias", None)
         skip_bias_add = getattr(linear_layer, "skip_bias_add", False)
@@ -331,6 +340,7 @@ class SparsifyFn(nn.Module):
             weight_t,
             threshold,
             inclusive=inclusive,
+            **self._sparse_marker_kwargs(),
         )
         if output is None:
             return None
@@ -405,6 +415,7 @@ class SparsifyFn(nn.Module):
             "inclusive": inclusive,
             "bias": getattr(linear_layer, "bias", None),
             "skip_bias_add": getattr(linear_layer, "skip_bias_add", False),
+            "marker_metadata": self._sparse_marker_metadata(),
         }
 
     def _sparse_linear_plan_cache_key(
@@ -442,6 +453,11 @@ class SparsifyFn(nn.Module):
             plan["weight_t"],
             plan["threshold"],
             inclusive=plan["inclusive"],
+            **(
+                {"marker_metadata": plan["marker_metadata"]}
+                if plan.get("marker_metadata") is not None
+                else {}
+            ),
         )
         if output is None:
             output = sparse_gemv_impl(
@@ -450,6 +466,11 @@ class SparsifyFn(nn.Module):
                 plan["threshold"],
                 inclusive=plan["inclusive"],
                 weight_t=plan["weight_t"],
+                **(
+                    {"marker_metadata": plan["marker_metadata"]}
+                    if plan.get("marker_metadata") is not None
+                    else {}
+                ),
             )
         bias = plan["bias"]
         skip_bias_add = plan["skip_bias_add"]
@@ -469,6 +490,11 @@ class SparsifyFn(nn.Module):
             plan["weight_t"],
             plan["threshold"],
             inclusive=plan["inclusive"],
+            **(
+                {"marker_metadata": plan["marker_metadata"]}
+                if plan.get("marker_metadata") is not None
+                else {}
+            ),
         )
 
     def _tensor_model_parallel_world_size_is_one(self) -> bool:
@@ -513,6 +539,11 @@ class SparsifyFn(nn.Module):
         sparse_input: torch.Tensor,
         weight: torch.Tensor,
     ) -> bool:
+        if (
+            type(self) is SparsifyFn
+            and not self._static_threshold_allows_sparse_linear()
+        ):
+            return False
         mode = os.environ.get("VLLM_SPARSE_GEMV_LINEAR_POLICY", "auto").lower()
         if mode in {"all", "always"}:
             return True
@@ -544,6 +575,35 @@ class SparsifyFn(nn.Module):
         except ValueError:
             return _DEFAULT_SPARSE_GEMV_MIN_SPARSITY
         return min(1.0, max(0.0, parsed))
+
+    def _static_threshold_allows_sparse_linear(self) -> bool:
+        threshold = self.threshold
+        if threshold.numel() != 1:
+            return True
+        min_threshold = self._sparse_linear_min_static_threshold()
+        if min_threshold <= 0.0:
+            return True
+
+        cached = getattr(self, "_sparse_linear_static_threshold_abs_max", None)
+        if cached is None:
+            try:
+                cached = float(
+                    threshold.detach().to(dtype=torch.float32).abs().max().item()
+                )
+            except Exception:
+                return True
+            self._sparse_linear_static_threshold_abs_max = cached
+        return cached > min_threshold
+
+    def _sparse_linear_min_static_threshold(self) -> float:
+        value = os.environ.get("VLLM_SPARSE_GEMV_MIN_STATIC_THRESHOLD")
+        if value is None:
+            return _DEFAULT_SPARSE_GEMV_MIN_STATIC_THRESHOLD
+        try:
+            parsed = float(value)
+        except ValueError:
+            return _DEFAULT_SPARSE_GEMV_MIN_STATIC_THRESHOLD
+        return max(0.0, parsed)
 
     def _dense_fallback_policy(self) -> str:
         mode = os.environ.get(
@@ -582,6 +642,16 @@ class SparsifyFn(nn.Module):
         x: torch.Tensor,
     ) -> tuple[torch.Tensor | None, bool]:
         return self._threshold_for(x, dtype=torch.float32), False
+
+    def _sparse_marker_metadata(self) -> dict | None:
+        metadata = getattr(self, "_sparse_gemv_marker_metadata", None)
+        return metadata if isinstance(metadata, dict) else None
+
+    def _sparse_marker_kwargs(self) -> dict:
+        metadata = self._sparse_marker_metadata()
+        if metadata is None:
+            return {}
+        return {"marker_metadata": metadata}
 
     def _apply_rows(self, x: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
         if row_mask.numel() != x.shape[0]:
@@ -969,6 +1039,7 @@ class LaRosaSparsifyFn(SparsifyFn):
             sparse_input,
             weight_t,
             keep,
+            **self._sparse_marker_kwargs(),
         )
 
     def extra_repr(self) -> str:

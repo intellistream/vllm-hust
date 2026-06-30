@@ -202,6 +202,21 @@ def _activity_marker_payload(
     }
 
 
+def _marker_metadata_payload(
+    marker_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not marker_metadata:
+        return {}
+    payload: dict[str, Any] = {}
+    for key, value in marker_metadata.items():
+        key = str(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            payload[key] = value
+        else:
+            payload[key] = str(value)
+    return payload
+
+
 def _marker_record_limit() -> int:
     value = os.environ.get("VLLM_SPARSE_GEMV_MARKER_LIMIT")
     if value is None:
@@ -247,6 +262,7 @@ def _record_sparse_gemv_invocation(
     threshold: torch.Tensor | None = None,
     inclusive: bool | None = None,
     weight_t: torch.Tensor | None = None,
+    marker_metadata: dict[str, Any] | None = None,
 ) -> None:
     global _SPARSE_GEMV_INVOCATIONS, _SPARSE_GEMV_MARKED
     global _SPARSE_GEMV_MARKER_RECORDS
@@ -271,6 +287,7 @@ def _record_sparse_gemv_invocation(
             "invocations": _SPARSE_GEMV_INVOCATIONS,
             "marker_record": _SPARSE_GEMV_MARKER_RECORDS + 1,
         }
+        payload.update(_marker_metadata_payload(marker_metadata))
         payload.update(_tensor_marker_payload("x", x))
         payload.update(_tensor_marker_payload("threshold", threshold))
         payload.update(_tensor_marker_payload("weight_t", weight_t))
@@ -295,6 +312,7 @@ def _record_ascend_sparse_linear_marker(
     inclusive: bool,
     weight_t: torch.Tensor,
     op_name: str = "activation_sparse_linear_direct_t",
+    marker_metadata: dict[str, Any] | None = None,
 ) -> None:
     global _ASCEND_SPARSE_LINEAR_MARKED, _ASCEND_SPARSE_LINEAR_MARKER_RECORDS
     if _is_torch_compiling():
@@ -318,6 +336,7 @@ def _record_ascend_sparse_linear_marker(
             "inclusive": bool(inclusive),
             "marker_record": _ASCEND_SPARSE_LINEAR_MARKER_RECORDS + 1,
         }
+        payload.update(_marker_metadata_payload(marker_metadata))
         payload.update(_tensor_marker_payload("x", x))
         payload.update(_tensor_marker_payload("threshold", threshold))
         payload.update(_tensor_marker_payload("weight_t", weight_t))
@@ -336,6 +355,7 @@ def _try_ascend_direct_t_fast_path(
     weight_t: torch.Tensor | None,
     threshold: torch.Tensor,
     inclusive: bool,
+    marker_metadata: dict[str, Any] | None = None,
 ) -> torch.Tensor | None:
     if weight_t is None:
         return None
@@ -363,6 +383,7 @@ def _try_ascend_direct_t_fast_path(
         threshold=threshold,
         inclusive=inclusive,
         weight_t=weight_t,
+        marker_metadata=marker_metadata,
     )
     return op(
         x if x.is_contiguous() else x.contiguous(),
@@ -377,6 +398,7 @@ def _try_ascend_silu_and_mul_direct_t_fast_path(
     weight_t: torch.Tensor | None,
     threshold: torch.Tensor,
     inclusive: bool,
+    marker_metadata: dict[str, Any] | None = None,
 ) -> torch.Tensor | None:
     if weight_t is None:
         return None
@@ -409,6 +431,7 @@ def _try_ascend_silu_and_mul_direct_t_fast_path(
                 inclusive=inclusive,
                 weight_t=weight_t,
                 op_name="activation_sparse_silu_and_mul_packed_t",
+                marker_metadata=marker_metadata,
             )
             values, indices, counts = pack_op(
                 x if x.is_contiguous() else x.contiguous(),
@@ -428,6 +451,7 @@ def _try_ascend_silu_and_mul_direct_t_fast_path(
         inclusive=inclusive,
         weight_t=weight_t,
         op_name="activation_sparse_silu_and_mul_direct_t",
+        marker_metadata=marker_metadata,
     )
     return op(
         x if x.is_contiguous() else x.contiguous(),
@@ -444,6 +468,7 @@ def sparse_gemv_impl(
     sparsity_bin: int = 0,
     inclusive: bool = False,
     weight_t: torch.Tensor | None = None,
+    marker_metadata: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """Apply activation-threshold sparse GEMV with an AscendC fast path."""
     del sparsity_bin
@@ -452,12 +477,14 @@ def sparse_gemv_impl(
         threshold=threshold,
         inclusive=inclusive,
         weight_t=weight_t,
+        marker_metadata=marker_metadata,
     )
     fast_output = _try_ascend_direct_t_fast_path(
         x,
         weight_t,
         threshold,
         inclusive,
+        marker_metadata,
     )
     if fast_output is not None:
         return fast_output
@@ -506,6 +533,7 @@ def sparse_gemv_silu_and_mul_direct_t_cached_impl(
     threshold: torch.Tensor,
     *,
     inclusive: bool = False,
+    marker_metadata: dict[str, Any] | None = None,
 ) -> torch.Tensor | None:
     """Apply fused sparse gate/up projection plus SiLU*up on Ascend."""
     del weight
@@ -514,12 +542,14 @@ def sparse_gemv_silu_and_mul_direct_t_cached_impl(
         threshold=threshold,
         inclusive=inclusive,
         weight_t=weight_t,
+        marker_metadata=marker_metadata,
     )
     return _try_ascend_silu_and_mul_direct_t_fast_path(
         x,
         weight_t,
         threshold,
         inclusive,
+        marker_metadata,
     )
 
 
@@ -527,6 +557,7 @@ def sparse_gemv_topk_matmul_silu_impl(
     x: torch.Tensor,
     weight_t: torch.Tensor,
     keep: int,
+    marker_metadata: dict[str, Any] | None = None,
 ) -> torch.Tensor | None:
     """Apply La RoSA top-k sparse gate/up via selected-weight matmul on NPU."""
     if not _is_npu_tensor(x):
@@ -550,6 +581,7 @@ def sparse_gemv_topk_matmul_silu_impl(
         threshold=threshold,
         inclusive=True,
         weight_t=weight_t,
+        marker_metadata=marker_metadata,
     )
     _record_ascend_sparse_linear_marker(
         x=x,
@@ -557,6 +589,7 @@ def sparse_gemv_topk_matmul_silu_impl(
         inclusive=True,
         weight_t=weight_t,
         op_name="activation_sparse_topk_matmul_silu",
+        marker_metadata=marker_metadata,
     )
 
     selected_indices = topk_indices[0].to(dtype=torch.long).contiguous()
@@ -574,6 +607,7 @@ def sparse_gemv_direct_t_cached_impl(
     threshold: torch.Tensor,
     *,
     inclusive: bool = False,
+    marker_metadata: dict[str, Any] | None = None,
 ) -> torch.Tensor | None:
     """Fastest cached-plan path for already validated Ascend direct-T calls."""
     if not _is_npu_tensor(x):
@@ -595,12 +629,14 @@ def sparse_gemv_direct_t_cached_impl(
         threshold=threshold,
         inclusive=inclusive,
         weight_t=weight_t,
+        marker_metadata=marker_metadata,
     )
     _record_ascend_sparse_linear_marker(
         x=x,
         threshold=threshold,
         inclusive=inclusive,
         weight_t=weight_t,
+        marker_metadata=marker_metadata,
     )
     return op(x, weight_t, threshold, inclusive)
 

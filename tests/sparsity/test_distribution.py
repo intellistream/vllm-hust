@@ -503,6 +503,43 @@ def test_sparse_linear_auto_policy_keeps_single_batch_wide_output(monkeypatch):
     assert sparsify._should_use_sparse_linear_kernel(x, weight) is True
 
 
+def test_sparse_linear_policy_skips_near_zero_static_threshold(monkeypatch):
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", "all")
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_STATIC_THRESHOLD", raising=False)
+    x = torch.randn(1, 3584)
+    weight = torch.randn(32768, 3584)
+    sparse_threshold = SparsifyFn(
+        torch.tensor(1e-3),
+        use_sparse_gemv=True,
+        expected_sparsity=0.9,
+    )
+    dense_threshold = SparsifyFn(
+        torch.tensor(1e-9),
+        use_sparse_gemv=True,
+        expected_sparsity=0.9,
+    )
+
+    assert sparse_threshold._should_use_sparse_linear_kernel(x, weight) is True
+    assert dense_threshold._should_use_sparse_linear_kernel(x, weight) is False
+
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_MIN_STATIC_THRESHOLD", "0")
+
+    assert dense_threshold._should_use_sparse_linear_kernel(x, weight) is True
+
+
+def test_dense_fallback_uses_identity_for_near_zero_static_threshold(monkeypatch):
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_STATIC_THRESHOLD", raising=False)
+    x = torch.randn(1, 3584)
+    sparsify = SparsifyFn(
+        torch.tensor(1e-9),
+        apply_all_tokens=True,
+        use_sparse_gemv=True,
+        expected_sparsity=0.9,
+    )
+
+    assert sparsify.apply_dense_fallback(x) is x
+
+
 def test_sparse_linear_auto_policy_requires_expected_sparsity(monkeypatch):
     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
     monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
