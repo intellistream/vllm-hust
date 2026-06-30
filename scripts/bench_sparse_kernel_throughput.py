@@ -134,6 +134,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not fail when the vLLM sparse GEMV shim is never invoked.",
     )
+    parser.add_argument(
+        "--keep-sparse-markers-during-timing",
+        action="store_true",
+        help=(
+            "Keep sparse marker env vars set during timed sparse generation. "
+            "This is for diagnostics; marker file writes add overhead."
+        ),
+    )
+    parser.add_argument(
+        "--sparse-marker-limit",
+        type=int,
+        default=None,
+        help=(
+            "Optional VLLM_SPARSE_GEMV_MARKER_LIMIT override for diagnostic "
+            "runs that keep markers during timing."
+        ),
+    )
     parser.add_argument("--min-total-token-speedup", type=float, default=1.0)
     parser.add_argument("--min-output-token-speedup", type=float, default=1.0)
     parser.add_argument("--json-output", type=Path, default=None)
@@ -440,6 +457,7 @@ def main() -> int:
         "VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"
     )
     previous_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY")
+    previous_marker_limit = os.environ.get("VLLM_SPARSE_GEMV_MARKER_LIMIT")
     os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
         "0" if args.allow_sparse_gemv_fallback else "1"
     )
@@ -450,6 +468,10 @@ def main() -> int:
         os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = str(
             args.sparse_gemv_min_sparsity
         )
+    if args.sparse_marker_limit is not None:
+        if args.sparse_marker_limit < 0:
+            raise ValueError("--sparse-marker-limit must be non-negative")
+        os.environ["VLLM_SPARSE_GEMV_MARKER_LIMIT"] = str(args.sparse_marker_limit)
     active_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY", "0.70")
     marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_sparse_gemv_")
     marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
@@ -463,7 +485,9 @@ def main() -> int:
             prompts,
             build_sparse_config(args),
             "sparse",
-            disable_sparse_markers_during_timing=True,
+            disable_sparse_markers_during_timing=(
+                not args.keep_sparse_markers_during_timing
+            ),
         )
     finally:
         if previous_require_kernel is None:
@@ -490,6 +514,10 @@ def main() -> int:
             os.environ.pop("VLLM_SPARSE_GEMV_MIN_SPARSITY", None)
         else:
             os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = previous_min_sparsity
+        if previous_marker_limit is None:
+            os.environ.pop("VLLM_SPARSE_GEMV_MARKER_LIMIT", None)
+        else:
+            os.environ["VLLM_SPARSE_GEMV_MARKER_LIMIT"] = previous_marker_limit
 
     sparse_invocations_current_process = get_sparse_invocation_counter()
     sparse_marker_records = read_marker_records(marker_path)
@@ -665,6 +693,10 @@ def main() -> int:
         ),
         "sparse_gemv_min_sparsity": active_min_sparsity,
         "require_sparse_gemv_kernel": not args.allow_sparse_gemv_fallback,
+        "keep_sparse_markers_during_timing": (
+            args.keep_sparse_markers_during_timing
+        ),
+        "sparse_marker_limit": args.sparse_marker_limit,
         "dense": dense,
         "sparse": sparse,
         "total_token_speedup": total_token_speedup,
