@@ -1565,6 +1565,7 @@ def main() -> int:
                 "vllm_prefill_sparsify": args.vllm_prefill_sparsify,
                 "vllm_score_mode": args.vllm_score_mode,
                 "vllm_target_layers": args.target_layer,
+                "vllm_target_projections": args.target_projection,
                 "vllm_sparse_gemv_dense_fallback_policy": (
                     args.vllm_sparse_gemv_dense_fallback_policy
                 ),

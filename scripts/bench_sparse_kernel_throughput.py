@@ -19,6 +19,8 @@ from typing import Any
 import torch
 
 
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 SPARSE_MARKER_ENV_NAMES = (
     "VLLM_SPARSE_GEMV_MARKER_PATH",
     "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH",
@@ -747,8 +749,10 @@ def main() -> int:
             "text" if args.text_file is not None or args.inline_text else "random"
         ),
         "dtype": args.dtype,
+        "vllm_prefill_sparsify": args.vllm_prefill_sparsify,
         "sparse_linear_policy": os.environ.get("VLLM_SPARSE_GEMV_LINEAR_POLICY"),
         "target_layers": args.target_layer,
+        "target_projections": args.target_projection,
         "sparse_gemv_dense_fallback_policy": (
             args.sparse_gemv_dense_fallback_policy
         ),
