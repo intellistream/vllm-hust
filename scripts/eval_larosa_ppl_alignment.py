@@ -42,6 +42,8 @@ from eval_teal_ppl_alignment import (  # noqa: E402
     load_tokenizer,
     print_comparison,
     score_hf_windows,
+    score_vllm_decode_next_token_windows,
+    score_vllm_forced_decode_next_token_windows,
     score_vllm_windows,
     summarize_sparse_kernel_markers,
     torch_dtype,
@@ -128,6 +130,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     backends.add_argument(
+        "--vllm-score-mode",
+        choices=[
+            "prompt_logprobs",
+            "decode_next_token",
+            "forced_decode_next_token",
+        ],
+        default="prompt_logprobs",
+        help=(
+            "vLLM PPL scoring path. prompt_logprobs scores target tokens "
+            "during prefill. decode_next_token scores the first generated "
+            "token after each prefix. forced_decode_next_token forces a "
+            "one-token teacher bridge, then scores the following generated "
+            "decode token, matching decode sparse-kernel generation checks."
+        ),
+    )
+    backends.add_argument(
+        "--vllm-prefill-sparsify",
+        choices=["half", "all", "none"],
+        default="all",
+        help=(
+            "La RoSA sparsification policy for prompt/prefill tokens. all "
+            "matches the official scripts; none sparsifies generated-token "
+            "decode only; half keeps the TEAL-style last-half prefill policy."
+        ),
+    )
+    backends.add_argument(
         "--target-projection",
         action="append",
         choices=["self_attn.qkv", "self_attn.o", "mlp.gate_up", "mlp.down"],
@@ -135,6 +163,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Restrict sparse HF hooks and vLLM activation sparsity to this "
             "projection. Can be repeated."
+        ),
+    )
+    backends.add_argument(
+        "--target-layer",
+        action="append",
+        type=int,
+        default=None,
+        help=(
+            "Restrict sparse HF hooks and vLLM activation sparsity to this "
+            "zero-based layer id. Can be repeated."
         ),
     )
     backends.add_argument(
@@ -280,11 +318,15 @@ class HFLarosaReference:
         calibration_path: Path,
         rotation_dtype: torch.dtype,
         target_projections: list[str] | None,
+        target_layers: list[int] | None,
+        prefill_sparsify: str,
     ) -> None:
         self.model = model
         self.calibration_path = calibration_path
         self.rotation_dtype = rotation_dtype
         self.target_projections = target_projections
+        self.target_layers = target_layers
+        self.prefill_sparsify = prefill_sparsify
         self.sparsity = 0.0
         self.rotations: dict[int, torch.Tensor] = {}
         self.handles: list[Any] = []
@@ -292,6 +334,9 @@ class HFLarosaReference:
 
     def _targets(self, proj_name: str) -> bool:
         return self.target_projections is None or proj_name in self.target_projections
+
+    def _targets_layer(self, layer_idx: int) -> bool:
+        return self.target_layers is None or layer_idx in self.target_layers
 
     def set_sparsity(self, sparsity: float) -> None:
         self.sparsity = float(sparsity)
@@ -307,6 +352,9 @@ class HFLarosaReference:
     def _install_hooks(self) -> None:
         layers = self.model.model.layers
         for layer_idx, layer in enumerate(layers):
+            if not self._targets_layer(layer_idx):
+                continue
+
             if self._targets("self_attn.qkv") or self._targets("mlp.gate_up"):
                 q = torch.load(
                     rotation_path(self.calibration_path, layer_idx),
@@ -358,7 +406,7 @@ class HFLarosaReference:
             rot_x = torch.matmul(x.to(dtype=q.dtype), q)
             sparse_rot_x = official_topk_new(rot_x, self.sparse_level_h1)
             topk_x = torch.matmul(sparse_rot_x, q.t()).to(dtype=x.dtype)
-            return (topk_x, *inputs[1:])
+            return (self._apply_prefill_policy(x, topk_x), *inputs[1:])
 
         return hook
 
@@ -368,9 +416,43 @@ class HFLarosaReference:
             if self.sparse_level_h2 <= 0.0:
                 return inputs
             x = inputs[0]
-            return (official_topk_new(x, self.sparse_level_h2), *inputs[1:])
+            sparse_x = official_topk_new(x, self.sparse_level_h2)
+            return (self._apply_prefill_policy(x, sparse_x), *inputs[1:])
 
         return hook
+
+    def _apply_prefill_policy(
+        self,
+        x: torch.Tensor,
+        sparse_x: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.prefill_sparsify == "all":
+            return sparse_x
+
+        if x.dim() == 3:
+            seq_len = x.shape[1]
+            if seq_len == 1:
+                return sparse_x
+            if self.prefill_sparsify == "none":
+                return x
+            half_seq_len = seq_len // 2
+            if half_seq_len == 0:
+                return x
+            return torch.cat(
+                (x[:, :-half_seq_len, :], sparse_x[:, -half_seq_len:, :]),
+                dim=1,
+            )
+
+        if x.dim() != 2:
+            return sparse_x
+        if x.shape[0] == 1:
+            return sparse_x
+        if self.prefill_sparsify == "none":
+            return x
+        half_seq_len = x.shape[0] // 2
+        if half_seq_len == 0:
+            return x
+        return torch.cat((x[:-half_seq_len], sparse_x[-half_seq_len:]), dim=0)
 
 
 def load_hf_model(args: argparse.Namespace) -> torch.nn.Module:
@@ -452,9 +534,14 @@ def run_hf_reference(
     model_type: str,
 ) -> BackendComparison:
     if args.hf_reference_impl == "official_repo":
-        if args.target_projection:
+        if (
+            args.target_projection
+            or args.target_layer
+            or args.vllm_prefill_sparsify != "all"
+        ):
             raise ValueError(
-                "--target-projection is supported only with "
+                "--target-projection, --target-layer, and non-all "
+                "--vllm-prefill-sparsify policies are supported only with "
                 "--hf-reference-impl hooks."
             )
         model = build_official_larosa_model(args, model_type)
@@ -467,6 +554,8 @@ def run_hf_reference(
             args.calibration_path,
             torch_dtype(args.rotation_dtype),
             args.target_projection,
+            args.target_layer,
+            args.vllm_prefill_sparsify,
         )
         larosa_ref.set_sparsity(0.0)
         reference_name = "hooks"
@@ -497,7 +586,10 @@ def run_hf_reference(
     empty_backend_cache()
 
     return BackendComparison(
-        backend=f"hf_larosa:{reference_name}:all_tokens",
+        backend=(
+            f"hf_larosa:{reference_name}:"
+            f"prefill_sparsify={args.vllm_prefill_sparsify}"
+        ),
         dense=dense,
         sparse=sparse,
     )
@@ -507,8 +599,15 @@ def run_vllm_reference(
     args: argparse.Namespace,
     windows: list[list[int]],
 ) -> BackendComparison:
+    score_fn = (
+        score_vllm_decode_next_token_windows
+        if args.vllm_score_mode == "decode_next_token"
+        else score_vllm_forced_decode_next_token_windows
+        if args.vllm_score_mode == "forced_decode_next_token"
+        else score_vllm_windows
+    )
     dense_llm = build_vllm(args, None)
-    dense = score_vllm_windows(
+    dense = score_fn(
         dense_llm,
         windows,
         args.window_size,
@@ -524,13 +623,15 @@ def run_vllm_reference(
         "uniform_sparsity": args.sparsity,
         "calibration_path": str(args.calibration_path.resolve()),
         "decode_only": False,
-        "apply_all_tokens": True,
-        "prefill_sparsify": "all",
+        "apply_all_tokens": args.vllm_prefill_sparsify == "all",
+        "prefill_sparsify": args.vllm_prefill_sparsify,
         "strict_unsupported_check": True,
         "use_sparse_gemv": args.vllm_use_sparse_gemv,
     }
     if args.target_projection:
         sparsity_config["target_projections"] = args.target_projection
+    if args.target_layer:
+        sparsity_config["target_layers"] = args.target_layer
     previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
     previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
     previous_ascend_marker_path = os.environ.get(
@@ -565,7 +666,7 @@ def run_vllm_reference(
         os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = str(ascend_marker_path)
     try:
         sparse_llm = build_vllm(args, sparsity_config)
-        sparse = score_vllm_windows(
+        sparse = score_fn(
             sparse_llm,
             windows,
             args.window_size,
@@ -613,7 +714,8 @@ def run_vllm_reference(
 
     return BackendComparison(
         backend=(
-            "vllm_larosa:official_topk:all_tokens:"
+            f"vllm_larosa:official_topk:score_mode={args.vllm_score_mode}:"
+            f"prefill_sparsify={args.vllm_prefill_sparsify}:"
             f"use_sparse_gemv={args.vllm_use_sparse_gemv}:"
             "sparse_gemv_dense_fallback="
             f"{args.vllm_sparse_gemv_dense_fallback_policy}:"
@@ -631,6 +733,8 @@ def main() -> int:
 
     if args.sparsity < 0.0 or args.sparsity >= 1.0:
         raise ValueError("--sparsity must be in [0, 1).")
+    if args.target_layer is not None and any(layer < 0 for layer in args.target_layer):
+        raise ValueError("--target-layer values must be non-negative.")
     if (
         targets_larosa_second_site(args.target_projection)
         and args.sparsity * 1.2 >= 1.0
@@ -664,7 +768,9 @@ def main() -> int:
         "setup: "
         f"model={args.model}, model_type={model_type}, "
         f"sparsity={args.sparsity}, windows={len(windows)}, "
-        f"tokens={len(token_ids)}, calibration_path={args.calibration_path}"
+        f"tokens={len(token_ids)}, vllm_score_mode={args.vllm_score_mode}, "
+        f"vllm_prefill_sparsify={args.vllm_prefill_sparsify}, "
+        f"calibration_path={args.calibration_path}"
     )
 
     hf_result = None
@@ -691,6 +797,10 @@ def main() -> int:
                 "windows": len(windows),
                 "hf_reference_impl": args.hf_reference_impl,
                 "rotation_dtype": args.rotation_dtype,
+                "target_layers": args.target_layer,
+                "target_projections": args.target_projection,
+                "vllm_prefill_sparsify": args.vllm_prefill_sparsify,
+                "vllm_score_mode": args.vllm_score_mode,
                 "vllm_sparse_gemv_dense_fallback_policy": (
                     args.vllm_sparse_gemv_dense_fallback_policy
                 ),
