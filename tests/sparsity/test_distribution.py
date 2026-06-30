@@ -13,6 +13,7 @@ from vllm.sparsity.distribution import (
     LaRosaSparsifyFn,
     SparsifyFn,
     larosa_topk,
+    row_topk_threshold,
 )
 from vllm.sparsity.layers import build_sparsifier, targets_layer
 from vllm.sparsity.rotation import merge_rotation_into_weight
@@ -78,6 +79,53 @@ def test_sparsify_fn_partial_sparsity():
     sparsity = (out == 0).float().mean().item()
     # Should be roughly 1 - 0.617 = 0.383
     assert 0.30 < sparsity < 0.45
+
+
+def test_row_topk_threshold_matches_topk_threshold():
+    x_abs = torch.tensor(
+        [
+            [0.1, 3.0, 2.0, 2.0, 0.5],
+            [4.0, 1.0, 4.0, 0.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    keep = 3
+
+    topk_values, _ = torch.topk(x_abs, keep, dim=-1)
+    expected = topk_values[..., -1]
+
+    assert torch.equal(row_topk_threshold(x_abs, keep), expected)
+
+    signed = torch.tensor(
+        [
+            [0.1, -3.0, 2.0, -2.0, 0.5],
+            [-4.0, 1.0, 4.0, 0.0, -2.0],
+        ],
+        dtype=torch.float32,
+    )
+    sparse = larosa_topk(signed, sparsity_level=0.4)
+    expected_sparse = torch.where(
+        signed.abs() >= expected.unsqueeze(-1),
+        signed,
+        torch.zeros_like(signed),
+    )
+    assert torch.equal(sparse, expected_sparse)
+
+
+def test_row_topk_threshold_topk_backend_matches_default(monkeypatch):
+    x_abs = torch.tensor(
+        [[0.25, 1.5, 0.75, 3.0, 2.0, 0.5]],
+        dtype=torch.float32,
+    )
+    keep = 2
+
+    monkeypatch.delenv("VLLM_LAROSA_TOPK_THRESHOLD_BACKEND", raising=False)
+    default_threshold = row_topk_threshold(x_abs, keep)
+
+    monkeypatch.setenv("VLLM_LAROSA_TOPK_THRESHOLD_BACKEND", "topk")
+    topk_threshold = row_topk_threshold(x_abs, keep)
+
+    assert torch.equal(default_threshold, topk_threshold)
 
 
 def test_sparsify_fn_moved_threshold():

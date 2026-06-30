@@ -50,6 +50,7 @@ from eval_teal_ppl_alignment import (  # noqa: E402
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-7B"
 SUPPORTED_MODEL_TYPES = {"llama": "Llama2/3", "qwen2": "Qwen2/2.5"}
+LAROSA_SECOND_SITE_PROJECTIONS = {"self_attn.o", "mlp.down"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,6 +205,12 @@ def parse_args() -> argparse.Namespace:
     alignment.add_argument("--json-output", type=Path, default=None)
 
     return parser.parse_args()
+
+
+def targets_larosa_second_site(target_projections: list[str] | None) -> bool:
+    if target_projections is None:
+        return True
+    return any(proj in LAROSA_SECOND_SITE_PROJECTIONS for proj in target_projections)
 
 
 def get_model_config(args: argparse.Namespace) -> Any:
@@ -624,7 +631,10 @@ def main() -> int:
 
     if args.sparsity < 0.0 or args.sparsity >= 1.0:
         raise ValueError("--sparsity must be in [0, 1).")
-    if args.sparsity * 1.2 >= 1.0:
+    if (
+        targets_larosa_second_site(args.target_projection)
+        and args.sparsity * 1.2 >= 1.0
+    ):
         raise ValueError(
             "Official La RoSA h2 sparsity is sparsity * 1.2 and must be < 1. "
             f"Got sparsity={args.sparsity}."

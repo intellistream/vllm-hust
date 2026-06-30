@@ -24,6 +24,8 @@ SPARSE_MARKER_ENV_NAMES = (
     "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH",
 )
 
+LAROSA_SECOND_SITE_PROJECTIONS = {"self_attn.o", "mlp.down"}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -235,6 +237,12 @@ def build_sparse_config(args: argparse.Namespace) -> dict[str, Any]:
     return common
 
 
+def targets_larosa_second_site(target_projections: list[str] | None) -> bool:
+    if target_projections is None:
+        return True
+    return any(proj in LAROSA_SECOND_SITE_PROJECTIONS for proj in target_projections)
+
+
 def build_llm(
     args: argparse.Namespace,
     activation_sparsity_config: dict[str, Any] | None,
@@ -401,7 +409,11 @@ def main() -> int:
         and not 0.0 <= args.sparse_gemv_min_sparsity <= 1.0
     ):
         raise ValueError("--sparse-gemv-min-sparsity must be in [0, 1]")
-    if args.method == "larosa" and args.sparsity * 1.2 >= 1.0:
+    if (
+        args.method == "larosa"
+        and targets_larosa_second_site(args.target_projection)
+        and args.sparsity * 1.2 >= 1.0
+    ):
         raise ValueError("La RoSA h2 sparsity is sparsity * 1.2 and must be < 1")
 
     prompts = build_prompts(args)

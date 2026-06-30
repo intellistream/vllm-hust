@@ -797,9 +797,42 @@ def larosa_topk(x: torch.Tensor, sparsity_level: float) -> torch.Tensor:
             f"hidden size {x.shape[-1]}: sparsity_level={sparsity_level}."
         )
 
-    topk_values, _ = torch.topk(torch.abs(x), keep, dim=-1)
-    keep_threshold = topk_values[..., -1:]
+    keep_threshold = row_topk_threshold(torch.abs(x), keep).unsqueeze(-1)
     return torch.where(torch.abs(x) >= keep_threshold, x, torch.zeros_like(x))
+
+
+def row_topk_threshold(x_abs: torch.Tensor, keep: int) -> torch.Tensor:
+    """Return the kth-largest per-row threshold without materializing indices."""
+    backend = os.environ.get(
+        "VLLM_LAROSA_TOPK_THRESHOLD_BACKEND",
+        "kthvalue",
+    ).lower()
+    if backend == "topk":
+        topk_values, _ = torch.topk(x_abs, keep, dim=-1)
+        return topk_values[..., -1]
+    if backend in {"ascend", "ascend_custom", "custom"}:
+        ascend_threshold = _try_ascend_topk_threshold(x_abs, keep)
+        if ascend_threshold is not None:
+            return ascend_threshold
+    kth = x_abs.shape[-1] - keep + 1
+    return torch.kthvalue(x_abs, kth, dim=-1).values
+
+
+def _try_ascend_topk_threshold(
+    x_abs: torch.Tensor,
+    keep: int,
+) -> torch.Tensor | None:
+    if not getattr(x_abs, "is_npu", False):
+        return None
+    ascend_ops = getattr(torch.ops, "_C_ascend", None)
+    if ascend_ops is None:
+        return None
+    op = getattr(ascend_ops, "activation_sparse_topk_threshold", None)
+    if op is None:
+        return None
+    if x_abs.dtype != torch.float32:
+        x_abs = x_abs.to(dtype=torch.float32)
+    return op(x_abs.contiguous(), keep)
 
 
 class LaRosaSparsifyFn(SparsifyFn):
@@ -911,8 +944,8 @@ class LaRosaSparsifyFn(SparsifyFn):
                 "La RoSA sparsity_level keeps fewer than one activation for "
                 f"hidden size {x.shape[-1]}: sparsity_level={self.sparsity_level}."
             )
-        topk_values, _ = torch.topk(x.abs().to(dtype=torch.float32), keep, dim=-1)
-        return topk_values[..., -1].contiguous(), True
+        threshold = row_topk_threshold(x.abs().to(dtype=torch.float32), keep)
+        return threshold.contiguous(), True
 
     def _try_apply_topk_matmul_gate_up_silu(
         self,
