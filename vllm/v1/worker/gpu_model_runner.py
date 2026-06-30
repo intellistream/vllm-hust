@@ -69,6 +69,7 @@ from vllm.model_executor.model_loader.reload import (
     initialize_layerwise_reload,
 )
 from vllm.model_executor.models.interfaces import (
+    MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -483,6 +484,7 @@ class GPUModelRunner(
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self.eplb_state: EplbState | None = None
+        self._moe_model: MixtureOfExperts | None = None
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
         self.eep_eplb_suppressed = False
         """
@@ -857,6 +859,11 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+        self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
+        if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
+            self.mamba_prev_last_scheduled_idx = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -1343,13 +1350,27 @@ class GPUModelRunner(
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
             if not is_last_rank:
-                # Add new_token_ids to token_ids_cpu.
-                start_token_index = num_computed_tokens
-                end_token_index = num_computed_tokens + len(new_token_ids)
-                self.input_batch.token_ids_cpu[
-                    req_index, start_token_index:end_token_index
-                ] = new_token_ids
-                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+                start_token_index = self.input_batch.num_tokens_no_spec[req_index]
+                # For chunked prefill, num_computed_tokens may less
+                # than num_tokens_no_spec.
+                # Async scheduled PP: no new_token_ids, advance num_tokens_no_spec
+                # according to num_computed_tokens.
+                end_token_index = max(
+                    start_token_index,
+                    num_computed_tokens + len(new_token_ids),
+                )
+                if end_token_index > start_token_index:
+                    if new_token_ids:
+                        # Add new_token_ids to token_ids_cpu.
+                        num_new_tokens = end_token_index - start_token_index
+                        tokens_to_append = new_token_ids[-num_new_tokens:]
+                        self.input_batch.token_ids_cpu[
+                            req_index, start_token_index:end_token_index
+                        ] = tokens_to_append
+                    self.input_batch.is_token_ids[
+                        req_index, start_token_index:end_token_index
+                    ] = True
+                    self.input_batch.num_tokens_no_spec[req_index] = end_token_index
 
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
@@ -1441,27 +1462,36 @@ class GPUModelRunner(
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
-        if self.cache_config.mamba_cache_mode == "align":
+        is_align = self.cache_config.mamba_cache_mode == "align"
+        if is_align:
             for i, num_tokens in enumerate(
                 self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
             ):
                 self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
-            mamba_utils.postprocess_mamba(
-                scheduler_output,
-                self.kv_cache_config,
-                self.input_batch,
-                self.requests,
-                self.mamba_state_idx,
-                self.compilation_config.static_forward_context,
-                self.model.get_mamba_state_copy_func(),
-                self._get_mamba_copy_bufs(),
-            )
         else:
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
             )
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
+
+        mamba_utils.postprocess_mamba(
+            scheduler_output,
+            self.kv_cache_config,
+            self.cache_config,
+            self.input_batch,
+            self.requests,
+            self.mamba_state_idx,
+            self.num_spec_tokens,
+            num_reqs,
+            forward_context=(
+                self.compilation_config.static_forward_context if is_align else None
+            ),
+            mamba_state_copy_funcs=(
+                self.model.get_mamba_state_copy_func() if is_align else None
+            ),
+            copy_bufs=self._get_mamba_copy_bufs() if is_align else None,
+        )
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -1501,9 +1531,6 @@ class GPUModelRunner(
     def _init_mrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
         assert supports_mrope(model), "M-RoPE support is not implemented."
-        assert req_state.prompt_token_ids is not None, (
-            "M-RoPE requires prompt_token_ids to be available."
-        )
         mrope_model = cast(SupportsMRoPE, model)
 
         # `prompt_embeds` is a passthrough modality (no grid_thw), models'
@@ -1512,9 +1539,23 @@ class GPUModelRunner(
         mrope_features = [
             f for f in req_state.mm_features if f.modality != "prompt_embeds"
         ]
+
+        if req_state.prompt_token_ids is not None:
+            input_tokens = req_state.prompt_token_ids
+        elif req_state.prompt_embeds is not None:
+            # For embeddings-only inputs, get_mrope_input_positions only
+            # needs the sequence length when mm_features is empty (which is
+            # the case here since prompt_embeds are filtered out above).
+            seq_len = req_state.prompt_embeds.shape[0]
+            input_tokens = list(range(seq_len))
+        else:
+            raise ValueError(
+                "M-RoPE requires either prompt_token_ids or prompt_embeds."
+            )
+
         req_state.mrope_positions, req_state.mrope_position_delta = (
             mrope_model.get_mrope_input_positions(
-                req_state.prompt_token_ids,
+                input_tokens,
                 mrope_features,
             )
         )
@@ -1679,13 +1720,17 @@ class GPUModelRunner(
 
         num_common_tokens = len(sample_flattened_indices)
         total_without_spec = total_num_scheduled_tokens - total_num_spec_tokens
+        if self.enable_prompt_embeds:
+            # The multimodal embed path reads is_token_ids.gpu; its .cpu copy is
+            # refreshed every step but the async fast paths below only scatter
+            # input_ids.gpu, so refresh is_token_ids.gpu here too.
+            self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
         if num_common_tokens < total_without_spec:
             # If not all requests are decodes from the last iteration,
             # we need to copy the input_ids_cpu to the GPU first.
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
-                self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
         if num_common_tokens == 0:
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
@@ -1960,6 +2005,15 @@ class GPUModelRunner(
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
 
+        if self.mamba_prev_last_scheduled_idx is not None:
+            mamba_utils.preprocess_mamba_all_specdec(
+                scheduler_output,
+                self.input_batch,
+                self.mamba_state_idx,
+                num_reqs,
+                self.mamba_prev_last_scheduled_idx,
+            )
+
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
@@ -2174,6 +2228,9 @@ class GPUModelRunner(
         # Used by mamba backends to distinguish actual decodes from
         # short extends.
         is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
+        # Zero out padded rows so stale data from condense() doesn't
+        # misclassify padding as prefill in CUDA graph mode.
+        is_prefilling[num_reqs:] = False
 
         if self.use_async_spec_decode:
             # GPU tensors are authoritative in async mode.
@@ -2258,6 +2315,13 @@ class GPUModelRunner(
                         :num_reqs_padded
                     ],
                 )
+                if (
+                    isinstance(builder, Mamba2AttentionMetadataBuilder)
+                    and self.mamba_prev_last_scheduled_idx is not None
+                ):
+                    extra_attn_metadata_args["prev_last_scheduled_idx"] = (
+                        self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
+                    )
 
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
@@ -3125,7 +3189,7 @@ class GPUModelRunner(
 
         return tuple(tasks)
 
-    def sync_and_slice_intermediate_tensors(
+    def sync_and_gather_intermediate_tensors(
         self,
         num_tokens: int,
         intermediate_tensors: IntermediateTensors | None,
@@ -3136,24 +3200,23 @@ class GPUModelRunner(
         tp = self.vllm_config.parallel_config.tensor_parallel_size
         is_rs = is_residual_scattered_for_sp(self.vllm_config, num_tokens)
 
-        # When sequence parallelism is enabled, the "residual" tensor is sharded
-        # across tensor parallel ranks, so each rank only needs its own slice.
+        # When sequence parallelism is enabled, the "residual" tensor is
+        # sharded across TP ranks. All-gather it here because downstream
+        # QKV + Attention needs the full residual before the SP split point.
         if sync_self:
             assert intermediate_tensors is not None
             for k, v in intermediate_tensors.items():
                 is_scattered = k == "residual" and is_rs
-                copy_len = num_tokens // tp if is_scattered else num_tokens
-                self.intermediate_tensors[k][:copy_len].copy_(
-                    v[:copy_len], non_blocking=True
+                if is_scattered:
+                    local_len = num_tokens // tp
+                    v = get_tp_group().all_gather(v[:local_len], dim=0)
+
+                self.intermediate_tensors[k][:num_tokens].copy_(
+                    v[:num_tokens], non_blocking=True
                 )
 
         return IntermediateTensors(
-            {
-                k: v[: num_tokens // tp]
-                if k == "residual" and is_rs
-                else v[:num_tokens]
-                for k, v in self.intermediate_tensors.items()
-            }
+            {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}
         )
 
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
@@ -3164,8 +3227,7 @@ class GPUModelRunner(
             return
 
         assert self.eplb_state is not None
-        model = self.get_model()
-        assert is_mixture_of_experts(model)
+        assert self._moe_model is not None
         self.eplb_state.step(
             is_dummy,
             is_profile,
@@ -3177,11 +3239,10 @@ class GPUModelRunner(
         expanded_physical_to_logical: torch.Tensor,
         old_num_physical_experts: int,
     ) -> None:
-        model = self.get_model()
-        assert is_mixture_of_experts(model)
+        assert self._moe_model is not None
 
         self.eplb_state = EplbState.from_mapping(
-            model=model,
+            model=self._moe_model,
             model_config=self.model_config,
             device=self.device,
             parallel_config=self.parallel_config,
@@ -3306,14 +3367,41 @@ class GPUModelRunner(
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.model.embed_input_ids(
-                self.input_ids.gpu[:num_scheduled_tokens],
-                multimodal_embeddings=mm_embeds,
-                is_multimodal=is_mm_embed,
-            )
+            if self.enable_prompt_embeds and self.input_batch.req_prompt_embeds:
+                # Some positions carry precomputed prompt_embeds: they are
+                # already in self.inputs_embeds and marked is_token_ids=False.
+                # Embed only the token-id positions (zeroing the placeholder ids
+                # at prompt_embeds positions so the embedding gather cannot read
+                # out-of-range ids), and write them back without clobbering the
+                # prompt_embeds positions.
+                is_token_ids = self.is_token_ids.gpu[:num_scheduled_tokens]
+                safe_input_ids = torch.where(
+                    is_token_ids,
+                    self.input_ids.gpu[:num_scheduled_tokens],
+                    0,
+                )
+                inputs_embeds_scheduled = self.model.embed_input_ids(
+                    safe_input_ids,
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
+                target = self.inputs_embeds.gpu[:num_scheduled_tokens]
+                self.inputs_embeds.gpu[:num_scheduled_tokens] = torch.where(
+                    is_token_ids.unsqueeze(-1),
+                    inputs_embeds_scheduled,
+                    target,
+                )
+            else:
+                inputs_embeds_scheduled = self.model.embed_input_ids(
+                    self.input_ids.gpu[:num_scheduled_tokens],
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
 
-            # TODO(woosuk): Avoid the copy. Optimize.
-            self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
+                # TODO(woosuk): Avoid the copy. Optimize.
+                self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(
+                    inputs_embeds_scheduled
+                )
 
             input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
             model_kwargs = {
@@ -3369,7 +3457,7 @@ class GPUModelRunner(
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
-            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+            intermediate_tensors = self.sync_and_gather_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True
             )
 
@@ -4213,7 +4301,7 @@ class GPUModelRunner(
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
-            if self.use_async_scheduling and get_pp_group().world_size > 1:
+            if self.use_async_scheduling and not get_pp_group().is_last_rank:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # type: ignore[return-value]
@@ -4916,8 +5004,20 @@ class GPUModelRunner(
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
 
+                # Resolve the MoE model, unwrapping VLM wrappers if needed.
+                # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
+                # actual MoE language model but don't implement
+                # MixtureOfExperts themselves.
+                moe_candidate = self.model
+                if not is_mixture_of_experts(moe_candidate) and isinstance(
+                    moe_candidate, SupportsMultiModal
+                ):
+                    moe_candidate = moe_candidate.get_language_model()
+                if is_mixture_of_experts(moe_candidate):
+                    self._moe_model = moe_candidate
+
                 if (
-                    is_mixture_of_experts(self.model)
+                    self._moe_model is not None
                     and self.parallel_config.enable_eplb
                     and not load_dummy_weights
                 ):
@@ -4927,7 +5027,7 @@ class GPUModelRunner(
                     )
                     assert self.eplb_state is not None
                     self.eplb_state.add_model(
-                        self.model,
+                        self._moe_model,
                         self.model_config,
                     )
                     eplb_models += 1
@@ -4967,7 +5067,7 @@ class GPUModelRunner(
         )  # Temporary hack for dynamic res video w/o support for bs>1 yet
 
         if (
-            is_mixture_of_experts(self.model)
+            self._moe_model is not None
             and self.parallel_config.enable_eplb
             and not load_dummy_weights
             and self.eplb_state is not None
@@ -5031,7 +5131,10 @@ class GPUModelRunner(
         if not layer_ids:
             dflash_config = getattr(hf_config, "dflash_config", None)
             if dflash_config and isinstance(dflash_config, dict):
-                layer_ids = dflash_config.get("target_layer_ids")
+                # Add 1 to convert DFlash's aux layer id semantics
+                layer_ids = [
+                    i + 1 for i in (dflash_config.get("target_layer_ids") or [])
+                ]
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
@@ -5125,7 +5228,6 @@ class GPUModelRunner(
         if not num_prompt_logprobs_dict:
             return {}
 
-        in_progress_dict = self.input_batch.in_progress_prompt_logprobs_cpu
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
 
         # Since prompt logprobs are a rare feature, prioritize simple,
@@ -5149,14 +5251,14 @@ class GPUModelRunner(
             )
 
             # Set up target LogprobsTensors object.
-            logprobs_tensors = in_progress_dict.get(req_id)
-            if not logprobs_tensors:
+            logprobs_tensors = request.in_progress_prompt_logprobs_cpu
+            if logprobs_tensors is None:
                 # Create empty logprobs CPU tensors for the entire prompt.
                 # If chunked, we'll copy in slice by slice.
                 logprobs_tensors = LogprobsTensors.empty_cpu(
                     num_prompt_tokens - 1, num_prompt_logprobs + 1
                 )
-                in_progress_dict[req_id] = logprobs_tensors
+                request.in_progress_prompt_logprobs_cpu = logprobs_tensors
 
             # Determine number of logits to retrieve.
             start_idx = request.num_computed_tokens
@@ -5213,7 +5315,7 @@ class GPUModelRunner(
         # num_prompt_logprobs_dict.
         for req_id in completed_prefill_reqs:
             del num_prompt_logprobs_dict[req_id]
-            del in_progress_dict[req_id]
+            self.requests[req_id].in_progress_prompt_logprobs_cpu = None
 
         # Must synchronize the non-blocking GPU->CPU transfers.
         if prompt_logprobs_dict:
@@ -5514,6 +5616,9 @@ class GPUModelRunner(
                     num_scheduled_tokens, self.query_pos.np
                 )
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(
+                    cum_num_tokens[-1]
+                )
                 self.query_start_loc.copy_to_gpu()
 
                 # Sync block table CPU->GPU so cleared rows from
@@ -5578,7 +5683,7 @@ class GPUModelRunner(
                         )
                     )
 
-                intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                intermediate_tensors = self.sync_and_gather_intermediate_tensors(
                     num_tokens_padded, None, False
                 )
 

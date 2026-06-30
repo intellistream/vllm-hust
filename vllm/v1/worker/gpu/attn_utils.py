@@ -67,8 +67,8 @@ def init_attn_backend(
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
 
-        group_map: dict[tuple[tuple[str, str], KVCacheSpec], AttentionGroup] = {}
-        group_order: list[tuple[tuple[str, str], KVCacheSpec]] = []
+        group_map: dict[tuple[tuple[str, str], KVCacheSpec, int], AttentionGroup] = {}
+        group_order: list[tuple[tuple[str, str], KVCacheSpec, int]] = []
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
@@ -78,7 +78,11 @@ def init_attn_backend(
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-            key = (attn_backend.full_cls_name(), layer_kv_cache_spec)
+            # Split on per-rank num_heads_q so layers with different Q-head
+            # counts (e.g. a spec-decode draft head and its target) get separate
+            # metadata builders.
+            num_heads_q = getattr(attn_layers[layer_name], "num_heads", 0)
+            key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
             if key not in group_map:
                 group_map[key] = AttentionGroup(
                     attn_backend,
@@ -182,25 +186,21 @@ def _reshape_kv_cache(
                 for i in range(len(kv_cache_stride_order))
             ]
 
-            dtype = kv_cache_spec.dtype
-            raw_tensor = raw_tensor.view(dtype)
-            if kv_cache_spec.page_size_padded is not None:
-                # Use strided view to handle page_size_bytes that
-                # include padding. This follows the same pattern as
-                # MambaSpec handling in gpu_model_runner.py.
-                # NOTE: This assumes kv_cache_shape[0] == num_blocks
-                # (i.e. the first physical dimension is the block
-                # index), which holds for MLA backends but NOT for
-                # standard attention backends whose shape starts with
-                # a K/V dimension of size 2.
-                dtype_size = get_dtype_size(dtype)
-                page_stride = kv_cache_spec.page_size_bytes // dtype_size
-                strides = list(torch.empty(kv_cache_shape).stride())
-                strides[inv_order[0]] = page_stride
-                kv_cache = torch.as_strided(
-                    raw_tensor,
-                    size=kv_cache_shape,
-                    stride=tuple(strides),
+            if isinstance(kv_cache_spec, AttentionSpec):
+                has_attn = True
+                # Use storage_block_size: it equals block_size for uncompressed
+                # specs but is smaller for compressed ones (DeepSeek V4), which
+                # store block_size tokens in block_size // compress_ratio slots.
+                num_blocks_per_kv_block = (
+                    kv_cache_spec.storage_block_size // kernel_block_size
+                )
+                kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                kv_cache_shape = group.backend.get_kv_cache_shape(
+                    kernel_num_blocks,
+                    kernel_block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    cache_dtype_str=cache_dtype,
                 )
             else:
                 # No padding — safe to use a contiguous view.

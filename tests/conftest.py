@@ -1008,6 +1008,8 @@ class VllmRunner:
             req_sample_output_ids: list[list[int]] = []
             req_sample_output_strs: list[str] = []
             req_logprobs = []
+            if req_output.prompt_logprobs:
+                req_logprobs.extend(req_output.prompt_logprobs)
             for sample in req_output.outputs:
                 output_str = sample.text
                 output_ids = list(sample.token_ids)
@@ -1254,6 +1256,7 @@ class VllmRunner:
             # Ignore shutdown errors as cleanup will still proceed
             pass
         del self.llm
+        torch._dynamo.reset()
         cleanup_dist_env_and_memory()
 
 

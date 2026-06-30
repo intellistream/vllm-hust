@@ -295,6 +295,10 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+        # In-flight requests still prefilling (prefill chunks + in-progress
+        # async KV loads). Their remaining-block reservation gates async loads.
+        self._inflight_prefills: set[Request] = set()
+
     def _should_get_num_common_prefix_blocks(self) -> bool:
         device_config = getattr(self.vllm_config, "device_config", None)
         device_type = getattr(device_config, "device_type", None)
@@ -667,6 +671,19 @@ class Scheduler(SchedulerInterface):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
+                    # Skip request with pending mm encoding prefetches
+                    if (
+                        self.ec_connector is not None
+                        and request.mm_features
+                        and hasattr(self.ec_connector, "ensure_cache_available")
+                        and not self.ec_connector.ensure_cache_available(
+                            request, num_computed_tokens
+                        )
+                    ):
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
@@ -762,6 +779,14 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
+                reserved_blocks = 0
+                if load_kv_async:
+                    # An async load holds its blocks for the whole transfer with
+                    # no forward progress and isn't preemptible here. Admit it
+                    # only if it fits in (free - other in-flight reservations), to
+                    # avoid deadlock and predictable preemptions.
+                    reserved_blocks = self._inflight_prefill_reserved_blocks()
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -772,6 +797,7 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    reserved_blocks=reserved_blocks,
                 )
 
                 if new_blocks is None:
@@ -823,6 +849,7 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    self._inflight_prefills.add(request)
                     continue
 
                 self.running.append(request)
@@ -846,6 +873,9 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                # Only track requests that will still be prefilling after this chunk.
+                if num_computed_tokens + num_new_tokens < request.num_tokens:
+                    self._inflight_prefills.add(request)
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -975,6 +1005,7 @@ class Scheduler(SchedulerInterface):
         )
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
+        self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -1006,6 +1037,9 @@ class Scheduler(SchedulerInterface):
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
+            # Drop from the in-flight-prefill set once it's no longer prefilling.
+            if not request.is_prefill_chunk:
+                self._inflight_prefills.discard(request)
 
         # Clear the finished request IDs.
         # NOTE: We shouldn't do self.finished_req_ids.clear() here because
@@ -1845,6 +1879,7 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
@@ -1883,7 +1918,29 @@ class Scheduler(SchedulerInterface):
         return num_waiting + len(self.running)
 
     def has_finished_requests(self) -> bool:
-        return len(self.finished_req_ids) > 0
+        if self.finished_req_ids:
+            return True
+        if self.connector is None:
+            return False
+        # Finished requests waiting on delayed connector cleanup remain in
+        # self.requests after they have been removed from scheduling queues.
+        num_in_queues = (
+            len(self.waiting) + len(self.skipped_waiting) + len(self.running)
+        )
+        return len(self.requests) > num_in_queues
+
+    def has_requests(self) -> bool:
+        # Override the interface default to also keep the engine alive while a
+        # connector still has pending push work (e.g. push-mode WRITE transfers
+        # in flight after all "live" requests have finished). Without this hook
+        # the engine would quiesce before the connector can drain completions.
+        # TODO: replace with a more general mechanism for connectors to keep
+        # the scheduler alive.
+        return (
+            self.has_unfinished_requests()
+            or self.has_finished_requests()
+            or (self.connector is not None and self.connector.has_pending_push_work())
+        )
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
@@ -1933,8 +1990,16 @@ class Scheduler(SchedulerInterface):
 
     def reset_connector_cache(self) -> bool:
         if self.connector is None:
-            logger.warning("reset_connector called but no KV connector is configured.")
-            return False
+            # No connector attached -> nothing to reset, treat as success so
+            # callers that unconditionally request a connector reset (e.g. as
+            # part of a cache-clearing cascade after a weight update) don't
+            # see reset_prefix_cache() flip to False purely because they
+            # didn't configure a connector.
+            logger.debug(
+                "reset_connector requested but no KV connector is configured; "
+                "treating as no-op success."
+            )
+            return True
 
         if self.connector.reset_cache() is False:
             return False
@@ -2058,6 +2123,30 @@ class Scheduler(SchedulerInterface):
             return self.connector.request_finished(request, block_ids[0])
 
         return self.connector.request_finished_all_groups(request, block_ids)
+
+    def _request_remaining_blocks(self, request: Request) -> int:
+        """Blocks `request` still needs to allocate to hold its full sequence."""
+        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=full_num_tokens,
+            new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=request.num_computed_tokens,
+            num_tokens_main_model=full_num_tokens,
+            apply_admission_cap=True,
+        )
+
+    def _inflight_prefill_reserved_blocks(self) -> int:
+        """Blocks in-flight prefills still need to finish (their reservation).
+
+        Sums remaining full-ISL blocks over `self._inflight_prefills` (running
+        prefills + in-progress async loads). The candidate async load isn't yet
+        in the set, so it's naturally excluded.
+        """
+        return sum(
+            self._request_remaining_blocks(req) for req in self._inflight_prefills
+        )
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """

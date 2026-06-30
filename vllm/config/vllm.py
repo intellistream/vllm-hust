@@ -117,7 +117,13 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable if TP > 1 and Hopper/Blackwell and flashinfer installed."""
+    """Enable if TP > 1, PP == 1, Hopper/Blackwell, and flashinfer installed.
+
+    Gated off for PP > 1: the fused op's GPU-side peer-signal spin-wait
+    assumes byte-identical kernel launches across TP peers, but concurrent
+    independent warmup of multiple TP subgroups lets ranks pick divergent
+    FlashInfer launch configs and deadlock.
+    """
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
@@ -130,6 +136,7 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
 
     return (
         cfg.parallel_config.tensor_parallel_size > 1
+        and cfg.parallel_config.pipeline_parallel_size == 1
         and current_platform.is_cuda()
         and has_flashinfer()
         and (
@@ -473,6 +480,48 @@ class VllmConfig:
         return 0
 
     @property
+    def use_v2_model_runner(self) -> bool:
+        use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        if use_v2_model_runner is not None:
+            return use_v2_model_runner
+
+        if not self._is_default_v2_model_runner_model():
+            return False
+
+        if not HAS_TRITON:
+            logger.warning_once(
+                "Model Runner V2 requires Triton; using the V1 model runner instead."
+            )
+            return False
+
+        unsupported = self._get_v2_model_runner_unsupported_features()
+        if unsupported:
+            logger.warning_once(
+                "Model Runner V2 does not yet support %s; using the V1 model "
+                "runner instead.",
+                ", ".join(unsupported),
+            )
+            return False
+
+        return True
+
+    def _is_default_v2_model_runner_model(self) -> bool:
+        model_config = self.model_config
+        if model_config is None:
+            return False
+
+        if model_config.runner_type != "generate":
+            return False
+
+        architectures = getattr(model_config, "architectures", [])
+        if not any(
+            arch in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES for arch in architectures
+        ):
+            return False
+
+        return not model_config.is_moe and not model_config.is_quantized
+
+    @property
     def needs_dp_coordinator(self) -> bool:
         """
         Determine if the DPCoordinator process is needed.
@@ -708,6 +757,48 @@ class VllmConfig:
 
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
+
+    def _verify_kv_transfer_compat(self) -> None:
+        """Reject configurations that silently corrupt KV transfers."""
+        if (
+            self.kv_transfer_config is None
+            or self.kv_transfer_config.kv_connector is None
+        ):
+            return
+
+        # PyTorch's expandable_segments allocator uses CUDA VMM, which can
+        # remap a virtual address range to different physical pages over the
+        # engine's lifetime. KV connectors that pin KV cache memory (e.g.
+        # NixlConnector via ibv_reg_mr, MooncakeConnector) end up with their
+        # registrations pointing at stale physical pages after any remap,
+        # producing RDMA failures like IBV_WC_REM_ACCESS_ERR /
+        # NIXL_ERR_REMOTE_DISCONNECT at the first inter-node KV transfer.
+        # We can't enumerate every in-tree and out-of-tree connector that
+        # pins memory, so we conservatively reject the combination whenever
+        # any KV connector is configured.
+        #
+        # Sleep mode is exempt: CuMemAllocator.use_memory_pool toggles
+        # expandable_segments off around its pool (see #40812), so the KV
+        # cache allocated within that context lands on stable physical pages
+        # even when the env var is set.
+        if "expandable_segments:True" not in os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", ""
+        ):
+            return
+        if self.model_config is not None and self.model_config.enable_sleep_mode:
+            return
+
+        raise ValueError(
+            f"KV connector {self.kv_transfer_config.kv_connector} is "
+            "incompatible with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+            "unless enable_sleep_mode is also enabled. PyTorch's CUDA VMM "
+            "allocator can remap KV cache virtual addresses to different "
+            "physical pages, invalidating any pinned/registered KV memory "
+            "(e.g. IB memory regions registered by NIXL or Mooncake). Either "
+            "unset expandable_segments:True or enable sleep mode (which "
+            "routes KV allocations through CuMemAllocator's pool, where "
+            "expandable_segments is automatically disabled)."
+        )
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
@@ -1343,6 +1434,7 @@ class VllmConfig:
 
         # Handle the KV connector configs
         self._post_init_kv_transfer_config()
+        self._verify_kv_transfer_compat()
 
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
@@ -1819,7 +1911,24 @@ class VllmConfig:
             self.speculative_config is not None
             and self.speculative_config.method not in ("eagle", "eagle3", "mtp")
         ):
-            unsupported.append(f"speculative method '{self.speculative_config.method}'")
+            unsupported.append("sequence parallelism")
+
+        if speculative_config is not None:
+            # TODO: ngram / ngram_gpu are not supported by the v2 model runner yet
+            if speculative_config.method in ("ngram", "ngram_gpu"):
+                unsupported.append("ngram/ngram_gpu speculative decoding")
+            elif speculative_config.method not in ("eagle", "eagle3", "mtp"):
+                unsupported.append(f"speculative method '{speculative_config.method}'")
+
+            # V2 EagleSpeculator does not support parallel_drafting (required by PEagle)
+            if speculative_config.parallel_drafting:
+                unsupported.append("parallel drafting for speculative decoding")
+
+            if (
+                speculative_config.method == "eagle3"
+                and self.parallel_config.pipeline_parallel_size > 1
+            ):
+                unsupported.append("EAGLE3 with pipeline parallelism")
 
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
@@ -1842,10 +1951,23 @@ class VllmConfig:
             # Will be added by https://github.com/vllm-project/vllm/pull/38390
             unsupported.append("EC transfer")
 
+        return unsupported
+
+    def _validate_v2_model_runner(self) -> None:
+        """Check for features not yet supported by the V2 model runner."""
+        if not HAS_TRITON:
+            raise ValueError("Model Runner V2 requires Triton.")
+
+        unsupported = self._get_v2_model_runner_unsupported_features()
         if unsupported:
             raise ValueError(
-                "VLLM_USE_V2_MODEL_RUNNER does not yet support: "
-                + ", ".join(unsupported)
+                f"Model Runner V2 does not yet support: {', '.join(unsupported)}"
+            )
+
+        if self.reasoning_config is not None:
+            logger.warning_once(
+                "Model Runner V2 does not yet support the thinking_token_budget "
+                "request parameter. Set VLLM_USE_V2_MODEL_RUNNER=0 if this is required."
             )
 
     def validate_block_size(self) -> None:

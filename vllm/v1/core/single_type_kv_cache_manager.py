@@ -236,7 +236,11 @@ class SingleTypeKVCacheManager(ABC):
                 cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
             )
             req_blocks.extend(allocated_blocks)
-            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
+            if type(self.kv_cache_spec) in (
+                FullAttentionSpec,
+                TQFullAttentionSpec,
+                MLAAttentionSpec,
+            ):
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
@@ -264,7 +268,11 @@ class SingleTypeKVCacheManager(ABC):
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
-            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
+            if type(self.kv_cache_spec) in (
+                FullAttentionSpec,
+                TQFullAttentionSpec,
+                MLAAttentionSpec,
+            ):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
 
@@ -983,13 +991,11 @@ class MambaManager(SingleTypeKVCacheManager):
             num_required_blocks = (
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
-            if num_required_blocks == len(req_blocks):
+            # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
+            # over-allocated at last round.
+            if num_required_blocks <= len(req_blocks):
                 return []
             else:
-                assert num_required_blocks > len(req_blocks), (
-                    "num_required_blocks "
-                    f"{num_required_blocks} < len(req_blocks) {len(req_blocks)}"
-                )
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
                 # Record the last state block

@@ -188,6 +188,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "trtllm"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
+    VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
     VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
@@ -257,6 +258,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
+    VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
     VLLM_ENABLE_CUDA_COMPATIBILITY: bool = False
@@ -1360,6 +1362,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of 512 MB should be enough for roughly 1000 JSON schemas.
     # It can be changed with this variable if needed for some reason.
     "VLLM_XGRAMMAR_CACHE_MB": lambda: int(os.getenv("VLLM_XGRAMMAR_CACHE_MB", "512")),
+    # Maximum time in seconds allowed for regex compilation in structured
+    # output backends (xgrammar, outlines). Prevents ReDoS attacks where
+    # adversarial patterns cause exponential DFA state-space explosion.
+    # Set to 0 to disable the timeout (not recommended in production).
+    "VLLM_REGEX_COMPILATION_TIMEOUT_S": lambda: int(
+        os.getenv("VLLM_REGEX_COMPILATION_TIMEOUT_S", "5")
+    ),
     # Control the threshold for msgspec to use 'zero copy' for
     # serialization/deserialization of tensors. Tensors below
     # this limit will be encoded into the msgpack buffer, and
@@ -1738,6 +1747,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable using UVA (Unified Virtual Addressing) for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA": lambda: bool(
         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_UVA", "0"))
+    ),
+    # On WSL2 with a compatible kernel (>= 4.19.121), pinned memory is
+    # supported but disabled by default due to a small performance regression.
+    # Set to 1 when pinned memory or UVA is required (e.g. CPU offloading
+    # or v2 model runner).
+    "VLLM_WSL2_ENABLE_PIN_MEMORY": lambda: bool(
+        int(os.getenv("VLLM_WSL2_ENABLE_PIN_MEMORY", "0"))
     ),
     # Disable logging of vLLM logo at server startup time.
     "VLLM_DISABLE_LOG_LOGO": lambda: bool(int(os.getenv("VLLM_DISABLE_LOG_LOGO", "0"))),
