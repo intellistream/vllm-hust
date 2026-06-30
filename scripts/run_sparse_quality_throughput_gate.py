@@ -100,7 +100,16 @@ def parse_args() -> argparse.Namespace:
 
     generation = parser.add_argument_group("generation throughput")
     generation.add_argument("--num-prompts", type=int, default=1)
-    generation.add_argument("--warmup-prompts", type=int, default=0)
+    generation.add_argument(
+        "--warmup-prompts",
+        type=int,
+        default=1,
+        help=(
+            "Prompts used to warm dense and sparse runs before timed "
+            "generation. A sparse warmup also records marker evidence before "
+            "marker env vars are disabled for timing."
+        ),
+    )
     generation.add_argument("--input-len", type=int, default=128)
     generation.add_argument("--output-len", type=int, default=128)
     generation.add_argument("--seed", type=int, default=0)
@@ -127,6 +136,17 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--shutdown-timeout", type=int, default=60)
     runtime.add_argument("--trust-remote-code", action="store_true")
     runtime.add_argument("--dry-run", action="store_true")
+    runtime.add_argument(
+        "--sparse-linear-policy",
+        choices=["auto", "all", "none"],
+        default=None,
+        help=(
+            "Optional VLLM_SPARSE_GEMV_LINEAR_POLICY override shared by the "
+            "PPL and throughput child processes. Use 'all' when forced-decode "
+            "PPL batches multiple decode rows but the Ascend sparse op should "
+            "still be required and marker-checked."
+        ),
+    )
 
     gate = parser.add_argument_group("gate thresholds")
     gate.add_argument("--max-ppl-ratio", type=float, default=1.05)
@@ -327,10 +347,12 @@ def build_throughput_command(args: argparse.Namespace, output_path: Path) -> lis
     return command
 
 
-def run_command(command: list[str]) -> int:
+def run_command(command: list[str], args: argparse.Namespace) -> int:
     print("+ " + " ".join(command), flush=True)
     env = os.environ.copy()
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if args.sparse_linear_policy is not None:
+        env["VLLM_SPARSE_GEMV_LINEAR_POLICY"] = args.sparse_linear_policy
     completed = subprocess.run(command, check=False, env=env)
     return completed.returncode
 
@@ -454,6 +476,12 @@ def validate_ppl_result(
         args.target_projection,
         setup_projections,
     )
+    if setup.get("vllm_sparse_linear_policy") != args.sparse_linear_policy:
+        failures.append(
+            "PPL sparse linear policy mismatch: "
+            f"expected {args.sparse_linear_policy}, "
+            f"got {setup.get('vllm_sparse_linear_policy')}"
+        )
 
     ppl_ratio = vllm.get("ppl_ratio")
     delta_nll = vllm.get("delta_nll")
@@ -520,6 +548,12 @@ def validate_throughput_result(
         args.target_projection,
         data.get("target_projections"),
     )
+    if data.get("sparse_linear_policy") != args.sparse_linear_policy:
+        failures.append(
+            "throughput sparse linear policy mismatch: "
+            f"expected {args.sparse_linear_policy}, "
+            f"got {data.get('sparse_linear_policy')}"
+        )
 
     output_speedup = data.get("output_token_speedup")
     total_speedup = data.get("total_token_speedup")
@@ -565,6 +599,7 @@ def summary_payload(
         "target_projections": args.target_projection,
         "vllm_prefill_sparsify": args.vllm_prefill_sparsify,
         "vllm_score_mode": args.vllm_score_mode,
+        "sparse_linear_policy": args.sparse_linear_policy,
         "max_ppl_ratio": args.max_ppl_ratio,
         "max_delta_nll": args.max_delta_nll,
         "min_total_token_speedup": args.min_total_token_speedup,
@@ -608,8 +643,8 @@ def main() -> int:
     throughput_returncode: int | None = None
 
     if not args.dry_run:
-        ppl_returncode = run_command(ppl_command)
-        throughput_returncode = run_command(throughput_command)
+        ppl_returncode = run_command(ppl_command, args)
+        throughput_returncode = run_command(throughput_command, args)
 
     failures: list[str] = []
     if args.dry_run:

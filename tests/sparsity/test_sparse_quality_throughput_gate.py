@@ -62,6 +62,7 @@ def _args(tmp_path: Path) -> SimpleNamespace:
         vllm_enforce_eager=True,
         shutdown_timeout=30,
         trust_remote_code=False,
+        sparse_linear_policy=None,
         max_ppl_ratio=1.05,
         max_delta_nll=None,
         min_total_token_speedup=0.0,
@@ -161,6 +162,31 @@ def test_gate_rejects_mismatched_projection(tmp_path: Path) -> None:
     _, failures = validate_ppl_result(ppl, args)
 
     assert any("target projections mismatch" in failure for failure in failures)
+
+
+def test_gate_rejects_mismatched_sparse_linear_policy(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+    args.sparse_linear_policy = "all"
+    ppl = {
+        "setup": {
+            "model": args.model,
+            "sparsity": args.sparsity,
+            "vllm_prefill_sparsify": "none",
+            "vllm_score_mode": "forced_decode_next_token",
+            "vllm_target_layers": [0, 26],
+            "vllm_target_projections": ["mlp.gate_up"],
+            "vllm_sparse_linear_policy": "auto",
+        },
+        "vllm": {
+            "ppl_ratio": 1.01,
+            "delta_nll": 0.01,
+            "sparse_kernel_markers": _markers(),
+        },
+    }
+
+    _, failures = validate_ppl_result(ppl, args)
+
+    assert any("sparse linear policy mismatch" in failure for failure in failures)
 
 
 def test_gate_rejects_missing_decode_marker_shape(tmp_path: Path) -> None:

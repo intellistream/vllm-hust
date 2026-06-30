@@ -1572,6 +1572,9 @@ def main() -> int:
                 "vllm_sparse_gemv_min_sparsity": (
                     args.vllm_sparse_gemv_min_sparsity
                 ),
+                "vllm_sparse_linear_policy": os.environ.get(
+                    "VLLM_SPARSE_GEMV_LINEAR_POLICY"
+                ),
                 "histogram_path": str(histogram_path),
                 "vllm_calibration_path": str(calibration_path),
             },
