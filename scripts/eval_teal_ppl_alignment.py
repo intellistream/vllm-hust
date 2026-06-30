@@ -200,13 +200,18 @@ def parse_args() -> argparse.Namespace:
     )
     backends.add_argument(
         "--vllm-score-mode",
-        choices=["prompt_logprobs", "decode_next_token"],
+        choices=[
+            "prompt_logprobs",
+            "decode_next_token",
+            "forced_decode_next_token",
+        ],
         default="prompt_logprobs",
         help=(
             "vLLM PPL scoring path. prompt_logprobs scores target tokens "
-            "during prefill. decode_next_token scores each target as a "
-            "one-token decode step using logprob_token_ids, matching "
-            "prefill_sparsify=none generation checks."
+            "during prefill. decode_next_token scores the first generated "
+            "token after each prefix. forced_decode_next_token forces a "
+            "one-token teacher bridge, then scores the following generated "
+            "decode token, matching prefill_sparsify=none generation checks."
         ),
     )
     backends.add_argument(
@@ -1006,6 +1011,102 @@ def score_vllm_decode_next_token_windows(
     )
 
 
+def score_vllm_forced_decode_next_token_windows(
+    llm: Any,
+    windows: list[list[int]],
+    window_size: int,
+    desc: str,
+) -> PPLStats:
+    """Score target tokens from unmasked generated-token decode logits.
+
+    A normal ``max_tokens=1`` generation returns the prompt's next-token logits,
+    so it does not exercise vLLM's generated-token decode path. For target token
+    ``x[i]``, this scorer uses ``x[:i-1]`` as the prompt, forces ``x[i-1]`` as
+    the first generated bridge token, and reads the logprob of ``x[i]`` from the
+    second generated token. Only the bridge token is masked; the scored token's
+    logits are left unmodified.
+    """
+    from vllm import SamplingParams
+    from vllm.sparsity.logits_processors import FORCE_FIRST_TOKEN_EXTRA_ARG
+
+    nlls: list[float] = []
+    weighted_nll_sum = 0.0
+    token_count = 0
+    for window in tqdm(windows, desc=desc):
+        start = target_start(len(window), window_size)
+        prompts: list[dict[str, list[int]]] = []
+        sampling_params: list[Any] = []
+        targets: list[int] = []
+        for position in range(start, len(window)):
+            if position <= 1:
+                continue
+            bridge_token = int(window[position - 1])
+            target = int(window[position])
+            prompts.append({"prompt_token_ids": window[: position - 1]})
+            targets.append(target)
+            sampling_params.append(
+                SamplingParams(
+                    temperature=0.0,
+                    max_tokens=2,
+                    ignore_eos=True,
+                    logprob_token_ids=[target],
+                    detokenize=False,
+                    extra_args={FORCE_FIRST_TOKEN_EXTRA_ARG: bridge_token},
+                )
+            )
+        if not prompts:
+            continue
+
+        outputs = llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=False,
+        )
+        if len(outputs) != len(targets):
+            raise RuntimeError(
+                f"vLLM returned {len(outputs)} outputs for "
+                f"{len(targets)} forced decode scoring prompts."
+            )
+
+        nll = 0.0
+        count = 0
+        for output, target in zip(outputs, targets):
+            if not output.outputs:
+                raise RuntimeError("vLLM returned no decode output.")
+            logprobs = output.outputs[0].logprobs
+            if not logprobs or len(logprobs) < 2:
+                raise RuntimeError(
+                    "vLLM did not return the second-step decode logprobs."
+                )
+            entry = logprobs[1]
+            item = entry.get(target)
+            if item is None:
+                raise KeyError(
+                    f"Target token id {target} missing from forced decode "
+                    "logprobs."
+                )
+            nll -= float(item.logprob)
+            count += 1
+
+        window_nll = nll / count
+        nlls.append(window_nll)
+        weighted_nll_sum += nll
+        token_count += count
+
+    if not nlls or token_count == 0:
+        raise ValueError("No forced decode PPL targets were scored.")
+    mean_nll = sum(nlls) / len(nlls)
+    token_weighted_nll = weighted_nll_sum / token_count
+    return PPLStats(
+        nll=mean_nll,
+        ppl=math.exp(mean_nll),
+        token_weighted_nll=token_weighted_nll,
+        token_weighted_ppl=math.exp(token_weighted_nll),
+        windows=len(nlls),
+        tokens=token_count,
+    )
+
+
 def build_vllm(
     args: argparse.Namespace,
     activation_sparsity_config: dict[str, Any] | None,
@@ -1021,6 +1122,10 @@ def build_vllm(
         "enforce_eager": args.vllm_enforce_eager,
         "shutdown_timeout": args.vllm_shutdown_timeout,
     }
+    if args.vllm_score_mode == "forced_decode_next_token":
+        kwargs["logits_processors"] = [
+            "vllm.sparsity.logits_processors:ForceFirstTokenLogitsProcessor",
+        ]
     if activation_sparsity_config is not None:
         kwargs["activation_sparsity_config"] = activation_sparsity_config
     return LLM(**kwargs)
@@ -1204,6 +1309,8 @@ def run_vllm_reference(
     score_fn = (
         score_vllm_decode_next_token_windows
         if args.vllm_score_mode == "decode_next_token"
+        else score_vllm_forced_decode_next_token_windows
+        if args.vllm_score_mode == "forced_decode_next_token"
         else score_vllm_windows
     )
     dense_llm = build_vllm(args, None)
