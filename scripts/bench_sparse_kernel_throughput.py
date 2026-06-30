@@ -75,6 +75,16 @@ def parse_args() -> argparse.Namespace:
             "token buffer is much larger than the measured request."
         ),
     )
+    parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Optional fixed KV cache memory budget passed to vLLM. This skips "
+            "vLLM's memory-profiling calculation, which can be noisy on shared "
+            "Ascend hosts."
+        ),
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--shutdown-timeout", type=int, default=60)
     parser.add_argument("--vllm-prefill-sparsify", default="none")
@@ -263,6 +273,8 @@ def build_llm(
         kwargs["activation_sparsity_config"] = activation_sparsity_config
     if args.max_num_batched_tokens is not None:
         kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.kv_cache_memory_bytes is not None:
+        kwargs["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
     return LLM(**kwargs)
 
 
