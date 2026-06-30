@@ -141,6 +141,11 @@ class KVConnectorFactory:
         connector_cls, _ = cls._get_connector_class_with_compat(kv_transfer_config)
         return connector_cls
 
+    @classmethod
+    def supports_hma_config(cls, kv_transfer_config: "KVTransferConfig") -> bool:
+        connector_cls = cls.get_connector_class(kv_transfer_config)
+        return supports_hma(connector_cls)
+
 
 # Register various connectors here.
 # The registration should not be done in each individual file, as we want to

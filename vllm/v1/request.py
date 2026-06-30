@@ -141,6 +141,10 @@ class Request:
         # Used in forced preemption (reset_prefix_cache) with async scheduling.
         self.discard_latest_async_tokens = False
 
+        # V2+PP+async: Enforces `pp_size` cadence between same-request decode steps
+        # so the worker's broadcast slot ring stays consistent.
+        self.next_decode_eligible_step = 0
+
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt

@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
 )
@@ -231,8 +232,10 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
+            scheduler_block_size=self.block_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
+            watermark=self.scheduler_config.watermark,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -242,7 +245,14 @@ class Scheduler(SchedulerInterface):
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
-        self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+        # cadence (`next_decode_eligible_step`).
+        self.current_step = 0
+        # DP prefill balancing: Flag to track whether the last cadence-aligned
+        # prefill batch fully drained the waiting queue. Prefill throttling
+        # is disabled in this case.
+        self.prefill_capacity_bound = False
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -374,7 +384,8 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -409,6 +420,12 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
+        # all prefill compute unless saturated.
+        defer_prefills = (
+            throttle_prefills and not self.prefill_capacity_bound
+        ) and any(not r.is_prefill_chunk for r in self.running)
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -427,6 +444,18 @@ class Scheduler(SchedulerInterface):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
                 # partial draft tokens since this prevents uniform decode optimizations.
+                req_index += 1
+                continue
+
+            if self.current_step < request.next_decode_eligible_step:
+                # V2+PP+async: enforce `pp_size` steps between same-req decodes
+                # to match worker-side sampled-tokens broadcast slot ring cadence.
+                req_index += 1
+                continue
+
+            if defer_prefills and request.is_prefill_chunk:
+                # DP prefill balancing: defer this in-progress prefill chunk to a
+                # cadence-aligned step; decodes still run to fill this step.
                 req_index += 1
                 continue
 
@@ -707,6 +736,11 @@ class Scheduler(SchedulerInterface):
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
+                elif defer_prefills and request.num_computed_tokens == 0:
+                    # DP prefill balancing: async KV loads (the branch above) are
+                    # allowed to start even on throttled steps, but committing new
+                    # prefill compute is deferred to a cadence-aligned step.
+                    break
                 else:
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
@@ -798,6 +832,7 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
+                    has_scheduled_reqs=bool(self.running),
                 )
 
                 if new_blocks is None:
@@ -895,6 +930,11 @@ class Scheduler(SchedulerInterface):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+
+            # DP prefill balancing: on a step that admitted prefills (release),
+            # record whether it was capacity-bound.
+            if not defer_prefills:
+                self.prefill_capacity_bound = bool(self.waiting)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1190,21 +1230,22 @@ class Scheduler(SchedulerInterface):
         # trackers for accounting at the encoder input level.
         mm_hashes_to_schedule = set()
         num_embeds_to_schedule = 0
-        for i, mm_feature in enumerate(mm_features):
+
+        lo, hi = get_mm_features_in_window(
+            mm_features,
+            start=num_computed_tokens,
+            end=num_computed_tokens + num_new_tokens + shift_computed_tokens,
+        )
+        # For encoder-decoder, all inputs sit at start_pos=0, so lo=0 always.
+        if self.is_encoder_decoder:
+            lo = 0
+
+        for i in range(lo, hi):
+            mm_feature = mm_features[i]
             start_pos = mm_feature.mm_position.offset
             num_encoder_tokens = mm_feature.mm_position.length
             num_encoder_embeds = mm_feature.mm_position.get_num_embeds()
             item_identifier = mm_feature.identifier
-
-            # The encoder output is needed if the two ranges overlap:
-            # [num_computed_tokens, num_computed_tokens + num_new_tokens) and
-            # [start_pos, start_pos + num_encoder_tokens)
-            if (
-                start_pos
-                >= num_computed_tokens + num_new_tokens + shift_computed_tokens
-            ):
-                # The encoder input is not needed in this step.
-                break
 
             if self.is_encoder_decoder and num_computed_tokens > 0:
                 assert start_pos == 0, (
@@ -1220,10 +1261,6 @@ class Scheduler(SchedulerInterface):
                 # inputs before running the decoder.  Once we've calculated some
                 # decoder tokens (num_computed_tokens > 0), then we know we
                 # already calculated encoder inputs and can skip here.
-                continue
-            elif start_pos + num_encoder_tokens <= num_computed_tokens:
-                # The encoder input is already computed and stored
-                # in the decoder's KV cache.
                 continue
 
             if item_identifier in mm_hashes_to_schedule:
@@ -2138,12 +2175,8 @@ class Scheduler(SchedulerInterface):
         )
 
     def _inflight_prefill_reserved_blocks(self) -> int:
-        """Blocks in-flight prefills still need to finish (their reservation).
+        """Num blocks in-flight prefills still need to finish (their reservation)."""
 
-        Sums remaining full-ISL blocks over `self._inflight_prefills` (running
-        prefills + in-progress async loads). The candidate async load isn't yet
-        in the set, so it's naturally excluded.
-        """
         return sum(
             self._request_remaining_blocks(req) for req in self._inflight_prefills
         )
