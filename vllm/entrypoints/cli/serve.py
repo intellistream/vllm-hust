@@ -277,6 +277,7 @@ def run_multi_api_server(args: argparse.Namespace):
     # Per-API-server ports are picked by the kernel at each child's bind()
     # to avoid parent-probe vs child-bind TOCTOU; Rust front-end opts out
     # because it has no port-report-back channel.
+    rust_frontend_path = None
     addresses = get_engine_zmq_addresses(
         vllm_config,
         num_api_servers,

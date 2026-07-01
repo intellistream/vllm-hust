@@ -51,7 +51,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -426,6 +426,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ) + spec.num_speculative_blocks
             max_num_blocks_per_group.append(max_num_blocks)
 
+        self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
+            self.kv_cache_config, self.vllm_config, self.device
+        )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
@@ -947,10 +950,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
-        max_seq_len_np = None
-        if self.use_pp:
-            # max_seq_len is only consumed by the PP `compute_need_sampled_mask`
-            max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -1067,8 +1066,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.model_state.postprocess_state(idx_mapping, num_sampled)
-
-        self.model_state.postprocess_state(input_batch, num_sampled)
 
     @torch.inference_mode()
     def execute_model(

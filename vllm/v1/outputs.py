@@ -109,6 +109,45 @@ class LogprobsTensors(NamedTuple):
         )
 
 
+class RoutedExpertsLists(NamedTuple):
+    """CPU-side routed experts, the form :meth:`RoutedExpertsManager.store_batch`
+    consumes.
+
+    Batched per scheduler step: the leading dim is the number of tokens
+    scheduled across all requests in this step (``total_num_scheduled_tokens``),
+    not per-request tokens. ``slot_mapping[i]`` tells the scheduler which
+    physical KV-cache slot row ``i`` of ``routing_data`` belongs to.
+    """
+
+    # (num_scheduled_tokens, num_layers, num_experts_per_tok)
+    routing_data: np.ndarray
+    # (num_scheduled_tokens,)
+    slot_mapping: np.ndarray
+
+
+class RoutedExpertsTensors(NamedTuple):
+    """Device-side snapshot of routed experts data, pending async D2H.
+
+    Produced by :class:`GPUModelRunner` at the end of each async-scheduled
+    step. The copy stream waits on the default stream, then issues
+    non-blocking D2H via :meth:`to_cpu_nonblocking` into a pinned CPU
+    buffer; :class:`AsyncGPUModelRunnerOutput.get_output` synchronizes
+    the copy before the scheduler reads it.
+
+    Sliced to ``total_num_scheduled_tokens`` (step-level, across all
+    requests — NOT per-request). Both ``routing_data`` and
+    ``slot_mapping`` must be private clones when sourced from shared
+    capturer / prepare-input buffers, so the next forward pass /
+    ``_prepare_inputs`` on the default stream does not race with a
+    D2H still pending on the copy stream.
+    """
+
+    # (num_scheduled_tokens, num_layers, num_experts_per_tok)
+    routing_data: torch.Tensor
+    # (num_scheduled_tokens,)
+    slot_mapping: torch.Tensor
+
+
 # [num_reqs, <dynamic>]
 # The shape of each element depends on the pooler used
 PoolerOutput: TypeAlias = torch.Tensor | list[torch.Tensor] | list[torch.Tensor | None]

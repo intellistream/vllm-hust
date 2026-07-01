@@ -104,8 +104,8 @@ class WhisperModelState(ModelState):
         else:
             encoder_outputs: list[torch.Tensor] = []
             for req_id in input_batch.req_ids:
-                req_idx = req_states.req_id_to_index[req_id]
-                num_computed_tokens = req_states.num_computed_tokens_np[req_idx]
+                req_idx = self.req_states.req_id_to_index[req_id]
+                num_computed_tokens = self.req_states.num_computed_tokens_np[req_idx]
                 if num_computed_tokens > 0:
                     continue
 

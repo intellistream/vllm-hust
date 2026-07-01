@@ -36,7 +36,6 @@ from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
-from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 from vllm.v1.utils import record_function_or_nullcontext
@@ -450,7 +449,5 @@ class LLMEngine:
             if callable(stateless_destroy_torch_distributed_process_group):
                 stateless_destroy_torch_distributed_process_group(dp_group)
             self.dp_group = cast(Any, None)
-
-    def __del__(self):
         with suppress(Exception):
             self.shutdown()
