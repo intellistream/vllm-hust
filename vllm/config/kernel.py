@@ -117,6 +117,7 @@ MoEBackend = Literal[
     "flashinfer_trtllm",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
+    "flashinfer_b12x",
     "marlin",
     "aiter",
     "emulation",
@@ -140,13 +141,15 @@ class KernelConfig:
     """Backend for MoE expert computation kernels. Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
-    - "triton": Use Triton-based fused MoE kernels 
+    - "triton": Use Triton-based fused MoE kernels
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
+    - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
+      (RTX Pro 6000 / DGX Spark)
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "aiter": Use AMD AITer kernels (ROCm only)
     - "emulation": use BF16/FP16 GEMM, dequantizing weights and

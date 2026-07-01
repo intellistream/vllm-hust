@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -13,9 +14,31 @@ from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
-from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.model_states.interface import (
+    ModelSpecificAttnMetadata,
+    ModelState,
+)
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
+
+@dataclass
+class WhisperAttnMetadata(ModelSpecificAttnMetadata):
+    encoder_seq_lens: dict[int, tuple[torch.Tensor, np.ndarray]]
+
+    def get_extra_common_attn_kwargs(
+        self,
+        kv_cache_group_id: int,
+        num_reqs: int,
+    ) -> dict[str, Any]:
+        encoder_seq_lens = self.encoder_seq_lens.get(kv_cache_group_id)
+        if encoder_seq_lens is None:
+            return {}
+        encoder_seq_lens_gpu, encoder_seq_lens_cpu = encoder_seq_lens
+        return {
+            "encoder_seq_lens": encoder_seq_lens_gpu[:num_reqs],
+            "encoder_seq_lens_cpu": encoder_seq_lens_cpu[:num_reqs],
+        }
 
 
 class WhisperModelState(ModelState):
@@ -127,8 +150,10 @@ class WhisperModelState(ModelState):
         else:
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
-        encoder_seq_lens = self._get_encoder_seq_lens(
-            input_batch.req_ids, attn_groups, for_capture
+        whisper_attn_metadata = WhisperAttnMetadata(
+            self._get_encoder_seq_lens(
+                input_batch.req_ids, attn_groups, for_capture, num_reqs
+            )
         )
 
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
@@ -152,7 +177,8 @@ class WhisperModelState(ModelState):
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
-            encoder_seq_lens=encoder_seq_lens,
+            model_specific_attn_metadata=whisper_attn_metadata,
+            for_cudagraph_capture=for_capture,
         )
         return attn_metadata
 
@@ -161,8 +187,8 @@ class WhisperModelState(ModelState):
         req_ids: list[str],
         attn_groups: list[list[AttentionGroup]],
         for_capture: bool,
+        num_reqs: int,
     ) -> dict[int, tuple[torch.Tensor, np.ndarray]]:
-        num_reqs = len(req_ids)
         encoder_seq_lens_np = np.zeros(num_reqs, dtype=np.int32)
         if not for_capture:
             # During normal execution, use actual encoder lengths.

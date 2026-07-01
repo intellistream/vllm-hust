@@ -101,6 +101,13 @@ pre-commit run ruff-check --all-files
 pre-commit run mypy-3.10 --all-files --hook-stage manual
 ```
 
+<<<<<<< HEAD
+=======
+The line length limit for Python code is 88 characters. If you are not sure, use pre-commit to check.
+
+Use [Google-style docstrings](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings) (`Args:`/`Returns:`/`Raises:` sections), not reStructuredText/Sphinx fields (`:param:`, `:return:`, `:rtype:`).
+
+>>>>>>> a80af2435 (Speed up docs build (#44635))
 ### Commit messages
 
 Add attribution using commit trailers such as `Co-authored-by:` (other projects use `Assisted-by:` or `Generated-by:`). For example:
