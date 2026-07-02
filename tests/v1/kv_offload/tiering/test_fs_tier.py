@@ -16,12 +16,12 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
-
-from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
 from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
+
+from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
 
 # ---------------------------------------------------------------------------
 # Helpers

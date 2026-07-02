@@ -11,7 +11,8 @@ import torch.nn.functional as F
 try:
     from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 except ImportError:
-    from typing import Any, Callable, TypeVar
+    from collections.abc import Callable
+    from typing import Any, TypeVar
 
     _F = TypeVar("_F", bound=Callable[..., Any])
 

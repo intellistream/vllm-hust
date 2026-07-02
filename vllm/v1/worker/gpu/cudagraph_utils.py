@@ -4,7 +4,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import product
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn as nn

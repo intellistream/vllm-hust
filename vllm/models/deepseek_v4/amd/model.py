@@ -7,6 +7,11 @@ from itertools import islice
 import regex as re
 import torch
 import torch.nn as nn
+from vllm.models.deepseek_v4.attention import (
+    DeepseekV4Indexer,
+    DeepseekV4MLAModules,
+    DeepseekV4MultiHeadLatentAttentionWrapper,
+)
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -45,11 +50,6 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
-)
-from vllm.models.deepseek_v4.attention import (
-    DeepseekV4Indexer,
-    DeepseekV4MLAModules,
-    DeepseekV4MultiHeadLatentAttentionWrapper,
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors

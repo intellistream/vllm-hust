@@ -80,7 +80,7 @@ def main(args: Namespace):
             clear_line(num_printed_lines)
             num_printed_lines = 0
             for i, line in enumerate(h):
-                num_printed_lines += 1
+                num_printed_lines += 1  # noqa: SIM113
                 print(f"Beam candidate {i}: {line!r}", flush=True)
     else:
         output = get_response(response)

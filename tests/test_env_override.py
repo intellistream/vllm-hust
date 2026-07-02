@@ -46,13 +46,15 @@ class TestAscendRuntimePath:
             ),
             patch(
                 "vllm.env_override.os.path.isdir",
-                side_effect=lambda path: path
-                in {
-                    driver_lib64,
-                    driver_driver_lib64,
-                    driver_tools,
-                }
-                or real_isdir(path),
+                side_effect=lambda path: (
+                    path
+                    in {
+                        driver_lib64,
+                        driver_driver_lib64,
+                        driver_tools,
+                    }
+                    or real_isdir(path)
+                ),
             ),
         ):
             env_override._maybe_set_ascend_runtime_path()
