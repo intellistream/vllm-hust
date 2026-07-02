@@ -444,6 +444,7 @@ class LLMEngine:
                 module.cleanup()
 
     def shutdown(self, timeout: float | None = None) -> None:
+        from vllm.v1.metrics.prometheus import shutdown_prometheus  # noqa: F811
         if callable(shutdown_prometheus):
             shutdown_prometheus()
 

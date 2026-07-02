@@ -151,7 +151,7 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
-        self.scheduler.available_kv_cache_memory_bytes = (
+        self.scheduler.available_kv_cache_memory_bytes = (  # type: ignore[attr-defined]
             self.available_gpu_memory_for_kv_cache
             if self.available_gpu_memory_for_kv_cache >= 0
             else None

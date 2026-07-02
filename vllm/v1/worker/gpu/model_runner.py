@@ -186,7 +186,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
-                self.speculator = init_speculator( self.device)
+                self.speculator = init_speculator(self.vllm_config, self.device)
 
             if self.speculative_config.method == "eagle3":
                 # EAGLE3 may require auxiliary hidden states from target model outputs.
@@ -426,7 +426,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_blocks_per_group.append(max_num_blocks)
 
         self.attn_backends, self.attn_groups, attn_cg_support = init_attn_backend(
-            self.kv_cache_config,  self.device
+            self.kv_cache_config, self.vllm_config, self.device
         )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -473,7 +473,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.device,
             self.cache_config.cache_dtype,
         )
-        self.kv_connector = get_kv_connector( kv_caches_dict)
+        self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -963,7 +963,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_computed_tokens_np=self.req_states.num_computed_tokens.np[idx_mapping_np],
             prefill_len_np=self.req_states.prefill_len.np[idx_mapping_np],
             num_computed_prefill_tokens_np=self.req_states.num_computed_prefill_tokens[idx_mapping_np],
-            max_seq_len_np=self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None,  # type: ignore[arg-type]
+            max_seq_len_np=(
+                self.req_states.max_seq_len[idx_mapping_np]
+                if self.use_pp else None
+            ),
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             logits_indices=logits_indices,
@@ -1242,6 +1245,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             with set_forward_context(
                 attn_metadata,
+                self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
                 num_tokens_across_dp=num_tokens_across_dp,
@@ -1315,7 +1319,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            return ModelRunnerOutput(req_ids=[], req_id_to_index={}, kv_connector_output=kv_connector_output)
+            return ModelRunnerOutput(
+                req_ids=[], req_id_to_index={}, kv_connector_output=kv_connector_output
+            )
 
         # Last rank: sample tokens
         sampler_output, num_sampled, num_rejected = self.sample(
@@ -1449,7 +1455,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
-            return ModelRunnerOutput(req_ids=[], req_id_to_index={}, kv_connector_output=kv_connector_output)
+            return ModelRunnerOutput(
+                req_ids=[], req_id_to_index={}, kv_connector_output=kv_connector_output
+            )
 
         assert self.pooling_runner is not None
         pooler_output, is_valid = self.pooling_runner.pool(

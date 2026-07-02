@@ -182,7 +182,7 @@ class ServingTokens(OpenAIServing):
         # not set it, matching the OpenAI-compat endpoints. ``SamplingParams``
         # defaults ``max_tokens`` to 16, which would otherwise silently cap
         # every generation that omits the field.
-        if not request.is_sampling_param_provided("max_tokens"):
+        if not request.is_sampling_param_provided("max_tokens"):  # type: ignore[attr-defined]
             sampling_params.max_tokens = get_max_tokens(
                 max_model_len=self.model_config.max_model_len,
                 max_tokens=None,
