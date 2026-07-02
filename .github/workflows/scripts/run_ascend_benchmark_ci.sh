@@ -1142,11 +1142,11 @@ case "$BENCH_SCENARIO" in
     )
     ;;
   sharegpt-online)
-    if [[ -z "$BENCH_DATASET_PATH" ]]; then
+    if [[ "$SAME_SPEC_BENCHMARK_ENABLED" != "1" && -z "$BENCH_DATASET_PATH" ]]; then
       echo "BENCH_DATASET_PATH is required for sharegpt-online" >&2
       exit 2
     fi
-    if [[ -z "$BENCH_CONSTRAINTS_FILE" ]]; then
+    if [[ "$SAME_SPEC_BENCHMARK_ENABLED" != "1" && -z "$BENCH_CONSTRAINTS_FILE" ]]; then
       echo "BENCH_CONSTRAINTS_FILE is required for sharegpt-online" >&2
       exit 2
     fi
@@ -1154,7 +1154,11 @@ case "$BENCH_SCENARIO" in
     EFFECTIVE_DATASET_PATH="$BENCH_DATASET_PATH"
     EFFECTIVE_INPUT_LEN=${BENCH_INPUT_LEN:-1024}
     EFFECTIVE_OUTPUT_LEN=${BENCH_OUTPUT_LEN:-256}
-    EFFECTIVE_CONSTRAINTS_FILE="$BENCH_CONSTRAINTS_FILE"
+    if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then
+      EFFECTIVE_CONSTRAINTS_FILE=$SAME_SPEC_CONSTRAINTS_FILE
+    else
+      EFFECTIVE_CONSTRAINTS_FILE="$BENCH_CONSTRAINTS_FILE"
+    fi
     bench_args=(
       --backend vllm
       --endpoint /v1/completions
@@ -1213,7 +1217,7 @@ else
   fi
 fi
 
-if [[ "$BENCH_SCENARIO" == "random-online" && "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then
+if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then
   run_same_spec_current_benchmark
 else
   start_server

@@ -40,3 +40,29 @@ def test_benchmark_snapshot_sync_explains_missing_write_credentials():
     assert "VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY" in text
     assert "VLLM_HUST_BENCHMARK_GH_TOKEN" in text
     assert "Benchmark repo publish target:" in text
+
+
+def test_same_spec_benchmark_is_not_limited_to_random_online():
+    text = script_text("run_ascend_benchmark_ci.sh")
+
+    assert 'if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then' in text
+    assert (
+        'if [[ "$BENCH_SCENARIO" == "random-online" && '
+        '"$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'
+        not in text
+    )
+
+
+def test_sharegpt_same_spec_does_not_require_manual_dataset_inputs():
+    text = script_text("run_ascend_benchmark_ci.sh")
+    sharegpt_block = text[text.index("  sharegpt-online)") : text.index("  *)")]
+
+    assert (
+        'if [[ "$SAME_SPEC_BENCHMARK_ENABLED" != "1" && '
+        '-z "$BENCH_DATASET_PATH" ]]; then'
+    ) in sharegpt_block
+    assert (
+        'if [[ "$SAME_SPEC_BENCHMARK_ENABLED" != "1" && '
+        '-z "$BENCH_CONSTRAINTS_FILE" ]]; then'
+    ) in sharegpt_block
+    assert "EFFECTIVE_CONSTRAINTS_FILE=$SAME_SPEC_CONSTRAINTS_FILE" in sharegpt_block

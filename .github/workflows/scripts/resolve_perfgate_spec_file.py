@@ -9,9 +9,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+DEFAULT_SCENARIO = "random-online"
+
+SCENARIO_CHIP_TO_SPEC = {
+    ("random-online", "910B2"): (
+        "docs/official-baselines/perfgate-ascend-qwen25-3b-910b2.json"
+    ),
+    ("random-online", "910B3"): (
+        "docs/official-baselines/perfgate-ascend-qwen25-3b-910b3.json"
+    ),
+    ("sharegpt-online", "910B2"): (
+        "docs/official-baselines/"
+        "perfgate-ascend-qwen25-3b-sharegpt-online-910b2.json"
+    ),
+}
+
 CHIP_TO_SPEC = {
-    "910B2": "docs/official-baselines/perfgate-ascend-qwen25-3b-910b2.json",
-    "910B3": "docs/official-baselines/perfgate-ascend-qwen25-3b-910b3.json",
+    chip_model: spec_file
+    for (scenario, chip_model), spec_file in SCENARIO_CHIP_TO_SPEC.items()
+    if scenario == DEFAULT_SCENARIO
 }
 
 
@@ -51,6 +67,7 @@ def resolve_spec_file(
     *,
     explicit_spec_file: str,
     explicit_chip_model: str,
+    scenario: str,
     npu_smi_bin: str,
 ) -> tuple[str, str]:
     if explicit_spec_file:
@@ -61,12 +78,15 @@ def resolve_spec_file(
 
     chip_model = explicit_chip_model or detect_chip_model_from_npu_smi(npu_smi_bin)
     chip_model = chip_model.upper().replace(" ", "")
-    spec_file = CHIP_TO_SPEC.get(chip_model)
+    scenario = (scenario or DEFAULT_SCENARIO).strip()
+    spec_file = SCENARIO_CHIP_TO_SPEC.get((scenario, chip_model))
     if not spec_file:
         supported = ", ".join(sorted(CHIP_TO_SPEC))
         raise ValueError(
-            "unable to resolve perfgate spec file for Ascend chip model "
-            f"{chip_model or '<unknown>'}; supported: {supported}"
+            "unable to resolve perfgate spec file for Ascend scenario "
+            f"{scenario or '<unknown>'} and chip model "
+            f"{chip_model or '<unknown>'}; supported chip models for "
+            f"{DEFAULT_SCENARIO}: {supported}"
         )
 
     return spec_file, chip_model
@@ -100,6 +120,10 @@ def main() -> int:
         default=os.environ.get("NPU_SMI_BIN", "npu-smi").strip(),
     )
     parser.add_argument(
+        "--scenario",
+        default=os.environ.get("BENCH_SCENARIO", DEFAULT_SCENARIO).strip(),
+    )
+    parser.add_argument(
         "--benchmark-repo",
         default=os.environ.get("VLLM_HUST_BENCHMARK_REPO", "").strip(),
     )
@@ -117,6 +141,7 @@ def main() -> int:
         spec_file, chip_model = resolve_spec_file(
             explicit_spec_file=args.explicit_spec_file,
             explicit_chip_model=args.explicit_chip_model,
+            scenario=args.scenario,
             npu_smi_bin=args.npu_smi_bin,
         )
     except ValueError as exc:

@@ -37,6 +37,7 @@ def test_resolve_spec_file_prefers_explicit_override() -> None:
     spec_file, chip_model = resolver.resolve_spec_file(
         explicit_spec_file="docs/official-baselines/custom.json",
         explicit_chip_model="",
+        scenario="sharegpt-online",
         npu_smi_bin="",
     )
 
@@ -50,6 +51,7 @@ def test_resolve_spec_file_maps_explicit_chip_model() -> None:
     spec_file, chip_model = resolver.resolve_spec_file(
         explicit_spec_file="",
         explicit_chip_model="910B2",
+        scenario="random-online",
         npu_smi_bin="",
     )
 
@@ -64,6 +66,37 @@ def test_resolve_spec_file_fails_closed_for_unknown_chip_model() -> None:
         resolver.resolve_spec_file(
             explicit_spec_file="",
             explicit_chip_model="910A",
+            scenario="random-online",
+            npu_smi_bin="",
+        )
+
+
+def test_resolve_spec_file_maps_scenario_and_chip_model() -> None:
+    resolver = load_resolver()
+
+    spec_file, chip_model = resolver.resolve_spec_file(
+        explicit_spec_file="",
+        explicit_chip_model="910B2",
+        scenario="sharegpt-online",
+        npu_smi_bin="",
+    )
+
+    assert (
+        spec_file
+        == "docs/official-baselines/"
+        "perfgate-ascend-qwen25-3b-sharegpt-online-910b2.json"
+    )
+    assert chip_model == "910B2"
+
+
+def test_resolve_spec_file_fails_closed_for_unregistered_scenario() -> None:
+    resolver = load_resolver()
+
+    with pytest.raises(ValueError, match="prefix-repetition-online"):
+        resolver.resolve_spec_file(
+            explicit_spec_file="",
+            explicit_chip_model="910B2",
+            scenario="prefix-repetition-online",
             npu_smi_bin="",
         )
 
@@ -89,6 +122,8 @@ def test_main_writes_absolute_same_spec_file(
             "resolve_perfgate_spec_file.py",
             "--explicit-chip-model",
             "910B2",
+            "--scenario",
+            "random-online",
             "--benchmark-repo",
             str(tmp_path),
             "--github-env",
@@ -122,6 +157,8 @@ def test_main_falls_back_when_auto_selected_spec_is_missing(
             "resolve_perfgate_spec_file.py",
             "--explicit-chip-model",
             "910B2",
+            "--scenario",
+            "random-online",
             "--benchmark-repo",
             str(tmp_path),
             "--fallback-spec-file",
