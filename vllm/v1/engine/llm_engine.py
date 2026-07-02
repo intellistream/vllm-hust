@@ -443,11 +443,24 @@ class LLMEngine:
             if isinstance(module, TorchCompileWithNoGuardsWrapper):
                 module.cleanup()
 
-    def __del__(self):
+    def shutdown(self, timeout: float | None = None) -> None:
+        if callable(shutdown_prometheus):
+            shutdown_prometheus()
+
+        if renderer := getattr(self, "renderer", None):
+            renderer.shutdown()
+            self.renderer = None
+
+        if engine_core := getattr(self, "engine_core", None):
+            engine_core.shutdown(timeout=timeout)
+            self.engine_core = cast(Any, None)
+
         dp_group = getattr(self, "dp_group", None)
         if dp_group is not None and not self.external_launcher_dp:
             if callable(stateless_destroy_torch_distributed_process_group):
                 stateless_destroy_torch_distributed_process_group(dp_group)
             self.dp_group = cast(Any, None)
+
+    def __del__(self):
         with suppress(Exception):
             self.shutdown()

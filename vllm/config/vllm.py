@@ -844,7 +844,7 @@ class VllmConfig:
             "PYTORCH_CUDA_ALLOC_CONF", ""
         ):
             return
-        if self.model_config is not None and (self.model_config.enable_cumem_allocator):
+        if self.model_config is not None and (getattr(self.model_config, 'enable_cumem_allocator', False)):
             return
 
         raise ValueError(

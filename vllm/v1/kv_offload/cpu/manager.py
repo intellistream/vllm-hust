@@ -37,6 +37,8 @@ class CPUOffloadingManager(OffloadingManager):
         num_blocks: int,
         cache_policy: Literal["lru", "arc"] = "lru",
         enable_events: bool = False,
+        store_threshold: int = 1,
+        max_tracker_size: int = 64_000,
     ):
         self.medium: str = CPULoadStoreSpec.medium()
         self._num_blocks: int = num_blocks

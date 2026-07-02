@@ -73,6 +73,7 @@ class SimpleCPUOffloadScheduler:
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
         lazy_offload: bool = False,
+        hash_block_size: int | None = None,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -82,6 +83,7 @@ class SimpleCPUOffloadScheduler:
         )
         # NOTE: We use the same block size for both GPU and CPU.
         self.block_size = vllm_config.cache_config.block_size
+        self.hash_block_size = hash_block_size or self.block_size
         # Derive a CPU KVCacheConfig from the GPU config and build a coordinator
         assert kv_cache_config is not None
         self.cpu_kv_cache_config = self._derive_cpu_config(
