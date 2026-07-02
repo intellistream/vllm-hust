@@ -426,7 +426,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ) + spec.num_speculative_blocks
             max_num_blocks_per_group.append(max_num_blocks)
 
-        self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
+        self.attn_backends, self.attn_groups, attn_cg_support = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
         )
         self.block_tables = BlockTables(
@@ -435,7 +435,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_batched_tokens=self.max_num_tokens,
             max_num_blocks_per_group=max_num_blocks_per_group,
             device=self.device,
-            kernel_block_sizes=self.kernel_block_sizes,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
@@ -472,10 +471,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
-            self.attn_groups,
+            self.attn_backends,
             self.device,
             self.cache_config.cache_dtype,
-            self.kernel_block_sizes,
             self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
@@ -485,10 +483,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_block_zeroer = KVBlockZeroer(
             self.device,
             is_pin_memory_available(),
-            attn_groups_iter=(g for groups in self.attn_groups for g in groups),
-            kernel_block_sizes=self.kernel_block_sizes,
-            cache_dtype=self.cache_config.cache_dtype,
-            static_forward_context=self.compilation_config.static_forward_context,
         )
 
     @torch.inference_mode()

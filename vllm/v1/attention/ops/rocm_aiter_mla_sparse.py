@@ -11,8 +11,14 @@ import torch.nn.functional as F
 try:
     from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 except ImportError:
-    def eager_break_during_capture(fn):
+    from typing import Any, Callable, TypeVar
+
+    _F = TypeVar("_F", bound=Callable[..., Any])
+
+    def eager_break_during_capture(fn: _F) -> _F:
         return fn
+
+
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
