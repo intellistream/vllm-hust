@@ -247,14 +247,14 @@ def create_whisper_attention_backend_with_block_pooling(
         overrides={
             "get_builder_cls": lambda: WhisperCausalAttentionWithBlockPoolingBuilder,
             "get_impl_cls": lambda: WhisperCausalAttentionWithBlockPoolingImpl,
-            "get_kv_cache_shape": lambda num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str: (
+            "get_kv_cache_shape": lambda nb, bs, nkh, hs, cd: (
                 underlying_attn_backend.get_kv_cache_shape(
-                    num_blocks,
+                    nb,
                     # we stretch each block by `block_pool_size`
-                    block_size * block_pool_size,
-                    num_kv_heads // block_pool_size,
-                    head_size,
-                    cache_dtype_str,
+                    bs * block_pool_size,
+                    nkh // block_pool_size,
+                    hs,
+                    cd,
                 )
             ),
             "forward_includes_kv_cache_update": True,
