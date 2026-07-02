@@ -582,3 +582,25 @@ direct_register_custom_op(
     op_func=_hc_head_fused_kernel,
     mutates_args=["out"],
 )
+
+
+# Minimal CustomOp wrappers for AMD DeepSeek V4 model compatibility.
+# These are registered with the upstream names so that model code can
+# import and instantiate them.
+from vllm.model_executor.custom_op import CustomOp  # noqa: E402
+
+
+class MHCPreOp(CustomOp):
+    pass
+
+
+class MHCPostOp(CustomOp):
+    pass
+
+
+class HCHeadOp(CustomOp):
+    pass
+
+
+class MHCFusedPostPreOp(CustomOp):
+    pass

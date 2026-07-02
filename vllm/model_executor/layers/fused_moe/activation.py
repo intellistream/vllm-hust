@@ -15,8 +15,10 @@ class MoEActivation(Enum):
     # and produce output of shape [..., d]
     SILU = "silu"
     GELU = "gelu"
+    GELU_TANH = "gelu_tanh"
     RELU2 = "relu2"
     SWIGLUOAI = "swigluoai"
+    SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
     SWIGLUSTEP = "swiglustep"
 
     # Non-gated activations (no mul with gate) expect input of shape [..., d]
@@ -24,6 +26,7 @@ class MoEActivation(Enum):
     # NOTE: Non-gated activations require the "_no_mul" suffix to be present.
     SILU_NO_MUL = "silu_no_mul"
     GELU_NO_MUL = "gelu_no_mul"
+    GELU_TANH_NO_MUL = "gelu_tanh_no_mul"
     RELU2_NO_MUL = "relu2_no_mul"
 
     @property
@@ -53,6 +56,7 @@ class MoEActivation(Enum):
     @classmethod
     def from_str(cls, s: str) -> "MoEActivation":
         """Parse from string for backward compatibility."""
+        s = _STR_ALIASES.get(s, s)
         for member in cls:
             if member.value == s:
                 return member
@@ -61,20 +65,28 @@ class MoEActivation(Enum):
 
 
 # Module-level lookup tables used by MoEActivation functions.
+_STR_ALIASES: dict[str, str] = {
+    "gelu_pytorch_tanh": "gelu_tanh",
+}
+
 _CUSTOM_OP_NAMES: dict[MoEActivation, str] = {
     MoEActivation.SILU: "silu_and_mul",
     MoEActivation.GELU: "gelu_and_mul",
+    MoEActivation.GELU_TANH: "gelu_tanh_and_mul",
     MoEActivation.SWIGLUOAI: "swigluoai_and_mul",
+    MoEActivation.SWIGLUOAI_UNINTERLEAVE: "silu_and_mul_with_clamp",
     MoEActivation.SWIGLUSTEP: "swiglustep_and_mul",
     MoEActivation.RELU2: "relu2",
     MoEActivation.SILU_NO_MUL: "silu_and_mul",
     MoEActivation.GELU_NO_MUL: "gelu_and_mul",
+    MoEActivation.GELU_TANH_NO_MUL: "gelu_tanh_and_mul",
     MoEActivation.RELU2_NO_MUL: "relu2",
 }
 
 _WITHOUT_MUL: dict[MoEActivation, MoEActivation] = {
     MoEActivation.SILU: MoEActivation.SILU_NO_MUL,
     MoEActivation.GELU: MoEActivation.GELU_NO_MUL,
+    MoEActivation.GELU_TANH: MoEActivation.GELU_TANH_NO_MUL,
     MoEActivation.RELU2: MoEActivation.RELU2_NO_MUL,
 }
 
