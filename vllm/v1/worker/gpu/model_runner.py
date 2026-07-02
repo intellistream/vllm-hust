@@ -266,12 +266,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_loader = get_model_loader(self.vllm_config.load_config)
             logger.info("Loading model from scratch...")
 
-            self.model = model_loader.load_model(
-                vllm_config=self.vllm_config
-            )
+            self.model = model_loader.load_model(vllm_config=self.vllm_config)
             if self.lora_config:
                 self.model = self.load_lora_model(
-                    self.model,  self.device
+                    self.model, self.vllm_config, self.device
                 )
 
             if self.use_aux_hidden_state_outputs:
@@ -298,7 +296,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Initialize the components that require the model.
         self.model_state = init_model_state(
-             self.model, self.encoder_cache, self.device
+            self.vllm_config, self.model, self.encoder_cache, self.device
         )
 
         self.decode_query_len = (
@@ -450,6 +448,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.max_num_reqs,
         )
         self.cudagraph_manager = ModelCudaGraphManager(
+            self.vllm_config,
             self.device,
             cudagraph_mode,
             decode_query_len=self.decode_query_len,
@@ -960,12 +959,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             is_prefilling_np=is_prefilling_np,
-            num_computed_tokens_np=self.req_states.num_computed_tokens.np[idx_mapping_np],
+            num_computed_tokens_np=self.req_states.num_computed_tokens_np[
+                idx_mapping_np
+            ],
             prefill_len_np=self.req_states.prefill_len.np[idx_mapping_np],
-            num_computed_prefill_tokens_np=self.req_states.num_computed_prefill_tokens[idx_mapping_np],
+            num_computed_prefill_tokens_np=self.req_states.num_computed_prefill_tokens[
+                idx_mapping_np
+            ],
             max_seq_len_np=(
-                self.req_states.max_seq_len[idx_mapping_np]
-                if self.use_pp else None
+                self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None
             ),
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],

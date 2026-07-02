@@ -79,17 +79,3 @@ def shutdown_prometheus() -> None:
         logger.debug("Marked Prometheus metrics for process %d as dead", pid)
     except Exception as e:
         logger.error("Error during metrics cleanup: %s", str(e))
-
-
-def shutdown_prometheus():
-    """Shutdown prometheus metrics."""
-
-    path = _prometheus_multiproc_dir
-    if path is None:
-        return
-    try:
-        pid = os.getpid()
-        multiprocess.mark_process_dead(pid, path)
-        logger.debug("Marked Prometheus metrics for process %d as dead", pid)
-    except Exception as e:
-        logger.error("Error during metrics cleanup: %s", str(e))
