@@ -147,6 +147,29 @@ class RoutedExpertsTensors(NamedTuple):
     # (num_scheduled_tokens,)
     slot_mapping: torch.Tensor
 
+    def to_cpu_nonblocking(self) -> "RoutedExpertsTensors":
+        """Issue non-blocking D2H on the current stream.
+
+        NOTE: ``non_blocking=True`` only delivers true overlap when the
+        CPU target is pinned. The current fallback here allocates a
+        new pageable CPU tensor per call, which silently degrades to a
+        synchronous copy; acceptable because the sync happens on the
+        dedicated copy stream, not the default stream.
+        """
+        if self.routing_data.device.type == "cpu":
+            return self
+        return RoutedExpertsTensors(
+            self.routing_data.to("cpu", non_blocking=True),
+            self.slot_mapping.to("cpu", non_blocking=True),
+        )
+
+    def tolists(self) -> "RoutedExpertsLists":
+        """Convert to the numpy-backed form consumed by the scheduler."""
+        return RoutedExpertsLists(
+            routing_data=self.routing_data.numpy(force=True),
+            slot_mapping=self.slot_mapping.numpy(force=True),
+        )
+
 
 # [num_reqs, <dynamic>]
 # The shape of each element depends on the pooler used
@@ -244,6 +267,9 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Per-step routed experts data captured by the worker.
+    routed_experts: "RoutedExpertsLists | None" = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

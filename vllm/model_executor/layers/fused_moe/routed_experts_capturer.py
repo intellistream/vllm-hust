@@ -368,4 +368,3 @@ class RoutedExpertsReader:
 
     def __del__(self) -> None:
         """Close shared memory on destruction (do not unlink)."""
-        self.cleanup()

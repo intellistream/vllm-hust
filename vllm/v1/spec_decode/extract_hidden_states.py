@@ -37,6 +37,7 @@ class ExtractHiddenStatesProposer:
         self.device = device
         self.dtype = vllm_config.model_config.dtype
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.kv_cache_gid: int = -1
 
         # Model and attention layer tracking (initialized in load_model)
         self.model: nn.Module | None = None
