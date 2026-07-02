@@ -263,7 +263,7 @@ jobs:
       MODEL_PARAMETERS: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '3B' || '14B' }}
       MODEL_PRECISION: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'BF16' || 'FP16' }}
       DTYPE: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'bfloat16' || 'float16' }}
-      MAX_MODEL_LEN: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '256' || '1024' }}
+      MAX_MODEL_LEN: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '256' || '1280' }}
       MAX_NUM_SEQS: "1"
       BENCH_NUM_PROMPTS: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.num_prompts || (github.event_name == 'workflow_dispatch' && inputs.num_prompts || '200') }}
       BENCH_RANDOM_INPUT_LEN: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '64' || '1024' }}
@@ -274,14 +274,14 @@ jobs:
       BENCH_OUTPUT_LEN: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.output_length || (github.event_name == 'workflow_dispatch' && inputs.output_length || '') }}
       INPUT_BENCHMARK_SCENARIO: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.benchmark_scenario || (github.event_name == 'workflow_dispatch' && inputs.benchmark_scenario || '') }}
       PR_LABELS: ${{ github.event_name == 'pull_request' && toJson(github.event.pull_request.labels) || '[]' }}
-      SOC_VERSION: ascend910b3
+      SOC_VERSION: ascend910b2
       HARDWARE_VENDOR: Huawei
-      HARDWARE_CHIP_MODEL: 910B3
+      HARDWARE_CHIP_MODEL: 910B2
       CHIP_COUNT: "1"
       NODE_COUNT: "1"
       SAME_SPEC_BENCHMARK_ENABLED: ${{ vars.VLLM_HUST_SAME_SPEC_BENCHMARK_ENABLED || '1' }}
       PERFGATE_MODE: ${{ vars.VLLM_HUST_PERFGATE_MODE || 'report' }}
-      PERFGATE_SPEC_FILE: ${{ vars.VLLM_HUST_PERFGATE_SPEC_FILE || 'docs/official-baselines/perfgate-ascend-qwen25-3b-910b3.json' }}
+      PERFGATE_SPEC_FILE: ${{ vars.VLLM_HUST_PERFGATE_SPEC_FILE || 'docs/official-baselines/perfgate-ascend-qwen25-3b-910b2.json' }}
       MAIN_SAME_SPEC_SPEC_FILE: ${{ vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || 'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-qwen25-14b-910b2.json' }}
       SAME_SPEC_SPEC_FILE: ${{ vars.VLLM_HUST_SAME_SPEC_SPEC_FILE || '' }}
       SAME_SPEC_CONSTRAINTS_FILE: ${{ vars.VLLM_HUST_SAME_SPEC_CONSTRAINTS_FILE || '' }}

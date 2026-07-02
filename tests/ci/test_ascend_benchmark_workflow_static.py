@@ -92,10 +92,13 @@ def test_main_benchmark_defaults_match_ascend_main_config():
     assert "github.event_name == 'pull_request' || github.event_name == 'issue_comment'" in text
     assert "&& '3B' || '14B'" in text
     assert "&& 'BF16' || 'FP16'" in text
-    assert "&& '256' || '1024'" in text
+    assert "&& '256' || '1280'" in text
     assert "&& '64' || '1024'" in text
     assert "&& '16' || '256'" in text
-    assert "perfgate-ascend-qwen25-3b-910b3.json" in text
+    assert "SOC_VERSION: ascend910b2" in text
+    assert "HARDWARE_CHIP_MODEL: 910B2" in text
+    assert "perfgate-ascend-qwen25-3b-910b2.json" in text
+    assert "perfgate-ascend-qwen25-3b-910b3.json" not in text
     assert "official-ascend-jan-2026-v0180-random-online-qwen25-14b-910b2.json" in text
 
 
