@@ -960,6 +960,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             is_prefilling_np=is_prefilling_np,
+            num_computed_tokens_np=self.req_states.num_computed_tokens.np[idx_mapping_np],
+            prefill_len_np=self.req_states.prefill_len.np[idx_mapping_np],
+            num_computed_prefill_tokens_np=self.req_states.num_computed_prefill_tokens[idx_mapping_np],
+            max_seq_len_np=self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None,  # type: ignore[arg-type]
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             logits_indices=logits_indices,
@@ -1027,7 +1031,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.draft_logits,
             )
 
-        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected  # type: ignore[return-value]
 
     def postprocess_sampled(
         self,
@@ -1192,7 +1196,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.scheduled_encoder_inputs, input_batch
             )
             if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
-                input_ids = None
+                input_ids = None  # type: ignore[assignment]
 
         model_inputs = {
             "input_ids": input_ids,

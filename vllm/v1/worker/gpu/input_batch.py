@@ -70,6 +70,13 @@ class InputBatch:
     # [num_reqs] CPU bool array.
     is_prefilling_np: np.ndarray
 
+    # [num_reqs] CPU int arrays populated from req_states.
+    num_computed_tokens_np: np.ndarray
+    prefill_len_np: np.ndarray
+    num_computed_prefill_tokens_np: np.ndarray
+    # [num_reqs] CPU int array, None when PP not in use.
+    max_seq_len_np: np.ndarray | None
+
     # [num_tokens_after_padding]
     input_ids: torch.Tensor
     # [num_tokens_after_padding]
@@ -149,6 +156,10 @@ class InputBatch:
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=None,
             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
+            num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
+            prefill_len_np=num_scheduled_tokens.copy(),
+            num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
+            max_seq_len_np=None,
             input_ids=input_ids,
             positions=positions,
             logits_indices=logits_indices,
