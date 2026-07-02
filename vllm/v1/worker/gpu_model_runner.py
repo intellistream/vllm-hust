@@ -3556,13 +3556,16 @@ class GPUModelRunner(
             # the last sync, so this enqueue is naturally covered
             # without requiring its own synchronize.
             if self.routed_experts_initialized:
-                buf = self.routed_experts_capturer.get_device_buffer()
-                total = scheduler_output.total_num_scheduled_tokens
-                self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
-                self.routed_experts_slot_mapping_cpu[:total].copy_(
-                    self.routed_experts_slot_mapping_device[:total],
-                    non_blocking=True,
-                )
+                buf = self.routed_experts_capturer._device_buffer
+                if buf is not None:
+                    total = scheduler_output.total_num_scheduled_tokens
+                    self.routed_experts_cpu[:total].copy_(
+                        buf[:total], non_blocking=True
+                    )
+                    self.routed_experts_slot_mapping_cpu[:total].copy_(
+                        self.routed_experts_slot_mapping_device[:total],
+                        non_blocking=True,
+                    )
 
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
@@ -4557,14 +4560,15 @@ class GPUModelRunner(
             # Without clones, the copy stream would read torn data.
             routed_experts_snapshot = None
             if self.routed_experts_initialized:
-                buf = self.routed_experts_capturer.get_device_buffer()
-                total = scheduler_output.total_num_scheduled_tokens
-                routed_experts_snapshot = RoutedExpertsTensors(
-                    routing_data=buf[:total].clone(),
-                    slot_mapping=self.routed_experts_slot_mapping_device[
-                        :total
-                    ].clone(),
-                )
+                buf = self.routed_experts_capturer._device_buffer
+                if buf is not None:
+                    total = scheduler_output.total_num_scheduled_tokens
+                    routed_experts_snapshot = RoutedExpertsTensors(
+                        routing_data=buf[:total].clone(),
+                        slot_mapping=self.routed_experts_slot_mapping_device[
+                            :total
+                        ].clone(),
+                    )
 
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
@@ -7289,19 +7293,18 @@ class GPUModelRunner(
             "Initializing routed experts capturer, enable_return_routed_experts: %s",
             self.model_config.enable_return_routed_experts,
         )
-        self.routed_experts_capturer = RoutedExpertsCapturer(
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-            vllm_config=self.vllm_config,
-        )
+        self.routed_experts_capturer = RoutedExpertsCapturer()
         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
         self._bind_routed_experts_capturer(self.routed_experts_capturer)
 
         # Pinned CPU buffer for non-blocking D2H of ``routing_data`` on
         # the sync scheduling path. Shape / dtype mirror the device
         # capturer exactly so ``copy_`` is a straight memcpy.
+        dev_buf = self.routed_experts_capturer._device_buffer
+        assert dev_buf is not None, "RoutedExpertsCapturer buffer not initialized"
         self.routed_experts_cpu = torch.empty(
-            self.routed_experts_capturer.device_buffer.shape,
-            dtype=self.routed_experts_capturer.device_buffer.dtype,
+            dev_buf.shape,
+            dtype=dev_buf.dtype,
             device="cpu",
             pin_memory=self.pin_memory,
         )
