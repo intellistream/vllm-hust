@@ -271,6 +271,7 @@ def benchmark_config(
                     moe_config=moe_config,
                     quant_config=quant_config,
                 ),
+                inplace=not disable_inplace(),
             )
 
         with override_config(config):
@@ -278,6 +279,7 @@ def benchmark_config(
                 x, input_gating, topk, renormalize=not use_deep_gemm
             )
 
+            inplace = not disable_inplace()
             if use_deep_gemm:
                 return deep_gemm_experts.apply(
                     x,
@@ -296,6 +298,7 @@ def benchmark_config(
                 w2,
                 topk_weights,
                 topk_ids,
+                inplace=inplace,
                 quant_config=quant_config,
             )
 

@@ -392,28 +392,15 @@ class LazyLoader(ModuleType):
 # Optional dependency detection utilities
 @cache
 def _has_module(module_name: str) -> bool:
-    """Return True if *module_name* can be imported in the current environment.
+    """Return True if *module_name* can be found in the current environment.
 
-    Uses ``importlib.util.find_spec`` as a fast pre-check, then performs a
-    trial import to verify that native dependencies (shared libraries, etc.)
-    are also satisfied. Any failure during the trial import is treated as the
-    module being unavailable. The result is cached so that subsequent queries
-    for the same module incur no additional overhead.
+    The result is cached so that subsequent queries for the same module incur
+    no additional overhead.
     """
     try:
-        if importlib.util.find_spec(module_name) is None:
-            return False
+        return importlib.util.find_spec(module_name) is not None
     except ModuleNotFoundError:
         return False
-
-    try:
-        importlib.import_module(module_name)
-    except ImportError:
-        logger.warning(
-            "Module %s was found but failed to import", module_name, exc_info=True
-        )
-        return False
-    return True
 
 
 def has_deep_ep() -> bool:

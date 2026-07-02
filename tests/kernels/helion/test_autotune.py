@@ -63,7 +63,7 @@ class TestAutotuneDisabledKernel:
         with dummy_kernel_registry(configs={}) as register:
             wrapper = register(
                 "autotune_test_kernel",
-                config_picker=lambda args, keys: None,
+                config_picker=lambda args, keys: "default",
                 fake_impl=lambda *a, **kw: None,
                 input_generator=lambda: {
                     "small": (

@@ -284,13 +284,7 @@ def _compare_sp(
         "mp",
     ]
 
-    compare_two_settings(
-        model_id,
-        tp_sp_args,
-        tp_args,
-        method=method,
-        force_v1_runner=True,
-    )
+    compare_two_settings(model_id, tp_sp_args, tp_args, method=method)
 
 
 SP_TEXT_GENERATION_MODELS = {
