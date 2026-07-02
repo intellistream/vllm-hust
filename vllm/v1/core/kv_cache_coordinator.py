@@ -493,7 +493,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if any(gid in self.eagle_group_ids for gid in group_ids)
         }
 
-    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+    def cache_blocks(self, request: Request, num_computed_tokens: int) -> int:
         # Cache hits in this coordinator are always a multiple of
         # ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``).
         # Within an aligned region, SWA groups only consult a subset of blocks
@@ -502,12 +502,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         num_computed_tokens = (
             num_computed_tokens // self.scheduler_block_size * self.scheduler_block_size
         )
-        for manager in self.single_type_managers:
-            manager.cache_blocks(
-                request,
-                num_computed_tokens,
-                alignment_tokens=self.scheduler_block_size,
-            )
+        cached_blocks_per_manager = [
+            manager.cache_blocks(request, num_computed_tokens)
+            for manager in self.single_type_managers
+        ]
+        return max(cached_blocks_per_manager, default=0)
 
     def find_longest_cache_hit(
         self,

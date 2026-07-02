@@ -50,6 +50,7 @@ if TYPE_CHECKING:
         EncoderCudaGraphCaptureInputs,
         EncoderCudaGraphConfig,
         EncoderCudaGraphReplayBuffers,
+        EncoderItemSpec,
     )
 else:
     VllmConfig = object
@@ -1575,6 +1576,18 @@ class SupportsEncoderCudaGraph(Protocol):
         """
         ...
 
+    def get_encoder_cudagraph_item_specs(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list["EncoderItemSpec"]:
+        """Return specs describing each item in the batch.
+
+        Replaces the former separate methods for num_items,
+        per_item_output_tokens, and per_item_input_sizes.
+        The manager derives all three from this single return value.
+        """
+        ...
+
     def select_encoder_cudagraph_items(
         self,
         mm_kwargs: dict[str, Any],
@@ -1630,6 +1643,25 @@ class SupportsEncoderCudaGraph(Protocol):
         """Run the encoder forward pass without precomputed buffers.
 
         Used as eager fallback when inputs exceed all budgets.
+        """
+        ...
+
+    def postprocess_encoder_output(
+        self,
+        output: torch.Tensor,
+        indices: list[int],
+        per_item_out_tokens: list[int],
+        dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
+        clone: bool = False,
+        batch_mm_kwargs: dict[str, Any] | None = None,
+        local_output: torch.Tensor | None = None,
+    ) -> None:
+        """
+        Post-process encoder output after graph replay.
+
+        By default, delegates to ``scatter_output_slices``.
+        Override for models requiring extra processing (e.g. Step3-VL
+        merges features according to dynamic patch counts).
         """
         ...
 
