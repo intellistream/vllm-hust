@@ -95,7 +95,10 @@ class KnormFullAttentionManager(FullAttentionManager):
         return evict_blocks * self.block_size
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
     ) -> None:
         """Remove the *least important* blocks from the prefix.
 
@@ -104,6 +107,7 @@ class KnormFullAttentionManager(FullAttentionManager):
         region.  Blocks without scores (newly allocated, not yet observed
         in a forward pass) are evicted last.
         """
+        del num_prompt_tokens
         # ── 1. Drain and ingest pending scores ──
         scores = drain_block_scores()
         if scores:
