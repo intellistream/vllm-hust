@@ -64,6 +64,134 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _get_segment_reuse_runner_plan(request: Request) -> dict[str, Any] | None:
+    runner_extensions = getattr(request, "runner_extensions", None)
+    if not isinstance(runner_extensions, dict):
+        return None
+    plan = runner_extensions.get("segment_reuse")
+    return plan if isinstance(plan, dict) else None
+
+
+def _cap_segment_reuse_envelope_prefill(
+    request: Request,
+    num_computed_tokens: int,
+    num_new_tokens: int,
+) -> int:
+    """Schedule only the fresh envelope before body-block stitching.
+
+    Segment-reuse matched prompts are not a contiguous prefix-cache hit: the
+    envelope is fresh, the body is borrowed, and the terminal body token must be
+    replayed for sampling logits. Until the body splice is committed, scheduling
+    the whole prompt defeats the optimization. This cap lets the first scheduler
+    step materialize just the fresh envelope.
+    """
+    plan = _get_segment_reuse_runner_plan(request)
+    if not plan or not plan.get("runner_supported", False):
+        return num_new_tokens
+    if plan.get("kind") != "vllm-runner-stitch-plan":
+        return num_new_tokens
+    phase = plan.setdefault("scheduler_phase", "envelope_prefill")
+    if phase != "envelope_prefill":
+        return num_new_tokens
+
+    try:
+        envelope_tokens = int(plan["fresh_envelope_tokens"])
+    except (KeyError, TypeError, ValueError):
+        return num_new_tokens
+    if envelope_tokens <= num_computed_tokens:
+        return num_new_tokens
+
+    capped = min(num_new_tokens, envelope_tokens - num_computed_tokens)
+    if 0 < capped < num_new_tokens:
+        logger.info(
+            "segment_reuse: capped request %s prefill from %d to %d fresh "
+            "envelope tokens",
+            request.request_id,
+            num_new_tokens,
+            capped,
+        )
+        return capped
+    return num_new_tokens
+
+
+def _make_segment_reuse_body_blocks(
+    kv_cache_manager: KVCacheManager,
+    plan: dict[str, Any],
+) -> KVCacheBlocks | None:
+    body_block_ids = plan.get("body_block_ids")
+    if not isinstance(body_block_ids, list) or not body_block_ids:
+        return None
+    # The terminal token is replayed into a fresh scratch block. Therefore the
+    # borrowed block list must exclude the block containing the terminal token.
+    body_block_ids = body_block_ids[:-1]
+    if not body_block_ids:
+        return None
+    try:
+        blocks = [
+            kv_cache_manager.block_pool.blocks[int(block_id)]
+            for block_id in body_block_ids
+        ]
+    except (TypeError, ValueError, IndexError):
+        return None
+    # Segment reuse currently records full-attention body blocks from the first
+    # KV group. This matches the single-group Qwen3/NPU experiment path.
+    return kv_cache_manager.create_kv_cache_blocks((blocks,))
+
+
+def _prepare_segment_reuse_terminal_replay(
+    kv_cache_manager: KVCacheManager,
+    request: Request,
+    num_new_tokens: int,
+) -> tuple[int, int, KVCacheBlocks | None]:
+    plan = _get_segment_reuse_runner_plan(request)
+    if not plan or not plan.get("runner_supported", False):
+        return num_new_tokens, 0, None
+    if plan.get("kind") != "vllm-runner-stitch-plan":
+        return num_new_tokens, 0, None
+    if plan.get("scheduler_phase") not in (None, "envelope_prefill"):
+        return num_new_tokens, 0, None
+
+    try:
+        envelope_tokens = int(plan["fresh_envelope_tokens"])
+        body_terminal_token = int(plan["body_terminal_token"])
+        body_block_size = int(plan["body_block_size"])
+    except (KeyError, TypeError, ValueError):
+        return num_new_tokens, 0, None
+    if request.num_computed_tokens < envelope_tokens:
+        return num_new_tokens, 0, None
+    if body_terminal_token < request.num_computed_tokens:
+        return num_new_tokens, 0, None
+    if body_block_size <= 0 or body_terminal_token % body_block_size != 0:
+        plan["scheduler_phase"] = "terminal_replay_alignment_unsupported"
+        logger.warning(
+            "segment_reuse: request %s cannot enter terminal replay; terminal "
+            "token %d is not block-aligned for block size %d",
+            request.request_id,
+            body_terminal_token,
+            body_block_size,
+        )
+        return num_new_tokens, 0, None
+
+    body_blocks = _make_segment_reuse_body_blocks(kv_cache_manager, plan)
+    if body_blocks is None:
+        logger.warning(
+            "segment_reuse: request %s cannot enter terminal replay; "
+            "body blocks are unavailable",
+            request.request_id,
+        )
+        return num_new_tokens, 0, None
+
+    num_new_computed_tokens = body_terminal_token - request.num_computed_tokens
+    plan["scheduler_phase"] = "terminal_replay"
+    logger.info(
+        "segment_reuse: request %s splicing %d body-computed tokens and "
+        "scheduling 1 terminal replay token",
+        request.request_id,
+        num_new_computed_tokens,
+    )
+    return 1, num_new_computed_tokens, body_blocks
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -496,6 +624,11 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            num_new_tokens = _cap_segment_reuse_envelope_prefill(
+                request,
+                request.num_computed_tokens,
+                num_new_tokens,
+            )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -507,6 +640,17 @@ class Scheduler(SchedulerInterface):
                 self.max_model_len
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
+            )
+            segment_reuse_num_new_computed_tokens = 0
+            segment_reuse_new_computed_blocks = None
+            (
+                num_new_tokens,
+                segment_reuse_num_new_computed_tokens,
+                segment_reuse_new_computed_blocks,
+            ) = _prepare_segment_reuse_terminal_replay(
+                self.kv_cache_manager,
+                request,
+                num_new_tokens,
             )
 
             # Schedule encoder inputs.
@@ -556,6 +700,8 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
+                        num_new_computed_tokens=segment_reuse_num_new_computed_tokens,
+                        new_computed_blocks=segment_reuse_new_computed_blocks,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
 
@@ -606,6 +752,8 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
+            if segment_reuse_new_computed_blocks is not None:
+                new_blocks = segment_reuse_new_computed_blocks + new_blocks
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
@@ -628,6 +776,9 @@ class Scheduler(SchedulerInterface):
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
                 request.spec_token_ids = []
+
+            if segment_reuse_num_new_computed_tokens > 0:
+                request.num_computed_tokens += segment_reuse_num_new_computed_tokens
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
@@ -829,6 +980,11 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    num_new_tokens = _cap_segment_reuse_envelope_prefill(
+                        request,
+                        num_computed_tokens,
+                        num_new_tokens,
+                    )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
