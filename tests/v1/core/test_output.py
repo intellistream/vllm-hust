@@ -34,3 +34,16 @@ def test_repr_with_multi_element_tensor() -> None:
 
     assert "prompt_embeds_shape=torch.Size([10, 768])" in repr(new_requests_data)
     assert "prompt_embeds_shape=torch.Size([10, 768])" in new_requests_data.anon_repr()
+
+
+def test_new_request_data_carries_runner_extensions() -> None:
+    new_requests_data = _create_new_requests_data(None)
+    new_requests_data.runner_extensions["segment_reuse"] = {
+        "kind": "vllm-runner-stitch-plan"
+    }
+
+    assert new_requests_data.runner_extensions == {
+        "segment_reuse": {"kind": "vllm-runner-stitch-plan"}
+    }
+    assert "runner_extensions=['segment_reuse']" in repr(new_requests_data)
+    assert "runner_extensions=['segment_reuse']" in new_requests_data.anon_repr()
