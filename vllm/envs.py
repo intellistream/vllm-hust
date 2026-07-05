@@ -1944,7 +1944,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
-        int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
+        int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD") or "0")
     ),
     # ================== Knorm KV Cache Compression ==================
     # Fraction of KV cache blocks to KEEP. 1.0 = no compression.
