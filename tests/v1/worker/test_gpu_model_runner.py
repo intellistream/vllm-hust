@@ -137,7 +137,10 @@ def model_runner():
 model_runner_2 = model_runner
 
 
-def _schedule_new_request(*req_ids: str) -> SchedulerOutput:
+def _schedule_new_request(
+    *req_ids: str,
+    runner_extensions: dict[str, object] | None = None,
+) -> SchedulerOutput:
     new_reqs = []
     num_scheduled_tokens = {}
     total_num_scheduled_tokens = 0
@@ -152,6 +155,7 @@ def _schedule_new_request(*req_ids: str) -> SchedulerOutput:
                 block_ids=([0],),
                 num_computed_tokens=0,
                 lora_request=None,
+                runner_extensions=dict(runner_extensions or {}),
             )
         )
         num_scheduled_tokens[req_id] = 3
@@ -394,7 +398,12 @@ def test_update_states_new_request(model_runner, dist_init):
     req_id = "req_0"
 
     # new req
-    scheduler_output = _schedule_new_request(req_id)
+    runner_extensions = {
+        "segment_reuse": {"kind": "vllm-runner-stitch-plan", "version": 1}
+    }
+    scheduler_output = _schedule_new_request(
+        req_id, runner_extensions=runner_extensions
+    )
 
     metadata_before = model_runner.input_batch.sampling_metadata
     model_runner._update_states(scheduler_output)
@@ -402,6 +411,7 @@ def test_update_states_new_request(model_runner, dist_init):
     assert _is_req_added(model_runner, req_id)
     assert _is_req_scheduled(model_runner, req_id)
     assert _is_req_state_block_table_match(model_runner, req_id)
+    assert model_runner.requests[req_id].runner_extensions == runner_extensions
 
 
 def test_update_states_request_finished(model_runner, dist_init):

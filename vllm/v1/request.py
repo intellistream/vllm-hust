@@ -100,6 +100,11 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        # Opaque request-local metadata for scheduler/runner extensions.
+        # The core scheduler does not interpret these values; extensions may
+        # attach small serializable plans here and worker-side components can
+        # consume them after NewRequestData/CachedRequestState propagation.
+        self.runner_extensions: dict[str, Any] = {}
 
         if pooling_params is not None:
             # Pooling models.

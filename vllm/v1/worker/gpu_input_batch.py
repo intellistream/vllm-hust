@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
-from dataclasses import dataclass
-from typing import cast
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -56,6 +56,7 @@ class CachedRequestState:
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
     prompt_is_token_ids: list[bool] | None = None
+    runner_extensions: dict[str, Any] = field(default_factory=dict)
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0

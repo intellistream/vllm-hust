@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
@@ -39,6 +39,7 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    runner_extensions: dict[str, Any] = field(default_factory=dict)
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -61,6 +62,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
+            runner_extensions=dict(getattr(request, "runner_extensions", {})),
             prefill_token_ids=prefill_token_ids,
         )
 
@@ -78,6 +80,7 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
+            f"runner_extensions={list(self.runner_extensions)},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
         )
@@ -103,6 +106,7 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
+            f"runner_extensions={list(self.runner_extensions)},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
         )
