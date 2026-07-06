@@ -451,32 +451,6 @@ class KVCacheManager:
         ):
             watermark_blocks = self.watermark_blocks
 
-        if full_sequence_must_fit:
-            # If this step already schedules the full remaining sequence,
-            # the usual allocation path below is equivalent to the admission
-            # check and avoids an extra coordinator pass.
-            full_num_tokens = min(request.num_tokens, self.max_model_len)
-            remaining_sequence_tokens = max(
-                0,
-                full_num_tokens - total_computed_tokens,
-            )
-            if num_new_tokens < remaining_sequence_tokens:
-                admission_blocks = self.coordinator.get_num_blocks_to_allocate(
-                    request_id=request.request_id,
-                    num_tokens=full_num_tokens,
-                    new_computed_blocks=new_computed_block_list,
-                    num_encoder_tokens=num_encoder_tokens,
-                    total_computed_tokens=total_computed_tokens,
-                    num_tokens_main_model=full_num_tokens,
-                    apply_admission_cap=True,
-                )
-            else:
-                admission_blocks = num_blocks_to_allocate
-
-            required_blocks = admission_blocks + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
-                return None
-
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
@@ -503,6 +477,32 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
+
+        if full_sequence_must_fit:
+            # If this step already schedules the full remaining sequence,
+            # the usual allocation path below is equivalent to the admission
+            # check and avoids an extra coordinator pass.
+            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            remaining_sequence_tokens = max(
+                0,
+                full_num_tokens - total_computed_tokens,
+            )
+            if num_new_tokens < remaining_sequence_tokens:
+                admission_blocks = self.coordinator.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                )
+            else:
+                admission_blocks = num_blocks_to_allocate
+
+            required_blocks = admission_blocks + watermark_blocks
+            if required_blocks > self.block_pool.get_num_free_blocks():
+                return None
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
