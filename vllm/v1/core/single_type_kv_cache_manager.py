@@ -400,7 +400,11 @@ class SingleTypeKVCacheManager(ABC):
         self.num_cached_block.pop(request_id, None)
         return req_blocks
 
-    def free(self, request_id: str) -> None:
+    def free(
+        self,
+        request_id: str,
+        prioritize_uncached_for_reuse: bool = False,
+    ) -> None:
         """
         Free the blocks for the request.
 
@@ -408,7 +412,10 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
         """
         # Free blocks in reverse order so that the tail blocks are freed first.
-        self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
+        self.block_pool.free_blocks(
+            reversed(self.pop_blocks_for_free(request_id)),
+            prioritize_uncached_for_reuse=prioritize_uncached_for_reuse,
+        )
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:

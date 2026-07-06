@@ -615,6 +615,7 @@ class BlockPool:
         self,
         ordered_blocks: Iterable[KVCacheBlock],
         prepend: bool = False,
+        prioritize_uncached_for_reuse: bool = False,
     ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
@@ -625,6 +626,10 @@ class BlockPool:
             prepend: If ``True``, blocks are inserted at the head of the free
                 queue (reused first). If ``False`` (default), blocks are
                 appended to the tail (standard LRU-like behavior).
+            prioritize_uncached_for_reuse: Compatibility hook for KVPlane
+                admission-denied requests. This branch already keeps uncached
+                blocks ahead of cached blocks on normal free, so the flag does
+                not need a separate ordering.
         """
         # Identify blocks with hash (LRU cache) and without it (will never match in APC)
         blocks_with_hash = []

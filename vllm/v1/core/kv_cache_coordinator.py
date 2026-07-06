@@ -285,7 +285,11 @@ class KVCacheCoordinator(ABC):
         ]
         return max(cached_blocks_per_manager, default=0)
 
-    def free(self, request_id: str) -> None:
+    def free(
+        self,
+        request_id: str,
+        prioritize_uncached_for_reuse: bool = False,
+    ) -> None:
         """
         Free the blocks for the request.
 
@@ -293,7 +297,10 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
         """
         for manager in self.single_type_managers:
-            manager.free(request_id)
+            manager.free(
+                request_id,
+                prioritize_uncached_for_reuse=prioritize_uncached_for_reuse,
+            )
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """
