@@ -421,6 +421,7 @@ jobs:
           # The runner container may not have HOME set; default to /root for root user.
           export HOME="${HOME:-/root}"
 
+          rm -rf "$HOME/.ssh"
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
 
@@ -434,7 +435,12 @@ jobs:
             echo "Unable to scan ssh.github.com host keys." >&2
             exit 2
           fi
-          cat "$known_hosts_tmp" >> "$HOME/.ssh/known_hosts"
+          {
+            cat "$known_hosts_tmp"
+            sed 's/^\[ssh\.github\.com\]:443 /github.com /' "$known_hosts_tmp"
+            sed 's/^\[ssh\.github\.com\]:443 /\[github.com\]:443 /' "$known_hosts_tmp"
+            sed 's/^\[ssh\.github\.com\]:443 /ssh.github.com /' "$known_hosts_tmp"
+          } > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
 
           cat > "$HOME/.ssh/config" <<EOF
@@ -442,6 +448,7 @@ jobs:
             HostName ssh.github.com
             Port 443
             User git
+            HostKeyAlias github.com
             IdentityFile $key_file
             IdentitiesOnly yes
             StrictHostKeyChecking yes
