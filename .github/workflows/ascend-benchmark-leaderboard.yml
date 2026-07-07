@@ -255,7 +255,7 @@ jobs:
       - docker
     timeout-minutes: 60
     env:
-      HOME: ${{ github.workspace }}/.ci-home
+      HOME: ${{ github.workspace }}/../.ci-home
       DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
       HF_HUB_DISABLE_TELEMETRY: "1"
       HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
