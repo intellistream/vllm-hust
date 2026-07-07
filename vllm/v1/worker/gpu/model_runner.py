@@ -59,6 +59,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
     init_kv_cache,
 )
+from vllm.v1.worker.gpu.adaptive_state_probe import AdaptiveStateProbe
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
     async_copy_to_gpu,
@@ -150,6 +151,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
+        self.adaptive_state_probe = AdaptiveStateProbe.from_env()
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -1161,6 +1163,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
         )
+
+        if self.adaptive_state_probe is not None:
+            self.adaptive_state_probe.record_step(
+                scheduler_output=scheduler_output,
+                batch_desc=batch_desc,
+                max_query_len=max_query_len,
+                uniform_tok_count=uniform_tok_count,
+                dummy_run=dummy_run,
+                skip_compiled=skip_compiled,
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
