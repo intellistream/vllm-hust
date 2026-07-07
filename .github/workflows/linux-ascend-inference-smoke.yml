@@ -76,13 +76,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          export HOME="${HOME:-/root}"
+
           if [[ -n "${CHECKOUT_GH_TOKEN:-}" ]]; then
             git config --global url."https://x-access-token:${CHECKOUT_GH_TOKEN}@github.com/".insteadOf "git@github.com:"
             echo "Configured GitHub HTTPS token checkout rewrite."
             exit 0
           fi
 
-          export HOME="${HOME:-/root}"
           rm -rf "$HOME/.ssh"
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
@@ -329,5 +330,9 @@ jobs:
       - name: Cleanup leftover Ascend CI processes
         if: always()
         run: |
+          if [[ ! -f "$VLLM_ASCEND_HUST_REPO/scripts/use_single_ascend_env.sh" ]]; then
+            echo "Skipping Ascend CI cleanup because vllm-ascend-hust was not checked out."
+            exit 0
+          fi
           source "$VLLM_ASCEND_HUST_REPO/scripts/use_single_ascend_env.sh"
           bash .github/workflows/scripts/cleanup_ascend_ci_processes.sh
