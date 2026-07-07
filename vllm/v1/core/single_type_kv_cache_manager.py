@@ -147,12 +147,17 @@ class SingleTypeKVCacheManager(ABC):
         num_req_blocks = len(self.req_to_blocks.get(request_id, ()))
 
         if request_id in self.num_cached_block:
-            # Fast-path: a running request won't have any new prefix-cache hits.
-            assert len(new_computed_blocks) == 0
+            # Fast-path: most running requests won't have any new prefix-cache
+            # hits. Segment-reuse stitching is the exception: after computing a
+            # fresh envelope, the scheduler can splice full body blocks before
+            # replaying the terminal tail.
+            num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
             # NOTE: With speculative decoding, request's blocks may be allocated
             # for draft tokens which are later rejected. In this case,
             # num_required_blocks may be smaller than num_req_blocks.
-            return max(num_required_blocks - num_req_blocks, 0)
+            num_new_blocks = max(num_required_blocks - num_local_computed_blocks, 0)
+            num_evictable_blocks = self._get_num_evictable_blocks(new_computed_blocks)
+            return num_new_blocks + num_evictable_blocks
 
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
@@ -231,6 +236,26 @@ class SingleTypeKVCacheManager(ABC):
         # them so cache_blocks() will not try to re-cache blocks that already
         # have a block_hash set.
         self.num_cached_block[request_id] = len(req_blocks)
+
+    def add_running_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+    ) -> None:
+        if not new_computed_blocks:
+            return
+        req_blocks = self.req_to_blocks[request_id]
+        if self.enable_caching:
+            self.block_pool.touch(new_computed_blocks)
+        else:
+            assert not any(new_computed_blocks), (
+                "Computed blocks should be empty when prefix caching is disabled"
+            )
+        req_blocks.extend(new_computed_blocks)
+        self.num_cached_block[request_id] = max(
+            self.num_cached_block.get(request_id, 0),
+            len(req_blocks),
+        )
 
     def allocate_external_computed_blocks(
         self,

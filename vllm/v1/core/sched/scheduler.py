@@ -120,13 +120,19 @@ def _make_segment_reuse_body_blocks(
     kv_cache_manager: KVCacheManager,
     plan: dict[str, Any],
 ) -> KVCacheBlocks | None:
-    body_block_ids = plan.get("body_block_ids")
+    scheduler_contract = plan.get("scheduler_replay_contract")
+    body_block_ids = (
+        scheduler_contract.get("borrowed_body_block_ids")
+        if isinstance(scheduler_contract, dict)
+        else None
+    )
+    if body_block_ids is None:
+        body_block_ids = plan.get("body_block_ids")
+        # Older plans replay the terminal token into a scratch block, so the
+        # terminal-containing body block is not borrowed.
+        if isinstance(body_block_ids, list):
+            body_block_ids = body_block_ids[:-1]
     if not isinstance(body_block_ids, list) or not body_block_ids:
-        return None
-    # The terminal token is replayed into a fresh scratch block. Therefore the
-    # borrowed block list must exclude the block containing the terminal token.
-    body_block_ids = body_block_ids[:-1]
-    if not body_block_ids:
         return None
     try:
         blocks = [
@@ -156,21 +162,26 @@ def _prepare_segment_reuse_terminal_replay(
     try:
         envelope_tokens = int(plan["fresh_envelope_tokens"])
         body_terminal_token = int(plan["body_terminal_token"])
-        body_block_size = int(plan["body_block_size"])
+        body_tail_start_token = int(
+            plan.get("body_tail_start_token", body_terminal_token)
+        )
+        body_tail_tokens = int(plan.get("body_tail_tokens", 1))
     except (KeyError, TypeError, ValueError):
         return num_new_tokens, 0, None
     if request.num_computed_tokens < envelope_tokens:
         return num_new_tokens, 0, None
-    if body_terminal_token < request.num_computed_tokens:
+    if body_tail_start_token < request.num_computed_tokens:
         return num_new_tokens, 0, None
-    if body_block_size <= 0 or body_terminal_token % body_block_size != 0:
-        plan["scheduler_phase"] = "terminal_replay_alignment_unsupported"
+    if body_tail_tokens <= 0:
+        return num_new_tokens, 0, None
+    if num_new_tokens < body_tail_tokens:
+        plan["scheduler_phase"] = "terminal_replay_budget_unsupported"
         logger.warning(
-            "segment_reuse: request %s cannot enter terminal replay; terminal "
-            "token %d is not block-aligned for block size %d",
+            "segment_reuse: request %s cannot enter terminal replay; tail "
+            "tokens %d exceed scheduled token budget %d",
             request.request_id,
-            body_terminal_token,
-            body_block_size,
+            body_tail_tokens,
+            num_new_tokens,
         )
         return num_new_tokens, 0, None
 
@@ -183,15 +194,17 @@ def _prepare_segment_reuse_terminal_replay(
         )
         return num_new_tokens, 0, None
 
-    num_new_computed_tokens = body_terminal_token - request.num_computed_tokens
+    num_new_computed_tokens = body_tail_start_token - request.num_computed_tokens
     plan["scheduler_phase"] = "terminal_replay"
     logger.info(
         "segment_reuse: request %s splicing %d body-computed tokens and "
-        "scheduling 1 terminal replay token",
+        "scheduling %d tail replay token(s) through terminal token %d",
         request.request_id,
         num_new_computed_tokens,
+        body_tail_tokens,
+        body_terminal_token,
     )
-    return 1, num_new_computed_tokens, body_blocks
+    return body_tail_tokens, num_new_computed_tokens, body_blocks
 
 
 class Scheduler(SchedulerInterface):

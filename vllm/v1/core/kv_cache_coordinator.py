@@ -203,12 +203,19 @@ class KVCacheCoordinator(ABC):
             num_external_computed_tokens: The number of external computed tokens.
         """
         # A running request is already tracked in num_cached_block and won't
-        # have new prefix-cache hits, so this is a no-op for it.
+        # have new prefix-cache hits in the ordinary prefix-cache path.
+        # Segment-reuse stitching is a controlled exception: a running request
+        # first computes a fresh envelope, then appends borrowed full body blocks
+        # before replaying the terminal tail into newly allocated scratch blocks.
         if any(
             request_id in manager.num_cached_block
             for manager in self.single_type_managers
         ):
-            assert all(len(blocks) == 0 for blocks in new_computed_blocks)
+            for i, manager in enumerate(self.single_type_managers):
+                manager.add_running_local_computed_blocks(
+                    request_id,
+                    new_computed_blocks[i],
+                )
             return
 
         # Two-phase allocation (issue #33775): first touch every group's local
