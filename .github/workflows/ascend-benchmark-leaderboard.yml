@@ -460,8 +460,8 @@ jobs:
             local repo_url=$1
             local target_dir=$2
             local target_sha=$3
-            local attempts=4
-            local delay_seconds=15
+            local attempts=6
+            local delay_seconds=20
             local try=1
             local parent_dir
             local temp_dir
@@ -472,6 +472,7 @@ jobs:
             mkdir -p "$parent_dir"
             rm -rf "$temp_dir"
             while [[ "$try" -le "$attempts" ]]; do
+              echo "Clone attempt ${try}/${attempts}: $repo_url"
               if git clone --depth 1 "$repo_url" "$temp_dir"; then
                 if ! git -C "$temp_dir" rev-parse --verify --quiet "$target_sha^{commit}" >/dev/null; then
                   git -C "$temp_dir" fetch --depth 1 origin "$target_sha"
@@ -488,6 +489,7 @@ jobs:
                 sleep "$delay_seconds"
               fi
               try=$((try + 1))
+              delay_seconds=$((delay_seconds * 2))
             done
 
             echo "Failed to clone $repo_url after ${attempts} attempts" >&2
