@@ -335,6 +335,29 @@ class SingleTypeKVCacheManager(ABC):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
 
+    def allocate_extra_blocks(
+        self, request_id: str, num_blocks: int
+    ) -> list[KVCacheBlock]:
+        """Allocate extra blocks that are addressed by custom slot mappings.
+
+        This is intentionally not reflected in ``num_tokens``. Segment-reuse
+        uses it to preserve a borrowed terminal body block as read-only context
+        while writing the replayed terminal token into a separate scratch block.
+        """
+        if num_blocks <= 0:
+            return []
+        req_blocks = self.req_to_blocks[request_id]
+        new_blocks = self.block_pool.get_new_blocks(num_blocks)
+        req_blocks.extend(new_blocks)
+        if type(self.kv_cache_spec) in (
+            FullAttentionSpec,
+            TQFullAttentionSpec,
+            MLAAttentionSpec,
+            HiddenStateCacheSpec,
+        ):
+            self.new_block_ids.extend(b.block_id for b in new_blocks)
+        return new_blocks
+
     def take_new_block_ids(self) -> list[int]:
         """Drain and return block IDs allocated since the last call."""
         ids = self.new_block_ids

@@ -207,6 +207,16 @@ def _prepare_segment_reuse_terminal_replay(
     return body_tail_tokens, num_new_computed_tokens, body_blocks
 
 
+def _segment_reuse_needs_current_token_scratch(request: Request) -> bool:
+    plan = _get_segment_reuse_runner_plan(request)
+    if not plan or plan.get("scheduler_phase") != "terminal_replay":
+        return False
+    contract = plan.get("scheduler_replay_contract")
+    if not isinstance(contract, dict):
+        return False
+    return bool(contract.get("scratch_current_token", False))
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -667,6 +677,9 @@ class Scheduler(SchedulerInterface):
                 request,
                 num_new_tokens,
             )
+            segment_reuse_needs_scratch = (
+                _segment_reuse_needs_current_token_scratch(request)
+            )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -718,9 +731,21 @@ class Scheduler(SchedulerInterface):
                         num_new_computed_tokens=segment_reuse_num_new_computed_tokens,
                         new_computed_blocks=segment_reuse_new_computed_blocks,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        reserved_blocks=1 if segment_reuse_needs_scratch else 0,
                     )
 
                     if new_blocks is not None:
+                        if segment_reuse_needs_scratch:
+                            scratch_blocks = self.kv_cache_manager.allocate_extra_blocks(
+                                request.request_id,
+                                1,
+                            )
+                            if scratch_blocks is None:
+                                raise RuntimeError(
+                                    "segment_reuse: scratch block allocation failed "
+                                    "despite reserved capacity"
+                                )
+                            new_blocks = new_blocks + scratch_blocks
                         # The request can be scheduled.
                         break
 

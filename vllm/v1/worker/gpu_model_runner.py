@@ -2149,6 +2149,11 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        self._apply_segment_reuse_scratch_slot_overrides(
+            num_reqs,
+            num_scheduled_tokens,
+            positions_np,
+        )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -4472,6 +4477,68 @@ class GPUModelRunner(
             collect_knorm_scores(self, self.input_batch)
 
         return None
+
+    def _apply_segment_reuse_scratch_slot_overrides(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        positions_np: np.ndarray,
+    ) -> None:
+        token_offset = 0
+        for req_idx in range(num_reqs):
+            req_id = self.input_batch.req_ids[req_idx]
+            req_state = self.requests.get(req_id)
+            num_tokens = int(num_scheduled_tokens[req_idx])
+            if req_state is None or num_tokens <= 0:
+                token_offset += num_tokens
+                continue
+
+            plan = req_state.runner_extensions.get("segment_reuse")
+            contract = (
+                plan.get("scheduler_replay_contract")
+                if isinstance(plan, dict)
+                else None
+            )
+            if not (isinstance(contract, dict) and contract.get("scratch_current_token")):
+                token_offset += num_tokens
+                continue
+
+            token_position = int(positions_np[token_offset])
+            expected_num_tokens = int(contract.get("step_num_scheduled_tokens", 0) or 0)
+            expected_position = int(contract.get("input_token_position", -1) or -1)
+            if num_tokens != expected_num_tokens or token_position != expected_position:
+                token_offset += num_tokens
+                continue
+            if num_tokens != 1:
+                raise RuntimeError(
+                    "segment_reuse scratch-current-token replay expects one "
+                    f"scheduled token, got {num_tokens}"
+                )
+
+            for group_idx, block_ids in enumerate(req_state.block_ids):
+                if not block_ids:
+                    continue
+                block_table = self.input_batch.block_table[group_idx]
+                scratch_block_id = int(block_ids[-1])
+                kernel_block_offset = (
+                    token_position
+                    % (block_table.block_size * block_table.blocks_per_kv_block)
+                ) // block_table.block_size
+                kernel_block_id = (
+                    scratch_block_id * block_table.blocks_per_kv_block
+                    + kernel_block_offset
+                )
+                slot_offset = token_position % block_table.block_size
+                scratch_slot = kernel_block_id * block_table.block_size + slot_offset
+                block_table.slot_mapping.gpu[token_offset] = scratch_slot
+
+            logger.info(
+                "segment_reuse: request %s writing terminal token %d into "
+                "scratch KV slot(s)",
+                req_id,
+                token_position,
+            )
+            token_offset += num_tokens
 
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None

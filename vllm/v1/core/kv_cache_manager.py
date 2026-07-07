@@ -719,6 +719,19 @@ class KVCacheManager:
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
 
+    def allocate_extra_blocks(
+        self, request_id: str, num_blocks_per_group: int
+    ) -> KVCacheBlocks | None:
+        if num_blocks_per_group <= 0:
+            return self.empty_kv_cache_blocks
+        required_blocks = num_blocks_per_group * self.num_kv_cache_groups
+        if required_blocks > self.block_pool.get_num_free_blocks():
+            return None
+        blocks = self.coordinator.allocate_extra_blocks(
+            request_id, num_blocks_per_group
+        )
+        return self.create_kv_cache_blocks(blocks)
+
     def take_new_block_ids(self) -> list[int]:
         """Drain and return new attention block IDs for zeroing."""
         ids: list[int] = []

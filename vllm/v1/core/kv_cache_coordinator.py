@@ -272,6 +272,17 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def allocate_extra_blocks(
+        self, request_id: str, num_blocks_per_group: int
+    ) -> tuple[list[KVCacheBlock], ...]:
+        """Allocate extra per-group blocks outside the logical token length."""
+        return tuple(
+            []
+            if isinstance(manager, CrossAttentionManager)
+            else manager.allocate_extra_blocks(request_id, num_blocks_per_group)
+            for manager in self.single_type_managers
+        )
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> int:
         """
         Cache the blocks for the request.
