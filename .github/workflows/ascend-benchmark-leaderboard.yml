@@ -435,7 +435,11 @@ jobs:
             echo "Unable to scan ssh.github.com host keys." >&2
             exit 2
           fi
-          sed 's/^\[ssh\.github\.com\]:443 /github.com /' "$known_hosts_tmp" > "$HOME/.ssh/known_hosts"
+          awk 'NF >= 3 && $1 !~ /^#/ { print "github.com " $2 " " $3 }' "$known_hosts_tmp" > "$HOME/.ssh/known_hosts"
+          if [[ ! -s "$HOME/.ssh/known_hosts" ]]; then
+            echo "Unable to normalize ssh.github.com host keys for github.com." >&2
+            exit 2
+          fi
           chmod 600 "$HOME/.ssh/known_hosts"
 
           cat > "$HOME/.ssh/config" <<EOF
