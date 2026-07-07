@@ -435,12 +435,7 @@ jobs:
             echo "Unable to scan ssh.github.com host keys." >&2
             exit 2
           fi
-          {
-            cat "$known_hosts_tmp"
-            sed 's/^\[ssh\.github\.com\]:443 /github.com /' "$known_hosts_tmp"
-            sed 's/^\[ssh\.github\.com\]:443 /\[github.com\]:443 /' "$known_hosts_tmp"
-            sed 's/^\[ssh\.github\.com\]:443 /ssh.github.com /' "$known_hosts_tmp"
-          } > "$HOME/.ssh/known_hosts"
+          sed 's/^\[ssh\.github\.com\]:443 /github.com /' "$known_hosts_tmp" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
 
           cat > "$HOME/.ssh/config" <<EOF
