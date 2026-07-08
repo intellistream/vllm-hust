@@ -27,6 +27,7 @@ jobs:
       - docker
     timeout-minutes: 45
     env:
+      HOME: ${{ github.workspace }}/../.ci-home
       DEFAULT_SYSTEM_ASCEND_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
       HF_HUB_DISABLE_TELEMETRY: "1"
       HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
@@ -34,6 +35,8 @@ jobs:
       HUGGINGFACE_HUB_CACHE: ${{ github.workspace }}/../.hf-cache/hub
       TRANSFORMERS_CACHE: ${{ github.workspace }}/../.hf-cache/transformers
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      CHECKOUT_GH_TOKEN: ${{ secrets.VLLM_HUST_BENCHMARK_GH_TOKEN || secrets.GITHUB_TOKEN }}
+      CHECKOUT_SSH_KEY: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY || '' }}
       ASCEND_E2E_USE_SUDO: ${{ vars.VLLM_HUST_ASCEND_E2E_USE_SUDO || '1' }}
       ASCEND_E2E_ROOT_HELPER: ${{ vars.VLLM_HUST_ASCEND_E2E_ROOT_HELPER || '' }}
       SOC_VERSION: ascend910b3
@@ -68,6 +71,11 @@ jobs:
           fi
 
           rm -rf "${cleanup_paths[@]}"
+
+      - name: Configure GitHub checkout transport
+        if: ${{ startsWith(env.TARGET_REPO_URL, 'git@github.com:') }}
+        shell: bash
+        run: bash .github/workflows/scripts/configure_github_checkout_transport.sh
 
       - name: Checkout target repo with retry
         run: |
@@ -237,7 +245,8 @@ jobs:
         run: |
           source "$VLLM_ASCEND_HUST_REPO/scripts/use_single_ascend_env.sh"
           bash "$VLLM_ASCEND_HUST_REPO/scripts/install_local_ascend_plugin.sh" "$VLLM_ASCEND_HUST_REPO"
-          "$PYTHON_BIN" -m pip install --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "wheel" "packaging>=24.2"
+          "$PYTHON_BIN" -m pip install --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" "wheel" "packaging>=24.2"
+          "$PYTHON_BIN" -m pip uninstall -y vllm 2>/dev/null || true
           VLLM_TARGET_DEVICE=empty "$PYTHON_BIN" -m pip install -e . --no-build-isolation --no-deps
 
       - name: Verify installation
@@ -264,6 +273,10 @@ jobs:
       - name: Cleanup leftover Ascend CI processes
         if: always()
         run: |
+          if [[ ! -f "$VLLM_ASCEND_HUST_REPO/scripts/use_single_ascend_env.sh" ]]; then
+            echo "Skipping Ascend CI cleanup because vllm-ascend-hust was not checked out."
+            exit 0
+          fi
           source "$VLLM_ASCEND_HUST_REPO/scripts/use_single_ascend_env.sh"
           bash .github/workflows/scripts/cleanup_ascend_ci_processes.sh
 

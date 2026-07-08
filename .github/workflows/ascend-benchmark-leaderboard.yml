@@ -255,7 +255,7 @@ jobs:
       - docker
     timeout-minutes: 60
     env:
-      HOME: ${{ github.workspace }}/.ci-home
+      HOME: ${{ github.workspace }}/../.ci-home
       DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
       HF_HUB_DISABLE_TELEMETRY: "1"
       HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
@@ -300,17 +300,19 @@ jobs:
       WEBSITE_LEADERBOARD_URL: ${{ vars.VLLM_HUST_LEADERBOARD_URL || '' }}
       PUBLISH_TO_BENCHMARK_REPO: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.VLLM_HUST_PUBLISH_BENCHMARK_ON_MAIN == '1') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_benchmark_repo)) && '1' || '0' }}
       PUBLISH_TO_HF: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_to_hf && secrets.HF_TOKEN != '') && '1' || '0' }}
-      TARGET_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && format('https://github.com/{0}.git', github.repository) || format('git@github.com:{0}.git', github.repository) }}
+      TARGET_REPO_URL: git@github.com:${{ github.repository }}.git
       TARGET_REPO_SHA: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_head_sha || github.sha }}
-      BENCHMARK_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-hust-benchmark.git' || 'git@github.com:vLLM-HUST/vllm-hust-benchmark.git' }}
+      BENCHMARK_REPO_URL: git@github.com:vLLM-HUST/vllm-hust-benchmark.git
       BENCHMARK_REPO_SLUG: vLLM-HUST/vllm-hust-benchmark
       BENCHMARK_REPO_GH_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN || '' }}
-      BENCHMARK_REPO_SSH_KEY: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY || '' }}
+      BENCHMARK_REPO_SSH_KEY: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY || '' }}
+      CHECKOUT_GH_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN || '' }}
+      CHECKOUT_SSH_KEY: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY || '' }}
       BENCHMARK_REPO_REF: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && (vars.VLLM_HUST_BENCHMARK_REPO_REF || 'main') || 'main' }}
-      WEBSITE_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-hust-website.git' || 'git@github.com:vLLM-HUST/vllm-hust-website.git' }}
-      VLLM_ASCEND_HUST_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-ascend-hust.git' || 'git@github.com:vLLM-HUST/vllm-ascend-hust.git' }}
+      WEBSITE_REPO_URL: git@github.com:vLLM-HUST/vllm-hust-website.git
+      VLLM_ASCEND_HUST_REPO_URL: git@github.com:vLLM-HUST/vllm-ascend-hust.git
       ISSUE_COMMENT_PR_NUMBER: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_number || '' }}
-      HUST_ASCEND_MANAGER_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/ascend-runtime-manager.git' || 'git@github.com:vLLM-HUST/ascend-runtime-manager.git' }}
+      HUST_ASCEND_MANAGER_REPO_URL: git@github.com:vLLM-HUST/ascend-runtime-manager.git
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
       # Disable precompiled CUDA wheel fetch from wheels.vllm.ai.
       # The Ascend benchmark uses the vllm-ascend-hust plugin, not CUDA
@@ -407,20 +409,43 @@ jobs:
             exit 1
           }
 
-      - name: Configure GitHub SSH checkout
-        if: ${{ env.BENCHMARK_REPO_SSH_KEY != '' }}
+      - name: Configure GitHub checkout transport
+        if: ${{ startsWith(env.TARGET_REPO_URL, 'git@github.com:') }}
         shell: bash
         run: |
           set -euo pipefail
 
-          # The runner container may not have HOME set; default to /root for root user.
-          export HOME="${HOME:-/root}"
+          state_root="${CHECKOUT_TRANSPORT_STATE_ROOT:-${GITHUB_WORKSPACE}/../.checkout-transport}"
+          home_dir="${CHECKOUT_TRANSPORT_HOME:-${state_root}/home}"
+          git_config="${CHECKOUT_TRANSPORT_GIT_CONFIG:-${state_root}/gitconfig}"
+          ssh_dir="${CHECKOUT_TRANSPORT_SSH_DIR:-${state_root}/ssh}"
 
-          mkdir -p "$HOME/.ssh"
-          chmod 700 "$HOME/.ssh"
+          mkdir -p "$home_dir" "$ssh_dir"
+          chmod 700 "$home_dir" "$ssh_dir"
 
-          key_file="$HOME/.ssh/vllm_hust_benchmark_key"
-          printf '%s\n' "$BENCHMARK_REPO_SSH_KEY" > "$key_file"
+          {
+            echo "HOME=$home_dir"
+            echo "GIT_CONFIG_GLOBAL=$git_config"
+          } >> "$GITHUB_ENV"
+
+          export HOME="$home_dir"
+          export GIT_CONFIG_GLOBAL="$git_config"
+
+          if [[ -n "${CHECKOUT_GH_TOKEN:-}" ]]; then
+            git config --file "$git_config" \
+              url."https://x-access-token:${CHECKOUT_GH_TOKEN}@github.com/".insteadOf \
+              "git@github.com:"
+            echo "Configured GitHub HTTPS token checkout rewrite."
+            exit 0
+          fi
+
+          if [[ -z "${CHECKOUT_SSH_KEY:-}" ]]; then
+            echo "CHECKOUT_GH_TOKEN or CHECKOUT_SSH_KEY is required for GitHub SSH clone URLs." >&2
+            exit 2
+          fi
+
+          key_file="${ssh_dir}/github_checkout_key"
+          printf '%s\n' "$CHECKOUT_SSH_KEY" > "$key_file"
           chmod 600 "$key_file"
 
           known_hosts_tmp="$(mktemp)"
@@ -429,24 +454,46 @@ jobs:
             echo "Unable to scan ssh.github.com host keys." >&2
             exit 2
           fi
-          cat "$known_hosts_tmp" >> "$HOME/.ssh/known_hosts"
-          chmod 600 "$HOME/.ssh/known_hosts"
 
-          cat > "$HOME/.ssh/config" <<EOF
+          known_hosts="${ssh_dir}/known_hosts"
+          awk 'NF >= 3 && $1 !~ /^#/ { print "github.com " $2 " " $3 }' \
+            "$known_hosts_tmp" > "$known_hosts"
+          if [[ ! -s "$known_hosts" ]]; then
+            echo "Unable to normalize ssh.github.com host keys for github.com." >&2
+            exit 2
+          fi
+          chmod 600 "$known_hosts"
+
+          ssh_config="${ssh_dir}/config"
+          cat > "$ssh_config" <<EOF
           Host github.com
             HostName ssh.github.com
             Port 443
             User git
+            HostKeyAlias github.com
             IdentityFile $key_file
             IdentitiesOnly yes
             StrictHostKeyChecking yes
           EOF
-          chmod 600 "$HOME/.ssh/config"
+          chmod 600 "$ssh_config"
 
-          ssh_output="$(ssh -o BatchMode=yes -T git@github.com 2>&1)" && ssh_status=$? || ssh_status=$?
+          ssh_wrapper="${ssh_dir}/github_ssh"
+          cat > "$ssh_wrapper" <<EOF
+          #!/usr/bin/env bash
+          exec ssh -F "$ssh_config" -o UserKnownHostsFile="$known_hosts" -o GlobalKnownHostsFile=/dev/null "\$@"
+          EOF
+          chmod 700 "$ssh_wrapper"
+
+          echo "GIT_SSH_COMMAND=$ssh_wrapper" >> "$GITHUB_ENV"
+
+          ssh_output="$("$ssh_wrapper" -o BatchMode=yes -T git@github.com 2>&1)" && ssh_status=$? || ssh_status=$?
           echo "$ssh_output"
+          if [[ "$ssh_output" == *"Host key verification failed"* ]]; then
+            echo "GitHub SSH host key verification failed after explicit checkout setup." >&2
+            exit 2
+          fi
           if [[ "$ssh_output" == *"Permission denied"* ]]; then
-            echo "GitHub SSH authentication failed for the configured key." >&2
+            echo "GitHub SSH authentication failed for the configured checkout key." >&2
             exit 2
           fi
           if [[ "$ssh_status" -ne 0 && "$ssh_status" -ne 1 ]]; then
@@ -460,8 +507,8 @@ jobs:
             local repo_url=$1
             local target_dir=$2
             local target_sha=$3
-            local attempts=4
-            local delay_seconds=15
+            local attempts=6
+            local delay_seconds=20
             local try=1
             local parent_dir
             local temp_dir
@@ -472,6 +519,7 @@ jobs:
             mkdir -p "$parent_dir"
             rm -rf "$temp_dir"
             while [[ "$try" -le "$attempts" ]]; do
+              echo "Clone attempt ${try}/${attempts}: $repo_url"
               if git clone --depth 1 "$repo_url" "$temp_dir"; then
                 if ! git -C "$temp_dir" rev-parse --verify --quiet "$target_sha^{commit}" >/dev/null; then
                   git -C "$temp_dir" fetch --depth 1 origin "$target_sha"
@@ -488,6 +536,7 @@ jobs:
                 sleep "$delay_seconds"
               fi
               try=$((try + 1))
+              delay_seconds=$((delay_seconds * 2))
             done
 
             echo "Failed to clone $repo_url after ${attempts} attempts" >&2
@@ -796,7 +845,7 @@ jobs:
             exit 0
           fi
 
-          "${PYTHON_BIN}" -m pip install "torch==2.9.0" "torch-npu==2.9.0"
+          "${PYTHON_BIN}" -m pip install "torch==2.10.0" "torch-npu==2.10.0"
 
       - name: Runner health preflight (before install)
         env:
@@ -956,7 +1005,8 @@ jobs:
         run: |
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
           bash "${VLLM_ASCEND_HUST_REPO}/scripts/install_local_ascend_plugin.sh" "$VLLM_ASCEND_HUST_REPO"
-          "${PYTHON_BIN}" -m pip install --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "wheel" "packaging>=24.2"
+          "${PYTHON_BIN}" -m pip install --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" "wheel" "packaging>=24.2"
+          "${PYTHON_BIN}" -m pip uninstall -y vllm 2>/dev/null || true
           VLLM_TARGET_DEVICE=empty "${PYTHON_BIN}" -m pip install -e . --no-build-isolation --no-deps
           "${PYTHON_BIN}" -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema
 

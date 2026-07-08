@@ -280,7 +280,7 @@ if TYPE_CHECKING:
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
-    VLLM_KNORM_COMPRESSION_RATIO: float = 0.5
+    VLLM_KNORM_COMPRESSION_RATIO: float = 1.0
     VLLM_KNORM_WARMUP_TOKENS: int = 32
     VLLM_KNORM_ENABLED: bool = True
     VLLM_KNORM_SCORE_AGGREGATION: str = "min"
@@ -1954,7 +1954,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Knorm KV Cache Compression ==================
     # Fraction of KV cache blocks to KEEP. 1.0 = no compression.
     "VLLM_KNORM_COMPRESSION_RATIO": lambda: float(
-        os.getenv("VLLM_KNORM_COMPRESSION_RATIO", "0.5")
+        os.getenv("VLLM_KNORM_COMPRESSION_RATIO", "1.0")
     ),
     # Number of tokens at the sequence start to always keep (attention sink).
     "VLLM_KNORM_WARMUP_TOKENS": lambda: int(
