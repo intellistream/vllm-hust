@@ -430,6 +430,7 @@ jobs:
             exit 2
           fi
           cat "$known_hosts_tmp" >> "$HOME/.ssh/known_hosts"
+          sed 's/^\[ssh.github.com\]:443/[github.com]:443/' "$known_hosts_tmp" >> "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
 
           cat > "$HOME/.ssh/config" <<EOF
