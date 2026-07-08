@@ -34,6 +34,7 @@ jobs:
       HUGGINGFACE_HUB_CACHE: ${{ github.workspace }}/../.hf-cache/hub
       TRANSFORMERS_CACHE: ${{ github.workspace }}/../.hf-cache/transformers
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GITHUB_CHECKOUT_SSH_KEY: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
       ASCEND_E2E_USE_SUDO: ${{ vars.VLLM_HUST_ASCEND_E2E_USE_SUDO || '1' }}
       ASCEND_E2E_ROOT_HELPER: ${{ vars.VLLM_HUST_ASCEND_E2E_ROOT_HELPER || '' }}
       SOC_VERSION: ascend910b3
@@ -68,6 +69,51 @@ jobs:
           fi
 
           rm -rf "${cleanup_paths[@]}"
+
+      - name: Configure GitHub SSH checkout
+        if: ${{ env.GITHUB_CHECKOUT_SSH_KEY != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export HOME="${HOME:-/root}"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          key_file="$HOME/.ssh/vllm_hust_checkout_key"
+          known_hosts_file="$HOME/.ssh/vllm_hust_known_hosts"
+          printf '%s\n' "$GITHUB_CHECKOUT_SSH_KEY" > "$key_file"
+          chmod 600 "$key_file"
+
+          ssh-keyscan -p 443 -t rsa,ecdsa,ed25519 ssh.github.com > "$known_hosts_file" 2>/dev/null
+          if [[ ! -s "$known_hosts_file" ]]; then
+            echo "Unable to scan ssh.github.com host keys." >&2
+            exit 2
+          fi
+          chmod 600 "$known_hosts_file"
+
+          cat > "$HOME/.ssh/config" <<EOF
+          Host ssh.github.com
+            User git
+            IdentityFile $key_file
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile $known_hosts_file
+          EOF
+          chmod 600 "$HOME/.ssh/config"
+
+          git config --global url."ssh://git@ssh.github.com:443/".insteadOf "https://github.com/"
+
+          ssh_output="$(ssh -p 443 -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" -i "$key_file" -T git@ssh.github.com 2>&1)" && ssh_status=$? || ssh_status=$?
+          echo "$ssh_output"
+          if [[ "$ssh_output" == *"Permission denied"* ]]; then
+            echo "GitHub SSH authentication failed for the configured key." >&2
+            exit 2
+          fi
+          if [[ "$ssh_status" -ne 0 && "$ssh_status" -ne 1 ]]; then
+            echo "GitHub SSH probe failed with status $ssh_status." >&2
+            exit "$ssh_status"
+          fi
 
       - name: Checkout target repo with retry
         run: |

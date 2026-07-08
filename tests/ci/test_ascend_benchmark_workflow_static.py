@@ -10,6 +10,12 @@ WORKFLOW_PATH = (
     Path(__file__).resolve().parents[2]
     / ".github/workflows/ascend-benchmark-leaderboard.yml"
 )
+INFERENCE_WORKFLOW_PATHS = (
+    Path(__file__).resolve().parents[2]
+    / ".github/workflows/linux-ascend-inference-smoke.yml",
+    Path(__file__).resolve().parents[2]
+    / ".github/workflows/linux-ascend-inference-regression.yml",
+)
 
 
 def workflow_text() -> str:
@@ -127,6 +133,21 @@ def test_trusted_pr_checkout_can_rewrite_https_to_ssh_over_443():
     assert "sed 's/^\\[ssh.github.com\\]:443/github.com/'" in text
     assert "https://github.com/vLLM-HUST/vllm-hust-benchmark.git" in text
     assert "https://github.com/vLLM-HUST/vllm-ascend-hust.git" in text
+
+
+def test_inference_workflows_rewrite_github_checkout_to_ssh_over_443():
+    for workflow_path in INFERENCE_WORKFLOW_PATHS:
+        text = workflow_path.read_text(encoding="utf-8")
+
+        configure_step = text.index("      - name: Configure GitHub SSH checkout")
+        checkout_step = text.index("      - name: Checkout target repo with retry")
+
+        assert configure_step < checkout_step
+        assert "GITHUB_CHECKOUT_SSH_KEY: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}" in text
+        assert "ssh-keyscan -p 443 -t rsa,ecdsa,ed25519 ssh.github.com" in text
+        assert 'url."ssh://git@ssh.github.com:443/".insteadOf "https://github.com/"' in text
+        assert "UserKnownHostsFile $known_hosts_file" in text
+        assert "ssh -p 443" in text
 
 
 def test_main_benchmark_defaults_match_ascend_main_config():
