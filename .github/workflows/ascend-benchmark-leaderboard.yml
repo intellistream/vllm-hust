@@ -252,9 +252,7 @@ jobs:
       issues: write
     runs-on:
       - self-hosted
-      - ascend
-      - 910b
-      - docker
+      - linux-aarch64-a2b3-1
     timeout-minutes: 60
     env:
       HOME: ${{ github.workspace }}/.ci-home
