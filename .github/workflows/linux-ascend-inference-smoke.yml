@@ -237,6 +237,12 @@ jobs:
           dirname "$PYTHON_BIN" >> "$GITHUB_PATH"
           "$PYTHON_BIN" --version
 
+      - name: Install ascend-runtime-manager from fresh checkout
+        run: |
+          "$PYTHON_BIN" -m pip uninstall -y hust-ascend-manager 2>/dev/null || true
+          "$PYTHON_BIN" -m pip install --no-deps -e "$HUST_ASCEND_MANAGER_REPO"
+          "$PYTHON_BIN" -c "import hust_ascend_manager.doctor; print('hust-ascend-manager loaded from:', hust_ascend_manager.doctor.__file__)"
+
       - name: Install Ascend torch stack for preflight
         run: |
           source "$VLLM_ASCEND_HUST_REPO/scripts/use_single_ascend_env.sh"
