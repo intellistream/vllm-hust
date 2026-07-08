@@ -424,23 +424,27 @@ jobs:
           chmod 600 "$key_file"
 
           known_hosts_tmp="$(mktemp)"
+          known_hosts_file="$HOME/.ssh/vllm_hust_known_hosts"
           ssh-keyscan -p 443 -t rsa,ecdsa,ed25519 ssh.github.com > "$known_hosts_tmp" 2>/dev/null
           if [[ ! -s "$known_hosts_tmp" ]]; then
             echo "Unable to scan ssh.github.com host keys." >&2
             exit 2
           fi
-          cat "$known_hosts_tmp" >> "$HOME/.ssh/known_hosts"
-          sed 's/^\[ssh.github.com\]:443/[github.com]:443/' "$known_hosts_tmp" >> "$HOME/.ssh/known_hosts"
-          chmod 600 "$HOME/.ssh/known_hosts"
+          cat "$known_hosts_tmp" > "$known_hosts_file"
+          sed 's/^\[ssh.github.com\]:443/[github.com]:443/' "$known_hosts_tmp" >> "$known_hosts_file"
+          sed 's/^\[ssh.github.com\]:443/github.com/' "$known_hosts_tmp" >> "$known_hosts_file"
+          chmod 600 "$known_hosts_file"
 
           cat > "$HOME/.ssh/config" <<EOF
           Host github.com
             HostName ssh.github.com
             Port 443
             User git
+            HostKeyAlias github.com
             IdentityFile $key_file
             IdentitiesOnly yes
             StrictHostKeyChecking yes
+            UserKnownHostsFile $known_hosts_file
           EOF
           chmod 600 "$HOME/.ssh/config"
           git config --global url."git@github.com:".insteadOf "https://github.com/"

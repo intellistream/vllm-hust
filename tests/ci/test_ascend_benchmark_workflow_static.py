@@ -120,7 +120,11 @@ def test_trusted_pr_checkout_can_rewrite_https_to_ssh_over_443():
     assert 'git config --global url."git@github.com:".insteadOf "https://github.com/"' in text
     assert "HostName ssh.github.com" in text
     assert "Port 443" in text
+    assert "HostKeyAlias github.com" in text
+    assert "known_hosts_file=\"$HOME/.ssh/vllm_hust_known_hosts\"" in text
+    assert "UserKnownHostsFile $known_hosts_file" in text
     assert "sed 's/^\\[ssh.github.com\\]:443/[github.com]:443/'" in text
+    assert "sed 's/^\\[ssh.github.com\\]:443/github.com/'" in text
     assert "https://github.com/vLLM-HUST/vllm-hust-benchmark.git" in text
     assert "https://github.com/vLLM-HUST/vllm-ascend-hust.git" in text
 
