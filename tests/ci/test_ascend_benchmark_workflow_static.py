@@ -117,10 +117,10 @@ def test_trusted_pr_checkout_can_rewrite_https_to_ssh_over_443():
         "github.event_name != 'pull_request' || "
         "github.event.pull_request.head.repo.full_name == github.repository"
     ) in text
-    assert 'git config --global url."git@github.com:".insteadOf "https://github.com/"' in text
-    assert "HostName ssh.github.com" in text
-    assert "Port 443" in text
-    assert "HostKeyAlias github.com" in text
+    assert 'url."ssh://git@ssh.github.com:443/".insteadOf "https://github.com/"' in text
+    assert 'url."ssh://git@ssh.github.com:443/".insteadOf "git@github.com:"' in text
+    assert "Host ssh.github.com" in text
+    assert "-p 443" in text
     assert "known_hosts_file=\"$HOME/.ssh/vllm_hust_known_hosts\"" in text
     assert "UserKnownHostsFile $known_hosts_file" in text
     assert "sed 's/^\\[ssh.github.com\\]:443/[github.com]:443/'" in text

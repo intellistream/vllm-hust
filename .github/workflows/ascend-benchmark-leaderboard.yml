@@ -436,20 +436,18 @@ jobs:
           chmod 600 "$known_hosts_file"
 
           cat > "$HOME/.ssh/config" <<EOF
-          Host github.com
-            HostName ssh.github.com
-            Port 443
+          Host ssh.github.com
             User git
-            HostKeyAlias github.com
             IdentityFile $key_file
             IdentitiesOnly yes
             StrictHostKeyChecking yes
             UserKnownHostsFile $known_hosts_file
           EOF
           chmod 600 "$HOME/.ssh/config"
-          git config --global url."git@github.com:".insteadOf "https://github.com/"
+          git config --global url."ssh://git@ssh.github.com:443/".insteadOf "https://github.com/"
+          git config --global url."ssh://git@ssh.github.com:443/".insteadOf "git@github.com:"
 
-          ssh_output="$(ssh -o BatchMode=yes -T git@github.com 2>&1)" && ssh_status=$? || ssh_status=$?
+          ssh_output="$(ssh -p 443 -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" -i "$key_file" -T git@ssh.github.com 2>&1)" && ssh_status=$? || ssh_status=$?
           echo "$ssh_output"
           if [[ "$ssh_output" == *"Permission denied"* ]]; then
             echo "GitHub SSH authentication failed for the configured key." >&2
