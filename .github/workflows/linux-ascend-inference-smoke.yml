@@ -22,7 +22,8 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       - self-hosted
-      - linux-aarch64-a2b3-0
+      - ascend
+      - 910b
       - docker
     timeout-minutes: 30
     env:

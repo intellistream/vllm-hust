@@ -251,7 +251,8 @@ jobs:
       issues: write
     runs-on:
       - self-hosted
-      - linux-aarch64-a2b3-0
+      - ascend
+      - 910b
       - docker
     timeout-minutes: 60
     env:
