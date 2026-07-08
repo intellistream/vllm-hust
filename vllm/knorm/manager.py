@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from inspect import signature
 from typing import TYPE_CHECKING
 
 from vllm.knorm.config import KnormConfig
@@ -190,8 +191,12 @@ class KnormFullAttentionManager(FullAttentionManager):
         prioritize_uncached_for_reuse: bool = False,
     ) -> None:
         """Free blocks and clean up score records."""
-        super().free(
-            request_id,
-            prioritize_uncached_for_reuse=prioritize_uncached_for_reuse,
-        )
+        parent_free = super().free
+        if "prioritize_uncached_for_reuse" in signature(parent_free).parameters:
+            parent_free(
+                request_id,
+                prioritize_uncached_for_reuse=prioritize_uncached_for_reuse,
+            )
+        else:
+            parent_free(request_id)
         self._block_scores.pop(request_id, None)
