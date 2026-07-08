@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 import vllm.envs as envs
+from vllm.knorm.config import KnormConfig
 from vllm.envs import (
     disable_envs_cache,
     enable_envs_cache,
@@ -132,6 +133,12 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
     ):
         assert environment_variables["VLLM_USE_PRECOMPILED"]() is True
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
+
+
+def test_knorm_is_opt_in_by_default() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        assert environment_variables["VLLM_KNORM_COMPRESSION_RATIO"]() == 1.0
+        assert KnormConfig().is_active is False
 
 
 class TestEnvWithChoices:
