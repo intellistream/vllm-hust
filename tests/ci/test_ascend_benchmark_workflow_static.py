@@ -105,7 +105,7 @@ def test_benchmark_repo_default_ref_is_main():
     ) in text
 
 
-def test_pr_checkout_urls_use_https_without_publish_ssh_key():
+def test_trusted_pr_checkout_can_rewrite_https_to_ssh_over_443():
     text = workflow_text()
 
     assert "format('https://github.com/{0}.git', github.repository)" in text
@@ -113,6 +113,13 @@ def test_pr_checkout_urls_use_https_without_publish_ssh_key():
     assert (
         "github.event_name == 'pull_request' || github.event_name == 'issue_comment'"
     ) in text
+    assert (
+        "github.event_name != 'pull_request' || "
+        "github.event.pull_request.head.repo.full_name == github.repository"
+    ) in text
+    assert 'git config --global url."git@github.com:".insteadOf "https://github.com/"' in text
+    assert "HostName ssh.github.com" in text
+    assert "Port 443" in text
     assert "https://github.com/vLLM-HUST/vllm-hust-benchmark.git" in text
     assert "https://github.com/vLLM-HUST/vllm-ascend-hust.git" in text
 
