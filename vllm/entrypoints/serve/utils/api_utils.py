@@ -30,7 +30,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
-_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S = 20
+_ASCEND_TORCH_PREFLIGHT_DEFAULT_TIMEOUT_S = 20
 _ASCEND_TORCH_PREFLIGHT_CMDS = {"serve", "launch"}
 _ASCEND_EXPLICIT_BACKENDS = {"ascend", "npu"}
 
@@ -270,12 +270,33 @@ def _run_ascend_torch_preflight() -> None:
         [sys.executable, "-c", probe],
         capture_output=True,
         text=True,
-        timeout=_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S,
+        timeout=_ascend_torch_preflight_timeout_s(),
         check=False,
         env=os.environ.copy(),
     )
     if result.returncode != 0:
         raise SystemExit(_format_ascend_torch_preflight_failure(result))
+
+
+def _ascend_torch_preflight_timeout_s() -> float:
+    raw_timeout = os.environ.get("VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S")
+    if raw_timeout is None or raw_timeout.strip() == "":
+        return float(_ASCEND_TORCH_PREFLIGHT_DEFAULT_TIMEOUT_S)
+    try:
+        timeout = float(raw_timeout)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S=%r",
+            raw_timeout,
+        )
+        return float(_ASCEND_TORCH_PREFLIGHT_DEFAULT_TIMEOUT_S)
+    if timeout <= 0:
+        logger.warning(
+            "Ignoring non-positive VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S=%r",
+            raw_timeout,
+        )
+        return float(_ASCEND_TORCH_PREFLIGHT_DEFAULT_TIMEOUT_S)
+    return timeout
 
 
 def _maybe_run_ascend_torch_preflight(argv: list[str] | None = None) -> None:
