@@ -174,6 +174,7 @@ class RequestState:
         self.lifecycle_scheduled_emitted = False
         self.lifecycle_first_token_emitted = False
         self.lifecycle_decode_done_emitted = False
+        self.lifecycle_stream_done_emitted = False
         self.lifecycle_cleanup_done_emitted = False
         self.queue = queue
         self.num_cached_tokens = 0
@@ -672,6 +673,8 @@ class OutputProcessor:
                 else:
                     # LLMEngine: return list of RequestOutputs.
                     request_outputs.append(request_output)
+                if request_output.finished:
+                    self._emit_lifecycle_stream_done(req_state, request_output)
 
             # Free completed requests.
             if finish_reason is not None:
@@ -881,6 +884,32 @@ class OutputProcessor:
             external_request_id=req_state.external_req_id,
         )
         req_state.lifecycle_cleanup_done_emitted = True
+
+    def _emit_lifecycle_stream_done(
+        self,
+        req_state: RequestState,
+        request_output: RequestOutput | PoolingRequestOutput,
+    ) -> None:
+        if req_state.lifecycle_stream_done_emitted:
+            return
+        output_count = (
+            len(request_output.outputs)
+            if isinstance(request_output.outputs, list)
+            else 1
+        )
+        emit_lifecycle(
+            "stream_done",
+            req_state.request_id,
+            timestamp_ms=monotonic_ms(),
+            external_request_id=req_state.external_req_id,
+            output_count=output_count,
+            generation_tokens=(
+                req_state.stats.num_generation_tokens
+                if req_state.stats is not None
+                else None
+            ),
+        )
+        req_state.lifecycle_stream_done_emitted = True
 
     def _update_stats_from_finished(
         self,
