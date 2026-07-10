@@ -4,8 +4,9 @@
 import time
 import weakref
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from copy import copy
-from typing import Any
+from typing import Any, cast
 
 import torch.nn as nn
 from typing_extensions import TypeVar
@@ -33,8 +34,10 @@ from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.request_lifecycle_hooks import emit_lifecycle, monotonic_ms
 from vllm.v1.executor import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
+from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 from vllm.v1.utils import record_function_or_nullcontext
@@ -231,6 +234,13 @@ class LLMEngine:
         if not isinstance(request_id, str):
             raise TypeError(f"request_id must be a string, got {type(request_id)}")
 
+        emit_lifecycle(
+            "received",
+            request_id,
+            timestamp_ms=monotonic_ms(),
+            priority=priority,
+        )
+
         # Process raw inputs into the request.
         if isinstance(prompt, EngineCoreRequest):
             logger.warning_once(
@@ -268,10 +278,32 @@ class LLMEngine:
         params = request.params
 
         n = params.n if isinstance(params, SamplingParams) else 1
+        prompt_tokens = (
+            len(request.prompt_token_ids)
+            if request.prompt_token_ids is not None
+            else None
+        )
+        max_tokens = getattr(params, "max_tokens", None)
+
+        emit_lifecycle(
+            "tokenized",
+            req_id,
+            timestamp_ms=monotonic_ms(),
+            external_request_id=request.external_req_id or request_id,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            n=n,
+        )
 
         if n == 1:
             # Make a new RequestState and queue.
             self.output_processor.add_request(request, prompt_text, None, 0)
+            emit_lifecycle(
+                "queued",
+                req_id,
+                timestamp_ms=monotonic_ms(),
+                external_request_id=request.external_req_id or request_id,
+            )
             # Add the request to EngineCore.
             self.engine_core.add_request(request)
             return req_id
@@ -287,6 +319,14 @@ class LLMEngine:
             # Make a new RequestState and queue.
             self.output_processor.add_request(
                 child_request, prompt_text, parent_req, idx
+            )
+            emit_lifecycle(
+                "queued",
+                child_request.request_id,
+                timestamp_ms=monotonic_ms(),
+                external_request_id=child_request.external_req_id or req_id,
+                parent_request_id=req_id,
+                request_index=idx,
             )
             # Add the request to EngineCore.
             self.engine_core.add_request(child_request)
