@@ -471,7 +471,19 @@ class KVCacheManager:
                     apply_admission_cap=True,
                 )
             else:
-                admission_blocks = num_blocks_to_allocate
+                admission_blocks = self.coordinator.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=min(
+                        total_computed_tokens
+                        + num_new_tokens
+                        + num_lookahead_tokens,
+                        self.max_model_len,
+                    ),
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_tokens_main_model=total_computed_tokens + num_new_tokens,
+                )
 
             required_blocks = admission_blocks + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():

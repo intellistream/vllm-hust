@@ -1946,6 +1946,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
     ),
+    # Emit per-request prefix-cache trace lines from the v1 KV cache manager.
+    "VLLM_DEBUG_PREFIX_CACHE_TRACE": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_PREFIX_CACHE_TRACE", "0"))
+    ),
     # ================== Knorm KV Cache Compression ==================
     # Fraction of KV cache blocks to KEEP. 1.0 = no compression.
     "VLLM_KNORM_COMPRESSION_RATIO": lambda: float(
