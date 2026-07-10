@@ -31,6 +31,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.request_lifecycle_hooks import emit_lifecycle, monotonic_ms
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -170,6 +171,10 @@ class RequestState:
         self.n = n
         self.temperature = temperature
         self.is_prefilling = True
+        self.lifecycle_scheduled_emitted = False
+        self.lifecycle_first_token_emitted = False
+        self.lifecycle_decode_done_emitted = False
+        self.lifecycle_cleanup_done_emitted = False
         self.queue = queue
         self.num_cached_tokens = 0
 
@@ -614,6 +619,9 @@ class OutputProcessor:
             self._update_stats_from_output(
                 req_state, engine_core_output, engine_core_timestamp, iteration_stats
             )
+            self._emit_lifecycle_from_output(
+                req_state, engine_core_output, engine_core_timestamp
+            )
 
             new_token_ids = engine_core_output.new_token_ids
             pooling_output = engine_core_output.pooling_output
@@ -694,6 +702,7 @@ class OutputProcessor:
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
+        self._emit_lifecycle_cleanup_done(req_state)
         self.request_states.pop(req_id)
 
         internal_ids = self.external_req_ids[req_state.external_req_id]
@@ -791,6 +800,87 @@ class OutputProcessor:
             self.lora_states,
             req_state.lora_name,
         )
+
+    def _emit_lifecycle_from_output(
+        self,
+        req_state: RequestState,
+        engine_core_output: EngineCoreOutput,
+        engine_core_timestamp: float | None,
+    ) -> None:
+        req_stats = req_state.stats
+        if req_stats is None:
+            return
+
+        if req_stats.scheduled_ts and not req_state.lifecycle_scheduled_emitted:
+            emit_lifecycle(
+                "scheduled",
+                req_state.request_id,
+                timestamp_ms=monotonic_ms(req_stats.scheduled_ts),
+                external_request_id=req_state.external_req_id,
+                prompt_tokens=req_state.prompt_len,
+                queue_delay_ms=(
+                    (req_stats.scheduled_ts - req_stats.queued_ts) * 1000.0
+                    if req_stats.queued_ts
+                    else None
+                ),
+            )
+            req_state.lifecycle_scheduled_emitted = True
+
+        if (
+            req_state.is_prefilling
+            and req_stats.first_token_ts
+            and not req_state.lifecycle_first_token_emitted
+        ):
+            prefill_metadata = engine_core_output.prefill_stats
+            emit_lifecycle(
+                "prefill_done",
+                req_state.request_id,
+                timestamp_ms=monotonic_ms(req_stats.first_token_ts),
+                external_request_id=req_state.external_req_id,
+                prompt_tokens=req_state.prompt_len,
+                cached_tokens=(
+                    prefill_metadata.num_cached_tokens
+                    if prefill_metadata is not None
+                    else req_state.num_cached_tokens
+                ),
+            )
+            emit_lifecycle(
+                "first_token",
+                req_state.request_id,
+                timestamp_ms=monotonic_ms(req_stats.first_token_ts),
+                external_request_id=req_state.external_req_id,
+                first_token_latency_ms=req_stats.first_token_latency * 1000.0,
+                prompt_tokens=req_state.prompt_len,
+            )
+            req_state.lifecycle_first_token_emitted = True
+
+        if engine_core_output.finish_reason is not None:
+            timestamp_s = (
+                req_stats.last_token_ts
+                if req_stats.last_token_ts
+                else engine_core_timestamp
+            )
+            if timestamp_s and not req_state.lifecycle_decode_done_emitted:
+                emit_lifecycle(
+                    "decode_done",
+                    req_state.request_id,
+                    timestamp_ms=monotonic_ms(timestamp_s),
+                    external_request_id=req_state.external_req_id,
+                    finish_reason=str(engine_core_output.finish_reason),
+                    generation_tokens=req_stats.num_generation_tokens,
+                )
+                req_state.lifecycle_decode_done_emitted = True
+
+    def _emit_lifecycle_cleanup_done(self, req_state: RequestState) -> None:
+        if req_state.lifecycle_cleanup_done_emitted:
+            return
+        emit_lifecycle(
+            "cleanup_done",
+            req_state.request_id,
+            timestamp_ms=monotonic_ms(),
+            external_request_id=req_state.external_req_id,
+        )
+        req_state.lifecycle_cleanup_done_emitted = True
 
     def _update_stats_from_finished(
         self,
