@@ -25,7 +25,7 @@ elif [[ -x "$DEFAULT_SYSTEM_ASCEND_ROOT_HELPER" ]]; then
 else
   ASCEND_E2E_ROOT_HELPER=$REPO_ASCEND_ROOT_HELPER
 fi
-VLLM_CLI=("$PYTHON_BIN" -m vllm.entrypoints.cli.main)
+VLLM_OPENAI_SERVER=("$PYTHON_BIN" -m vllm.entrypoints.openai.api_server)
 
 server_pid=""
 server_group_pid=""
@@ -249,15 +249,17 @@ wait_for_ascend_runtime_ready() {
 }
 
 run_runner_npu_preflight_once() {
+  # Use hust-ascend-manager runtime check for the NPU probe (controlled env).
+  hust-ascend-manager runtime check \
+    --repo "${WORKSPACE_ROOT:-${GITHUB_WORKSPACE:-$PWD}}" \
+    --python "$PYTHON_BIN" \
+    --require-npu --json >/dev/null || return 1
+
+  # Device-specific torch.zeros allocation check
   "$PYTHON_BIN" - <<'PY'
-import importlib.util
 import os
 
 import torch
-
-if importlib.util.find_spec("torch_npu") is None:
-    raise RuntimeError("torch_npu is not installed in the smoke-test environment")
-
 import torch_npu  # noqa: F401
 
 device = os.environ.get("VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE", "npu:0")
@@ -268,6 +270,54 @@ if not torch.npu.is_available():
 torch.npu.set_device(device)
 _ = torch.zeros(1, device=device)
 print("torch.zeros preflight ok")
+PY
+}
+
+prepend_env_path() {
+  local var_name=$1
+  local path_value=$2
+  local current_value=${!var_name:-}
+
+  [[ -d "$path_value" ]] || return 0
+
+  case ":$current_value:" in
+    *":$path_value:"*) ;;
+    *)
+      if [[ -n "$current_value" ]]; then
+        export "$var_name=$path_value:$current_value"
+      else
+        export "$var_name=$path_value"
+      fi
+      ;;
+  esac
+}
+
+configure_ascend_python_runtime_paths() {
+  local runtime_root
+
+  for runtime_root in \
+    "${ASCEND_HOME_PATH:-}" \
+    "${ASCEND_TOOLKIT_HOME:-}" \
+    "${ASCEND_TOOLKIT_LATEST_HOME:-}" \
+    /usr/local/Ascend/ascend-toolkit/latest; do
+    [[ -n "$runtime_root" ]] || continue
+    prepend_env_path PYTHONPATH "$runtime_root/python/site-packages"
+    prepend_env_path LD_LIBRARY_PATH "$runtime_root/lib64"
+  done
+
+  "$PYTHON_BIN" - <<'PY'
+import os
+
+try:
+    from acl.rt import memcpy  # noqa: F401
+except Exception as exc:
+    raise RuntimeError(
+        "CANN acl Python bindings are not importable. "
+        f"ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH')!r}, "
+        f"PYTHONPATH={os.environ.get('PYTHONPATH')!r}"
+    ) from exc
+
+print("ascend_acl_python_import=ok")
 PY
 }
 
@@ -314,7 +364,8 @@ start_server() {
         PYTHON_BIN="$helper_python_bin" setsid sudo -E -n "$ASCEND_E2E_ROOT_HELPER" serve >"$SERVER_LOG" 2>&1 &
       fi
     else
-      setsid "${VLLM_CLI[@]}" serve "$MODEL_NAME" \
+      setsid "${VLLM_OPENAI_SERVER[@]}" \
+        --model "$MODEL_NAME" \
         --host "$HOST" \
         --port "$PORT" \
         --dtype "$DTYPE" \
@@ -328,7 +379,8 @@ start_server() {
     if [[ "$ASCEND_E2E_USE_SUDO" == "1" ]]; then
       run_ascend_root_helper serve >"$SERVER_LOG" 2>&1 &
     else
-      "${VLLM_CLI[@]}" serve "$MODEL_NAME" \
+      "${VLLM_OPENAI_SERVER[@]}" \
+        --model "$MODEL_NAME" \
         --host "$HOST" \
         --port "$PORT" \
         --dtype "$DTYPE" \
@@ -353,6 +405,48 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
     sock.bind(("127.0.0.1", 0))
     print(sock.getsockname()[1])
 PY
+}
+
+print_server_log_tail() {
+  if [[ -f "$SERVER_LOG" ]]; then
+    echo "---- vLLM server log tail ----" >&2
+    tail -n 300 "$SERVER_LOG" >&2
+    echo "---- end vLLM server log tail ----" >&2
+  else
+    echo "vLLM server log not found: $SERVER_LOG" >&2
+  fi
+}
+
+curl_with_server_log() {
+  local description=$1
+  shift
+  local max_attempts=${E2E_HTTP_REQUEST_ATTEMPTS:-5}
+  local delay_seconds=${E2E_HTTP_REQUEST_DELAY_SECONDS:-2}
+  local attempt=1
+  local rc=0
+
+  while [[ "$attempt" -le "$max_attempts" ]]; do
+    if curl -fsS "$@"; then
+      return 0
+    else
+      rc=$?
+    fi
+
+    if [[ -n "$server_pid" ]] && ! kill -0 "$server_pid" 2>/dev/null; then
+      echo "$description failed because the vLLM server exited (curl exit $rc)" >&2
+      print_server_log_tail
+      return "$rc"
+    fi
+
+    if [[ "$attempt" -eq "$max_attempts" ]]; then
+      echo "$description failed after ${max_attempts} attempts (curl exit $rc)" >&2
+      print_server_log_tail
+      return "$rc"
+    fi
+
+    sleep "$delay_seconds"
+    attempt=$((attempt + 1))
+  done
 }
 
 trap cleanup EXIT
@@ -392,6 +486,7 @@ if [[ "$ASCEND_E2E_USE_SUDO" == "1" ]]; then
     exit "$?"
   fi
 else
+  configure_ascend_python_runtime_paths
   if ensure_runner_npu_ready; then
     :
   else
@@ -425,10 +520,13 @@ for attempt in $(seq 1 120); do
   sleep 2
 done
 
-curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null
+curl_with_server_log \
+  "vLLM models endpoint readiness confirmation" \
+  "http://$HOST:$PORT/v1/models" >/dev/null
 
 completion_response=$(mktemp)
-curl -fsS "http://$HOST:$PORT/v1/completions" \
+curl_with_server_log "vLLM completions request" \
+  "http://$HOST:$PORT/v1/completions" \
   -H "Content-Type: application/json" \
   -d "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
   > "$completion_response"

@@ -108,6 +108,7 @@ def test_defaults_with_usage_context():
     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
 
 
+
 def test_kivi_cache_args_from_cli():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(
@@ -123,3 +124,41 @@ def test_kivi_cache_args_from_cli():
     assert vllm_config.cache_config.cache_dtype == "kivi_int4"
     assert vllm_config.cache_config.kivi_group_size == 32
     assert vllm_config.cache_config.kivi_residual_length == 32
+
+def test_mm_prefix_lm_raises_batched_tokens_floor():
+    """Verify that prefix-LM multimodal models auto-raise
+    max_num_batched_tokens to fit at least one multimodal item.
+
+    Regression test for https://github.com/vllm-project/vllm/issues/42687
+    """
+    from unittest.mock import patch
+
+    # Simulate a prefix-LM multimodal model whose largest modality
+    # (video) requires 2496 tokens — more than the 2048 default.
+    fake_mm_min = (2496, "video")
+
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        max_model_len=2048,
+        enforce_eager=True,
+    )
+
+    with (
+        patch.object(
+            type(engine_args),
+            "_get_min_mm_batched_tokens",
+            staticmethod(lambda _mc: fake_mm_min),
+        ),
+        patch(
+            "vllm.config.ModelConfig.is_multimodal_model",
+            new_callable=lambda: property(lambda self: True),
+        ),
+        patch(
+            "vllm.config.ModelConfig.is_mm_prefix_lm",
+            new_callable=lambda: property(lambda self: True),
+        ),
+    ):
+        vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
+
+    assert vllm_config.scheduler_config.max_num_batched_tokens >= 2496
+
