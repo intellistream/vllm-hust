@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import os
+import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -27,7 +29,12 @@ from vllm.tracing import (
     instrument_manual,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreRequest,
+    FinishReason,
+)
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -40,6 +47,21 @@ from vllm.v1.metrics.stats import (
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
+
+
+def _trace_kvdelta_lifecycle_metric(**metrics: float) -> None:
+    if not metrics:
+        return
+    trace_path = os.environ.get("VLLM_KVDELTA_TRACE_FILE", "").strip()
+    if not trace_path:
+        return
+    fields = " ".join(f"{key}={float(value):.9f}" for key, value in metrics.items())
+    try:
+        with open(trace_path, "a", encoding="utf-8") as handle:
+            handle.write(f"{time.time():.6f} kvdelta_metric {fields}\n")
+            handle.flush()
+    except OSError:
+        pass
 
 
 class RequestOutputCollector:
@@ -149,6 +171,7 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        kv_transfer_params: dict[str, Any] | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -172,6 +195,8 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.kv_transfer_params = kv_transfer_params
+        self.first_kvdelta_output_recorded = False
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -245,6 +270,15 @@ class RequestState:
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
+        kv_transfer_params = None
+        if (
+            request.sampling_params is not None
+            and request.sampling_params.extra_args is not None
+        ):
+            candidate = request.sampling_params.extra_args.get("kv_transfer_params")
+            if isinstance(candidate, dict):
+                kv_transfer_params = candidate
+
         assert request.external_req_id is not None
         return cls(
             request_id=request.request_id,
@@ -267,6 +301,7 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            kv_transfer_params=kv_transfer_params,
         )
 
     def make_request_output(
@@ -620,6 +655,36 @@ class OutputProcessor:
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
+            if (
+                req_state.kv_transfer_params is not None
+                and not req_state.first_kvdelta_output_recorded
+                and (new_token_ids or pooling_output is not None)
+            ):
+                req_state.first_kvdelta_output_recorded = True
+                queued_ts = 0.0
+                scheduled_ts = 0.0
+                for event in engine_core_output.events or ():
+                    if event.type == EngineCoreEventType.QUEUED:
+                        queued_ts = event.timestamp
+                    elif event.type == EngineCoreEventType.SCHEDULED:
+                        scheduled_ts = event.timestamp
+                output_ts = engine_core_timestamp or time.monotonic()
+                metrics = {
+                    "engine_first_output_count": 1.0,
+                    "engine_first_output_token_count": float(len(new_token_ids)),
+                }
+                if queued_ts > 0.0:
+                    metrics["engine_queue_to_first_output_s"] = max(
+                        output_ts - queued_ts, 0.0
+                    )
+                if scheduled_ts > 0.0:
+                    metrics["engine_scheduler_to_first_output_s"] = max(
+                        output_ts - scheduled_ts, 0.0
+                    )
+                    metrics["engine_first_output_has_schedule_count"] = 1.0
+                else:
+                    metrics["engine_first_output_missing_schedule_count"] = 1.0
+                _trace_kvdelta_lifecycle_metric(**metrics)
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts

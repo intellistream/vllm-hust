@@ -826,7 +826,7 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
-                if self.log_stats:
+                if self.log_stats or request.kv_transfer_params is not None:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
@@ -1081,7 +1081,7 @@ class Scheduler(SchedulerInterface):
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
 
-        if self.log_stats:
+        if self.log_stats or session.kv_transfer_params is not None:
             session.record_event(EngineCoreEventType.QUEUED)
 
     def _make_cached_request_data(
@@ -1821,7 +1821,7 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
-            if self.log_stats:
+            if self.log_stats or request.kv_transfer_params is not None:
                 request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
