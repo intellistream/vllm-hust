@@ -6,6 +6,7 @@ import queue
 import signal
 import threading
 import time
+import traceback
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
@@ -601,7 +602,17 @@ class EngineCore:
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
-                exec_model_fut.result()
+                try:
+                    exec_model_fut.result()
+                except Exception as exc:
+                    logger.error(
+                        "execute_model failed before sampling; original "
+                        "exception type=%s message=%s traceback=%s",
+                        type(exc).__name__,
+                        exc,
+                        "".join(traceback.format_exception(exc)),
+                    )
+                    raise
                 raise RuntimeError("unexpected error")
 
         # Before processing the model output, process any aborts that happened

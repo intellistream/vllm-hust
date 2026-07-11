@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -66,6 +68,66 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _segment_reuse_trace_event(event: str, **payload: Any) -> None:
+    path = os.environ.get("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE")
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {"event": event, **payload},
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n"
+            )
+    except Exception:
+        logger.debug("segment_reuse: failed to write scheduler diagnostic event",
+                     exc_info=True)
+
+
+def _segment_reuse_block_ids(
+    blocks: KVCacheBlocks | None,
+) -> tuple[list[int], ...] | None:
+    if blocks is None:
+        return None
+    return blocks.get_block_ids(allow_none=True)
+
+
+def _segment_reuse_flat_block_ids(
+    block_ids: tuple[list[int], ...] | None,
+) -> set[int]:
+    if block_ids is None:
+        return set()
+    return {block_id for group in block_ids for block_id in group}
+
+
+def _segment_reuse_pin_blocks(
+    kv_cache_manager: KVCacheManager,
+    request_id: str,
+    blocks: KVCacheBlocks,
+) -> None:
+    unpinned_blocks = [
+        block
+        for group in blocks.blocks
+        for block in group
+        if not block.is_null and block.ref_cnt == 0
+    ]
+    if not unpinned_blocks:
+        return
+    _segment_reuse_trace_event(
+        "scheduler_terminal_replay_repin_live_blocks",
+        request_id=request_id,
+        block_ids=[block.block_id for block in unpinned_blocks],
+        all_block_ids=_segment_reuse_block_ids(blocks),
+    )
+    kv_cache_manager.block_pool.touch(unpinned_blocks)
+
+
 def _get_segment_reuse_runner_plan(request: Request) -> dict[str, Any] | None:
     runner_extensions = getattr(request, "runner_extensions", None)
     if not isinstance(runner_extensions, dict):
@@ -111,6 +173,15 @@ def _cap_segment_reuse_envelope_prefill(
             request.request_id,
             num_new_tokens,
             capped,
+        )
+        _segment_reuse_trace_event(
+            "scheduler_envelope_cap",
+            request_id=request.request_id,
+            phase=phase,
+            num_computed_tokens=num_computed_tokens,
+            num_new_tokens=num_new_tokens,
+            capped_tokens=capped,
+            envelope_tokens=envelope_tokens,
         )
         return capped
     return num_new_tokens
@@ -169,8 +240,22 @@ def _prepare_segment_reuse_terminal_replay(
     except (KeyError, TypeError, ValueError):
         return num_new_tokens, 0, None
     if request.num_computed_tokens < envelope_tokens:
+        _segment_reuse_trace_event(
+            "scheduler_terminal_replay_wait_envelope",
+            request_id=request.request_id,
+            num_computed_tokens=request.num_computed_tokens,
+            envelope_tokens=envelope_tokens,
+            scheduled_tokens=num_new_tokens,
+        )
         return num_new_tokens, 0, None
     if body_tail_start_token < request.num_computed_tokens:
+        _segment_reuse_trace_event(
+            "scheduler_terminal_replay_invalid_position",
+            request_id=request.request_id,
+            num_computed_tokens=request.num_computed_tokens,
+            body_tail_start_token=body_tail_start_token,
+            scheduled_tokens=num_new_tokens,
+        )
         return num_new_tokens, 0, None
     if body_tail_tokens <= 0:
         return num_new_tokens, 0, None
@@ -183,6 +268,12 @@ def _prepare_segment_reuse_terminal_replay(
             body_tail_tokens,
             num_new_tokens,
         )
+        _segment_reuse_trace_event(
+            "scheduler_terminal_replay_budget_unsupported",
+            request_id=request.request_id,
+            body_tail_tokens=body_tail_tokens,
+            scheduled_tokens=num_new_tokens,
+        )
         return num_new_tokens, 0, None
 
     body_blocks = _make_segment_reuse_body_blocks(kv_cache_manager, plan)
@@ -191,6 +282,12 @@ def _prepare_segment_reuse_terminal_replay(
             "segment_reuse: request %s cannot enter terminal replay; "
             "body blocks are unavailable",
             request.request_id,
+        )
+        _segment_reuse_trace_event(
+            "scheduler_terminal_replay_missing_body_blocks",
+            request_id=request.request_id,
+            body_block_ids=plan.get("body_block_ids"),
+            scheduler_replay_contract=plan.get("scheduler_replay_contract"),
         )
         return num_new_tokens, 0, None
 
@@ -203,6 +300,20 @@ def _prepare_segment_reuse_terminal_replay(
         num_new_computed_tokens,
         body_tail_tokens,
         body_terminal_token,
+    )
+    _segment_reuse_trace_event(
+        "scheduler_terminal_replay_ready",
+        request_id=request.request_id,
+        num_computed_tokens=request.num_computed_tokens,
+        num_new_computed_tokens=num_new_computed_tokens,
+        scheduled_tail_tokens=body_tail_tokens,
+        original_scheduled_tokens=num_new_tokens,
+        body_tail_start_token=body_tail_start_token,
+        body_tail_tokens=body_tail_tokens,
+        body_terminal_token=body_terminal_token,
+        borrowed_body_block_ids=(
+            plan.get("scheduler_replay_contract", {}) or {}
+        ).get("borrowed_body_block_ids"),
     )
     return body_tail_tokens, num_new_computed_tokens, body_blocks
 
@@ -725,6 +836,44 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
+                    segment_reuse_live_block_ids_before = None
+                    if segment_reuse_new_computed_blocks is not None:
+                        segment_reuse_live_blocks_before = (
+                            self.kv_cache_manager.get_blocks(request.request_id)
+                        )
+                        _segment_reuse_pin_blocks(
+                            self.kv_cache_manager,
+                            request.request_id,
+                            segment_reuse_live_blocks_before,
+                        )
+                        segment_reuse_live_block_ids_before = (
+                            _segment_reuse_block_ids(
+                                segment_reuse_live_blocks_before
+                            )
+                        )
+                        _segment_reuse_trace_event(
+                            "scheduler_running_terminal_replay_allocate_attempt",
+                            request_id=request.request_id,
+                            computed_tokens_before=request.num_computed_tokens,
+                            num_new_computed_tokens=(
+                                segment_reuse_num_new_computed_tokens
+                            ),
+                            scheduled_tokens=num_new_tokens,
+                            free_blocks=(
+                                self.kv_cache_manager.block_pool.get_num_free_blocks()
+                            ),
+                            reserved_blocks=(
+                                1 if segment_reuse_needs_scratch else 0
+                            ),
+                            body_block_ids=(
+                                segment_reuse_new_computed_blocks.get_block_ids(
+                                    allow_none=True
+                                )
+                            ),
+                            live_block_ids_before=(
+                                segment_reuse_live_block_ids_before
+                            ),
+                        )
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
@@ -735,6 +884,40 @@ class Scheduler(SchedulerInterface):
                     )
 
                     if new_blocks is not None:
+                        if segment_reuse_new_computed_blocks is not None:
+                            fresh_block_ids = _segment_reuse_block_ids(new_blocks)
+                            live_ids = _segment_reuse_flat_block_ids(
+                                segment_reuse_live_block_ids_before
+                            )
+                            body_ids = _segment_reuse_flat_block_ids(
+                                _segment_reuse_block_ids(
+                                    segment_reuse_new_computed_blocks
+                                )
+                            )
+                            fresh_ids = _segment_reuse_flat_block_ids(
+                                fresh_block_ids
+                            )
+                            aliased_ids = sorted(fresh_ids & (live_ids | body_ids))
+                            if aliased_ids:
+                                _segment_reuse_trace_event(
+                                    "scheduler_terminal_replay_fresh_block_alias",
+                                    request_id=request.request_id,
+                                    aliased_block_ids=aliased_ids,
+                                    live_block_ids_before=(
+                                        segment_reuse_live_block_ids_before
+                                    ),
+                                    body_block_ids=(
+                                        segment_reuse_new_computed_blocks.get_block_ids(
+                                            allow_none=True
+                                        )
+                                    ),
+                                    fresh_block_ids=fresh_block_ids,
+                                )
+                                raise AssertionError(
+                                    "segment_reuse terminal replay allocated "
+                                    "fresh block(s) that alias live context: "
+                                    f"{aliased_ids}"
+                                )
                         if segment_reuse_needs_scratch:
                             scratch_blocks = self.kv_cache_manager.allocate_extra_blocks(
                                 request.request_id,
@@ -750,6 +933,20 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
+                    if segment_reuse_new_computed_blocks is not None:
+                        _segment_reuse_trace_event(
+                            "scheduler_running_terminal_replay_allocate_retry",
+                            request_id=request.request_id,
+                            computed_tokens_before=request.num_computed_tokens,
+                            num_new_computed_tokens=(
+                                segment_reuse_num_new_computed_tokens
+                            ),
+                            scheduled_tokens=num_new_tokens,
+                            free_blocks=(
+                                self.kv_cache_manager.block_pool.get_num_free_blocks()
+                            ),
+                            running_reqs=len(self.running),
+                        )
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
@@ -786,6 +983,21 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                if segment_reuse_new_computed_blocks is not None:
+                    plan = _get_segment_reuse_runner_plan(request)
+                    if plan is not None:
+                        plan["scheduler_phase"] = "envelope_prefill"
+                    _segment_reuse_trace_event(
+                        "scheduler_running_terminal_replay_allocate_failed",
+                        request_id=request.request_id,
+                        computed_tokens_before=request.num_computed_tokens,
+                        num_new_computed_tokens=segment_reuse_num_new_computed_tokens,
+                        scheduled_tokens=num_new_tokens,
+                        free_blocks=(
+                            self.kv_cache_manager.block_pool.get_num_free_blocks()
+                        ),
+                        rollback_phase="envelope_prefill",
+                    )
                 break
 
             # Schedule the request.
@@ -793,6 +1005,30 @@ class Scheduler(SchedulerInterface):
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
             if segment_reuse_new_computed_blocks is not None:
+                if os.environ.get("VLLM_SEGMENT_REUSE_TRACE_REQUESTS"):
+                    logger.info(
+                        "segment_reuse: request %s terminal replay worker "
+                        "block payload body=%s fresh=%s computed_tokens=%d "
+                        "scheduled_tokens=%d",
+                        request_id,
+                        segment_reuse_new_computed_blocks.get_block_ids(
+                            allow_none=True
+                        ),
+                        new_blocks.get_block_ids(allow_none=True),
+                        segment_reuse_num_new_computed_tokens,
+                        num_new_tokens,
+                    )
+                _segment_reuse_trace_event(
+                    "scheduler_running_terminal_replay_scheduled",
+                    request_id=request_id,
+                    computed_tokens_before=request.num_computed_tokens,
+                    num_new_computed_tokens=segment_reuse_num_new_computed_tokens,
+                    scheduled_tokens=num_new_tokens,
+                    body_block_ids=segment_reuse_new_computed_blocks.get_block_ids(
+                        allow_none=True
+                    ),
+                    fresh_block_ids=new_blocks.get_block_ids(allow_none=True),
+                )
                 new_blocks = segment_reuse_new_computed_blocks + new_blocks
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -936,6 +1172,20 @@ class Scheduler(SchedulerInterface):
                         new_computed_blocks, num_new_local_computed_tokens = (
                             self.kv_cache_manager.get_computed_blocks(request)
                         )
+                    plan = _get_segment_reuse_runner_plan(request)
+                    if plan is not None:
+                        _segment_reuse_trace_event(
+                            "scheduler_waiting_computed_blocks",
+                            request_id=request.request_id,
+                            state=getattr(request, "segment_reuse_state", None),
+                            phase=plan.get("scheduler_phase"),
+                            num_new_local_computed_tokens=num_new_local_computed_tokens,
+                            block_ids=new_computed_blocks.get_block_ids(
+                                allow_none=True
+                            ),
+                            num_tokens=request.num_tokens,
+                            num_prompt_tokens=request.num_prompt_tokens,
+                        )
 
                     # In case of hybrid models, obtain hint for Marconi-style APC logic
                     if self.has_mamba_layers:
@@ -1025,6 +1275,20 @@ class Scheduler(SchedulerInterface):
                         num_computed_tokens,
                         num_new_tokens,
                     )
+                    plan = _get_segment_reuse_runner_plan(request)
+                    if plan is not None:
+                        _segment_reuse_trace_event(
+                            "scheduler_waiting_after_envelope_cap",
+                            request_id=request.request_id,
+                            state=getattr(request, "segment_reuse_state", None),
+                            phase=plan.get("scheduler_phase"),
+                            num_computed_tokens=num_computed_tokens,
+                            num_new_tokens=num_new_tokens,
+                            token_budget=token_budget,
+                            enable_chunked_prefill=(
+                                self.scheduler_config.enable_chunked_prefill
+                            ),
+                        )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1054,6 +1318,16 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        plan = _get_segment_reuse_runner_plan(request)
+                        if plan is not None:
+                            _segment_reuse_trace_event(
+                                "scheduler_waiting_break_no_chunk_budget",
+                                request_id=request.request_id,
+                                state=getattr(request, "segment_reuse_state", None),
+                                phase=plan.get("scheduler_phase"),
+                                num_new_tokens=num_new_tokens,
+                                token_budget=token_budget,
+                            )
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -1140,6 +1414,17 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    plan = _get_segment_reuse_runner_plan(request)
+                    if plan is not None:
+                        _segment_reuse_trace_event(
+                            "scheduler_waiting_allocate_failed",
+                            request_id=request.request_id,
+                            state=getattr(request, "segment_reuse_state", None),
+                            phase=plan.get("scheduler_phase"),
+                            num_computed_tokens=num_computed_tokens,
+                            num_new_tokens=num_new_tokens,
+                            free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                        )
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1206,6 +1491,20 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                plan = _get_segment_reuse_runner_plan(request)
+                if plan is not None:
+                    _segment_reuse_trace_event(
+                        "scheduler_waiting_scheduled",
+                        request_id=request_id,
+                        state=getattr(request, "segment_reuse_state", None),
+                        phase=plan.get("scheduler_phase"),
+                        num_computed_tokens=num_computed_tokens,
+                        scheduled_tokens=num_new_tokens,
+                        token_budget_after=token_budget,
+                        block_ids=req_to_new_blocks[request_id].get_block_ids(
+                            allow_none=True
+                        ),
+                    )
                 if pad_spec_decode:
                     scheduled_spec_decode_tokens[request_id] = [
                         -1

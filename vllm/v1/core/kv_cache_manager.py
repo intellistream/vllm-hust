@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import json
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -25,6 +27,55 @@ logger = init_logger(__name__)
 
 def _prefix_cache_trace_enabled() -> bool:
     return envs.VLLM_DEBUG_PREFIX_CACHE_TRACE
+
+
+def _segment_reuse_trace_event(event: str, **payload) -> None:
+    path = os.environ.get("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE")
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {"event": event, **payload},
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n"
+            )
+    except Exception:
+        logger.debug("segment_reuse: failed to write KV diagnostic event",
+                     exc_info=True)
+
+
+def _segment_reuse_terminal_replay_active(request: Request) -> bool:
+    runner_extensions = getattr(request, "runner_extensions", None)
+    if not isinstance(runner_extensions, dict):
+        return False
+    plan = runner_extensions.get("segment_reuse")
+    if not isinstance(plan, dict):
+        return False
+    return (
+        plan.get("kind") == "vllm-runner-stitch-plan"
+        and plan.get("scheduler_phase") == "terminal_replay"
+    )
+
+
+def _segment_reuse_seed_registration_pending(request: Request) -> bool:
+    """Return whether segment-reuse still needs the prompt body KV intact."""
+    if getattr(request, "segment_reuse_state", None) != "seed":
+        return False
+    boundary_spec = getattr(request, "segment_reuse_boundary_spec", None)
+    if boundary_spec is None:
+        return False
+    attention_contract = getattr(boundary_spec, "attention_contract", None)
+    return attention_contract in {
+        "control-envelope-excluded-from-model-body",
+        "masked-envelope-hidden-from-body",
+    }
 
 
 def _count_block_groups(block_groups: Sequence[Sequence[KVCacheBlock]]) -> int:
@@ -462,11 +513,32 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
-        self.coordinator.remove_skipped_blocks(
-            request.request_id,
-            total_computed_tokens,
-            num_prompt_tokens=request.num_prompt_tokens,
-        )
+        segment_reuse_seed_pending = _segment_reuse_seed_registration_pending(request)
+        segment_reuse_terminal_replay = _segment_reuse_terminal_replay_active(request)
+        if segment_reuse_seed_pending:
+            _segment_reuse_trace_event(
+                "kv_remove_skipped_blocks_deferred",
+                request_id=request.request_id,
+                phase="seed_registration_pending",
+                state=getattr(request, "segment_reuse_state", None),
+                total_computed_tokens=total_computed_tokens,
+                num_prompt_tokens=request.num_prompt_tokens,
+            )
+        elif segment_reuse_terminal_replay:
+            _segment_reuse_trace_event(
+                "kv_remove_skipped_blocks_deferred",
+                request_id=request.request_id,
+                phase="terminal_replay",
+                state=getattr(request, "segment_reuse_state", None),
+                total_computed_tokens=total_computed_tokens,
+                num_prompt_tokens=request.num_prompt_tokens,
+            )
+        else:
+            self.coordinator.remove_skipped_blocks(
+                request.request_id,
+                total_computed_tokens,
+                num_prompt_tokens=request.num_prompt_tokens,
+            )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,

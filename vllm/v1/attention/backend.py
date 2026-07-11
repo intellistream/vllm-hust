@@ -462,6 +462,14 @@ class CommonAttentionMetadata:
     fixed sliding window. None disables R-SWA. The attention backend copies this
     into its own persistent buffer and reads ``rswa_window`` from model config."""
 
+    segment_reuse_body_isolation: dict[int, dict[str, Any]] | None = None
+    """Segment-reuse boundary metadata keyed by request index.
+
+    Backends may use this to construct a body-isolated prefill mask. Presence of
+    metadata does not imply the contract was enforced; the backend must only
+    mark a body object reusable after it has consumed the metadata.
+    """
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
@@ -558,6 +566,12 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
+            segment_reuse_body_isolation={
+                idx: value
+                for idx, value in (self.segment_reuse_body_isolation or {}).items()
+                if idx < num_actual_reqs
+            }
+            or None,
         )
 
 

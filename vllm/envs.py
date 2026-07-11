@@ -1081,6 +1081,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
     ),
+    # Emit verbose prefix-cache diagnostics for scheduler/KV lifecycle
+    # debugging. Disabled by default because the hot path checks this env.
+    "VLLM_DEBUG_PREFIX_CACHE_TRACE": lambda: (
+        os.environ.get("VLLM_DEBUG_PREFIX_CACHE_TRACE", "0").strip().lower()
+        in ("1", "true")
+    ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
     # VLLM_ALLOW_RUNTIME_LORA_UPDATING is enabled.

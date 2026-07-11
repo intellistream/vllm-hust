@@ -3,6 +3,7 @@
 """Compare the with and without prefix caching."""
 
 import copy
+import json
 from collections.abc import Callable
 from math import lcm
 from types import SimpleNamespace
@@ -94,6 +95,85 @@ def make_request(
         cache_salt=cache_salt,
         block_hasher=get_request_block_hasher(block_size, hash_fn),
     )
+
+
+def test_block_pool_does_not_maintain_null_block_refcount() -> None:
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    null_block = pool.null_block
+    assert null_block.is_null
+    assert null_block.ref_cnt == 0
+
+    pool.touch([null_block])
+    assert null_block.ref_cnt == 0
+
+    pool.free_blocks([null_block])
+    assert null_block.ref_cnt == 0
+
+
+def test_segment_reuse_seed_pending_defers_skipped_block_cleanup(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    block_size = 16
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=block_size,
+    )
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=32,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["layer"], sliding_window_spec)],
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    diagnostics_file = tmp_path / "segment_reuse_runtime_events.jsonl"
+    monkeypatch.setenv("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE", str(diagnostics_file))
+
+    token_ids = [i for i in range(10) for _ in range(block_size)]
+    req = make_request("seed", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req)
+    blocks = manager.allocate_slots(
+        req,
+        len(token_ids),
+        num_computed_tokens,
+        computed_blocks,
+    )
+    assert blocks is not None
+    assert all(
+        block_id != manager.block_pool.null_block.block_id
+        for block_id in manager.get_block_ids(req.request_id)[0]
+    )
+
+    req.num_computed_tokens = len(token_ids)
+    req.segment_reuse_state = "seed"
+    req.segment_reuse_boundary_spec = SimpleNamespace(
+        envelope_token_count=2 * block_size,
+        attention_contract="masked-envelope-hidden-from-body",
+    )
+
+    next_blocks = manager.allocate_slots(req, 1)
+
+    assert next_blocks is not None
+    block_ids = manager.get_block_ids(req.request_id)[0]
+    assert block_ids[:10] != [manager.block_pool.null_block.block_id] * 10
+    assert all(block_id != manager.block_pool.null_block.block_id for block_id in block_ids[:10])
+    events = [
+        json.loads(line)
+        for line in diagnostics_file.read_text(encoding="utf-8").splitlines()
+    ]
+    deferred = [
+        event
+        for event in events
+        if event["event"] == "kv_remove_skipped_blocks_deferred"
+    ]
+    assert deferred
+    assert deferred[-1]["phase"] == "seed_registration_pending"
 
 
 def make_kv_cache_manager(kv_cache_config: KVCacheConfig, **kwargs) -> KVCacheManager:

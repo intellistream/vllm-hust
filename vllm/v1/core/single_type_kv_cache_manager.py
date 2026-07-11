@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -28,6 +30,20 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+
+def _segment_reuse_trace_event(event: str, **payload) -> None:
+    path = os.environ.get("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE")
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": event, **payload}, default=str) + "\n")
+    except Exception:
+        pass
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -245,12 +261,13 @@ class SingleTypeKVCacheManager(ABC):
         if not new_computed_blocks:
             return
         req_blocks = self.req_to_blocks[request_id]
-        if self.enable_caching:
-            self.block_pool.touch(new_computed_blocks)
-        else:
-            assert not any(new_computed_blocks), (
-                "Computed blocks should be empty when prefix caching is disabled"
-            )
+        # Native prefix-cache lookup is disabled when ``enable_caching`` is false,
+        # but segment reuse can still hand the scheduler exact borrowed body
+        # blocks from its own guarded registry.  Those blocks must be touched so
+        # their ref-count tracks the running request; otherwise a fair
+        # "native-prefix-off, segment-reuse-on" experiment cannot commit a real
+        # splice.
+        self.block_pool.touch(new_computed_blocks)
         req_blocks.extend(new_computed_blocks)
         self.num_cached_block[request_id] = max(
             self.num_cached_block.get(request_id, 0),
@@ -319,12 +336,69 @@ class SingleTypeKVCacheManager(ABC):
             The new allocated blocks.
         """
         req_blocks = self.req_to_blocks[request_id]
+        self._pin_live_req_blocks(request_id, req_blocks)
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_new_blocks = num_required_blocks - len(req_blocks)
+        _segment_reuse_trace_event(
+            "kv_allocate_new_blocks_state",
+            request_id=request_id,
+            req_block_ids=[block.block_id for block in req_blocks],
+            req_block_is_null=[block.is_null for block in req_blocks],
+            req_block_ref_counts=[block.ref_cnt for block in req_blocks],
+            req_block_in_free_list=[
+                block.prev_free_block is not None
+                and block.next_free_block is not None
+                for block in req_blocks
+            ],
+            num_tokens=num_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            num_required_blocks=num_required_blocks,
+            num_existing_blocks=len(req_blocks),
+            num_new_blocks=num_new_blocks,
+        )
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            live_block_ids = {
+                block.block_id for block in req_blocks if not block.is_null
+            }
+            new_blocks = []
+            repaired_live_ids = []
+            while len(new_blocks) < num_new_blocks:
+                candidate = self.block_pool.get_new_blocks(1)[0]
+                _segment_reuse_trace_event(
+                    "kv_allocate_new_blocks_candidate",
+                    request_id=request_id,
+                    candidate_block_id=candidate.block_id,
+                    candidate_ref_cnt=candidate.ref_cnt,
+                    candidate_in_live_ids=candidate.block_id in live_block_ids,
+                    live_block_ids=sorted(live_block_ids),
+                )
+                if candidate.block_id in live_block_ids:
+                    # The free queue can be stale after experimental block-table
+                    # stitching: the block is logically live for this request but
+                    # still appears allocatable. Keep it pinned and continue with
+                    # another candidate rather than returning an alias that would
+                    # overwrite live KV.
+                    repaired_live_ids.append(candidate.block_id)
+                    continue
+                new_blocks.append(candidate)
+            if repaired_live_ids:
+                _segment_reuse_trace_event(
+                    "kv_allocate_new_blocks_live_duplicate_repaired",
+                    request_id=request_id,
+                    repaired_live_ids=repaired_live_ids,
+                    live_block_ids=sorted(live_block_ids),
+                    new_block_ids=[block.block_id for block in new_blocks],
+                    live_ref_counts={
+                        str(block.block_id): block.ref_cnt
+                        for block in req_blocks
+                        if not block.is_null
+                    },
+                    num_required_blocks=num_required_blocks,
+                    num_existing_blocks=len(req_blocks),
+                    num_new_blocks=num_new_blocks,
+                )
             req_blocks.extend(new_blocks)
             if type(self.kv_cache_spec) in (
                 FullAttentionSpec,
@@ -334,6 +408,34 @@ class SingleTypeKVCacheManager(ABC):
             ):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
+
+    def _pin_live_req_blocks(
+        self,
+        request_id: str,
+        req_blocks: Sequence[KVCacheBlock],
+    ) -> None:
+        """Repair the scheduler invariant that request-owned blocks are live.
+
+        Segment-reuse appends borrowed body blocks to an already-running request.
+        If an earlier transition left an existing request block with ref_cnt=0,
+        the free queue can hand it back as the fresh terminal-replay block and
+        overwrite live context. Pin those blocks before allocating more slots so
+        the runtime fails closed instead of silently corrupting KV.
+        """
+        unpinned_blocks = [
+            block
+            for block in req_blocks
+            if not block.is_null and block.ref_cnt == 0
+        ]
+        if not unpinned_blocks:
+            return
+        _segment_reuse_trace_event(
+            "kv_live_req_blocks_repin",
+            request_id=request_id,
+            block_ids=[block.block_id for block in unpinned_blocks],
+            all_block_ids=[block.block_id for block in req_blocks],
+        )
+        self.block_pool.touch(unpinned_blocks)
 
     def allocate_extra_blocks(
         self, request_id: str, num_blocks: int

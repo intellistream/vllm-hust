@@ -603,9 +603,11 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
+            if block.is_null:
+                continue
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -630,8 +632,10 @@ class BlockPool:
         blocks_with_hash = []
         blocks_without_hash = []
         for block in ordered_blocks:
+            if block.is_null:
+                continue
             block.ref_cnt -= 1
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0:
                 if block.block_hash is None:
                     blocks_without_hash.append(block)
                 else:

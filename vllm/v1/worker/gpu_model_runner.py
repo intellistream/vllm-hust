@@ -2379,6 +2379,41 @@ class GPUModelRunner(
         if self.model_config.rswa_window is not None:
             rswa_prefix_lens = num_prompt_tokens_cpu
 
+        segment_reuse_body_isolation = None
+        for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            boundary = req_state.runner_extensions.get("segment_reuse_boundary")
+            if not isinstance(boundary, dict):
+                continue
+            if segment_reuse_body_isolation is None:
+                segment_reuse_body_isolation = {}
+            segment_reuse_body_isolation[req_idx] = {
+                "version": int(boundary.get("version", 1) or 1),
+                "boundary_class": str(boundary.get("boundary_class") or ""),
+                "attention_contract": str(boundary.get("attention_contract") or ""),
+                "body_start_token": int(boundary.get("body_start_token", 0) or 0),
+                "envelope_token_count": int(
+                    boundary.get("envelope_token_count", 0) or 0
+                ),
+                "body_token_count": int(boundary.get("body_token_count", 0) or 0),
+                "terminal_replay_query_start_token": int(
+                    boundary.get("terminal_replay_query_start_token", -1) or -1
+                ),
+                "terminal_replay_query_tokens": int(
+                    boundary.get("terminal_replay_query_tokens", 0) or 0
+                ),
+                "terminal_replay_context_tokens": int(
+                    boundary.get("terminal_replay_context_tokens", 0) or 0
+                ),
+                "terminal_replay_token_position": int(
+                    boundary.get("terminal_replay_token_position", -1) or -1
+                ),
+                "body_reused_tokens": int(boundary.get("body_reused_tokens", 0) or 0),
+                "body_tail_tokens": int(boundary.get("body_tail_tokens", 0) or 0),
+            }
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2397,6 +2432,7 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            segment_reuse_body_isolation=segment_reuse_body_isolation,
         )
 
         if self.dcp_world_size > 1:
