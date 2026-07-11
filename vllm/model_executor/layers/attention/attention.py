@@ -85,6 +85,12 @@ def _segment_reuse_trace_attention_dispatch_qkv(
     path = os.environ.get("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE")
     if not path:
         return
+    if isinstance(attn_metadata, dict):
+        attn_metadata = attn_metadata.get(layer_name)
+    elif isinstance(attn_metadata, list) and attn_metadata:
+        first_metadata = attn_metadata[0]
+        if isinstance(first_metadata, dict):
+            attn_metadata = first_metadata.get(layer_name)
     terminal_query_tokens = int(
         getattr(attn_metadata, "segment_reuse_terminal_query_tokens", 0) or 0
     )
