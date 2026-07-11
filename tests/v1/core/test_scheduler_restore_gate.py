@@ -115,3 +115,19 @@ def test_restore_gate_emits_fallback_reason_without_reduction():
     assert restore_fallback_reasons == {
         request.request_id: "connector_match_unavailable",
     }
+
+
+def test_restore_gate_reads_connector_specific_fallback_reason():
+    request = SimpleNamespace(request_id="restore-connector-fallback")
+    connector = SimpleNamespace(
+        get_restore_fallback_reason=lambda req: (
+            "prefix_chain_incomplete"
+            if req.request_id == request.request_id
+            else None
+        )
+    )
+
+    assert (
+        Scheduler._get_connector_restore_fallback_reason(connector, request)
+        == "prefix_chain_incomplete"
+    )

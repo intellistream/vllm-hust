@@ -765,6 +765,11 @@ class Scheduler(SchedulerInterface):
                                 request, num_new_local_computed_tokens
                             )
                         )
+                        restore_fallback_reason = (
+                            self._get_connector_restore_fallback_reason(
+                                self.connector, request
+                            )
+                        )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -775,7 +780,10 @@ class Scheduler(SchedulerInterface):
                                 None,
                                 computed_tokens_reduced,
                                 restore_fallback_reasons,
-                                fallback_reason="connector_match_unavailable",
+                                fallback_reason=(
+                                    restore_fallback_reason
+                                    or "connector_match_unavailable"
+                                ),
                             )
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
@@ -787,6 +795,9 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                             computed_tokens_reduced,
                             restore_fallback_reasons,
+                            fallback_reason=restore_fallback_reason
+                            if num_external_computed_tokens <= 0
+                            else None,
                         )
 
                         connector_prefix_cache_queries = (
@@ -1201,6 +1212,23 @@ class Scheduler(SchedulerInterface):
 
         if num_external_computed_tokens and num_external_computed_tokens > 0:
             request.kv_restore_computed_tokens_reduced = num_external_computed_tokens
+
+    @staticmethod
+    def _get_connector_restore_fallback_reason(
+        connector: KVConnectorBase_V1,
+        request: Request,
+    ) -> str | None:
+        reason_fn = getattr(connector, "get_restore_fallback_reason", None)
+        if callable(reason_fn):
+            reason = reason_fn(request)
+            if reason:
+                return str(reason)
+        reasons = getattr(connector, "restore_fallback_reasons", None)
+        if isinstance(reasons, dict):
+            reason = reasons.get(request.request_id)
+            if reason:
+                return str(reason)
+        return None
 
     @staticmethod
     def _record_restore_scheduled_forward(
