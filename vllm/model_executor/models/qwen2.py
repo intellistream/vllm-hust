@@ -27,6 +27,8 @@
 
 from collections.abc import Iterable
 from itertools import islice
+import json
+import os
 from typing import Any
 
 import torch
@@ -75,6 +77,61 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+
+def _segment_reuse_tensor_summary(tensor: torch.Tensor | None) -> dict[str, Any] | None:
+    if tensor is None:
+        return None
+    try:
+        detached = tensor.detach()
+        return {
+            "shape": [int(dim) for dim in detached.shape],
+            "dtype": str(detached.dtype).replace("torch.", ""),
+            "device": str(detached.device),
+            "abs_sum": float(detached.float().abs().sum().item()),
+        }
+    except Exception as exc:
+        return {
+            "summary_error": type(exc).__name__,
+            "summary_error_message": str(exc),
+        }
+
+
+def _segment_reuse_trace_qkv_projection_boundary(
+    *,
+    model_family: str,
+    stage: str,
+    prefix: str,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    qkv: torch.Tensor | None = None,
+    q: torch.Tensor | None = None,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+) -> None:
+    path = os.environ.get("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE")
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        payload = {
+            "event": "vllm_model_terminal_replay_qkv_projection_boundary",
+            "model_family": model_family,
+            "stage": stage,
+            "prefix": prefix,
+            "positions_summary": _segment_reuse_tensor_summary(positions),
+            "hidden_states_summary": _segment_reuse_tensor_summary(hidden_states),
+            "qkv_summary": _segment_reuse_tensor_summary(qkv),
+            "projected_query_summary": _segment_reuse_tensor_summary(q),
+            "projected_key_summary": _segment_reuse_tensor_summary(k),
+            "projected_value_summary": _segment_reuse_tensor_summary(v),
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
 
 
 class Qwen2MLP(nn.Module):
@@ -152,6 +209,7 @@ class Qwen2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.dual_chunk_attention_config = dual_chunk_attention_config
         self.qk_norm = qk_norm
+        self.prefix = prefix
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -210,6 +268,17 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        _segment_reuse_trace_qkv_projection_boundary(
+            model_family="qwen2",
+            stage="qkv_split_pre_rope",
+            prefix=self.prefix,
+            positions=positions,
+            hidden_states=hidden_states,
+            qkv=qkv,
+            q=q,
+            k=k,
+            v=v,
+        )
 
         # Apply QK normalization if enabled (before RoPE)
         if self.qk_norm:
@@ -228,6 +297,16 @@ class Qwen2Attention(nn.Module):
             k = k.view(total_tokens, self.kv_size)
 
         q, k = self.rotary_emb(positions, q, k)
+        _segment_reuse_trace_qkv_projection_boundary(
+            model_family="qwen2",
+            stage="pre_attention_post_rope",
+            prefix=self.prefix,
+            positions=positions,
+            hidden_states=hidden_states,
+            q=q,
+            k=k,
+            v=v,
+        )
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
