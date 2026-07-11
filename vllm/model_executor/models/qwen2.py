@@ -109,6 +109,11 @@ def _segment_reuse_trace_qkv_projection_boundary(
     k: torch.Tensor | None = None,
     v: torch.Tensor | None = None,
 ) -> None:
+    try:
+        if torch.compiler.is_compiling():
+            return
+    except Exception:
+        pass
     path = os.environ.get("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE")
     if not path:
         return
