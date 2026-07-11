@@ -25,6 +25,8 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
+import json
+import os
 import threading
 import weakref
 from collections.abc import Callable
@@ -47,6 +49,70 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 
 logger = init_logger(__name__)
+
+
+def _segment_reuse_tensor_summary(tensor: torch.Tensor | None) -> dict[str, Any] | None:
+    if tensor is None:
+        return None
+    try:
+        detached = tensor.detach()
+        return {
+            "shape": [int(dim) for dim in detached.shape],
+            "dtype": str(detached.dtype).replace("torch.", ""),
+            "device": str(detached.device),
+            "data_ptr": int(detached.data_ptr()),
+            "abs_sum": float(detached.float().abs().sum().item()),
+        }
+    except Exception as exc:
+        return {
+            "summary_error": type(exc).__name__,
+            "summary_error_message": str(exc),
+        }
+
+
+def _segment_reuse_trace_breakable_eager_call(
+    *,
+    fn_name: str,
+    invocation: str,
+    replay_index: int,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    if fn_name != "unified_attention_with_output":
+        return
+    path = os.environ.get("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE")
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        payload = {
+            "event": "vllm_breakable_cudagraph_eager_call_qkv",
+            "fn_name": fn_name,
+            "invocation": invocation,
+            "replay_index": replay_index,
+            "query_summary": _segment_reuse_tensor_summary(args[0])
+            if len(args) > 0 and isinstance(args[0], torch.Tensor)
+            else None,
+            "key_summary": _segment_reuse_tensor_summary(args[1])
+            if len(args) > 1 and isinstance(args[1], torch.Tensor)
+            else None,
+            "value_summary": _segment_reuse_tensor_summary(args[2])
+            if len(args) > 2 and isinstance(args[2], torch.Tensor)
+            else None,
+            "output_summary": _segment_reuse_tensor_summary(args[3])
+            if len(args) > 3 and isinstance(args[3], torch.Tensor)
+            else None,
+            "layer_name": str(args[4]) if len(args) > 4 else None,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        logger.debug(
+            "segment_reuse: failed to write breakable cudagraph diagnostic",
+            exc_info=True,
+        )
 
 
 def is_breakable_cudagraph_enabled() -> bool:
@@ -112,7 +178,22 @@ def eager_break_during_capture(fn: F) -> F:
             k: weak_ref_tensor(v) if isinstance(v, torch.Tensor) else v
             for k, v in kwargs.items()
         }
-        return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
+        replay_count = 0
+
+        def traced_eager_fn() -> Any:
+            nonlocal replay_count
+            invocation = "capture" if replay_count == 0 else "replay"
+            _segment_reuse_trace_breakable_eager_call(
+                fn_name=fn.__name__,
+                invocation=invocation,
+                replay_index=replay_count,
+                args=weak_args,
+                kwargs=weak_kwargs,
+            )
+            replay_count += 1
+            return fn(*weak_args, **weak_kwargs)
+
+        return capture.add_eager(traced_eager_fn)
 
     return wrapper  # type: ignore[return-value]
 
