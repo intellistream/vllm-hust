@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -50,6 +52,70 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
 
 logger = init_logger(__name__)
+
+
+def _segment_reuse_tensor_summary(tensor: torch.Tensor | None) -> dict[str, Any] | None:
+    if tensor is None:
+        return None
+    try:
+        detached = tensor.detach()
+        return {
+            "shape": [int(dim) for dim in detached.shape],
+            "dtype": str(detached.dtype).replace("torch.", ""),
+            "device": str(detached.device),
+            "abs_sum": float(detached.float().abs().sum().item()),
+        }
+    except Exception as exc:
+        return {
+            "summary_error": type(exc).__name__,
+            "summary_error_message": str(exc),
+        }
+
+
+def _segment_reuse_trace_attention_dispatch_qkv(
+    *,
+    stage: str,
+    layer_name: str,
+    attn_metadata: AttentionMetadata | None,
+    query: torch.Tensor | None,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
+    output: torch.Tensor | None = None,
+) -> None:
+    path = os.environ.get("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE")
+    if not path:
+        return
+    terminal_query_tokens = int(
+        getattr(attn_metadata, "segment_reuse_terminal_query_tokens", 0) or 0
+    )
+    if terminal_query_tokens <= 0:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        payload = {
+            "event": "vllm_attention_terminal_replay_dispatch_qkv",
+            "stage": stage,
+            "layer_name": layer_name,
+            "attn_state": str(getattr(attn_metadata, "attn_state", None)),
+            "terminal_query_start": int(
+                getattr(attn_metadata, "segment_reuse_terminal_query_start", -1)
+                or -1
+            ),
+            "terminal_query_tokens": terminal_query_tokens,
+            "query_summary": _segment_reuse_tensor_summary(query),
+            "key_summary": _segment_reuse_tensor_summary(key),
+            "value_summary": _segment_reuse_tensor_summary(value),
+            "output_summary": _segment_reuse_tensor_summary(output),
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        logger.debug(
+            "segment_reuse: failed to write attention dispatch diagnostic",
+            exc_info=True,
+        )
 
 
 def validate_kv_sharing_target(
@@ -781,6 +847,15 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    _segment_reuse_trace_attention_dispatch_qkv(
+        stage="unified_attention_with_output_pre_impl",
+        layer_name=str(layer_name),
+        attn_metadata=attn_metadata,
+        query=query,
+        key=key,
+        value=value,
+        output=output,
+    )
 
     self.impl.forward(
         self,
