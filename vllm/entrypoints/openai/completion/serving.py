@@ -129,6 +129,7 @@ class OpenAIServingCompletion(OpenAIServing):
         request: CompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
+        received_timestamp_ms = time.monotonic() * 1000.0
         if request.stream and request.use_beam_search:
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
@@ -200,6 +201,15 @@ class OpenAIServingCompletion(OpenAIServing):
                     trace_headers=trace_headers,
                 )
             else:
+                self._emit_openai_entry_lifecycle(
+                    request_id=request_id_item,
+                    route="openai_completion",
+                    engine_input=engine_input,
+                    sampling_params=sampling_params,
+                    received_timestamp_ms=received_timestamp_ms,
+                    prompt_index=i,
+                    prompt_count=len(engine_inputs),
+                )
                 generator = self.engine_client.generate(
                     engine_input,
                     sampling_params,

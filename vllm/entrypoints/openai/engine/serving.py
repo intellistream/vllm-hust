@@ -34,6 +34,7 @@ from vllm.tracing import (
     extract_trace_headers,
     log_tracing_disabled_warning,
 )
+from vllm.v1.engine.request_lifecycle_hooks import emit_lifecycle, monotonic_ms
 
 logger = init_logger(__name__)
 
@@ -166,6 +167,49 @@ class OpenAIServing(BaseServing, BeamSearchOnlineMixin):
             return int(rank_str)
         except ValueError:
             return None
+
+    def _emit_openai_entry_lifecycle(
+        self,
+        *,
+        request_id: str,
+        route: str,
+        engine_input: EngineInput,
+        sampling_params: object,
+        received_timestamp_ms: float | None,
+        prompt_index: int,
+        prompt_count: int,
+    ) -> None:
+        tokenized_timestamp_ms = monotonic_ms()
+        prompt_len = self._extract_prompt_len(engine_input)
+        max_tokens = getattr(sampling_params, "max_tokens", None)
+        common_metadata = {
+            "route": route,
+            "prompt_index": prompt_index,
+            "prompt_count": prompt_count,
+            "prompt_tokens": prompt_len,
+            "max_tokens": max_tokens,
+        }
+        emit_lifecycle(
+            "received",
+            request_id,
+            timestamp_ms=received_timestamp_ms,
+            source="openai_serving_entry",
+            **common_metadata,
+        )
+        emit_lifecycle(
+            "tokenized",
+            request_id,
+            timestamp_ms=tokenized_timestamp_ms,
+            source="openai_render_complete",
+            **common_metadata,
+        )
+        emit_lifecycle(
+            "queued",
+            request_id,
+            timestamp_ms=monotonic_ms(),
+            source="engine_client_generate_call",
+            **common_metadata,
+        )
 
     async def _with_kv_transfer_rejection_cleanup(
         self,

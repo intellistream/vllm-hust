@@ -247,6 +247,7 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        received_timestamp_ms = time.monotonic() * 1000.0
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -350,6 +351,15 @@ class OpenAIServingChat(OpenAIServing):
                 else:
                     reasoning_ended = None
 
+                self._emit_openai_entry_lifecycle(
+                    request_id=sub_request_id,
+                    route="openai_chat_completion",
+                    engine_input=engine_input,
+                    sampling_params=sampling_params,
+                    received_timestamp_ms=received_timestamp_ms,
+                    prompt_index=i,
+                    prompt_count=len(engine_inputs),
+                )
                 generator = self.engine_client.generate(
                     engine_input,
                     sampling_params,
