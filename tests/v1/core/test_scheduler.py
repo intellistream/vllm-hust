@@ -1625,6 +1625,72 @@ def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
     return initial_ecos
 
 
+def test_scheduler_reports_computed_tokens_reduced_for_async_restore():
+    """A completed async external KV load must change prefill planning.
+
+    This is the tiered-restore gate: copied/restored payload is not sufficient;
+    the scheduler output must prove that restored KV was registered as computed
+    prefix before choosing how many local prefill tokens to run.
+    """
+
+    block_size = 16
+    restored_tokens = block_size * 2
+    total_tokens = block_size * 4
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=restored_tokens, is_async=True),
+        block_size=block_size,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=total_tokens,
+        max_tokens=1,
+        block_size=block_size,
+        req_ids=["restore-gate"],
+    )
+
+    scheduler.add_request(request)
+    _step_until_kv_transfer_finished(scheduler, [request.request_id])
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == (
+        total_tokens - restored_tokens
+    )
+    assert output.computed_tokens_reduced == {
+        request.request_id: restored_tokens,
+    }
+    assert output.restore_fallback_reasons == {}
+    assert output.scheduled_new_reqs[0].num_computed_tokens == restored_tokens
+
+
+def test_scheduler_reports_restore_fallback_when_connector_cannot_match():
+    """Expose a hard no-go reason when restored KV cannot be registered."""
+
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=16)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        max_tokens=1,
+        block_size=16,
+        req_ids=["restore-fallback"],
+    )
+    scheduler.add_request(request)
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (None, False)
+    scheduler.connector.build_connector_meta.return_value = SimpleNamespace(requests=[])
+
+    output = scheduler.schedule()
+
+    assert request.request_id not in output.num_scheduled_tokens
+    assert output.computed_tokens_reduced == {}
+    assert output.restore_fallback_reasons == {
+        request.request_id: "connector_match_unavailable",
+    }
+    assert request.kv_restore_fallback_reason == "connector_match_unavailable"
+
+
 @pytest.mark.parametrize("is_async", [False, True])
 def test_kv_connector_basic(is_async: bool):
     """

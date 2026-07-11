@@ -436,6 +436,8 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        computed_tokens_reduced: dict[str, int] = {}
+        restore_fallback_reasons: dict[str, str] = {}
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -768,11 +770,24 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
+                            self._record_restore_planning_gate(
+                                request,
+                                None,
+                                computed_tokens_reduced,
+                                restore_fallback_reasons,
+                                fallback_reason="connector_match_unavailable",
+                            )
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
 
                         num_external_computed_tokens = ext_tokens
+                        self._record_restore_planning_gate(
+                            request,
+                            num_external_computed_tokens,
+                            computed_tokens_reduced,
+                            restore_fallback_reasons,
+                        )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -1009,6 +1024,9 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                self._record_restore_scheduled_forward(
+                    request, computed_tokens_reduced, restore_fallback_reasons
+                )
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -1113,6 +1131,8 @@ class Scheduler(SchedulerInterface):
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
+            computed_tokens_reduced=computed_tokens_reduced,
+            restore_fallback_reasons=restore_fallback_reasons,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
@@ -1155,6 +1175,48 @@ class Scheduler(SchedulerInterface):
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    @staticmethod
+    def _record_restore_planning_gate(
+        request: Request,
+        num_external_computed_tokens: int | None,
+        computed_tokens_reduced: dict[str, int],
+        restore_fallback_reasons: dict[str, str],
+        fallback_reason: str | None = None,
+    ) -> None:
+        """Record whether restored KV changed prefill planning.
+
+        This is intentionally scheduler-side evidence: a lower layer may have
+        copied KV payloads, but the runtime should only treat the restore as a
+        critical-path change when those tokens are registered as computed
+        before local prefill tokens are selected.
+        """
+        request.kv_restore_computed_tokens_reduced = 0
+        request.kv_restore_fallback_reason = None
+
+        if fallback_reason is not None:
+            request.kv_restore_fallback_reason = fallback_reason
+            restore_fallback_reasons[request.request_id] = fallback_reason
+            return
+
+        if num_external_computed_tokens and num_external_computed_tokens > 0:
+            request.kv_restore_computed_tokens_reduced = num_external_computed_tokens
+
+    @staticmethod
+    def _record_restore_scheduled_forward(
+        request: Request,
+        computed_tokens_reduced: dict[str, int],
+        restore_fallback_reasons: dict[str, str],
+    ) -> None:
+        """Emit restore evidence once the request actually schedules forward."""
+        if request.kv_restore_computed_tokens_reduced > 0:
+            computed_tokens_reduced[request.request_id] = (
+                request.kv_restore_computed_tokens_reduced
+            )
+        if request.kv_restore_fallback_reason:
+            restore_fallback_reasons[request.request_id] = (
+                request.kv_restore_fallback_reason
+            )
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.

@@ -151,6 +151,11 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Scheduler-side evidence that an external/restored KV path changed
+        # prefill planning. Payload copy events alone are not enough: a restore
+        # must reduce the tokens scheduled for local prefill.
+        self.kv_restore_computed_tokens_reduced = 0
+        self.kv_restore_fallback_reason: str | None = None
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

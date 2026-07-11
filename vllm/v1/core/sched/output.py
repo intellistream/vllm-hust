@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -214,6 +214,14 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    # req_id -> computed tokens avoided by external/restored KV before this
+    # request's prefill planning. This is scheduler-side evidence that a KV
+    # restore changed the critical path, not merely that bytes were copied.
+    computed_tokens_reduced: dict[str, int] = field(default_factory=dict)
+    # req_id -> fallback reason when an external/restored KV candidate could not
+    # be registered as computed prefix before scheduling.
+    restore_fallback_reasons: dict[str, str] = field(default_factory=dict)
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
@@ -251,6 +259,8 @@ class SchedulerOutput:
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens={},
             total_num_scheduled_tokens=0,
+            computed_tokens_reduced={},
+            restore_fallback_reasons={},
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
