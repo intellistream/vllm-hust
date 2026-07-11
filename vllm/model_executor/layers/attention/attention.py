@@ -543,6 +543,22 @@ class Attention(nn.Module, AttentionLayerBase):
             torch.ops.vllm.maybe_calc_kv_scales(
                 query, key, value, _encode_layer_name(self.layer_name)
             )
+        attn_metadata = None
+        try:
+            attn_metadata = get_forward_context().attn_metadata
+        except Exception:
+            logger.debug(
+                "segment_reuse: failed to read attention metadata for diagnostics",
+                exc_info=True,
+            )
+        _segment_reuse_trace_attention_dispatch_qkv(
+            stage="attention_forward_entry_pre_quant_pre_view",
+            layer_name=str(self.layer_name),
+            attn_metadata=attn_metadata,
+            query=query,
+            key=key,
+            value=value,
+        )
         if output_dtype is None:
             output_dtype = query.dtype
         if self.query_quant is not None:
@@ -573,6 +589,15 @@ class Attention(nn.Module, AttentionLayerBase):
             key = key.view(-1, self.num_kv_heads, self.head_size)
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
+        _segment_reuse_trace_attention_dispatch_qkv(
+            stage="attention_forward_pre_custom_op_post_view",
+            layer_name=str(self.layer_name),
+            attn_metadata=attn_metadata,
+            query=query,
+            key=key,
+            value=value,
+            output=output,
+        )
         kv_cache_dummy_dep = None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
