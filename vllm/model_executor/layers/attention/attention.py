@@ -63,6 +63,11 @@ def _segment_reuse_tensor_summary(tensor: torch.Tensor | None) -> dict[str, Any]
             "shape": [int(dim) for dim in detached.shape],
             "dtype": str(detached.dtype).replace("torch.", ""),
             "device": str(detached.device),
+            "data_ptr": int(detached.data_ptr()),
+            "stride": [int(dim) for dim in detached.stride()],
+            "storage_offset": int(detached.storage_offset()),
+            "is_contiguous": bool(detached.is_contiguous()),
+            "numel": int(detached.numel()),
             "abs_sum": float(detached.float().abs().sum().item()),
         }
     except Exception as exc:
