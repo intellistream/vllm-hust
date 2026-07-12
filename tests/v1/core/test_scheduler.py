@@ -504,6 +504,57 @@ def test_throttle_capacity_bound_guard_admits():
     assert "b" in output.num_scheduled_tokens
 
 
+def test_chunk_budget_isolates_decode_from_long_prefill():
+    """A bounded chunk leaves decode runnable beside a long prefill."""
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=64,
+        long_prefill_token_threshold=32,
+        enable_chunked_prefill=True,
+    )
+    decode_req, prefill_req = create_requests(
+        num_requests=2, num_tokens=256, req_ids=["decode", "prefill"]
+    )
+
+    scheduler.add_request(decode_req)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=["decode"],
+            req_id_to_index={"decode": 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    while decode_req.num_computed_tokens < decode_req.num_prompt_tokens:
+        output = scheduler.schedule()
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=["decode"],
+                req_id_to_index={"decode": 0},
+                sampled_token_ids=[
+                    [0]
+                    if decode_req.num_computed_tokens + 32
+                    >= decode_req.num_prompt_tokens
+                    else []
+                ],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    scheduler.add_request(prefill_req)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["decode"] == 1
+    assert output.num_scheduled_tokens["prefill"] == 32
+    assert sum(output.num_scheduled_tokens.values()) <= 64
+
+
 def test_no_mm_input_chunking():
     # Disable multimodal input chunking.
     scheduler = create_scheduler(
