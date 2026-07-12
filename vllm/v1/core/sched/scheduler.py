@@ -46,6 +46,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.prefill_budget import cap_scheduled_tokens
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -498,9 +499,11 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = cap_scheduled_tokens(
+                num_new_tokens,
+                self.scheduler_config.long_prefill_token_threshold,
+                token_budget,
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
