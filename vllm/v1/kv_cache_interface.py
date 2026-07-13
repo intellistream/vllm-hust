@@ -323,7 +323,121 @@ class FullAttentionSpec(AttentionSpec):
             self.block_size * self.num_kv_heads * last_dim * get_dtype_size(self.dtype)
         )
 
+@dataclass(frozen=True, kw_only=True)
+class KIVIInt4FullAttentionSpec(FullAttentionSpec):
+    kivi_group_size: int = 32
+    quant_bits: int = 4
+    quant_packed_dtype: torch.dtype = torch.int32
+    scale_dtype: torch.dtype | None = None
 
+    def __post_init__(self):
+        super().__post_init__()
+
+        if self.scale_dtype is None:
+            object.__setattr__(self, "scale_dtype", self.dtype)
+
+        if self.quant_bits != 4:
+            raise ValueError("Current KIVI spec only supports 4-bit history cache.")
+
+        if self.head_size != self.head_size_v:
+            raise ValueError(
+                "KIVI INT4 does not support head_size != head_size_v yet."
+            )
+
+        if self.block_size % self.kivi_group_size != 0:
+            raise ValueError(
+                "For the MVP KIVI paged layout, block_size must be divisible by "
+                "kivi_group_size."
+            )
+
+        if self.head_size % self.kivi_group_size != 0:
+            raise ValueError(
+                "For the MVP KIVI paged layout, head_size must be divisible by "
+                "kivi_group_size."
+            )
+
+        if self.head_size_v % self.kivi_group_size != 0:
+            raise ValueError(
+                "For the MVP KIVI paged layout, head_size_v must be divisible by "
+                "kivi_group_size."
+            )
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        group_size = self.kivi_group_size
+        pack_factor = 32 // self.quant_bits
+        q_bytes = get_dtype_size(self.quant_packed_dtype)
+        s_bytes = get_dtype_size(self.scale_dtype)
+
+        # K history page
+        k_quant_bytes = (
+            self.num_kv_heads
+            * self.head_size
+            * (self.block_size // pack_factor)
+            * q_bytes
+        )
+        k_scale_bytes = (
+            self.num_kv_heads
+            * self.head_size
+            * (self.block_size // group_size)
+            * s_bytes
+        )
+        k_mn_bytes = k_scale_bytes
+
+        # V history page
+        v_quant_bytes = (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size_v // pack_factor)
+            * q_bytes
+        )
+        v_scale_bytes = (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size_v // group_size)
+            * s_bytes
+        )
+        v_mn_bytes = v_scale_bytes
+
+        return (
+            k_quant_bytes
+            + k_scale_bytes
+            + k_mn_bytes
+            + v_quant_bytes
+            + v_scale_bytes
+            + v_mn_bytes
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert len(specs) > 0
+        assert all(isinstance(spec, cls) for spec in specs)
+
+        merged = super().merge(specs)
+
+        assert all(spec.kivi_group_size == specs[0].kivi_group_size for spec in specs), (
+            "All merged KIVI specs must share group size."
+        )
+        assert all(spec.quant_bits == specs[0].quant_bits for spec in specs), (
+            "All merged KIVI specs must share quant bits."
+        )
+        assert all(
+            spec.quant_packed_dtype == specs[0].quant_packed_dtype for spec in specs
+        ), (
+            "All merged KIVI specs must share quant_packed_dtype."
+        )
+        assert all(spec.scale_dtype == specs[0].scale_dtype for spec in specs), (
+            "All merged KIVI specs must share scale dtype."
+        )
+
+        return replace(
+            merged,
+            kivi_group_size=specs[0].kivi_group_size,
+            quant_bits=specs[0].quant_bits,
+            quant_packed_dtype=specs[0].quant_packed_dtype,
+            scale_dtype=specs[0].scale_dtype,
+        )
+        
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
     if spec.alignment is None:
         return

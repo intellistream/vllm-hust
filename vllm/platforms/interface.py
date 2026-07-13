@@ -644,7 +644,7 @@ class Platform:
         from vllm.config.vllm import set_current_vllm_config
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
-        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+        from vllm.utils.torch_utils import get_kv_cache_torch_dtype
         from vllm.v1.attention.backend import MultipleOf
         from vllm.v1.kv_cache_interface import (
             FullAttentionSpec,
@@ -660,7 +660,10 @@ class Platform:
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
         else:
-            kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            kv_cache_dtype = get_kv_cache_torch_dtype(
+                cache_config.cache_dtype,
+                model_config.dtype,
+            )
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 

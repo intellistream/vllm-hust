@@ -296,6 +296,13 @@ def get_kv_cache_torch_dtype(
                 torch_dtype = model_dtype
             else:
                 raise ValueError(f"Invalid model dtype: {model_dtype}")
+        elif cache_dtype == "kivi_int4":
+            if isinstance(model_dtype, str) and model_dtype in STR_DTYPE_TO_TORCH_DTYPE:
+                torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
+            elif isinstance(model_dtype, torch.dtype):
+                torch_dtype = model_dtype
+            else:
+                torch_dtype = torch.half
         elif cache_dtype in STR_DTYPE_TO_TORCH_DTYPE:
             torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
         else:
@@ -395,7 +402,7 @@ def resolve_kv_cache_dtype_string(
 def kv_cache_dtype_str_to_dtype(
     kv_cache_dtype: str, model_config: ModelConfig
 ) -> torch.dtype:
-    if kv_cache_dtype == "auto":
+    if kv_cache_dtype in {"auto", "kivi_int4"}:
         # Model config may not be specified for unit tests, default to float16
         return model_config.dtype if model_config else torch.half
     return STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]

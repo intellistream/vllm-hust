@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     SlidingWindowSpec,
     get_kv_quant_mode,
+    KIVIInt4FullAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -631,6 +632,17 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
                 tq_slot_size=tq_config.slot_size_aligned,
+            )
+        elif self.kv_cache_dtype == "kivi_int4":
+            cache_cfg = vllm_config.cache_config
+            return KIVIInt4FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,  # fp16/bf16, 给 scale/min 用
+                kivi_group_size=cache_cfg.kivi_group_size,
+                scale_dtype=self.kv_cache_torch_dtype,
             )
         else:
             return FullAttentionSpec(

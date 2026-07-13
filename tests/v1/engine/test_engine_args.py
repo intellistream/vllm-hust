@@ -108,6 +108,23 @@ def test_defaults_with_usage_context():
     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
 
 
+
+def test_kivi_cache_args_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--model",
+            "facebook/opt-125m",
+            "--kv-cache-dtype",
+            "kivi_int4",
+        ]
+    )
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+
+    assert vllm_config.cache_config.cache_dtype == "kivi_int4"
+    assert vllm_config.cache_config.kivi_group_size == 32
+    assert vllm_config.cache_config.kivi_residual_length == 32
+
 def test_mm_prefix_lm_raises_batched_tokens_floor():
     """Verify that prefix-LM multimodal models auto-raise
     max_num_batched_tokens to fit at least one multimodal item.
@@ -144,3 +161,4 @@ def test_mm_prefix_lm_raises_batched_tokens_floor():
         vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
 
     assert vllm_config.scheduler_config.max_num_batched_tokens >= 2496
+

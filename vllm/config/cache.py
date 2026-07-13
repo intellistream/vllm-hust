@@ -33,6 +33,8 @@ CacheDType = Literal[
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
+    "int8",
+    "kivi_int4",
 ]
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -81,6 +83,10 @@ class CacheConfig:
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
     """
+    kivi_group_size: int = Field(default=32, gt=0)
+    """Group size for KIVI fake quantization when cache_dtype='kivi_int4'."""
+    kivi_residual_length: int = Field(default=32, gt=0)
+    """Number of most-recent full-precision KV tokens kept by KIVI."""
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
@@ -271,6 +277,13 @@ class CacheConfig:
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+        if cache_dtype == "kivi_int4":
+            logger.info(
+                "Using %s kv cache. The concrete storage layout and "
+                "quant/dequant execution are backend-specific.",
+                str(cache_dtype),
+            )
+            return cache_dtype
         if kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
@@ -287,3 +300,19 @@ class CacheConfig:
                 str(cache_dtype),
             )
         return cache_dtype
+
+    @model_validator(mode="after")
+    def _validate_kivi_config(self) -> "CacheConfig":
+        if self.cache_dtype != "kivi_int4":
+            return self
+        if self.kivi_residual_length < self.kivi_group_size:
+            raise ValueError(
+                "kivi_residual_length must be >= kivi_group_size when "
+                "cache_dtype='kivi_int4'."
+            )
+        if self.kivi_residual_length % self.kivi_group_size != 0:
+            raise ValueError(
+                "kivi_residual_length must be divisible by kivi_group_size "
+                "when cache_dtype='kivi_int4'."
+            )
+        return self
