@@ -5,7 +5,7 @@ This script sends a long OpenAI-compatible chat request to a running vLLM
 server and prints the filesystem secondary-tier state before and after.
 
 Example:
-    python3 my_tests/test_offload.py \
+    python3 vllm/v1/kv_offload/tiering/my_tests/test_offload.py \
       --url http://127.0.0.1:8081/v1/chat/completions \
       --fs-root /tmp/vllm_kv_tiering_fs_verify \
       --max-context-chars 60000 \

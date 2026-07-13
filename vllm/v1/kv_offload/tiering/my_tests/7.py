@@ -5,7 +5,9 @@
 # - 覆盖 promotion 完成后 primary lookup 恢复 HIT，并可 prepare_load/complete_load。
 # - 追加 FileSystemTierManager 验证，覆盖 CPU primary -> SSD(fs) -> CPU primary 的真实字节 I/O。
 #
-PYTHONPATH="$PWD" python3 - <<'PY'
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../../.." && pwd)"
+PYTHONPATH="$REPO_ROOT" python3 - <<'PY'
 import mmap
 import os
 import tempfile

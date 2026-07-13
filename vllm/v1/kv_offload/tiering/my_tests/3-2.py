@@ -3,7 +3,9 @@
 # - 从 block_indices=[1] 开始 store/load，覆盖跨 CPU offload block 的 sub-block 映射。
 # - 同时检查未被目标映射覆盖的 CPU sub-block 保持 sentinel，不被误写。
 #
-cd /root/CGCL/vllm-hust
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../../.." && pwd)"
+cd "$REPO_ROOT"
 
 python - <<'PY'
 import torch

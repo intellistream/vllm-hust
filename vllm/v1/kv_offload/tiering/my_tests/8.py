@@ -4,7 +4,9 @@
 # - 显式配置 TTL 后，会话从 active -> idle_retained -> expired/deleted。
 # - 仅在 lifecycle_delete_expired_secondary=True 时删除 FS 二级块文件。
 #
-PYTHONPATH="$PWD" python3 - <<'PY'
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../../.." && pwd)"
+PYTHONPATH="$REPO_ROOT" python3 - <<'PY'
 import os
 import tempfile
 import time

@@ -1,8 +1,10 @@
-cd /root/CGCL/vllm-hust
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../../.." && pwd)"
+cd "$REPO_ROOT"
 
 mkdir -p /tmp/vllm_kv_tiering_fs
 
-PYTHONPATH="$PWD" python3 - <<'PY'
+PYTHONPATH="$REPO_ROOT" python3 - <<'PY'
 import os
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
