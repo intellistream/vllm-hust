@@ -2,12 +2,77 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rotary Positional Embeddings Base Class."""
 
+import json
+import os
+from typing import Any
+
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import CustomOp
 
 from .common import ApplyRotaryEmb
+
+
+def _segment_reuse_rotary_tensor_summary(
+    tensor: torch.Tensor | None,
+) -> dict[str, Any] | None:
+    if tensor is None:
+        return None
+    try:
+        detached = tensor.detach()
+        summary: dict[str, Any] = {
+            "shape": [int(dim) for dim in detached.shape],
+            "dtype": str(detached.dtype).replace("torch.", ""),
+            "device": str(detached.device),
+            "data_ptr": int(detached.data_ptr()),
+            "stride": [int(dim) for dim in detached.stride()],
+            "storage_offset": int(detached.storage_offset()),
+            "is_contiguous": bool(detached.is_contiguous()),
+            "numel": int(detached.numel()),
+            "abs_sum": float(detached.float().abs().sum().item()),
+        }
+        if detached.numel() > 0 and detached.numel() <= 4096:
+            flat = detached.flatten()
+            summary["head"] = flat[: min(8, flat.numel())].detach().cpu().tolist()
+            summary["tail"] = flat[-min(8, flat.numel()) :].detach().cpu().tolist()
+        return summary
+    except Exception as exc:
+        return {
+            "summary_error": type(exc).__name__,
+            "summary_error_message": str(exc),
+        }
+
+
+def _segment_reuse_trace_rotary_qk(
+    *,
+    stage: str,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    head_size: int,
+    rotary_dim: int,
+) -> None:
+    path = os.environ.get("VLLM_SEGMENT_REUSE_DIAGNOSTICS_FILE")
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        payload = {
+            "event": "vllm_rotary_terminal_replay_qk",
+            "stage": stage,
+            "head_size": int(head_size),
+            "rotary_dim": int(rotary_dim),
+            "positions_summary": _segment_reuse_rotary_tensor_summary(positions),
+            "query_summary": _segment_reuse_rotary_tensor_summary(query),
+            "key_summary": _segment_reuse_rotary_tensor_summary(key),
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        return
 
 
 # --8<-- [start:rotary_embedding]
@@ -208,7 +273,15 @@ class RotaryEmbedding(RotaryEmbeddingBase):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """A PyTorch-native implementation of forward()."""
         cos_sin_cache = self._match_cos_sin_cache_dtype(query)
-        return self.forward_static(
+        _segment_reuse_trace_rotary_qk(
+            stage="rotary_forward_native_pre",
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            rotary_dim=self.rotary_dim,
+        )
+        query, key = self.forward_static(
             positions,
             query,
             key,
@@ -217,6 +290,15 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             cos_sin_cache,
             self.is_neox_style,
         )
+        _segment_reuse_trace_rotary_qk(
+            stage="rotary_forward_native_post",
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            rotary_dim=self.rotary_dim,
+        )
+        return query, key
 
     def forward_cuda(
         self,
@@ -224,6 +306,14 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        _segment_reuse_trace_rotary_qk(
+            stage="rotary_forward_cuda_pre",
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            rotary_dim=self.rotary_dim,
+        )
         if self.use_flashinfer:
             torch.ops.vllm.flashinfer_rotary_embedding(
                 positions,
@@ -232,6 +322,14 @@ class RotaryEmbedding(RotaryEmbeddingBase):
                 self.head_size,
                 self.cos_sin_cache,
                 self.is_neox_style,
+            )
+            _segment_reuse_trace_rotary_qk(
+                stage="rotary_forward_cuda_post",
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                rotary_dim=self.rotary_dim,
             )
             return query, key
 
@@ -248,6 +346,14 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             self.head_size,
             cos_sin_cache,
             self.is_neox_style,
+        )
+        _segment_reuse_trace_rotary_qk(
+            stage="rotary_forward_cuda_post",
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            rotary_dim=self.rotary_dim,
         )
         return query, key
 
