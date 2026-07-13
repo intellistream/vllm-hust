@@ -45,6 +45,7 @@ from .compiler_interface import (
     is_compile_cache_enabled,
 )
 from .counter import compilation_counter
+from .mlp_materialization_probe import emit as emit_mlp_materialization_probe
 from .partition_rules import (
     inductor_partition_rule_context,
     should_split,
@@ -1047,6 +1048,31 @@ class VllmBackend:
         vllm_config = self.vllm_config
 
         self._log_compilation_config()
+        cc = vllm_config.compilation_config
+        emit_mlp_materialization_probe(
+            "vllm_backend_call",
+            prefix=self.prefix,
+            graph_module=graph.__class__.__name__,
+            graph_node_count=sum(1 for _ in graph.graph.nodes),
+            example_input_count=len(example_inputs),
+            backend=cc.backend,
+            cudagraph_mode=str(cc.cudagraph_mode),
+            compile_sizes=list(getattr(cc, "compile_sizes", None) or []),
+            compile_ranges=[
+                {
+                    "start": getattr(compile_range, "start", None),
+                    "end": getattr(compile_range, "end", None),
+                }
+                for compile_range in (getattr(cc, "compile_ranges", None) or [])
+            ],
+            compile_ranges_endpoints=list(
+                getattr(cc, "compile_ranges_endpoints", None) or []
+            ),
+            use_inductor_graph_partition=cc.use_inductor_graph_partition,
+            inductor_passes=list(cc.inductor_passes.keys()),
+            vllm_cache_root=envs.VLLM_CACHE_ROOT,
+            existing_cache_dir=self.compilation_config.cache_dir,
+        )
 
         # Minimal hashing here with existing utilities, reused below.
 
@@ -1099,6 +1125,17 @@ class VllmBackend:
         local_cache_dir = os.path.join(cache_dir, f"rank_{rank}_{dp_rank}", self.prefix)
         os.makedirs(local_cache_dir, exist_ok=True)
         self.compilation_config.local_cache_dir = local_cache_dir
+        emit_mlp_materialization_probe(
+            "compile_cache_root",
+            prefix=self.prefix,
+            cache_dir=cache_dir,
+            local_cache_dir=local_cache_dir,
+            env_hash=env_hash,
+            config_hash=config_hash,
+            compiler_hash=compiler_hash,
+            code_hash=code_hash,
+            vllm_cache_root=envs.VLLM_CACHE_ROOT,
+        )
 
         # Honors opt-outs such as CompilationMode.NONE or VLLM_DISABLE_COMPILE_CACHE.
         disable_cache = not is_compile_cache_enabled(self.inductor_config)
@@ -1120,6 +1157,13 @@ class VllmBackend:
 
         self.compiler_manager.initialize_cache(
             local_cache_dir, disable_cache, self.prefix
+        )
+        emit_mlp_materialization_probe(
+            "compile_cache_initialized",
+            prefix=self.prefix,
+            local_cache_dir=local_cache_dir,
+            disable_cache=disable_cache,
+            use_ngram_gpu=is_ngram_gpu_enabled,
         )
 
         # Reuses existing cache key

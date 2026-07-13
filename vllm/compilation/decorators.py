@@ -31,6 +31,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 from .monitor import monitor_profiling_run, monitor_torch_compile
+from .mlp_materialization_probe import emit as emit_mlp_materialization_probe
 
 # shape_id parameter was added to mark_unbacked in PyTorch 2.11.0
 _SUPPORTS_SHAPE_ID = is_torch_equal_or_newer("2.11.0")
@@ -505,22 +506,63 @@ def _support_torch_compile(
                             torch._dynamo.decorators.mark_unbacked(arg, dims)
 
     def __call__(self: type[_T], *args: Any, **kwargs: Any) -> Any:
+        forward_context_available = is_forward_context_available()
+        cudagraph_runtime_mode = None
+        skip_compiled = False
+        batch_descriptor = None
+        if forward_context_available:
+            forward_context = get_forward_context()
+            cudagraph_runtime_mode = str(forward_context.cudagraph_runtime_mode)
+            skip_compiled = bool(forward_context.skip_compiled)
+            batch_descriptor = str(forward_context.batch_descriptor)
+        emit_mlp_materialization_probe(
+            "compile_wrapper_entry",
+            class_name=self.__class__.__name__,
+            do_not_compile=bool(self.do_not_compile),
+            torch_compiler_is_compiling=bool(torch.compiler.is_compiling()),
+            forward_context_available=forward_context_available,
+            skip_compiled=skip_compiled,
+            already_compiled=bool(self.compiled),
+            has_aot_compiled_fn=getattr(self, "aot_compiled_fn", None) is not None,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+            vllm_cache_root=envs.VLLM_CACHE_ROOT,
+            compilation_cache_dir=getattr(self.compilation_config, "cache_dir", None),
+            compilation_local_cache_dir=getattr(
+                self.compilation_config, "local_cache_dir", None
+            ),
+        )
         # torch.compiler.is_compiling() means we are inside the compilation
         # e.g. TPU has the compilation logic in model runner, so we don't
         # need to compile the model inside.
         if self.do_not_compile or torch.compiler.is_compiling():
+            emit_mlp_materialization_probe(
+                "compile_wrapper_bypass",
+                reason="do_not_compile_or_torch_compiler_is_compiling",
+                class_name=self.__class__.__name__,
+            )
             return self.forward(*args, **kwargs)
 
         # If skip_compiled is set, bypass compiled model call. This is used e.g. for
         # enc-dec models where tensor shapes/types vary across invocations, preventing
         # the capture of a single computational graph.
-        if is_forward_context_available() and get_forward_context().skip_compiled:
+        if forward_context_available and get_forward_context().skip_compiled:
+            emit_mlp_materialization_probe(
+                "compile_wrapper_bypass",
+                reason="forward_context_skip_compiled",
+                class_name=self.__class__.__name__,
+            )
             return self.forward(*args, **kwargs)
 
         # if aot_compiled_fn is set, call it with partition wrapper context.
         # The partition wrapper must be active at runtime for CUDA graph
         # capture to work correctly with inductor graph partitioning.
         if getattr(self, "aot_compiled_fn", None) is not None:
+            emit_mlp_materialization_probe(
+                "compile_wrapper_aot_loaded_call",
+                class_name=self.__class__.__name__,
+                vllm_cache_root=envs.VLLM_CACHE_ROOT,
+            )
             with maybe_use_cudagraph_partition_wrapper(self.vllm_config):
                 return self.aot_compiled_fn(self, *args, **kwargs)
 
@@ -551,6 +593,13 @@ def _support_torch_compile(
                 "torch_aot_compile",
                 hash_key,
             )
+            emit_mlp_materialization_probe(
+                "compile_wrapper_aot_cache_root",
+                class_name=self.__class__.__name__,
+                hash_key=hash_key,
+                cache_dir=cache_dir,
+                vllm_cache_root=envs.VLLM_CACHE_ROOT,
+            )
 
             # Hash-level dir; shared across ranks on the same node.
             self.compilation_config.local_cache_dir = cache_dir
@@ -579,6 +628,14 @@ def _support_torch_compile(
                     return output
 
         if self.compiled:
+            emit_mlp_materialization_probe(
+                "compile_wrapper_compiled_call",
+                class_name=self.__class__.__name__,
+                compilation_cache_dir=getattr(self.compilation_config, "cache_dir", None),
+                compilation_local_cache_dir=getattr(
+                    self.compilation_config, "local_cache_dir", None
+                ),
+            )
             assert (
                 not envs.VLLM_USE_AOT_COMPILE
                 or self.vllm_config.compilation_config.backend == "eager"
@@ -596,6 +653,14 @@ def _support_torch_compile(
 
         original_code_object = self.original_code_object()
         logger.debug("Start compiling function %s", original_code_object)
+        emit_mlp_materialization_probe(
+            "compile_wrapper_first_compile",
+            class_name=self.__class__.__name__,
+            original_code_filename=original_code_object.co_filename,
+            original_code_name=original_code_object.co_name,
+            dynamic_shapes_type=str(ds_type),
+            vllm_cache_root=envs.VLLM_CACHE_ROOT,
+        )
 
         # we do not want tp delete the original code object entries since
         # we depend on them now to look up cached compiled functions.

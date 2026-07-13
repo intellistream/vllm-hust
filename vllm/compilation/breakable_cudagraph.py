@@ -34,6 +34,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+from vllm.compilation.mlp_materialization_probe import emit as emit_mlp_materialization_probe
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import (
@@ -309,6 +310,11 @@ class BreakableCUDAGraphWrapper:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if not is_forward_context_available():
+            emit_mlp_materialization_probe(
+                "breakable_cudagraph_bypass",
+                reason="no_forward_context",
+                wrapper_id=id(self),
+            )
             return self.runnable(*args, **kwargs)
 
         forward_context = get_forward_context()
@@ -320,6 +326,13 @@ class BreakableCUDAGraphWrapper:
         # vs FULL, so we match either. Entries are keyed by batch
         # descriptor, which already encodes prefill/decode distinctions.
         if cudagraph_runtime_mode == CUDAGraphMode.NONE:
+            emit_mlp_materialization_probe(
+                "breakable_cudagraph_bypass",
+                reason="runtime_mode_none",
+                wrapper_id=id(self),
+                batch_descriptor=str(batch_descriptor),
+                entry_count=len(self.entries),
+            )
             return self.runnable(*args, **kwargs)
 
         assert batch_descriptor is not None
@@ -329,7 +342,21 @@ class BreakableCUDAGraphWrapper:
             self.entries[batch_descriptor] = entry
 
         if entry.capture is None:
+            emit_mlp_materialization_probe(
+                "breakable_cudagraph_capture_required",
+                wrapper_id=id(self),
+                runtime_mode=str(cudagraph_runtime_mode),
+                batch_descriptor=str(batch_descriptor),
+                entry_count=len(self.entries),
+            )
             return self._capture(entry, args, kwargs)
+        emit_mlp_materialization_probe(
+            "breakable_cudagraph_replay_required",
+            wrapper_id=id(self),
+            runtime_mode=str(cudagraph_runtime_mode),
+            batch_descriptor=str(batch_descriptor),
+            entry_count=len(self.entries),
+        )
         return self._replay(entry, args, kwargs)
 
     # --- capture / replay paths -----------------------------------------
@@ -359,6 +386,13 @@ class BreakableCUDAGraphWrapper:
         validate_cudagraph_capturing_enabled()
 
         entry.input_addresses = self._collect_tensor_addresses(args, kwargs)
+        emit_mlp_materialization_probe(
+            "breakable_cudagraph_capture_start",
+            wrapper_id=id(self),
+            batch_descriptor=str(entry.batch_descriptor),
+            tensor_input_count=len(entry.input_addresses),
+            graph_pool_is_set=self.graph_pool is not None,
+        )
 
         if self.graph_pool is not None:
             set_graph_pool_id(self.graph_pool)
@@ -393,6 +427,12 @@ class BreakableCUDAGraphWrapper:
 
         entry.capture = capture
         entry.output = weak_ref_tensors(output)
+        emit_mlp_materialization_probe(
+            "breakable_cudagraph_capture_done",
+            wrapper_id=id(self),
+            batch_descriptor=str(entry.batch_descriptor),
+            capture=str(capture),
+        )
 
         logger.debug(
             "Captured breakable cudagraph for %s: %r",
@@ -420,5 +460,11 @@ class BreakableCUDAGraphWrapper:
         # dependencies from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
         assert entry.capture is not None
+        emit_mlp_materialization_probe(
+            "breakable_cudagraph_replay",
+            wrapper_id=id(self),
+            batch_descriptor=str(entry.batch_descriptor),
+            capture=str(entry.capture),
+        )
         entry.capture.replay()
         return entry.output
