@@ -126,7 +126,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64" OR ENABLE_X86_ISA)
         "-mavx512vl"
         "-mavx512bw"
         "-mavx512dq")
-    list(APPEND CXX_COMPILE_FLAGS_AVX512_AMX 
+    list(APPEND CXX_COMPILE_FLAGS_AVX512_AMX
         ${CXX_COMPILE_FLAGS_AVX512}
         "-mamx-bf16"
         "-mamx-tile"
@@ -156,9 +156,9 @@ elseif (ASIMD_FOUND)
         add_compile_definitions(ARM_BF16_SUPPORT)
     else()
         message(WARNING "BF16 functionality is not available")
-        set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16")  
+        set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16")
     endif()
-    list(APPEND CXX_COMPILE_FLAGS ${MARCH_FLAGS})     
+    list(APPEND CXX_COMPILE_FLAGS ${MARCH_FLAGS})
 elseif (S390_FOUND)
     message(STATUS "S390 detected")
     # Check for S390 VXE support
@@ -246,7 +246,7 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
             FetchContent_Populate(arm_compute
                 SUBBUILD_DIR "${FETCHCONTENT_BASE_DIR}/arm_compute-subbuild"
                 SOURCE_DIR   "${FETCHCONTENT_BASE_DIR}/arm_compute-src"
-                GIT_REPOSITORY git@github.com:ARM-software/ComputeLibrary.git
+                GIT_REPOSITORY https://github.com/ARM-software/ComputeLibrary.git
                 GIT_TAG        v52.6.0
                 GIT_SHALLOW    TRUE
                 GIT_PROGRESS   TRUE
@@ -257,15 +257,15 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
 
         # Build ACL with CMake
         set(_cmake_config_cmd
-             ${CMAKE_COMMAND} -G Ninja -B build 
-            -DARM_COMPUTE_BUILD_SHARED_LIB=OFF 
-            -DCMAKE_BUILD_TYPE=Release 
-            -DARM_COMPUTE_ARCH=armv8.2-a 
-            -DARM_COMPUTE_ENABLE_ASSERTS=OFF 
-            -DARM_COMPUTE_ENABLE_CPPTHREADS=OFF 
-            -DARM_COMPUTE_ENABLE_OPENMP=ON 
-            -DARM_COMPUTE_ENABLE_WERROR=OFF 
-            -DARM_COMPUTE_BUILD_EXAMPLES=OFF 
+             ${CMAKE_COMMAND} -G Ninja -B build
+            -DARM_COMPUTE_BUILD_SHARED_LIB=OFF
+            -DCMAKE_BUILD_TYPE=Release
+            -DARM_COMPUTE_ARCH=armv8.2-a
+            -DARM_COMPUTE_ENABLE_ASSERTS=OFF
+            -DARM_COMPUTE_ENABLE_CPPTHREADS=OFF
+            -DARM_COMPUTE_ENABLE_OPENMP=ON
+            -DARM_COMPUTE_ENABLE_WERROR=OFF
+            -DARM_COMPUTE_BUILD_EXAMPLES=OFF
             -DARM_COMPUTE_BUILD_TESTING=OFF)
         set(_cmake_build_cmd
             ${CMAKE_COMMAND} --build build -- -j${NPROC}
@@ -305,7 +305,7 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
             message(STATUS "aarch64 detected: using pinned oneDNN commit 9c5be1cc59e368aebf0909e6cf20f981ea61462a")
             FetchContent_Declare(
                 oneDNN
-                GIT_REPOSITORY git@github.com:oneapi-src/oneDNN.git
+                GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
                 GIT_TAG        9c5be1cc59e368aebf0909e6cf20f981ea61462a
                 GIT_PROGRESS   TRUE
                 GIT_SHALLOW    FALSE
@@ -313,7 +313,7 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
         else()
             FetchContent_Declare(
                 oneDNN
-                GIT_REPOSITORY git@github.com:oneapi-src/oneDNN.git
+                GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
                 GIT_TAG        v3.10
                 GIT_PROGRESS   TRUE
                 GIT_SHALLOW    TRUE
@@ -381,7 +381,7 @@ set(VLLM_OPENBLAS_LIB "")
 if (NOT ENABLE_X86_ISA)
     file(GLOB _VLLM_TORCH_OPENBLAS_LIBS
         "${TORCH_INSTALL_PREFIX}/lib/libopenblas*.so*")
-    # Note: we don't link openblas directly to _C extension, as it's available through libtorch.so 
+    # Note: we don't link openblas directly to _C extension, as it's available through libtorch.so
     if (_VLLM_TORCH_OPENBLAS_LIBS)
         list(GET _VLLM_TORCH_OPENBLAS_LIBS 0 VLLM_OPENBLAS_LIB)
         message(STATUS "CPU OpenBLAS library: ${VLLM_OPENBLAS_LIB}")
@@ -432,7 +432,7 @@ if (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND)
         ${VLLM_EXT_SRC})
 endif()
 
-if (POWER9_FOUND OR POWER10_FOUND OR POWER11_FOUND)	
+if (POWER9_FOUND OR POWER10_FOUND OR POWER11_FOUND)
     set(VLLM_EXT_SRC
         "csrc/cpu/shm.cpp"
         ${VLLM_EXT_SRC})
@@ -477,7 +477,7 @@ if (ENABLE_X86_ISA)
         "csrc/cpu/layernorm.cpp"
         "csrc/cpu/mla_decode.cpp"
         "csrc/cpu/pos_encoding.cpp"
-        "csrc/moe/dynamic_4bit_int_moe_cpu.cpp") 
+        "csrc/moe/dynamic_4bit_int_moe_cpu.cpp")
 
     set(VLLM_EXT_SRC_AVX2
         "csrc/cpu/sgl-kernels/fla.cpp"
@@ -491,7 +491,7 @@ if (ENABLE_X86_ISA)
         "csrc/cpu/layernorm.cpp"
         "csrc/cpu/mla_decode.cpp"
         "csrc/cpu/pos_encoding.cpp"
-        "csrc/moe/dynamic_4bit_int_moe_cpu.cpp") 
+        "csrc/moe/dynamic_4bit_int_moe_cpu.cpp")
 
     message(STATUS "CPU extension (AVX512F + BF16 + VNNI + AMX) source files: ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL}")
     message(STATUS "CPU extension (AVX512F) source files: ${VLLM_EXT_SRC_AVX512}")
@@ -516,7 +516,7 @@ if (ENABLE_X86_ISA)
     # For AMX kernels
     target_compile_definitions(_C PRIVATE "-DCPU_CAPABILITY_AMXBF16")
 
-    # AVX512F 
+    # AVX512F
     define_extension_target(
         _C_AVX512
         DESTINATION vllm
@@ -528,7 +528,7 @@ if (ENABLE_X86_ISA)
         WITH_SOABI
     )
 
-    # AVX2 
+    # AVX2
     define_extension_target(
         _C_AVX2
         DESTINATION vllm
