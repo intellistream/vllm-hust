@@ -31,17 +31,25 @@ Example configuration:
 }
 """
 
+from typing import Any
+
 import torch
 from typing_extensions import override
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
-from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCaches,
+    OffloadingManager,
+    OffloadingMetricMetadata,
+    OffloadingWorker,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.cpu.worker_factory import create_cpu_offloading_worker
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.lifecycle import LifecycleConfig
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
@@ -65,10 +73,34 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
     BLOCK_SIZE_ALIGNMENT = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
 
+    @classmethod
+    @override
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        metrics = super().build_metric_definitions(extra_config)
+        secondary_tier_configs = extra_config.get("secondary_tiers", [])
+        if not isinstance(secondary_tier_configs, list):
+            raise ValueError("secondary_tiers must be a list of tier configurations")
+
+        for tier_config in secondary_tier_configs:
+            assert isinstance(tier_config, dict)
+            tier_cls = SecondaryTierFactory.get_tier_class(tier_config)
+            metrics.update(tier_cls.build_metric_definitions(tier_config))
+        return metrics
+
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
         self._manager: OffloadingManager | None = None
+        if self.kv_events_config.self_describing_kv_events:
+            raise ValueError(
+                "self_describing_kv_events is not supported by "
+                "TieringOffloadingSpec. Tier promotions can emit primary-tier "
+                "store events that do not correspond to GPU store jobs, so the "
+                "current self-describing side table cannot describe them "
+                "correctly."
+            )
 
         # Parse secondary tier configurations
         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
@@ -91,11 +123,6 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             TieringOffloadingManager instance
         """
         if not self._manager:
-            kv_events_config = self.vllm_config.kv_events_config
-            enable_events = (
-                kv_events_config is not None and kv_events_config.enable_kv_cache_events
-            )
-
             # Create scheduler-side SharedOffloadRegion (rank=None) so the
             # primary tier can eagerly create a memoryview over _base.
             scheduler_mmap = SharedOffloadRegion(
@@ -111,7 +138,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             primary_tier = CPUPrimaryTierOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,  # type: ignore[arg-type]
-                enable_events=enable_events,
+                enable_events=self.kv_events_config.enable_kv_cache_events,
                 mmap_region=scheduler_mmap,
             )
 
@@ -138,12 +165,15 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     raise
 
             # Create TieringOffloadingManager. GPU↔CPU transfers use the inherited
-            # get_handlers(); secondary tier transfers are handled by the
-            # secondary tier managers and need no additional handlers here.
+            # get_worker(). Secondary tier transfers are handled by the
+            # secondary tier managers and need no additional workers here.
             tiering_manager = TieringOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
-                enable_events=enable_events,
+                enable_events=self.kv_events_config.enable_kv_cache_events,
+                lifecycle_config=LifecycleConfig.from_extra_config(
+                    self.extra_config
+                ),
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(
@@ -162,7 +192,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         return self._manager
 
     @override
-    def create_handlers(self, kv_caches: CanonicalKVCaches) -> CpuGpuOffloadingHandlers:
+    def create_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         rank = torch.accelerator.current_device_index()
         worker_mmap = SharedOffloadRegion(
             instance_id=self.vllm_config.instance_id,
@@ -171,7 +201,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             kv_bytes_per_block=self.kv_bytes_per_offloaded_block,
             cpu_page_size=self.cpu_page_size_per_worker,
         )
-        return CpuGpuOffloadingHandlers(
+        return create_cpu_offloading_worker(
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,

@@ -118,8 +118,8 @@ class CachedRequestData:
     # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.
     # When PP is not used, new_token_ids will be empty.
     new_token_ids: list[list[int]]
-    # For requests not scheduled in the last step, propagate the token ids to the
-    # connector. Won't contain requests that were scheduled in the prior step.
+    # MRV1-only: For requests not scheduled in the last step, propagate the token ids
+    # to the connector. Won't contain requests scheduled in the prior step.
     all_token_ids: dict[str, list[int]]
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
@@ -231,6 +231,11 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None
+    # Full logical KV block table for scheduled requests, keyed by request ID.
+    # This is intended for scheduler-side KV connectors that need logical
+    # token-block to physical KV-block mapping. It is separate from
+    # scheduled_cached_reqs.new_block_ids, which is a worker block-table delta.
+    kv_connector_full_block_ids: dict[str, tuple[list[int], ...] | None] | None = None
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
@@ -239,6 +244,10 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # Dynamic speculative decoding: optimal K chosen by scheduler.
+    # Number of spec tokens to schedule for the next step.
+    num_spec_tokens_to_schedule: int = 0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
