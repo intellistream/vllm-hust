@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -55,6 +56,27 @@ class BatchDescriptor:
     are captured for each num_active_loras value. This allows kernels
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
+    """
+    start_num_tokens: int = 0
+    """
+    For DUAL_INPLACE split-batch mode: the starting token offset for the
+    second split's offset view into the original buffer. When 0 (default),
+    the descriptor refers to a normal (non-offset) graph.
+    """
+    graph_variant: str = ""
+    """
+    For DUAL_INPLACE: identifies the split mode variant, e.g.
+    "inplace_serial" or "inplace_parallel". Empty string for normal graphs.
+    """
+    attention_backend: str = ""
+    """
+    For DUAL_INPLACE: the attention backend tag (e.g. "fia", "pa") used
+    during graph capture. Empty string for normal graphs.
+    """
+    capture_metadata_mode: str = ""
+    """
+    For DUAL_INPLACE: the metadata mode used during graph capture.
+    Empty string for normal graphs.
     """
 
 
@@ -184,26 +206,51 @@ class ForwardContext:
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
+    split_inplace_mode: str | None = None
+    """
+    For DUAL_INPLACE: the current split mode, e.g. "inplace_serial" or
+    "inplace_parallel". None when not in a split-batch execution path.
+    """
+    in_parallel_streams: bool = False
+    """
+    For DUAL_INPLACE: whether the current forward pass is executing on
+    the secondary (parallel) stream.
+    """
+    allow_inplace_lazy_capture: bool = False
+    """
+    For DUAL_INPLACE: whether lazy capture of an offset graph is allowed
+    during this forward pass.
+    """
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
         )
 
 
-_forward_context: ForwardContext | None = None
+_forward_context_local = threading.local()
+
+
+def _get_current_forward_context() -> ForwardContext | None:
+    return getattr(_forward_context_local, "value", None)
+
+
+def _set_current_forward_context(forward_context: ForwardContext | None) -> None:
+    _forward_context_local.value = forward_context
 
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
-    assert _forward_context is not None, (
+    forward_context = _get_current_forward_context()
+    assert forward_context is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
     )
-    return _forward_context
+    return forward_context
 
 
 def is_forward_context_available() -> bool:
-    return _forward_context is not None
+    return _get_current_forward_context() is not None
 
 
 def create_forward_context(
@@ -217,6 +264,9 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    split_inplace_mode: str | None = None,
+    in_parallel_streams: bool = False,
+    allow_inplace_lazy_capture: bool = False,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -235,6 +285,9 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
+        split_inplace_mode=split_inplace_mode,
+        in_parallel_streams=in_parallel_streams,
+        allow_inplace_lazy_capture=allow_inplace_lazy_capture,
     )
 
 
@@ -244,13 +297,12 @@ def override_forward_context(forward_context: ForwardContext | None):
     This is used to override the forward context for a specific
     forward pass.
     """
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = forward_context
+    prev_context = _get_current_forward_context()
+    _set_current_forward_context(forward_context)
     try:
         yield
     finally:
-        _forward_context = prev_context
+        _set_current_forward_context(prev_context)
 
 
 @contextmanager
@@ -265,6 +317,9 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    split_inplace_mode: str | None = None,
+    in_parallel_streams: bool = False,
+    allow_inplace_lazy_capture: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -325,6 +380,9 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
+        split_inplace_mode=split_inplace_mode,
+        in_parallel_streams=in_parallel_streams,
+        allow_inplace_lazy_capture=allow_inplace_lazy_capture,
     )
 
     try:
