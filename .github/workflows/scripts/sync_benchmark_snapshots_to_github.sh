@@ -38,24 +38,31 @@ write_github_env() {
 configure_push_remote() {
   local remote_url=
 
-  if [[ -n "$BENCHMARK_REPO_GH_TOKEN" ]]; then
-    remote_url="https://x-access-token:${BENCHMARK_REPO_GH_TOKEN}@github.com/${BENCHMARK_REPO_SLUG}.git"
-    git -C "$BENCHMARK_REPO_DIR" remote set-url "$BENCHMARK_REPO_REMOTE" "$remote_url"
-    return 0
-  fi
-
+  # Prefer SSH key over GH token: the SSH key is provisioned specifically
+  # for the benchmark repo, while the GH token may belong to a user
+  # without write access to the target repository.
   if [[ -n "$BENCHMARK_REPO_SSH_KEY" ]]; then
     remote_url="git@github.com:${BENCHMARK_REPO_SLUG}.git"
     git -C "$BENCHMARK_REPO_DIR" remote set-url "$BENCHMARK_REPO_REMOTE" "$remote_url"
     return 0
   fi
 
+  if [[ -n "$BENCHMARK_REPO_GH_TOKEN" ]]; then
+    remote_url="https://x-access-token:${BENCHMARK_REPO_GH_TOKEN}@github.com/${BENCHMARK_REPO_SLUG}.git"
+    git -C "$BENCHMARK_REPO_DIR" remote set-url "$BENCHMARK_REPO_REMOTE" "$remote_url"
+    return 0
+  fi
+
   if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-    echo "Either BENCHMARK_REPO_GH_TOKEN or BENCHMARK_REPO_SSH_KEY is required for direct benchmark publication in GitHub Actions" >&2
+    echo "L3 benchmark repository publication is enabled, but no cross-repository write credential is available." >&2
+    echo "Configure one of the following secrets on the vllm-hust workflow repository before enabling benchmark repo publish:" >&2
+    echo "  - VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY: SSH private key with write access to ${BENCHMARK_REPO_SLUG}" >&2
+    echo "  - VLLM_HUST_BENCHMARK_GH_TOKEN: GitHub token with contents write access to ${BENCHMARK_REPO_SLUG}" >&2
+    echo "Benchmark repo publish target: ${BENCHMARK_REPO_SLUG}@${SNAPSHOT_TARGET_BRANCH}" >&2
     exit 2
   fi
 
-  git -C "$BENCHMARK_REPO_DIR" remote set-url "$BENCHMARK_REPO_REMOTE" "$remote_url"
+  echo "No benchmark repo credential configured outside GitHub Actions; using existing ${BENCHMARK_REPO_REMOTE} remote."
 }
 
 for file_name in "${required_submission_files[@]}"; do
@@ -139,18 +146,66 @@ prepare_publication_commit() {
   git -C "$BENCHMARK_REPO_DIR" commit -m "$SNAPSHOT_COMMIT_MESSAGE"
 }
 
+verify_published_benchmark_repo_state() {
+  local expected_commit=$1
+  local verified_commit
+  local file_name
+
+  git -C "$BENCHMARK_REPO_DIR" fetch "$BENCHMARK_REPO_REMOTE" "$SNAPSHOT_TARGET_BRANCH"
+  verified_commit=$(git -C "$BENCHMARK_REPO_DIR" rev-parse "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH")
+  if [[ "$verified_commit" != "$expected_commit" ]]; then
+    echo "benchmark publication verification failed: expected $expected_commit, got $verified_commit" >&2
+    return 1
+  fi
+
+  for file_name in "${required_submission_files[@]}"; do
+    if ! git -C "$BENCHMARK_REPO_DIR" cat-file -e \
+      "$verified_commit:$relative_submission_dir/$file_name"; then
+      echo "benchmark publication verification failed: missing $relative_submission_dir/$file_name" >&2
+      return 1
+    fi
+  done
+
+  for file_name in "${required_snapshot_files[@]}"; do
+    if ! git -C "$BENCHMARK_REPO_DIR" cat-file -e \
+      "$verified_commit:$relative_snapshot_dir/$file_name"; then
+      echo "benchmark publication verification failed: missing $relative_snapshot_dir/$file_name" >&2
+      return 1
+    fi
+  done
+
+  write_github_env GITHUB_SNAPSHOT_SYNC_VERIFICATION verified
+  write_github_env GITHUB_SNAPSHOT_SYNC_VERIFIED_COMMIT "$verified_commit"
+  echo "Verified benchmark publication at ${BENCHMARK_REPO_SLUG}@${SNAPSHOT_TARGET_BRANCH}: $verified_commit"
+}
+
 for attempt in $(seq 1 "$SNAPSHOT_MAX_PUSH_ATTEMPTS"); do
   if ! prepare_publication_commit; then
     echo "Benchmark publication already includes submission $run_id"
+    echo "Benchmark repo target: ${BENCHMARK_REPO_SLUG}@${SNAPSHOT_TARGET_BRANCH}"
+    echo "Submission path: $relative_submission_dir"
+    echo "Snapshot path: $relative_snapshot_dir"
     write_github_env GITHUB_SNAPSHOT_SYNC_STATUS unchanged
+    write_github_env GITHUB_SNAPSHOT_SYNC_REPO "$BENCHMARK_REPO_SLUG"
+    write_github_env GITHUB_SNAPSHOT_SYNC_BRANCH "$SNAPSHOT_TARGET_BRANCH"
+    write_github_env GITHUB_SNAPSHOT_SYNC_SUBMISSION_PATH "$relative_submission_dir"
+    write_github_env GITHUB_SNAPSHOT_SYNC_SNAPSHOT_PATH "$relative_snapshot_dir"
+    verify_published_benchmark_repo_state "$(git -C "$BENCHMARK_REPO_DIR" rev-parse "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH")"
     exit 0
   fi
 
   snapshot_commit=$(git -C "$BENCHMARK_REPO_DIR" rev-parse HEAD)
   if git -C "$BENCHMARK_REPO_DIR" push "$BENCHMARK_REPO_REMOTE" "HEAD:$SNAPSHOT_TARGET_BRANCH"; then
+    verify_published_benchmark_repo_state "$snapshot_commit"
     echo "Pushed benchmark publication to ${BENCHMARK_REPO_SLUG}@${SNAPSHOT_TARGET_BRANCH}: $snapshot_commit"
+    echo "Submission path: $relative_submission_dir"
+    echo "Snapshot path: $relative_snapshot_dir"
     write_github_env GITHUB_SNAPSHOT_SYNC_STATUS pushed
     write_github_env GITHUB_SNAPSHOT_SYNC_COMMIT "$snapshot_commit"
+    write_github_env GITHUB_SNAPSHOT_SYNC_REPO "$BENCHMARK_REPO_SLUG"
+    write_github_env GITHUB_SNAPSHOT_SYNC_BRANCH "$SNAPSHOT_TARGET_BRANCH"
+    write_github_env GITHUB_SNAPSHOT_SYNC_SUBMISSION_PATH "$relative_submission_dir"
+    write_github_env GITHUB_SNAPSHOT_SYNC_SNAPSHOT_PATH "$relative_snapshot_dir"
     exit 0
   fi
 
@@ -161,4 +216,7 @@ for attempt in $(seq 1 "$SNAPSHOT_MAX_PUSH_ATTEMPTS"); do
 done
 
 echo "failed to push benchmark publication after $SNAPSHOT_MAX_PUSH_ATTEMPTS attempts" >&2
+echo "Benchmark repo target: ${BENCHMARK_REPO_SLUG}@${SNAPSHOT_TARGET_BRANCH}" >&2
+echo "Submission path: $relative_submission_dir" >&2
+echo "Snapshot path: $relative_snapshot_dir" >&2
 exit 1

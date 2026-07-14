@@ -23,6 +23,7 @@ from vllm.v1.kv_offload.cpu.worker_factory import (
     create_cpu_offloading_worker,
     is_ascend_platform,
 )
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 
 
 class CPUOffloadingSpec(OffloadingSpec):

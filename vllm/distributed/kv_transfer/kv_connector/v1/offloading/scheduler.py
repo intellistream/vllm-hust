@@ -1328,6 +1328,19 @@ class OffloadingConnectorScheduler:
 
         return stats
 
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        stats = self._connector_stats
+        self._connector_stats = None
+
+        manager_stats = self.manager.get_stats()
+        if manager_stats is not None:
+            if stats is None:
+                stats = manager_stats
+            else:
+                stats.aggregate(manager_stats)
+
+        return stats
+
     def request_finished(
         self,
         request: Request,

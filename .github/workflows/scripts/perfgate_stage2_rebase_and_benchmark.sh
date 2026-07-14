@@ -91,7 +91,8 @@ if [[ "$rebase_rc" -ne 0 ]]; then
 fi
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
-  "$PYTHON_BIN" -m pip install -e . --no-build-isolation --no-deps
+  "$PYTHON_BIN" -m pip install --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" "wheel" "packaging>=24.2"
+  VLLM_TARGET_DEVICE=empty VLLM_USE_PRECOMPILED=0 "$PYTHON_BIN" -m pip install -e . --no-build-isolation --no-deps
 fi
 
 run_stage2_benchmark() {
@@ -101,7 +102,7 @@ run_stage2_benchmark() {
   while [[ "$attempt" -le "$max_attempts" ]]; do
     echo "[perfgate-stage2] benchmark attempt ${attempt}/${max_attempts}"
     set +e
-    RUN_ID="$STAGE2_RUN_ID" RESULT_ROOT="$STAGE2_RESULT_ROOT" PUBLISH_TO_HF=0 \
+    RUN_ID="$STAGE2_RUN_ID" RESULT_ROOT="$STAGE2_RESULT_ROOT" PUBLISH_TO_HF=0 PUBLISH_TO_BENCHMARK_REPO=0 \
       bash .github/workflows/scripts/run_ascend_benchmark_ci.sh
     local rc=$?
     set -e
