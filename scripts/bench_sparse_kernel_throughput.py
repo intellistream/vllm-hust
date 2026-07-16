@@ -349,7 +349,7 @@ def run_case(
     synchronize()
     try:
         start = time.perf_counter()
-        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
         synchronize()
         elapsed = time.perf_counter() - start
     finally:
