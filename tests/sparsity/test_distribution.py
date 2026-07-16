@@ -3,8 +3,8 @@
 import json
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 import vllm.sparsity.distribution as distribution_module
 from vllm.sparsity.config import ActivationSparsityConfig
@@ -126,6 +126,34 @@ def test_row_topk_threshold_topk_backend_matches_default(monkeypatch):
     topk_threshold = row_topk_threshold(x_abs, keep)
 
     assert torch.equal(default_threshold, topk_threshold)
+
+
+def test_larosa_sparse_linear_threshold_passes_signed_input_to_ascend(
+    monkeypatch,
+):
+    x = torch.tensor([[1.0, -4.0, 3.0, -2.0]], dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_ascend_threshold(value, keep):
+        captured["value"] = value
+        captured["keep"] = keep
+        return torch.tensor([2.0], dtype=torch.float32)
+
+    monkeypatch.delenv("VLLM_LAROSA_TOPK_THRESHOLD_BACKEND", raising=False)
+    monkeypatch.setattr(
+        distribution_module,
+        "_try_ascend_topk_threshold",
+        fake_ascend_threshold,
+    )
+    sparsify = LaRosaSparsifyFn(sparsity_level=0.5, use_sparse_gemv=True)
+
+    threshold, inclusive = sparsify._sparse_linear_threshold(x)
+
+    assert captured["value"] is x
+    assert captured["keep"] == 2
+    assert threshold.dtype == torch.float32
+    assert threshold.tolist() == [2.0]
+    assert inclusive is True
 
 
 def test_sparsify_fn_moved_threshold():

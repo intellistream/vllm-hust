@@ -8,13 +8,12 @@ from torch import nn
 
 from vllm.sparsity.kernels.sparse_gemv import (
     can_use_sparse_gemv,
+    should_use_topk_matmul_silu,
     sparse_gemv_direct_t_cached_impl,
     sparse_gemv_impl,
     sparse_gemv_silu_and_mul_direct_t_cached_impl,
     sparse_gemv_topk_matmul_silu_impl,
-    should_use_topk_matmul_silu,
 )
-
 
 _DEFAULT_SPARSE_GEMV_MIN_SPARSITY = 0.70
 _DEFAULT_SPARSE_GEMV_MIN_STATIC_THRESHOLD = 1e-6
@@ -874,24 +873,30 @@ def row_topk_threshold(x_abs: torch.Tensor, keep: int) -> torch.Tensor:
     """Return the kth-largest per-row threshold without materializing indices."""
     backend = os.environ.get(
         "VLLM_LAROSA_TOPK_THRESHOLD_BACKEND",
-        "kthvalue",
+        "ascend",
     ).lower()
-    if backend == "topk":
-        topk_values, _ = torch.topk(x_abs, keep, dim=-1)
-        return topk_values[..., -1]
     if backend in {"ascend", "ascend_custom", "custom"}:
         ascend_threshold = _try_ascend_topk_threshold(x_abs, keep)
         if ascend_threshold is not None:
             return ascend_threshold
-    kth = x_abs.shape[-1] - keep + 1
-    return torch.kthvalue(x_abs, kth, dim=-1).values
+    x_abs_float = x_abs.to(dtype=torch.float32)
+    if backend == "topk":
+        topk_values, _ = torch.topk(x_abs_float, keep, dim=-1)
+        return topk_values[..., -1]
+    kth = x_abs_float.shape[-1] - keep + 1
+    return torch.kthvalue(x_abs_float, kth, dim=-1).values
 
 
 def _try_ascend_topk_threshold(
     x_abs: torch.Tensor,
     keep: int,
 ) -> torch.Tensor | None:
-    if not getattr(x_abs, "is_npu", False):
+    if (
+        not getattr(x_abs, "is_npu", False)
+        or x_abs.dim() != 2
+        or x_abs.shape[0] != 1
+        or x_abs.dtype not in (torch.float16, torch.bfloat16)
+    ):
         return None
     ascend_ops = getattr(torch.ops, "_C_ascend", None)
     if ascend_ops is None:
@@ -899,8 +904,6 @@ def _try_ascend_topk_threshold(
     op = getattr(ascend_ops, "activation_sparse_topk_threshold", None)
     if op is None:
         return None
-    if x_abs.dtype != torch.float32:
-        x_abs = x_abs.to(dtype=torch.float32)
     return op(x_abs.contiguous(), keep)
 
 
@@ -1013,7 +1016,15 @@ class LaRosaSparsifyFn(SparsifyFn):
                 "La RoSA sparsity_level keeps fewer than one activation for "
                 f"hidden size {x.shape[-1]}: sparsity_level={self.sparsity_level}."
             )
-        threshold = row_topk_threshold(x.abs().to(dtype=torch.float32), keep)
+        backend = os.environ.get(
+            "VLLM_LAROSA_TOPK_THRESHOLD_BACKEND",
+            "ascend",
+        ).lower()
+        if backend in {"ascend", "ascend_custom", "custom"}:
+            threshold = _try_ascend_topk_threshold(x, keep)
+            if threshold is not None:
+                return threshold.contiguous(), True
+        threshold = row_topk_threshold(x.abs(), keep)
         return threshold.contiguous(), True
 
     def _try_apply_topk_matmul_gate_up_silu(
