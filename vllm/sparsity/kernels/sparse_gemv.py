@@ -245,6 +245,13 @@ def _is_npu_tensor(tensor: torch.Tensor) -> bool:
     return getattr(getattr(tensor, "device", None), "type", None) == "npu"
 
 
+def _same_supported_sparse_dtype(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> bool:
+    return x.dtype in (torch.float16, torch.bfloat16) and weight.dtype == x.dtype
+
+
 def _threshold_numel_is_supported(
     threshold: torch.Tensor,
     x: torch.Tensor,
@@ -361,7 +368,7 @@ def _try_ascend_direct_t_fast_path(
         return None
     if not _is_npu_tensor(x):
         return None
-    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
+    if not _same_supported_sparse_dtype(x, weight_t):
         return None
     if x.dim() != 2 or weight_t.dim() != 2:
         return None
@@ -404,7 +411,7 @@ def _try_ascend_silu_and_mul_direct_t_fast_path(
         return None
     if not _is_npu_tensor(x):
         return None
-    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
+    if not _same_supported_sparse_dtype(x, weight_t):
         return None
     if x.dim() != 2 or weight_t.dim() != 2:
         return None
@@ -562,7 +569,7 @@ def sparse_gemv_topk_matmul_silu_impl(
     """Apply La RoSA top-k sparse gate/up via selected-weight matmul on NPU."""
     if not _is_npu_tensor(x):
         return None
-    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
+    if not _same_supported_sparse_dtype(x, weight_t):
         return None
     if x.dim() != 2 or x.shape[0] != 1:
         return None
@@ -612,7 +619,7 @@ def sparse_gemv_direct_t_cached_impl(
     """Fastest cached-plan path for already validated Ascend direct-T calls."""
     if not _is_npu_tensor(x):
         return None
-    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
+    if not _same_supported_sparse_dtype(x, weight_t):
         return None
     if threshold.dtype != torch.float32 or threshold.device != x.device:
         return None

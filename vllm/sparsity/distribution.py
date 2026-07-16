@@ -119,6 +119,14 @@ class SparsifyFn(nn.Module):
         self.prefill_sparsify = prefill_sparsify
         self.use_sparse_gemv = use_sparse_gemv
         self.expected_sparsity = expected_sparsity
+        # Dynamo cannot guard on Tensor.item() inside a compiled forward. The
+        # calibration threshold is immutable, so cache its scalar value here.
+        try:
+            self._sparse_linear_static_threshold_abs_max = float(
+                threshold.detach().to(dtype=torch.float32).abs().max().item()
+            )
+        except Exception:
+            self._sparse_linear_static_threshold_abs_max = float("inf")
 
     def _cached_tensor_to(
         self,
@@ -584,16 +592,7 @@ class SparsifyFn(nn.Module):
         if min_threshold <= 0.0:
             return True
 
-        cached = getattr(self, "_sparse_linear_static_threshold_abs_max", None)
-        if cached is None:
-            try:
-                cached = float(
-                    threshold.detach().to(dtype=torch.float32).abs().max().item()
-                )
-            except Exception:
-                return True
-            self._sparse_linear_static_threshold_abs_max = cached
-        return cached > min_threshold
+        return self._sparse_linear_static_threshold_abs_max > min_threshold
 
     def _sparse_linear_min_static_threshold(self) -> float:
         value = os.environ.get("VLLM_SPARSE_GEMV_MIN_STATIC_THRESHOLD")

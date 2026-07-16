@@ -540,6 +540,23 @@ def test_dense_fallback_uses_identity_for_near_zero_static_threshold(monkeypatch
     assert sparsify.apply_dense_fallback(x) is x
 
 
+def test_dense_fallback_static_threshold_compiles_fullgraph(monkeypatch):
+    monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_STATIC_THRESHOLD", raising=False)
+    sparsify = SparsifyFn(
+        torch.tensor(0.5),
+        apply_all_tokens=True,
+        use_sparse_gemv=True,
+        expected_sparsity=0.9,
+    )
+    x = torch.randn(2, 8)
+
+    compiled = torch.compile(
+        sparsify.apply_dense_fallback, backend="eager", fullgraph=True
+    )
+
+    assert torch.equal(compiled(x), sparsify(x))
+
+
 def test_sparse_linear_auto_policy_requires_expected_sparsity(monkeypatch):
     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
     monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
@@ -738,6 +755,19 @@ def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):
     assert records[1]["active_density_max"] == 0.75
     assert records[1]["active_density_mean"] == 0.5
     assert records[1]["active_sparsity_mean"] == 0.5
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_sparse_backend_accepts_matching_low_precision_dtype(dtype):
+    from vllm.sparsity.kernels.sparse_gemv import _same_supported_sparse_dtype
+
+    x = torch.empty(1, 4, dtype=dtype)
+
+    assert _same_supported_sparse_dtype(x, torch.empty(4, 3, dtype=dtype))
+    assert not _same_supported_sparse_dtype(
+        x,
+        torch.empty(4, 3, dtype=torch.float32),
+    )
 
 
 def test_ascend_direct_t_fast_path_marker_records_metadata(tmp_path, monkeypatch):
