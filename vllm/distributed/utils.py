@@ -137,6 +137,17 @@ def get_pp_indices(
     start_layer = sum(partitions[:pp_rank])
     end_layer = start_layer + partitions[pp_rank]
 
+    if partition_list_str is not None:
+        logger.info_once(
+            "Using custom PP layer partition from VLLM_PP_LAYER_PARTITION=%s: "
+            "pp_rank=%d/%d layers=[%d,%d)",
+            partition_list_str,
+            pp_rank,
+            pp_size,
+            start_layer,
+            end_layer,
+        )
+
     return (start_layer, end_layer)
 
 

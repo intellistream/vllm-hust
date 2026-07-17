@@ -773,6 +773,11 @@ class VllmConfig:
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
+            if envs.VLLM_USE_PP_OPT_SCHEDULER:
+                raise ValueError(
+                    "PP optimization scheduling owns the pipeline batch queue "
+                    "and is not compatible with async scheduling."
+                )
             # Currently, async scheduling only support eagle speculative
             # decoding.
             if self.speculative_config is not None:
@@ -797,7 +802,13 @@ class VllmConfig:
                 )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
-            if (
+            if envs.VLLM_USE_PP_OPT_SCHEDULER:
+                logger.info_once(
+                    "Disabling asynchronous scheduling because PP optimization "
+                    "scheduling owns the pipeline batch queue."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
                 self.model_config is not None
                 and self.model_config.runner_type == "pooling"
             ):

@@ -181,7 +181,7 @@ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.worker import mamba_utils
+from vllm.v1.worker import mamba_utils, pp_opt_profile
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
@@ -3853,6 +3853,7 @@ class GPUModelRunner(
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
     @torch.inference_mode()
+    @pp_opt_profile.profile_model_runner_execute
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3938,6 +3939,9 @@ class GPUModelRunner(
             req_ids = self.input_batch.req_ids
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+            pp_opt_profile.set_microbatch_stats(
+                self.input_batch, num_scheduled_tokens_np
+            )
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
@@ -4117,13 +4121,19 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            pp_opt_profile.mark_t2()
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            finally:
+                if pp_opt_profile.record_active():
+                    torch.cuda.synchronize()
+                pp_opt_profile.mark_t3()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

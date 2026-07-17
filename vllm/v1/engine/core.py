@@ -190,11 +190,15 @@ class EngineCore:
         # Batch queue for scheduled batches. This enables us to asynchronously
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
-        self.batch_queue_size = self.model_executor.max_concurrent_batches
+        if envs.VLLM_USE_PP_OPT_SCHEDULER and envs.VLLM_PP_OPT_BATCH_QUEUE_SIZE:
+            assert envs.VLLM_PP_OPT_BATCH_QUEUE_SIZE > 0
+            self.batch_queue_size = envs.VLLM_PP_OPT_BATCH_QUEUE_SIZE
+        else:
+            self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
-        if self.batch_queue_size > 1:
+        if self.batch_queue_size > 1 or envs.VLLM_USE_PP_OPT_SCHEDULER:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
 
@@ -215,9 +219,15 @@ class EngineCore:
                 hash_block_size, caching_hash_fn
             )
 
-        self.step_fn = (
-            self.step if self.batch_queue is None else self.step_with_batch_queue
-        )
+        if envs.VLLM_USE_PP_OPT_SCHEDULER:
+            self.in_flight_microbatch_ids: set[int] = set()
+            assert self.batch_queue is not None
+            logger.info("PP optimization scheduler is enabled")
+            self.step_fn = self.step_with_batch_queue_pp_opt
+        else:
+            self.step_fn = (
+                self.step if self.batch_queue is None else self.step_with_batch_queue
+            )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -555,6 +565,89 @@ class EngineCore:
                 )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
+            grammar_output = self.scheduler.get_grammar_bitmask(
+                deferred_scheduler_output
+            )
+            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+
+        return engine_core_outputs, model_executed
+
+    def step_with_batch_queue_pp_opt(
+        self,
+    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        """Schedule and execute PP optimization microbatches with the batch queue."""
+        batch_queue = self.batch_queue
+        assert batch_queue is not None
+        assert len(batch_queue) < self.batch_queue_size
+
+        model_executed = False
+        deferred_scheduler_output = None
+
+        if self.scheduler.has_requests_pp_opt():
+            new_microbatch_id = self.scheduler.select_microbatch_pp_opt(
+                self.in_flight_microbatch_ids
+            )
+            if new_microbatch_id is not None:
+                logger.debug(
+                    "Schedule PP optimization microbatch %s", new_microbatch_id
+                )
+                self.in_flight_microbatch_ids.add(new_microbatch_id)
+                scheduler_output = self.scheduler.schedule_pp_opt(new_microbatch_id)
+                scheduler_output.microbatch_id = new_microbatch_id
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+                if self.is_ec_consumer:
+                    model_executed = scheduler_output.total_num_scheduled_tokens > 0
+
+                if self.is_pooling_model or not model_executed:
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                else:
+                    if not scheduler_output.pending_structured_output_tokens:
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        deferred_scheduler_output = scheduler_output
+
+                if not deferred_scheduler_output:
+                    batch_queue.appendleft((future, scheduler_output, exec_future))
+                    if (
+                        model_executed
+                        and len(batch_queue) < self.batch_queue_size
+                        and not batch_queue[-1][0].done()
+                    ):
+                        return None, True
+
+        elif not batch_queue:
+            return None, False
+
+        if not batch_queue:
+            return None, False
+
+        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        microbatch_id = scheduler_output.microbatch_id
+        logger.debug("Finish PP optimization microbatch %s", microbatch_id)
+        self.in_flight_microbatch_ids.discard(microbatch_id)
+        with (
+            self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                exec_model_fut.result()
+                raise RuntimeError("unexpected error")
+
+        self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output_pp_opt(
+            scheduler_output, model_output
+        )
+
+        if deferred_scheduler_output:
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )

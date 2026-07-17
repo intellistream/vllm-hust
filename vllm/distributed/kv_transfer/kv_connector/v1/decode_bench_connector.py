@@ -331,18 +331,29 @@ class DecodeBenchConnectorWorker:
         assert self.kv_caches is not None, "KV caches must be registered before filling"
         assert self.group_to_layers is not None, "Group mapping must be initialized"
 
+        block_ids_by_group: dict[int, list[int]] = {}
+        num_tokens_by_group: dict[int, int] = {}
         for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
-            # Fill blocks for each KV cache group
             for group_idx, block_ids in enumerate(block_ids_per_group):
-                self._fill_blocks(group_idx, block_ids, num_tokens)
+                block_ids_by_group.setdefault(group_idx, []).extend(block_ids)
+                num_tokens_by_group[group_idx] = (
+                    num_tokens_by_group.get(group_idx, 0) + num_tokens
+                )
 
             logger.debug(
-                "DecodeBenchConnector: Filled %d blocks (%d tokens) across %d groups "
-                "for request %s",
+                "DecodeBenchConnector: Queued %d blocks (%d tokens) across %d "
+                "groups for request %s",
                 len(block_ids_per_group[0]) if block_ids_per_group else 0,
                 num_tokens,
                 len(block_ids_per_group),
                 req_id,
+            )
+
+        # Fill each group once so a large concurrent batch does not issue the
+        # same cache-fill kernels separately for every request.
+        for group_idx, block_ids in block_ids_by_group.items():
+            self._fill_blocks(
+                group_idx, block_ids, num_tokens_by_group[group_idx]
             )
 
     def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
@@ -372,41 +383,42 @@ class DecodeBenchConnectorWorker:
                 continue
 
             kv_cache = self.kv_caches[layer_name]
-
-            # Convert block_ids to tensor on device
-            block_ids_tensor = torch.tensor(
-                block_ids, dtype=torch.long, device=kv_cache.device
+            cache_tensors = (
+                tuple(kv_cache) if isinstance(kv_cache, list | tuple) else (kv_cache,)
             )
 
-            # Filter invalid block IDs
-            valid_mask = block_ids_tensor < kv_cache.shape[0]
-            valid_block_ids = block_ids_tensor[valid_mask]
-
-            if len(valid_block_ids) == 0:
-                continue
-
-            # Create fill values - either constant or random
-            block_shape = kv_cache.shape[1:]
-            if self.fill_std > 0:
-                # Random normal sampling
-                fill_values = torch.normal(
-                    mean=self.fill_mean,
-                    std=self.fill_std,
-                    size=(len(valid_block_ids),) + block_shape,
-                    dtype=kv_cache.dtype,
-                    device=kv_cache.device,
+            for cache_tensor in cache_tensors:
+                # Ascend stores key and value caches as separate tensors.
+                block_ids_tensor = torch.tensor(
+                    block_ids, dtype=torch.long, device=cache_tensor.device
                 )
-            else:
-                # Constant fill value
-                fill_values = torch.full(
-                    (len(valid_block_ids),) + block_shape,
-                    self.fill_mean,
-                    dtype=kv_cache.dtype,
-                    device=kv_cache.device,
-                )
+                valid_block_ids = block_ids_tensor[
+                    block_ids_tensor < cache_tensor.shape[0]
+                ]
+                if len(valid_block_ids) == 0:
+                    continue
 
-            # Batch fill operation
-            kv_cache[valid_block_ids] = fill_values
+                block_shape = cache_tensor.shape[1:]
+                if self.fill_std > 0:
+                    # Ascend normal generation does not support BF16 outputs.
+                    random_dtype = (
+                        torch.float32
+                        if cache_tensor.dtype == torch.bfloat16
+                        else cache_tensor.dtype
+                    )
+                    fill_values = torch.normal(
+                        mean=self.fill_mean,
+                        std=self.fill_std,
+                        size=block_shape,
+                        dtype=random_dtype,
+                        device=cache_tensor.device,
+                    ).to(cache_tensor.dtype)
+                    # One random block provides non-zero benchmark data. The
+                    # assignment broadcasts it while still writing every cache
+                    # block, without generating a full-cache FP32 temporary.
+                    cache_tensor[valid_block_ids] = fill_values
+                else:
+                    cache_tensor[valid_block_ids] = self.fill_mean
 
         logger.debug(
             "DecodeBenchConnector: Filled %d blocks in group %d with %s values "
