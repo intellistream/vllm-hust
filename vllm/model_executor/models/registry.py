@@ -142,6 +142,7 @@ _TEXT_GENERATION_MODELS = {
     "LagunaForCausalLM": ("laguna", "LagunaForCausalLM"),
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
     "SliceGPTLlamaForCausalLM": ("slicegpt_llama", "SliceGPTLlamaForCausalLM"),
+    "SliceGPTQwen2ForCausalLM": ("slicegpt_qwen2", "SliceGPTQwen2ForCausalLM"),
     "Llama4ForCausalLM": ("llama4", "Llama4ForCausalLM"),
     # For decapoda-research/llama-*
     "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
