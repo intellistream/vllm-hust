@@ -169,7 +169,7 @@ python benchmarks/pp_opt/analyze_results.py
 python benchmarks/pp_opt/plot_throughput.py
 ```
 
-## Expected result
+## Validated results
 
 The validated Qwen3-32B conversation run completed 1,000/1,000 requests in
 both modes on eight 910C NPUs:
@@ -180,10 +180,20 @@ both modes on eight 910C NPUs:
 | PP-opt | 1,187.73 s | 0.8419 req/s | 294.14 tok/s |
 | Speedup | **1.218x** | **+21.82%** | **+21.82%** |
 
-Treat approximately 1.1-1.3x as the expected range on the same hardware and
-software stack, not as a universal target. The full two-model/two-trace matrix
-has not yet been validated with the recovered static configuration; no
-expected speedup is claimed for those six remaining pairs.
+The validated Qwen3-235B-A22B conversation run also completed 1,000/1,000
+requests in both modes and generated the same 349,357 output tokens:
+
+| Mode | Duration | Request throughput | Output throughput |
+| --- | ---: | ---: | ---: |
+| Baseline | 1,735.38 s | 0.5762 req/s | 201.31 tok/s |
+| PP-opt | 1,479.88 s | 0.6757 req/s | 236.07 tok/s |
+| Speedup | **1.173x** | **+17.27%** | **+17.27%** |
+
+The required 200-request 235B gate measured a 1.201x speedup before the full
+pair was launched. Treat approximately 1.1-1.3x as the expected range for the
+two validated conversation workloads on the same hardware and software stack,
+not as a universal target. The two BurstGPT pairs have not yet been validated
+with the recovered static configuration.
 
 See [design.md](design.md) for scheduler and Ascend integration details and
 [results.md](results.md) for the measured pipeline compactness evidence.

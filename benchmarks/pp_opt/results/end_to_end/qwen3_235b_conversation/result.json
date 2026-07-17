@@ -1,0 +1,51 @@
+{
+  "date": "2026-07-18",
+  "model": "Qwen3-235B-A22B",
+  "trace": "conversation",
+  "request_count": 1000,
+  "successful_requests": 1000,
+  "failed_requests": 0,
+  "actual_output_tokens": 349357,
+  "pipeline_parallel_size": 4,
+  "tensor_parallel_size": 2,
+  "layer_partition": [23, 24, 24, 23],
+  "hardware": "8x Ascend 910C per mode",
+  "max_model_len": 131072,
+  "max_num_seqs": 512,
+  "max_num_batched_tokens": 512,
+  "full_transformer_execution": true,
+  "parameter_loading": "dummy with real input embedding",
+  "config_sha256": "82a50d0651e4502aa2165cc426bbeb74e6c452990078aacabdace1fff2ce2b18",
+  "model_config_sha256": "0ecd5d6fe6f2db6739e4e36ab06b88ebe7bd013ef31b9583f43796059a2b23a4",
+  "vllm_commit": "f527007c5fbc1955d6cea49d44d122e2e63217e9",
+  "vllm_ascend_commit": "f80aefce9d6a5bdb06e067088cf9242d9faec807",
+  "baseline": {
+    "duration_s": 1735.3791711330414,
+    "request_throughput_per_s": 0.5762427754178762,
+    "output_goodput_tokens_per_s": 201.31450567768562,
+    "mean_server_generation_tokens_per_s": 205.0670581327069,
+    "peak_server_generation_tokens_per_s": 446.5,
+    "mean_latency_ms": 200418.86714839935,
+    "p50_latency_ms": 213102.42629051208,
+    "p99_latency_ms": 548877.2003650665
+  },
+  "pp_opt": {
+    "duration_s": 1479.877961397171,
+    "request_throughput_per_s": 0.6757311577222898,
+    "output_goodput_tokens_per_s": 236.07149313188484,
+    "mean_server_generation_tokens_per_s": 240.9830917874397,
+    "peak_server_generation_tokens_per_s": 448.8,
+    "mean_latency_ms": 174949.47808098793,
+    "p50_latency_ms": 186754.49585914612,
+    "p99_latency_ms": 465058.9134693146
+  },
+  "speedup_factor": 1.1726501890025096,
+  "speedup_percent": 17.26501890025096,
+  "gate": {
+    "request_count": 200,
+    "actual_output_tokens": 71379,
+    "baseline_output_goodput_tokens_per_s": 158.8172544373886,
+    "pp_opt_output_goodput_tokens_per_s": 190.763199627881,
+    "speedup_factor": 1.2011490836034229
+  }
+}
