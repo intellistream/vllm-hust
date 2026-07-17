@@ -512,6 +512,11 @@ class GroupCoordinator:
             and getattr(self.device_communicator, "supports_tensor_dict", False)
         )
 
+        if envs.VLLM_USE_PP_OPT_SCHEDULER:
+            self.size_send_work: torch.distributed.Work | None = None
+            self.object_send_work: torch.distributed.Work | None = None
+            self.tensor_send_works: list[torch.distributed.Work] = []
+
     def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:
         """Create a new device-side ProcessGroup with the same per-rank membership
         as this coordinator's `device_group`, but backed by a distinct communicator.
@@ -895,13 +900,29 @@ class GroupCoordinator:
             [object_tensor.numel()], dtype=torch.long, device="cpu"
         )
 
-        # Send object size
+        if envs.VLLM_USE_PP_OPT_SCHEDULER:
+            if self.size_send_work is not None:
+                self.size_send_work.wait()
+            if self.object_send_work is not None:
+                self.object_send_work.wait()
 
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
-
-        # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
-
+            # Send object size
+            self.size_send_work = torch.distributed.isend(
+                size_tensor, dst=self.ranks[dst], group=self.cpu_group
+            )
+            # Send object
+            self.object_send_work = torch.distributed.isend(
+                object_tensor, dst=self.ranks[dst], group=self.cpu_group
+            )
+        else:
+            # Send object size
+            torch.distributed.send(
+                size_tensor, dst=self.ranks[dst], group=self.cpu_group
+            )
+            # Send object
+            torch.distributed.send(
+                object_tensor, dst=self.ranks[dst], group=self.cpu_group
+            )
         return None
 
     def recv_object(self, src: int) -> Any:
@@ -916,10 +937,17 @@ class GroupCoordinator:
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
-        # Receive object size
-        rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        if envs.VLLM_USE_PP_OPT_SCHEDULER:
+            # Receive object size
+            size_work = torch.distributed.irecv(
+                size_tensor, src=self.ranks[src], group=self.cpu_group
+            )
+            size_work.wait()
+        else:
+            # Receive object size
+            rank_size = torch.distributed.recv(
+                size_tensor, src=self.ranks[src], group=self.cpu_group
+            )
 
         # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
@@ -928,13 +956,19 @@ class GroupCoordinator:
             device="cpu",
         )
 
-        rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        if envs.VLLM_USE_PP_OPT_SCHEDULER:
+            object_work = torch.distributed.irecv(
+                object_tensor, src=self.ranks[src], group=self.cpu_group
+            )
+            object_work.wait()
+        else:
+            rank_object = torch.distributed.recv(
+                object_tensor, src=self.ranks[src], group=self.cpu_group
+            )
 
-        assert rank_object == rank_size, (
-            "Received object sender rank does not match the size sender rank."
-        )
+            assert rank_object == rank_size, (
+                "Received object sender rank does not match the size sender rank."
+            )
 
         obj = pickle.loads(object_tensor.numpy().tobytes())
 
@@ -1112,6 +1146,17 @@ class GroupCoordinator:
         assert len(tensor_keys) == len(tensor_list)
 
         handles: list[Handle] = []
+        overlap_pp_sends = (
+            envs.VLLM_USE_PP_OPT_SCHEDULER and envs.VLLM_PP_OPT_OVERLAP_SENDS
+        )
+        if (
+            envs.VLLM_USE_PP_OPT_SCHEDULER
+            and not overlap_pp_sends
+            and self.tensor_send_works is not None
+        ):
+            for tensor_send_work in self.tensor_send_works:
+                tensor_send_work.wait()
+            self.tensor_send_works = []
         for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 continue
@@ -1129,6 +1174,10 @@ class GroupCoordinator:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
             handles.append(handle)
 
+        if envs.VLLM_USE_PP_OPT_SCHEDULER and not overlap_pp_sends:
+            self.tensor_send_works = handles
+        elif envs.VLLM_USE_PP_OPT_SCHEDULER:
+            self.tensor_send_works = []
         return handles
 
     def recv_tensor_dict(

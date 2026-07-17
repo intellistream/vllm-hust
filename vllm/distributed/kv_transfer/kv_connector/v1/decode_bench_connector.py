@@ -345,18 +345,29 @@ class DecodeBenchConnectorWorker:
         assert self.kv_caches is not None, "KV caches must be registered before filling"
         assert self.group_to_layers is not None, "Group mapping must be initialized"
 
+        block_ids_by_group: dict[int, list[int]] = {}
+        num_tokens_by_group: dict[int, int] = {}
         for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
-            # Fill blocks for each KV cache group
             for group_idx, block_ids in enumerate(block_ids_per_group):
-                self._fill_blocks(group_idx, block_ids, num_tokens)
+                block_ids_by_group.setdefault(group_idx, []).extend(block_ids)
+                num_tokens_by_group[group_idx] = (
+                    num_tokens_by_group.get(group_idx, 0) + num_tokens
+                )
 
             logger.debug(
-                "DecodeBenchConnector: Filled %d blocks (%d tokens) across %d groups "
-                "for request %s",
+                "DecodeBenchConnector: Queued %d blocks (%d tokens) across %d "
+                "groups for request %s",
                 len(block_ids_per_group[0]) if block_ids_per_group else 0,
                 num_tokens,
                 len(block_ids_per_group),
                 req_id,
+            )
+
+        # Fill each group once so a large concurrent batch does not issue the
+        # same cache-fill kernels separately for every request.
+        for group_idx, block_ids in block_ids_by_group.items():
+            self._fill_blocks(
+                group_idx, block_ids, num_tokens_by_group[group_idx]
             )
 
     def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
@@ -386,7 +397,6 @@ class DecodeBenchConnectorWorker:
                 continue
 
             kv_cache = self.kv_caches[layer_name]
-
             # Attention layers store KV as a single block-indexed tensor whose
             # first dim is num_blocks; fill the requested block rows. Hybrid /
             # linear-attention layers (e.g. Mamba, Kimi Delta Attention) store

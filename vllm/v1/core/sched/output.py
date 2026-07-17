@@ -249,6 +249,9 @@ class SchedulerOutput:
     # underlying HBM region is preallocated at engine startup.
     kv_cache_usage: float = 0.0
 
+    # Microbatch ID for pipeline parallelism.
+    microbatch_id: int = -1
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -261,6 +264,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            microbatch_id=-1,
         )
 
 

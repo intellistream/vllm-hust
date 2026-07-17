@@ -1,0 +1,27 @@
+{
+  "config_key": "qwen3_32b_pp4tp2_8x910c",
+  "model_key": "qwen3_32b",
+  "model_name": "qwen3_32b",
+  "model_dir": "models/Qwen3-32B",
+  "embedding_shard": "model-00001-of-00017.safetensors",
+  "deployment": "pp4tp2",
+  "hardware": "8x910c",
+  "pipeline_parallel_size": 4,
+  "tensor_parallel_size": 2,
+  "npu_count": 8,
+  "layer_partition": [16, 16, 16, 16],
+  "kv_cache_size": 1490000,
+  "gpu_memory_utilization": 0.9,
+  "max_model_len": 131072,
+  "max_num_seqs": 512,
+  "max_num_batched_tokens": 512,
+  "share_dummy_weights": false,
+  "cost_model": "configs/qwen3_32b_pp4tp2_8x910c/fit_result.json",
+  "optimization": {
+    "batch_queue_size": 4,
+    "dynamic_microbatches": false,
+    "min_microbatches": 4,
+    "target_microbatch_size": 24,
+    "overlap_sends": false
+  }
+}

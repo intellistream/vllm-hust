@@ -1,0 +1,1506 @@
+{
+  "metadata": {
+    "model_name": "qwen3_32b",
+    "deployment": "pp4tp2",
+    "hardware": "8x910c",
+    "input_dir": "calibration/runs/qwen3_32b_pp4tp2_8x910c/20260715T114514Z",
+    "config_key": "qwen3_32b_pp4tp2_8x910c",
+    "config_sha256": "a7c21e380682279be46e482590134e7ea28df362deddb29c7f13add0db6b5919",
+    "model_config_sha256": "97e295b63283935788fac5e4f8860862a56d4089538cafc93f0431f2ebe483bb",
+    "pipeline_parallel_size": 4,
+    "tensor_parallel_size": 2,
+    "layer_partition": [
+      16,
+      16,
+      16,
+      16
+    ],
+    "calibration_run_id": "20260715T114514Z",
+    "installed_at": "2026-07-15T12:44:28.544109+00:00"
+  },
+  "cost_definitions": {
+    "forward": "cost_forward_ns",
+    "total": "cost_total_ns"
+  },
+  "filters": {
+    "warmup_step_fraction": 0.1,
+    "trim_extremes": 1,
+    "preprocessing": {
+      "raw_csv_rows": 43820,
+      "request_count_mismatch_excluded_rows": 9316,
+      "request_count_filtered_rows": 34504,
+      "aggregated_sample_count": 17252,
+      "warmup_excluded_count": 1608,
+      "trim_excluded_count": 176,
+      "final_sample_count": 15468,
+      "request_count_filter": {
+        "policy": "checkpoint_expected_request_num",
+        "excluded_row_count": 9316,
+        "output_row_count": 34504,
+        "workloads": {
+          "normal_req128_kv1490000_util060_seed0": {
+            "expected_request_num": 128,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req128_kv1490000_util070_seed0": {
+            "expected_request_num": 128,
+            "input_row_count": 968,
+            "request_mismatch_excluded_count": 304,
+            "output_row_count": 664
+          },
+          "normal_req128_kv1490000_util080_seed0": {
+            "expected_request_num": 128,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req128_kv1490000_util090_seed0": {
+            "expected_request_num": 128,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req16_kv1490000_util060_seed0": {
+            "expected_request_num": 16,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req16_kv1490000_util070_seed0": {
+            "expected_request_num": 16,
+            "input_row_count": 882,
+            "request_mismatch_excluded_count": 130,
+            "output_row_count": 752
+          },
+          "normal_req16_kv1490000_util080_seed0": {
+            "expected_request_num": 16,
+            "input_row_count": 908,
+            "request_mismatch_excluded_count": 188,
+            "output_row_count": 720
+          },
+          "normal_req16_kv1490000_util090_seed0": {
+            "expected_request_num": 16,
+            "input_row_count": 878,
+            "request_mismatch_excluded_count": 126,
+            "output_row_count": 752
+          },
+          "normal_req192_kv1490000_util060_seed0": {
+            "expected_request_num": 192,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req192_kv1490000_util070_seed0": {
+            "expected_request_num": 192,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req192_kv1490000_util080_seed0": {
+            "expected_request_num": 192,
+            "input_row_count": 856,
+            "request_mismatch_excluded_count": 80,
+            "output_row_count": 776
+          },
+          "normal_req192_kv1490000_util090_seed0": {
+            "expected_request_num": 192,
+            "input_row_count": 856,
+            "request_mismatch_excluded_count": 80,
+            "output_row_count": 776
+          },
+          "normal_req256_kv1490000_util060_seed0": {
+            "expected_request_num": 256,
+            "input_row_count": 880,
+            "request_mismatch_excluded_count": 128,
+            "output_row_count": 752
+          },
+          "normal_req256_kv1490000_util070_seed0": {
+            "expected_request_num": 256,
+            "input_row_count": 856,
+            "request_mismatch_excluded_count": 80,
+            "output_row_count": 776
+          },
+          "normal_req256_kv1490000_util080_seed0": {
+            "expected_request_num": 256,
+            "input_row_count": 864,
+            "request_mismatch_excluded_count": 96,
+            "output_row_count": 768
+          },
+          "normal_req256_kv1490000_util090_seed0": {
+            "expected_request_num": 256,
+            "input_row_count": 1064,
+            "request_mismatch_excluded_count": 496,
+            "output_row_count": 568
+          },
+          "normal_req32_kv1490000_util060_seed0": {
+            "expected_request_num": 32,
+            "input_row_count": 852,
+            "request_mismatch_excluded_count": 68,
+            "output_row_count": 784
+          },
+          "normal_req32_kv1490000_util070_seed0": {
+            "expected_request_num": 32,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req32_kv1490000_util080_seed0": {
+            "expected_request_num": 32,
+            "input_row_count": 846,
+            "request_mismatch_excluded_count": 62,
+            "output_row_count": 784
+          },
+          "normal_req32_kv1490000_util090_seed0": {
+            "expected_request_num": 32,
+            "input_row_count": 980,
+            "request_mismatch_excluded_count": 324,
+            "output_row_count": 656
+          },
+          "normal_req64_kv1490000_util060_seed0": {
+            "expected_request_num": 64,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req64_kv1490000_util070_seed0": {
+            "expected_request_num": 64,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req64_kv1490000_util080_seed0": {
+            "expected_request_num": 64,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "normal_req64_kv1490000_util090_seed0": {
+            "expected_request_num": 64,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "uniform_req128_kv1490000_util060_seed0": {
+            "expected_request_num": 128,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "uniform_req128_kv1490000_util070_seed0": {
+            "expected_request_num": 128,
+            "input_row_count": 1216,
+            "request_mismatch_excluded_count": 800,
+            "output_row_count": 416
+          },
+          "uniform_req128_kv1490000_util080_seed0": {
+            "expected_request_num": 128,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "uniform_req128_kv1490000_util090_seed0": {
+            "expected_request_num": 128,
+            "input_row_count": 888,
+            "request_mismatch_excluded_count": 144,
+            "output_row_count": 744
+          },
+          "uniform_req16_kv1490000_util060_seed0": {
+            "expected_request_num": 16,
+            "input_row_count": 916,
+            "request_mismatch_excluded_count": 204,
+            "output_row_count": 712
+          },
+          "uniform_req16_kv1490000_util070_seed0": {
+            "expected_request_num": 16,
+            "input_row_count": 952,
+            "request_mismatch_excluded_count": 272,
+            "output_row_count": 680
+          },
+          "uniform_req16_kv1490000_util080_seed0": {
+            "expected_request_num": 16,
+            "input_row_count": 1034,
+            "request_mismatch_excluded_count": 434,
+            "output_row_count": 600
+          },
+          "uniform_req16_kv1490000_util090_seed0": {
+            "expected_request_num": 16,
+            "input_row_count": 1410,
+            "request_mismatch_excluded_count": 1194,
+            "output_row_count": 216
+          },
+          "uniform_req192_kv1490000_util060_seed0": {
+            "expected_request_num": 192,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "uniform_req192_kv1490000_util070_seed0": {
+            "expected_request_num": 192,
+            "input_row_count": 1056,
+            "request_mismatch_excluded_count": 480,
+            "output_row_count": 576
+          },
+          "uniform_req192_kv1490000_util080_seed0": {
+            "expected_request_num": 192,
+            "input_row_count": 856,
+            "request_mismatch_excluded_count": 80,
+            "output_row_count": 776
+          },
+          "uniform_req192_kv1490000_util090_seed0": {
+            "expected_request_num": 192,
+            "input_row_count": 856,
+            "request_mismatch_excluded_count": 80,
+            "output_row_count": 776
+          },
+          "uniform_req256_kv1490000_util060_seed0": {
+            "expected_request_num": 256,
+            "input_row_count": 944,
+            "request_mismatch_excluded_count": 256,
+            "output_row_count": 688
+          },
+          "uniform_req256_kv1490000_util070_seed0": {
+            "expected_request_num": 256,
+            "input_row_count": 992,
+            "request_mismatch_excluded_count": 352,
+            "output_row_count": 640
+          },
+          "uniform_req256_kv1490000_util080_seed0": {
+            "expected_request_num": 256,
+            "input_row_count": 856,
+            "request_mismatch_excluded_count": 80,
+            "output_row_count": 776
+          },
+          "uniform_req256_kv1490000_util090_seed0": {
+            "expected_request_num": 256,
+            "input_row_count": 856,
+            "request_mismatch_excluded_count": 80,
+            "output_row_count": 776
+          },
+          "uniform_req32_kv1490000_util060_seed0": {
+            "expected_request_num": 32,
+            "input_row_count": 1000,
+            "request_mismatch_excluded_count": 368,
+            "output_row_count": 632
+          },
+          "uniform_req32_kv1490000_util070_seed0": {
+            "expected_request_num": 32,
+            "input_row_count": 1016,
+            "request_mismatch_excluded_count": 400,
+            "output_row_count": 616
+          },
+          "uniform_req32_kv1490000_util080_seed0": {
+            "expected_request_num": 32,
+            "input_row_count": 938,
+            "request_mismatch_excluded_count": 250,
+            "output_row_count": 688
+          },
+          "uniform_req32_kv1490000_util090_seed0": {
+            "expected_request_num": 32,
+            "input_row_count": 1000,
+            "request_mismatch_excluded_count": 368,
+            "output_row_count": 632
+          },
+          "uniform_req64_kv1490000_util060_seed0": {
+            "expected_request_num": 64,
+            "input_row_count": 864,
+            "request_mismatch_excluded_count": 96,
+            "output_row_count": 768
+          },
+          "uniform_req64_kv1490000_util070_seed0": {
+            "expected_request_num": 64,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "uniform_req64_kv1490000_util080_seed0": {
+            "expected_request_num": 64,
+            "input_row_count": 848,
+            "request_mismatch_excluded_count": 64,
+            "output_row_count": 784
+          },
+          "uniform_req64_kv1490000_util090_seed0": {
+            "expected_request_num": 64,
+            "input_row_count": 912,
+            "request_mismatch_excluded_count": 192,
+            "output_row_count": 720
+          }
+        }
+      },
+      "warmup_filter": {
+        "policy": "profile_step_fraction",
+        "warmup_step_fraction": 0.1,
+        "input_sample_count": 17252,
+        "excluded_sample_count": 1608,
+        "output_sample_count": 15644,
+        "workloads": {
+          "normal_req128_kv1490000_util060_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req128_kv1490000_util070_seed0": {
+            "profile_step_count": 83,
+            "skipped_step_count": 8,
+            "excluded_sample_count": 32
+          },
+          "normal_req128_kv1490000_util080_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req128_kv1490000_util090_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req16_kv1490000_util060_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req16_kv1490000_util070_seed0": {
+            "profile_step_count": 94,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req16_kv1490000_util080_seed0": {
+            "profile_step_count": 90,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req16_kv1490000_util090_seed0": {
+            "profile_step_count": 94,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req192_kv1490000_util060_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req192_kv1490000_util070_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req192_kv1490000_util080_seed0": {
+            "profile_step_count": 97,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req192_kv1490000_util090_seed0": {
+            "profile_step_count": 97,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req256_kv1490000_util060_seed0": {
+            "profile_step_count": 94,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req256_kv1490000_util070_seed0": {
+            "profile_step_count": 97,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req256_kv1490000_util080_seed0": {
+            "profile_step_count": 96,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req256_kv1490000_util090_seed0": {
+            "profile_step_count": 71,
+            "skipped_step_count": 7,
+            "excluded_sample_count": 28
+          },
+          "normal_req32_kv1490000_util060_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req32_kv1490000_util070_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req32_kv1490000_util080_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req32_kv1490000_util090_seed0": {
+            "profile_step_count": 82,
+            "skipped_step_count": 8,
+            "excluded_sample_count": 32
+          },
+          "normal_req64_kv1490000_util060_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req64_kv1490000_util070_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req64_kv1490000_util080_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "normal_req64_kv1490000_util090_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req128_kv1490000_util060_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req128_kv1490000_util070_seed0": {
+            "profile_step_count": 52,
+            "skipped_step_count": 5,
+            "excluded_sample_count": 20
+          },
+          "uniform_req128_kv1490000_util080_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req128_kv1490000_util090_seed0": {
+            "profile_step_count": 93,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req16_kv1490000_util060_seed0": {
+            "profile_step_count": 89,
+            "skipped_step_count": 8,
+            "excluded_sample_count": 32
+          },
+          "uniform_req16_kv1490000_util070_seed0": {
+            "profile_step_count": 85,
+            "skipped_step_count": 8,
+            "excluded_sample_count": 32
+          },
+          "uniform_req16_kv1490000_util080_seed0": {
+            "profile_step_count": 75,
+            "skipped_step_count": 7,
+            "excluded_sample_count": 28
+          },
+          "uniform_req16_kv1490000_util090_seed0": {
+            "profile_step_count": 27,
+            "skipped_step_count": 2,
+            "excluded_sample_count": 8
+          },
+          "uniform_req192_kv1490000_util060_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req192_kv1490000_util070_seed0": {
+            "profile_step_count": 72,
+            "skipped_step_count": 7,
+            "excluded_sample_count": 28
+          },
+          "uniform_req192_kv1490000_util080_seed0": {
+            "profile_step_count": 97,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req192_kv1490000_util090_seed0": {
+            "profile_step_count": 97,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req256_kv1490000_util060_seed0": {
+            "profile_step_count": 86,
+            "skipped_step_count": 8,
+            "excluded_sample_count": 32
+          },
+          "uniform_req256_kv1490000_util070_seed0": {
+            "profile_step_count": 80,
+            "skipped_step_count": 8,
+            "excluded_sample_count": 32
+          },
+          "uniform_req256_kv1490000_util080_seed0": {
+            "profile_step_count": 97,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req256_kv1490000_util090_seed0": {
+            "profile_step_count": 97,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req32_kv1490000_util060_seed0": {
+            "profile_step_count": 79,
+            "skipped_step_count": 7,
+            "excluded_sample_count": 28
+          },
+          "uniform_req32_kv1490000_util070_seed0": {
+            "profile_step_count": 77,
+            "skipped_step_count": 7,
+            "excluded_sample_count": 28
+          },
+          "uniform_req32_kv1490000_util080_seed0": {
+            "profile_step_count": 86,
+            "skipped_step_count": 8,
+            "excluded_sample_count": 32
+          },
+          "uniform_req32_kv1490000_util090_seed0": {
+            "profile_step_count": 79,
+            "skipped_step_count": 7,
+            "excluded_sample_count": 28
+          },
+          "uniform_req64_kv1490000_util060_seed0": {
+            "profile_step_count": 96,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req64_kv1490000_util070_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req64_kv1490000_util080_seed0": {
+            "profile_step_count": 98,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          },
+          "uniform_req64_kv1490000_util090_seed0": {
+            "profile_step_count": 90,
+            "skipped_step_count": 9,
+            "excluded_sample_count": 36
+          }
+        }
+      },
+      "trim_filter": {
+        "policy": "per_workload_cost_extremes",
+        "trim_extremes": 1,
+        "input_sample_count": 15644,
+        "excluded_sample_count": 176,
+        "output_sample_count": 15468,
+        "workloads": {
+          "normal_req128_kv1490000_util060_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req128_kv1490000_util070_seed0": {
+            "input_sample_count": 300,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req128_kv1490000_util080_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req128_kv1490000_util090_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req16_kv1490000_util060_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req16_kv1490000_util070_seed0": {
+            "input_sample_count": 340,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req16_kv1490000_util080_seed0": {
+            "input_sample_count": 324,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req16_kv1490000_util090_seed0": {
+            "input_sample_count": 340,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req192_kv1490000_util060_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req192_kv1490000_util070_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req192_kv1490000_util080_seed0": {
+            "input_sample_count": 352,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req192_kv1490000_util090_seed0": {
+            "input_sample_count": 352,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req256_kv1490000_util060_seed0": {
+            "input_sample_count": 340,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req256_kv1490000_util070_seed0": {
+            "input_sample_count": 352,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req256_kv1490000_util080_seed0": {
+            "input_sample_count": 348,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req256_kv1490000_util090_seed0": {
+            "input_sample_count": 256,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req32_kv1490000_util060_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req32_kv1490000_util070_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req32_kv1490000_util080_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req32_kv1490000_util090_seed0": {
+            "input_sample_count": 296,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req64_kv1490000_util060_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req64_kv1490000_util070_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req64_kv1490000_util080_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "normal_req64_kv1490000_util090_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req128_kv1490000_util060_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req128_kv1490000_util070_seed0": {
+            "input_sample_count": 188,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req128_kv1490000_util080_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req128_kv1490000_util090_seed0": {
+            "input_sample_count": 336,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req16_kv1490000_util060_seed0": {
+            "input_sample_count": 324,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req16_kv1490000_util070_seed0": {
+            "input_sample_count": 308,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req16_kv1490000_util080_seed0": {
+            "input_sample_count": 272,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req16_kv1490000_util090_seed0": {
+            "input_sample_count": 100,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req192_kv1490000_util060_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req192_kv1490000_util070_seed0": {
+            "input_sample_count": 260,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req192_kv1490000_util080_seed0": {
+            "input_sample_count": 352,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req192_kv1490000_util090_seed0": {
+            "input_sample_count": 352,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req256_kv1490000_util060_seed0": {
+            "input_sample_count": 312,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req256_kv1490000_util070_seed0": {
+            "input_sample_count": 288,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req256_kv1490000_util080_seed0": {
+            "input_sample_count": 352,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req256_kv1490000_util090_seed0": {
+            "input_sample_count": 352,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req32_kv1490000_util060_seed0": {
+            "input_sample_count": 288,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req32_kv1490000_util070_seed0": {
+            "input_sample_count": 280,
+            "excluded_sample_count": 2,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req32_kv1490000_util080_seed0": {
+            "input_sample_count": 312,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req32_kv1490000_util090_seed0": {
+            "input_sample_count": 288,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req64_kv1490000_util060_seed0": {
+            "input_sample_count": 348,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req64_kv1490000_util070_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req64_kv1490000_util080_seed0": {
+            "input_sample_count": 356,
+            "excluded_sample_count": 3,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          },
+          "uniform_req64_kv1490000_util090_seed0": {
+            "input_sample_count": 324,
+            "excluded_sample_count": 4,
+            "costs": {
+              "forward": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              },
+              "total": {
+                "low_candidate_count": 1,
+                "high_candidate_count": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "sample_count": 15468,
+  "models": [
+    {
+      "cost": "forward",
+      "pp_rank": 0,
+      "layer_num": 16,
+      "profiled_layer_nums": [
+        16
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": -88254.49899809643,
+        "p1": 1548224.1073528342,
+        "p2": 41572.63454151996,
+        "p3": -665026.4548667715,
+        "p4": 3500713.1747069308,
+        "p5": -0.0004617560238810506
+      },
+      "sample_count": 3863,
+      "rmse": 6732833.892051782,
+      "r2": 0.9324168059322062,
+      "success": true,
+      "message": "`ftol` termination condition is satisfied.",
+      "optimizer": {
+        "method": "trf",
+        "nfev": 37,
+        "njev": 29,
+        "status": 2,
+        "optimality": 15213025.27527497,
+        "cost": 8.755692735899194e+16
+      }
+    },
+    {
+      "cost": "total",
+      "pp_rank": 0,
+      "layer_num": 16,
+      "profiled_layer_nums": [
+        16
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 8681.72350834846,
+        "p1": 2853.9170018160517,
+        "p2": -238626.87923996407,
+        "p3": 3818165.780711475,
+        "p4": 3634839.591124033,
+        "p5": -0.020271290700617124
+      },
+      "sample_count": 3863,
+      "rmse": 6737235.250789398,
+      "r2": 0.9335553042012664,
+      "success": true,
+      "message": "`xtol` termination condition is satisfied.",
+      "optimizer": {
+        "method": "trf",
+        "nfev": 38,
+        "njev": 27,
+        "status": 3,
+        "optimality": 752970749.8662763,
+        "cost": 8.767143943948173e+16
+      }
+    },
+    {
+      "cost": "forward",
+      "pp_rank": 1,
+      "layer_num": 16,
+      "profiled_layer_nums": [
+        16
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 61063.895292290064,
+        "p1": -946879.2537742528,
+        "p2": 56168.23852998034,
+        "p3": -898657.990648092,
+        "p4": 797008.8600418828,
+        "p5": 49799.40947001849
+      },
+      "sample_count": 3877,
+      "rmse": 1726012.3273764306,
+      "r2": 0.9253854134854881,
+      "success": true,
+      "message": "`xtol` termination condition is satisfied.",
+      "optimizer": {
+        "method": "trf",
+        "nfev": 36,
+        "njev": 30,
+        "status": 3,
+        "optimality": 17413599.442198094,
+        "cost": 5775021317424098.0
+      }
+    },
+    {
+      "cost": "total",
+      "pp_rank": 1,
+      "layer_num": 16,
+      "profiled_layer_nums": [
+        16
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 70635.0452299395,
+        "p1": -988602.7863512457,
+        "p2": -343059.6939268579,
+        "p3": 5489090.814103528,
+        "p4": 3626678.2138331025,
+        "p5": 209444.85768840578
+      },
+      "sample_count": 3877,
+      "rmse": 6740928.697022088,
+      "r2": 0.9334513535828842,
+      "success": true,
+      "message": "`xtol` termination condition is satisfied.",
+      "optimizer": {
+        "method": "trf",
+        "nfev": 37,
+        "njev": 26,
+        "status": 3,
+        "optimality": 40380291409.294815,
+        "cost": 8.808567203522416e+16
+      }
+    },
+    {
+      "cost": "forward",
+      "pp_rank": 2,
+      "layer_num": 16,
+      "profiled_layer_nums": [
+        16
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 20380.208618578945,
+        "p1": -296182.36896109016,
+        "p2": 27852.627387644763,
+        "p3": -445607.89752200147,
+        "p4": 773886.8023042085,
+        "p5": 48370.678837175954
+      },
+      "sample_count": 3876,
+      "rmse": 1695818.9300730063,
+      "r2": 0.9285680939732339,
+      "success": true,
+      "message": "`xtol` termination condition is satisfied.",
+      "optimizer": {
+        "method": "trf",
+        "nfev": 36,
+        "njev": 25,
+        "status": 3,
+        "optimality": 158304695.8125,
+        "cost": 5573303972885088.0
+      }
+    },
+    {
+      "cost": "total",
+      "pp_rank": 2,
+      "layer_num": 16,
+      "profiled_layer_nums": [
+        16
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 219313.32420276597,
+        "p1": -3367073.2244379395,
+        "p2": 86344.1816744789,
+        "p3": -1381371.1579405013,
+        "p4": 3634063.328235988,
+        "p5": -0.006617893877045728
+      },
+      "sample_count": 3876,
+      "rmse": 6749801.36629521,
+      "r2": 0.9333898250891788,
+      "success": true,
+      "message": "`xtol` termination condition is satisfied.",
+      "optimizer": {
+        "method": "trf",
+        "nfev": 38,
+        "njev": 27,
+        "status": 3,
+        "optimality": 210908348933.8125,
+        "cost": 8.829492822284605e+16
+      }
+    },
+    {
+      "cost": "forward",
+      "pp_rank": 3,
+      "layer_num": 16,
+      "profiled_layer_nums": [
+        16
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 35975.25504429608,
+        "p1": -545019.3071339523,
+        "p2": -45304.34810605516,
+        "p3": 724903.302476386,
+        "p4": 803080.0783500621,
+        "p5": 50165.84356597302
+      },
+      "sample_count": 3852,
+      "rmse": 1709131.7451710603,
+      "r2": 0.9267872233880171,
+      "success": true,
+      "message": "`xtol` termination condition is satisfied.",
+      "optimizer": {
+        "method": "trf",
+        "nfev": 36,
+        "njev": 27,
+        "status": 3,
+        "optimality": 11060056.1640625,
+        "cost": 5626098926848939.0
+      }
+    },
+    {
+      "cost": "total",
+      "pp_rank": 3,
+      "layer_num": 16,
+      "profiled_layer_nums": [
+        16
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 92205.97775788813,
+        "p1": -1339219.7673032347,
+        "p2": 104699.02329508541,
+        "p3": -1675048.694259589,
+        "p4": 3620763.249490598,
+        "p5": -0.00046550545861815827
+      },
+      "sample_count": 3852,
+      "rmse": 6768602.193643723,
+      "r2": 0.9316821969651577,
+      "success": true,
+      "message": "`xtol` termination condition is satisfied.",
+      "optimizer": {
+        "method": "trf",
+        "nfev": 38,
+        "njev": 29,
+        "status": 3,
+        "optimality": 78209518.98124695,
+        "cost": 8.823771711306816e+16
+      }
+    }
+  ]
+}

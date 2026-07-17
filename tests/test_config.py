@@ -332,6 +332,39 @@ def test_async_scheduling_with_pipeline_parallelism_is_allowed():
     assert cfg.scheduler_config.async_scheduling is True
 
 
+def test_pp_opt_disables_default_async_scheduling(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_PP_OPT_SCHEDULER", "1")
+    cfg = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
+        ),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=2,
+            distributed_executor_backend="mp",
+            nnodes=2,
+        ),
+    )
+    assert cfg.scheduler_config.async_scheduling is False
+
+
+def test_pp_opt_rejects_explicit_async_scheduling(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_PP_OPT_SCHEDULER", "1")
+    with pytest.raises(ValueError, match="not compatible with async scheduling"):
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_model_len=8192,
+                is_encoder_decoder=False,
+                async_scheduling=True,
+            ),
+            parallel_config=ParallelConfig(
+                pipeline_parallel_size=2,
+                distributed_executor_backend="mp",
+                nnodes=2,
+            ),
+        )
+
+
 @dataclass
 class _TestConfigFields:
     a: int

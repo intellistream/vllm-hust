@@ -261,6 +261,16 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_USE_PP_OPT_SCHEDULER: bool = False
+    VLLM_PP_OPT_BATCH_QUEUE_SIZE: int | None = None
+    VLLM_PP_OPT_COST_MODEL_PATH: str | None = None
+    VLLM_PP_OPT_DYNAMIC_MICROBATCHES: bool = False
+    VLLM_PP_OPT_MIN_MICROBATCHES: int | None = None
+    VLLM_PP_OPT_TARGET_MICROBATCH_SIZE: int | None = None
+    VLLM_PP_OPT_MONITOR_INTERVAL: int = 0
+    VLLM_PP_OPT_OVERLAP_SENDS: bool = False
+    VLLM_PROFILE_PP_OPT_ENABLED: bool = False
+    VLLM_PROFILE_PP_OPT_OUTPUT_PATH: str | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1870,6 +1880,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to control the v2 model runner. If unset, use config defaults.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
+    ),
+    # Flag to enable PP optimization microbatch scheduling in EngineCore.
+    "VLLM_USE_PP_OPT_SCHEDULER": lambda: bool(
+        int(os.getenv("VLLM_USE_PP_OPT_SCHEDULER", "0"))
+    ),
+    "VLLM_PP_OPT_BATCH_QUEUE_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_PP_OPT_BATCH_QUEUE_SIZE")
+    ),
+    "VLLM_PP_OPT_COST_MODEL_PATH": lambda: os.getenv("VLLM_PP_OPT_COST_MODEL_PATH"),
+    "VLLM_PP_OPT_DYNAMIC_MICROBATCHES": lambda: bool(
+        int(os.getenv("VLLM_PP_OPT_DYNAMIC_MICROBATCHES", "0"))
+    ),
+    "VLLM_PP_OPT_MIN_MICROBATCHES": lambda: maybe_convert_int(
+        os.getenv("VLLM_PP_OPT_MIN_MICROBATCHES")
+    ),
+    "VLLM_PP_OPT_TARGET_MICROBATCH_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_PP_OPT_TARGET_MICROBATCH_SIZE")
+    ),
+    "VLLM_PP_OPT_MONITOR_INTERVAL": lambda: int(
+        os.getenv("VLLM_PP_OPT_MONITOR_INTERVAL", "0")
+    ),
+    "VLLM_PP_OPT_OVERLAP_SENDS": lambda: bool(
+        int(os.getenv("VLLM_PP_OPT_OVERLAP_SENDS", "0"))
+    ),
+    # PP optimization microbatch profiling instrumentation.
+    "VLLM_PROFILE_PP_OPT_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_PROFILE_PP_OPT_ENABLED", "0"))
+    ),
+    "VLLM_PROFILE_PP_OPT_OUTPUT_PATH": lambda: os.getenv(
+        "VLLM_PROFILE_PP_OPT_OUTPUT_PATH"
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

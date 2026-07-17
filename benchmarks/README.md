@@ -7,6 +7,7 @@ This directory used to contain vLLM's benchmark scripts and utilities for perfor
 - **Serving benchmarks**: Scripts for testing online inference performance (latency, throughput)
 - **Throughput benchmarks**: Scripts for testing offline batch inference performance
 - **Specialized benchmarks**: Tools for testing specific features like structured output, prefix caching, long document QA, request prioritization, and multi-modal inference
+- **PP optimization benchmark**: A KV-budgeted conversation trace for pipeline-parallel scheduler comparisons in [`pp_opt/`](pp_opt/README.md)
 - **Dataset utilities**: Framework for loading and sampling from various benchmark datasets (ShareGPT, HuggingFace datasets, synthetic data, etc.)
 
 ## Usage

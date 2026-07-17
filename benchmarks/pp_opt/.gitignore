@@ -1,0 +1,13 @@
+results/**
+!results/pipeline_profile/
+!results/pipeline_profile/analysis/
+calibration/runs/
+calibration/workloads/
+calibration/slurm-*.out
+!BurstGPT_1.csv
+!conversation_trace.csv
+!configs/**/config.json
+!configs/**/fit_result.json
+!results/pipeline_profile/analysis/*.json
+!results/pipeline_profile/analysis/*.csv
+!results/pipeline_profile/analysis/*.png

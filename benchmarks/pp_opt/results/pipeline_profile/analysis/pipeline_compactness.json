@@ -1,0 +1,144 @@
+{
+  "baseline": {
+    "profile": "Baseline",
+    "profile_root": "results/pipeline_profile/profiles/baseline_exact2",
+    "window_ms": 6041.2285,
+    "forward_scopes_per_stage": [
+      19,
+      19,
+      19,
+      19
+    ],
+    "microbatch_scopes": 0,
+    "context_tokens_p50": 1338767,
+    "context_tokens_p95": 1431377.0,
+    "context_tokens_cv": 0.031375181042155205,
+    "requests_p50": 90,
+    "mean_stage_compute_duty": 0.2217861089842902,
+    "stage_compute_duty_cv": 0.007174126460510209,
+    "mean_active_cube_utilization": 0.7667047476853879,
+    "mean_wall_clock_cube_utilization_proxy": 0.12999327054505555,
+    "average_active_compute_stages": 0.8871444359371607,
+    "all_stage_compute_idle_fraction": 0.11285556406283921,
+    "all_stages_computing_fraction": 0.0,
+    "at_least_two_stages_computing_fraction": 0.0,
+    "compute_occupancy_fraction": {
+      "0": 0.11285556406283921,
+      "1": 0.8871444359371607,
+      "2": 0.0,
+      "3": 0.0,
+      "4": 0.0
+    },
+    "wave_start_skew_p50_ms": 433.48325,
+    "wave_start_skew_p95_ms": 667.9009,
+    "wave_span_p50_ms": 500.94225,
+    "wave_span_p95_ms": 764.0734999999999,
+    "window_start_us": 1784285146165113.8,
+    "window_end_us": 1784285152206342.2
+  },
+  "optimized": {
+    "profile": "PP-opt",
+    "profile_root": "results/pipeline_profile/profiles/pp_opt_exact2",
+    "window_ms": 5214.68625,
+    "forward_scopes_per_stage": [
+      76,
+      76,
+      76,
+      76
+    ],
+    "microbatch_scopes": 76,
+    "context_tokens_p50": 340554.5,
+    "context_tokens_p95": 390447.0,
+    "context_tokens_cv": 0.12212498730181018,
+    "requests_p50": 21.5,
+    "mean_stage_compute_duty": 0.42761941094730294,
+    "stage_compute_duty_cv": 0.013301685081103635,
+    "mean_active_cube_utilization": 0.5511773582073919,
+    "mean_wall_clock_cube_utilization_proxy": 0.1565116190493485,
+    "average_active_compute_stages": 1.7104776437892117,
+    "all_stage_compute_idle_fraction": 0.148525474567142,
+    "all_stages_computing_fraction": 0.0684573304865657,
+    "at_least_two_stages_computing_fraction": 0.5469887090522464,
+    "compute_occupancy_fraction": {
+      "0": 0.148525474567142,
+      "1": 0.30448581638061156,
+      "2": 0.30343163023470493,
+      "3": 0.1750997483309758,
+      "4": 0.0684573304865657
+    },
+    "wave_start_skew_p50_ms": 179.480625,
+    "wave_start_skew_p95_ms": 258.8825,
+    "wave_span_p50_ms": 212.991875,
+    "wave_span_p95_ms": 292.386875,
+    "window_start_us": 1784285130994959.8,
+    "window_end_us": 1784285136209646.0
+  },
+  "comparison": {
+    "mean_stage_compute_duty": {
+      "baseline": 0.2217861089842902,
+      "optimized": 0.42761941094730294,
+      "relative_change": 0.9280712074604842
+    },
+    "mean_active_cube_utilization": {
+      "baseline": 0.7667047476853879,
+      "optimized": 0.5511773582073919,
+      "relative_change": -0.2811087190064411
+    },
+    "mean_wall_clock_cube_utilization_proxy": {
+      "baseline": 0.12999327054505555,
+      "optimized": 0.1565116190493485,
+      "relative_change": 0.20399785614365085
+    },
+    "average_active_compute_stages": {
+      "baseline": 0.8871444359371607,
+      "optimized": 1.7104776437892117,
+      "relative_change": 0.9280712074604842
+    },
+    "all_stages_computing_fraction": {
+      "baseline": 0.0,
+      "optimized": 0.0684573304865657,
+      "relative_change": null
+    },
+    "at_least_two_stages_computing_fraction": {
+      "baseline": 0.0,
+      "optimized": 0.5469887090522464,
+      "relative_change": null
+    },
+    "stage_compute_duty_cv": {
+      "baseline": 0.007174126460510209,
+      "optimized": 0.013301685081103635,
+      "reduction": -0.8541191257670757
+    },
+    "all_stage_compute_idle_fraction": {
+      "baseline": 0.11285556406283921,
+      "optimized": 0.148525474567142,
+      "reduction": -0.3160669196996029
+    },
+    "wave_start_skew_p50_ms": {
+      "baseline": 433.48325,
+      "optimized": 179.480625,
+      "reduction": 0.5859571851968906
+    },
+    "wave_start_skew_p95_ms": {
+      "baseline": 667.9009,
+      "optimized": 258.8825,
+      "reduction": 0.6123938446556967
+    },
+    "wave_span_p50_ms": {
+      "baseline": 500.94225,
+      "optimized": 212.991875,
+      "reduction": 0.574817506409172
+    },
+    "wave_span_p95_ms": {
+      "baseline": 764.0734999999999,
+      "optimized": 292.386875,
+      "reduction": 0.6173314805447381
+    }
+  },
+  "notes": [
+    "Device intervals come from CANN Overlap Analysis, not CPU launch time.",
+    "One TP rank (TP rank 0) represents each PP stage.",
+    "This reports pipeline occupancy, not theoretical FLOP-based MFU.",
+    "Wall-clock Cube utilization is a CANN PipeUtilization-derived MFU proxy."
+  ]
+}
