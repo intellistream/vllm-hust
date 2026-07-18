@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
+from vllm.v1.core.prefix_sharing_control import PREFIX_SHARING_FALLBACK_REASONS
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
@@ -621,6 +622,96 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_prefix_cache_blocks_cached, per_engine_labelvalues
         )
 
+        prefix_sharing_counter_specs = {
+            "configured_requests": (
+                "vllm:prefix_sharing_configured_requests",
+                "Requests carrying native KV prefix-sharing controls.",
+            ),
+            "admitted_lookups": (
+                "vllm:prefix_sharing_admitted_lookups",
+                "Native KV cache lookups admitted by prefix-sharing controls.",
+            ),
+            "denied_lookups": (
+                "vllm:prefix_sharing_denied_lookups",
+                "Native KV cache lookups denied by prefix-sharing controls.",
+            ),
+            "native_lookup_hit_requests": (
+                "vllm:prefix_sharing_native_lookup_hit_requests",
+                "Admitted requests with native KV cache lookup hits.",
+            ),
+            "native_lookup_hit_tokens": (
+                "vllm:prefix_sharing_native_lookup_hit_tokens",
+                "Tokens found by admitted native KV cache lookups.",
+            ),
+            "native_published_requests": (
+                "vllm:prefix_sharing_native_published_requests",
+                "Controlled requests that published native KV cache blocks.",
+            ),
+            "native_published_blocks": (
+                "vllm:prefix_sharing_native_published_blocks",
+                "Native KV cache blocks published by controlled requests.",
+            ),
+            "native_attached_requests": (
+                "vllm:prefix_sharing_native_attached_requests",
+                "Requests that attached native KV cache blocks.",
+            ),
+            "native_attached_blocks": (
+                "vllm:prefix_sharing_native_attached_blocks",
+                "Native KV cache blocks attached to controlled requests.",
+            ),
+            "consumed_kv_tokens": (
+                "vllm:prefix_sharing_consumed_kv_tokens",
+                "Tokens consumed from native KV cache after successful attach.",
+            ),
+            "realized_reuse_requests": (
+                "vllm:prefix_sharing_realized_reuse_requests",
+                "Requests with realized native KV reuse.",
+            ),
+            "avoided_prefill_tokens": (
+                "vllm:prefix_sharing_avoided_prefill_tokens",
+                "Prefill tokens avoided by realized native KV reuse.",
+            ),
+            "allocation_failures": (
+                "vllm:prefix_sharing_allocation_failures",
+                "Native attach candidates rejected by KV allocation capacity.",
+            ),
+            "rollback_count": (
+                "vllm:prefix_sharing_rollbacks",
+                "Native block ownership transactions rolled back after failure.",
+            ),
+            "ownership_releases": (
+                "vllm:prefix_sharing_ownership_releases",
+                "Controlled reuse requests that released native block ownership.",
+            ),
+        }
+        self.counter_prefix_sharing = {}
+        for field_name, (
+            metric_name,
+            documentation,
+        ) in prefix_sharing_counter_specs.items():
+            metric = self._counter_cls(
+                name=metric_name,
+                documentation=documentation,
+                labelnames=labelnames,
+            )
+            self.counter_prefix_sharing[field_name] = create_metric_per_engine(
+                metric, per_engine_labelvalues
+            )
+
+        prefix_sharing_fallbacks = self._counter_cls(
+            name="vllm:prefix_sharing_fallbacks",
+            documentation="Controlled native KV reuse fallbacks by reason.",
+            labelnames=labelnames + ["reason"],
+        )
+        self.counter_prefix_sharing_fallbacks = {}
+        for reason in PREFIX_SHARING_FALLBACK_REASONS:
+            labelvalues_with_reason = {
+                idx: values + [reason] for idx, values in per_engine_labelvalues.items()
+            }
+            self.counter_prefix_sharing_fallbacks[reason] = create_metric_per_engine(
+                prefix_sharing_fallbacks, labelvalues_with_reason
+            )
+
         #
         # External - KV connector prefix cache
         #
@@ -1185,6 +1276,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_prefix_cache_blocks_cached[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.blocks_cached
             )
+            prefix_sharing_stats = scheduler_stats.prefix_sharing_runtime_stats
+            for field_name, counters in self.counter_prefix_sharing.items():
+                counters[engine_idx].inc(prefix_sharing_stats.get(field_name, 0))
+            fallback_histogram = prefix_sharing_stats.get(
+                "fallback_reason_histogram", {}
+            )
+            for reason, count in fallback_histogram.items():
+                counters = self.counter_prefix_sharing_fallbacks.get(reason)
+                if counters is not None:
+                    counters[engine_idx].inc(count)
 
             if scheduler_stats.connector_prefix_cache_stats is not None:
                 self.counter_connector_prefix_cache_queries[engine_idx].inc(

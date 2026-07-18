@@ -2313,6 +2313,9 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
+        prefix_sharing_runtime_stats = (
+            self.kv_cache_manager.make_prefix_sharing_runtime_stats(reset=True)
+        )
         structured_output_cache_stats = (
             self.structured_output_manager.make_cache_stats()
         )
@@ -2336,6 +2339,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_usage=self.kv_cache_manager.usage,
             available_kv_cache_memory_bytes=self.available_kv_cache_memory_bytes,
             prefix_cache_stats=prefix_cache_stats,
+            prefix_sharing_runtime_stats=prefix_sharing_runtime_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             structured_output_cache_stats=structured_output_cache_stats,
             kv_cache_eviction_events=eviction_events,

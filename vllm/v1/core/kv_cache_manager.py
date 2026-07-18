@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.prefix_sharing_control import PrefixSharingRuntimeTracker
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -199,6 +200,7 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        self.prefix_sharing_runtime_tracker = PrefixSharingRuntimeTracker()
 
     @property
     def usage(self) -> float:
@@ -237,6 +239,9 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
+        policy = getattr(request, "prefix_sharing_policy", None)
+        if policy is not None:
+            self.prefix_sharing_runtime_tracker.observe_policy(request, policy)
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
@@ -247,11 +252,30 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        if policy is not None and policy.max_reuse_tokens is not None:
+            max_cache_hit_length = min(
+                max_cache_hit_length,
+                policy.max_reuse_tokens // self.hash_block_size * self.hash_block_size,
+            )
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if policy is not None:
+            if num_new_computed_tokens < policy.min_reuse_tokens:
+                self.prefix_sharing_runtime_tracker.observe_lookup(
+                    request.request_id,
+                    num_tokens=0,
+                    num_blocks=0,
+                    fallback_reason="reuse_wait_threshold_unmet",
+                )
+                return self.empty_kv_cache_blocks, 0
+            self.prefix_sharing_runtime_tracker.observe_lookup(
+                request.request_id,
+                num_tokens=num_new_computed_tokens,
+                num_blocks=_count_block_groups(computed_blocks),
+            )
 
         if _prefix_cache_trace_enabled():
             logger.info(
@@ -489,6 +513,9 @@ class KVCacheManager:
 
             required_blocks = admission_blocks + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                self.prefix_sharing_runtime_tracker.observe_allocation_failure(
+                    request.request_id, "allocation_capacity_rejected"
+                )
                 return None
 
         # Free the blocks that are skipped during the attention computation
@@ -509,27 +536,43 @@ class KVCacheManager:
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            self.prefix_sharing_runtime_tracker.observe_allocation_failure(
+                request.request_id, "allocation_capacity_rejected"
+            )
             return None
 
-        if (
-            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or num_external_computed_tokens > 0
-        ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.allocate_new_computed_blocks(
-                request_id=request.request_id,
-                new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=num_external_computed_tokens,
-            )
+        attached_native_blocks = False
+        try:
+            if (
+                new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+                or num_external_computed_tokens > 0
+            ):
+                # Append the new computed blocks to the request blocks until now to
+                # avoid the case where the new blocks cannot be allocated.
+                self.coordinator.allocate_new_computed_blocks(
+                    request_id=request.request_id,
+                    new_computed_blocks=new_computed_block_list,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                )
+                attached_native_blocks = num_new_computed_tokens > 0
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-        )
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
+            )
+        except Exception:
+            if attached_native_blocks:
+                self.coordinator.free(request.request_id)
+                self.prefix_sharing_runtime_tracker.observe_rollback(
+                    request.request_id, "allocation_exception_rollback"
+                )
+            raise
+
+        if attached_native_blocks:
+            self.prefix_sharing_runtime_tracker.observe_attach(request.request_id)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -558,6 +601,7 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+        self.prefix_sharing_runtime_tracker.observe_release(request.request_id)
 
     def remove_skipped_blocks(
         self,
@@ -589,7 +633,9 @@ class KVCacheManager:
         Returns:
             The request's blocks in allocation order.
         """
-        return self.coordinator.pop_blocks_for_free(request.request_id)
+        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
+        self.prefix_sharing_runtime_tracker.observe_release(request.request_id)
+        return blocks
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -691,10 +737,17 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
+        policy = getattr(request, "prefix_sharing_policy", None)
+        if policy is not None and not policy.write_admitted:
+            return
         if self.enable_caching:
             num_cached_blocks = self.coordinator.cache_blocks(
                 request, num_computed_tokens
             )
+            if policy is not None:
+                self.prefix_sharing_runtime_tracker.observe_publish(
+                    request.request_id, num_cached_blocks
+                )
             if _prefix_cache_trace_enabled():
                 logger.info(
                     "Prefix cache trace commit request_id=%s num_tokens=%d "
@@ -711,6 +764,10 @@ class KVCacheManager:
             if self.log_stats and num_cached_blocks > 0:
                 assert self.prefix_cache_stats is not None
                 self.prefix_cache_stats.record_blocks_cached(num_cached_blocks)
+
+    def make_prefix_sharing_runtime_stats(self, *, reset: bool = False) -> dict:
+        """Return counters emitted at native lookup/attach/lifetime seams."""
+        return self.prefix_sharing_runtime_tracker.snapshot(reset=reset)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

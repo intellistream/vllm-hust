@@ -216,6 +216,7 @@ class SchedulerStats:
     available_kv_cache_memory_bytes: int | None = None
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
+    prefix_sharing_runtime_stats: dict[str, Any] = field(default_factory=dict)
     connector_prefix_cache_stats: PrefixCacheStats | None = None
     structured_output_cache_stats: StructuredOutputCacheStats | None = None
 

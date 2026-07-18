@@ -14,6 +14,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.core.prefix_sharing_control import parse_prefix_sharing_policy
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -151,7 +152,12 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        self.prefix_sharing_policy = parse_prefix_sharing_policy(self)
         self.cache_salt: str | None = cache_salt
+        if self.prefix_sharing_policy is not None:
+            self.cache_salt = self.prefix_sharing_policy.derive_cache_salt(
+                cache_salt, request_id
+            )
 
         # Multi-modal related
         self.mm_features = mm_features or []
@@ -184,6 +190,11 @@ class Request:
         self.update_block_hashes()
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
+        if (
+            self.prefix_sharing_policy is not None
+            and not self.prefix_sharing_policy.read_admitted
+        ):
+            self.skip_reading_prefix_cache = True
 
         # Used for streaming
         self.resumable = resumable
