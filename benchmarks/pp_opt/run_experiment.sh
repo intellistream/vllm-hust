@@ -20,6 +20,7 @@ PORT="${PORT:-$((18000 + ${SLURM_JOB_ID:-0} % 10000))}"
 PIPELINE_PROFILE_SECONDS="${PIPELINE_PROFILE_SECONDS:-0}"
 PIPELINE_PROFILE_DELAY="${PIPELINE_PROFILE_DELAY:-15}"
 PIPELINE_PROFILE_STOP_AFTER_CAPTURE="${PIPELINE_PROFILE_STOP_AFTER_CAPTURE:-0}"
+USE_DECODE_BENCH_CONNECTOR="${USE_DECODE_BENCH_CONNECTOR:-1}"
 
 for path in "${CANN_ENV}" "${VENV_DIR}/bin/activate" "${ATB_ENV}"; do
   if [[ ! -f "${path}" ]]; then
@@ -48,6 +49,7 @@ case "${TRACE_KEY}" in
     ;;
   burstgpt)
     TRACE_FILE="${SCRIPT_DIR}/BurstGPT_1.csv"
+    python "${SCRIPT_DIR}/prepare_burstgpt.py" --output "${TRACE_FILE}"
     TRACE_ARGS=()
     ;;
   *)
@@ -104,6 +106,17 @@ case "${MODE}" in
 esac
 
 export VLLM_PP_LAYER_PARTITION="${PP_LAYER_PARTITION}"
+
+KV_TRANSFER_ARGS=()
+if [[ "${USE_DECODE_BENCH_CONNECTOR}" == "1" ]]; then
+  KV_TRANSFER_ARGS+=(
+    --kv-transfer-config
+    '{"kv_connector":"DecodeBenchConnector","kv_role":"kv_both","kv_connector_extra_config":{"fill_mean":0.0,"fill_std":0.15}}'
+  )
+elif [[ "${USE_DECODE_BENCH_CONNECTOR}" != "0" ]]; then
+  echo "USE_DECODE_BENCH_CONNECTOR must be 0 or 1" >&2
+  exit 2
+fi
 
 if [[ -n "${SLURM_GPUS_ON_NODE:-}" && "${SLURM_GPUS_ON_NODE}" != "${NPU_COUNT}" ]]; then
   echo "Expected ${NPU_COUNT} NPUs, got SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE}" >&2
@@ -209,6 +222,7 @@ export PP_LAYER_PARTITION COST_MODEL_PATH PP_OPT_BATCH_QUEUE_SIZE
 export PP_OPT_DYNAMIC_MICROBATCHES PP_OPT_MIN_MICROBATCHES
 export PP_OPT_TARGET_MICROBATCH_SIZE
 export PP_OPT_OVERLAP_SENDS
+export USE_DECODE_BENCH_CONNECTOR
 python - "${METADATA}" <<'PY'
 import json
 import os
@@ -232,6 +246,7 @@ keys = (
     "VLLM_PP_OPT_MIN_MICROBATCHES", "VLLM_PP_OPT_TARGET_MICROBATCH_SIZE",
     "VLLM_PP_OPT_OVERLAP_SENDS",
     "VLLM_PP_LAYER_PARTITION",
+    "USE_DECODE_BENCH_CONNECTOR",
     "TRACE_FILE", "MODEL_DIR", "SLURM_JOB_ID", "SLURM_JOB_NODELIST",
 )
 payload = {key.lower(): os.environ.get(key) for key in keys}
@@ -277,7 +292,7 @@ vllm serve "${MODEL_DIR}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   "${SERVER_MEMORY_ARGS[@]}" \
   "${SERVER_EXECUTION_ARGS[@]}" \
-  --kv-transfer-config '{"kv_connector":"DecodeBenchConnector","kv_role":"kv_both","kv_connector_extra_config":{"fill_mean":0.0,"fill_std":0.15}}' \
+  "${KV_TRANSFER_ARGS[@]}" \
   --additional-config '{"ascend_compilation_config":{"fuse_norm_quant":false,"fuse_qknorm_rope":false}}' \
   --safetensors-load-strategy eager \
   --hf-overrides "${VLLM_HF_OVERRIDES}" \

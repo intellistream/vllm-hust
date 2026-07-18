@@ -11,9 +11,11 @@ concurrently.
 
 ## Scheduler
 
-`VLLM_USE_PP_OPT_SCHEDULER=1` enables an isolated scheduler path. Scheduler
-outputs carry a `microbatch_id` through EngineCore and the workers. The
-scheduler owns:
+`VLLM_USE_PP_OPT_SCHEDULER=1` enables the isolated scheduler path when the
+DecodeBench connector is configured. Without that connector, EngineCore uses
+the default scheduler so ordinary prefill, decode, and mixed workloads retain
+the standard vLLM behavior. Scheduler outputs in the optimized path carry a
+`microbatch_id` through EngineCore and the workers. The scheduler owns:
 
 - request admission into a bounded set of persistent microbatches;
 - calibrated cost-based placement and next-microbatch selection;
@@ -97,3 +99,8 @@ microbatch kernel efficiency. Splitting too aggressively can lower Cube
 utilization enough to erase pipeline overlap gains. Configuration therefore
 requires both calibration and an end-to-end regression gate on each target
 deployment.
+
+The optimized queue path has not been validated with structured output or
+speculative decoding. Those modes are outside the current benchmark scope and
+should remain on the default scheduler until their deferred-sampling queue
+semantics are implemented and tested.

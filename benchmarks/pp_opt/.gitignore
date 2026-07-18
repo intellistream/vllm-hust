@@ -4,7 +4,7 @@ results/**
 calibration/runs/
 calibration/workloads/
 calibration/slurm-*.out
-!BurstGPT_1.csv
+BurstGPT_1.csv
 !conversation_trace.csv
 !configs/**/config.json
 !configs/**/fit_result.json

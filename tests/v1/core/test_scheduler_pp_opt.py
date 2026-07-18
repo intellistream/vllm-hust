@@ -649,6 +649,24 @@ def test_pp_opt_schedules_each_request_in_selected_microbatch():
     assert second_output.num_scheduled_tokens == {"a": 1, "b": 1}
 
 
+def test_default_scheduler_prefills_normally_without_kv_connector():
+    scheduler = _create_pp_opt_scheduler(pipeline_parallel_size=2)
+    request = create_requests(
+        1,
+        num_tokens=128,
+        max_tokens=2,
+        req_ids=["prefill"],
+    )[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"prefill": 128}
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["prefill"]
+    assert getattr(request, "num_external_computed_tokens", 0) == 0
+    assert request.num_computed_tokens == 128
+
+
 def test_pp_opt_continuously_schedules_multiple_in_flight_microbatches():
     scheduler = _create_pp_opt_scheduler(pipeline_parallel_size=3)
     requests = create_requests(
