@@ -98,7 +98,19 @@ elif grep -q '\*\*Overall: FAIL\*\*' "$REPORT_FILE" 2>/dev/null; then
 else
   result=unknown
 fi
+if grep -q '\*\*Stage 2: PASS\*\*' "$REPORT_FILE" 2>/dev/null; then
+  stage2_result=pass
+  stage2_completed=1
+elif grep -q '\*\*Stage 2: FAIL\*\*' "$REPORT_FILE" 2>/dev/null; then
+  stage2_result=fail
+  stage2_completed=1
+else
+  stage2_result=unknown
+  stage2_completed=0
+fi
 write_env PERFGATE_RESULT "$result"
+write_env PERFGATE_STAGE2_RESULT "$stage2_result"
+write_env PERFGATE_STAGE2_COMPLETED "$stage2_completed"
 write_env PERFGATE_REPORT_FILE "$REPORT_FILE"
 
 if [[ "$MODE" == "report" ]]; then

@@ -51,6 +51,9 @@ if [[ "${PERFGATE_BASELINE_AVAILABLE:-1}" != "1" || -z "${PERFGATE_BASELINE_FILE
   write_env PERFGATE_REPORT_FILE "$REPORT_FILE"
   write_env PERFGATE_STAGE2_NOT_RUN_REASON "Stage 1 baseline is unavailable; Stage 2 was not run"
   echo "Stage 1 performance gate skipped: $reason"
+  if [[ "$MODE" == "enforce" ]]; then
+    exit 2
+  fi
   exit 0
 fi
 
@@ -79,9 +82,16 @@ else
   result=unknown
 fi
 write_env PERFGATE_STAGE1_RESULT "$result"
+write_env PERFGATE_STAGE1_COMPLETED 1
 write_env PERFGATE_REPORT_FILE "$REPORT_FILE"
 
 if [[ "$rc" -ne 0 ]]; then
   echo "Stage 1 performance gate result: $result (exit $rc); final perfgate comparison/report step will decide job status."
+fi
+if [[ "$MODE" == "enforce" && ("$rc" -ne 0 || "$result" != "pass") ]]; then
+  if [[ "$rc" -ne 0 ]]; then
+    exit "$rc"
+  fi
+  exit 2
 fi
 exit 0

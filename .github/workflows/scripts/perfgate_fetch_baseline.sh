@@ -22,14 +22,15 @@ write_env() {
 baseline_unavailable() {
   local reason=$1
   echo "$reason" >&2
+  write_env PERFGATE_BASELINE_AVAILABLE 0
+  write_env PERFGATE_BASELINE_COMMIT "$COMMIT"
+  write_env PERFGATE_BASELINE_SOURCE unavailable
+  write_env PERFGATE_BASELINE_UNAVAILABLE_REASON "$reason"
   if [[ "$MODE" == "report" ]]; then
-    write_env PERFGATE_BASELINE_AVAILABLE 0
-    write_env PERFGATE_BASELINE_COMMIT "$COMMIT"
-    write_env PERFGATE_BASELINE_SOURCE unavailable
-    write_env PERFGATE_BASELINE_UNAVAILABLE_REASON "$reason"
     echo "Perfgate baseline unavailable in report mode; continuing without baseline."
     exit 0
   fi
+  echo "Perfgate baseline unavailable in enforce mode; failing."
   exit 2
 }
 
