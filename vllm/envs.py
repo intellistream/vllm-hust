@@ -290,6 +290,9 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_DEBUG_PREFIX_CACHE_TRACE: bool = False
+    VLLM_ADAPTIVE_STATE_PROBE_JSONL: str = ""
+    VLLM_ADAPTIVE_STATE_PROBE_EVERY: int = 1
+    VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS: int = 0
 
 
 def get_default_cache_root():
@@ -1085,6 +1088,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable verbose prefix-cache trace logs for local debugging.
     "VLLM_DEBUG_PREFIX_CACHE_TRACE": lambda: bool(
         int(os.environ.get("VLLM_DEBUG_PREFIX_CACHE_TRACE", "0"))
+    ),
+    # Optional JSONL destination for model-runner scheduling diagnostics.
+    # Empty (default) disables the probe.
+    "VLLM_ADAPTIVE_STATE_PROBE_JSONL": lambda: os.environ.get(
+        "VLLM_ADAPTIVE_STATE_PROBE_JSONL", ""
+    ),
+    # Record one scheduling-state row every N model-runner steps.
+    "VLLM_ADAPTIVE_STATE_PROBE_EVERY": lambda: int(
+        os.environ.get("VLLM_ADAPTIVE_STATE_PROBE_EVERY", "1")
+    ),
+    # Maximum scheduling-state rows per process. Zero means unlimited.
+    "VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS": lambda: int(
+        os.environ.get("VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS", "0")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

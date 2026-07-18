@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+_DEFAULT_EVERY_N_STEPS = 1
+_DEFAULT_MAX_RECORDS = 0
 
 
 def _safe_len(value: Any) -> int:
@@ -23,8 +26,16 @@ def _safe_len(value: Any) -> int:
         return 0
 
 
+def _read_int_env(name: str, default: int, *, minimum: int) -> int:
+    try:
+        return max(minimum, int(getattr(envs, name)))
+    except ValueError:
+        logger.warning("Ignoring invalid %s; using %d", name, default)
+        return default
+
+
 class AdaptiveStateProbe:
-    """Optional JSONL probe for adaptive-selector runtime experiments."""
+    """Optional JSONL probe for model-runner scheduling state."""
 
     def __init__(self, jsonl_path: Path, every_n_steps: int, max_records: int):
         self._jsonl_path = jsonl_path
@@ -33,18 +44,39 @@ class AdaptiveStateProbe:
         self._step = 0
         self._written = 0
         self._warned = False
+        self._disabled = False
 
         self._jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
     @classmethod
-    def from_env(cls) -> "AdaptiveStateProbe | None":
-        jsonl = os.getenv("VLLM_ADAPTIVE_STATE_PROBE_JSONL", "").strip()
+    def from_env(cls) -> AdaptiveStateProbe | None:
+        jsonl = envs.VLLM_ADAPTIVE_STATE_PROBE_JSONL.strip()
         if not jsonl:
             return None
 
-        every_n_steps = int(os.getenv("VLLM_ADAPTIVE_STATE_PROBE_EVERY", "1"))
-        max_records = int(os.getenv("VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS", "0"))
-        probe = cls(Path(jsonl), every_n_steps=every_n_steps, max_records=max_records)
+        every_n_steps = _read_int_env(
+            "VLLM_ADAPTIVE_STATE_PROBE_EVERY",
+            _DEFAULT_EVERY_N_STEPS,
+            minimum=1,
+        )
+        max_records = _read_int_env(
+            "VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS",
+            _DEFAULT_MAX_RECORDS,
+            minimum=0,
+        )
+        try:
+            probe = cls(
+                Path(jsonl),
+                every_n_steps=every_n_steps,
+                max_records=max_records,
+            )
+        except OSError:
+            logger.warning(
+                "AdaptiveStateProbe could not initialize path %s; disabling probe",
+                jsonl,
+                exc_info=True,
+            )
+            return None
         logger.info(
             "AdaptiveStateProbe enabled: path=%s every=%d max_records=%d",
             str(probe._jsonl_path),
@@ -63,6 +95,8 @@ class AdaptiveStateProbe:
         dummy_run: bool,
         skip_compiled: bool,
     ) -> None:
+        if self._disabled:
+            return
         self._step += 1
         if self._step % self._every_n_steps != 0:
             return
@@ -121,12 +155,14 @@ class AdaptiveStateProbe:
             }
 
             with self._jsonl_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(row, ensure_ascii=True) + "\n")
+                f.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
             self._written += 1
         except Exception:
             if not self._warned:
                 logger.warning(
-                    "AdaptiveStateProbe write failed once; suppressing further warnings",
+                    "AdaptiveStateProbe write failed once; "
+                    "suppressing further warnings",
                     exc_info=True,
                 )
                 self._warned = True
+            self._disabled = True
