@@ -169,6 +169,10 @@ python benchmarks/pp_opt/analyze_results.py
 python benchmarks/pp_opt/plot_throughput.py
 ```
 
+Throughput figures use a centered 30-second moving average by default while
+the generated CSV retains every one-second sample. Pass
+`--smooth-window-seconds 0` to plot the raw series.
+
 ## Validated results
 
 The validated Qwen3-32B conversation run completed 1,000/1,000 requests in

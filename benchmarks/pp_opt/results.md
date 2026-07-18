@@ -13,6 +13,21 @@ completed all requests and generated the same 349,357 output tokens.
 | PP-opt | 1,187.73 s | 0.8419 req/s | 294.14 tok/s |
 | Speedup | **1.218x** | **+21.82%** | **+21.82%** |
 
+| Latency metric | Baseline | PP-opt | Change |
+| --- | ---: | ---: | ---: |
+| Mean | 125.77 s | 101.70 s | **-19.14%** |
+| P50 | 131.07 s | 107.63 s | **-17.88%** |
+| P99 | 356.09 s | 278.52 s | **-21.78%** |
+
+The aggregate record and raw one-second series are stored under
+`results/end_to_end/qwen3_32b_conversation/`.
+
+![Qwen3-32B conversation throughput over time](results/end_to_end/qwen3_32b_conversation/throughput.png)
+
+The plotted lines are centered 30-second moving averages over 2,594 raw server
+samples. The smoothing changes only the visualization, not the throughput or
+latency calculations above.
+
 ## Validated Qwen3-235B-A22B comparison
 
 The 235B experiment used the same 1,000-request conversation trace and client
@@ -47,9 +62,10 @@ still require full reruns with the same static configuration.
 
 ![Qwen3-235B conversation throughput over time](results/end_to_end/qwen3_235b_conversation/throughput.png)
 
-The figure uses all 3,152 one-second server samples clipped to each client's
-first-send through final-completion interval. The underlying series is stored
-next to the figure as `throughput.csv`.
+The plotted lines are centered 30-second moving averages over all 3,152 raw
+one-second server samples clipped to each client's first-send through
+final-completion interval. The underlying unsmoothed series is stored next to
+the figure as `throughput.csv`.
 
 ## Pipeline compactness
 

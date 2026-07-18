@@ -79,7 +79,9 @@ eight NPUs; every layer still invokes its full operators.
 
 Aggregate output goodput is successful generated tokens divided by client wall
 time. The throughput curve uses vLLM's one-second generation-throughput log,
-clipped to the interval from first request send through final completion.
+clipped to the interval from first request send through final completion. The
+published figures apply a centered 30-second moving average for readability;
+the adjacent CSV artifacts retain the unsmoothed one-second samples.
 
 For pipeline compactness, the Ascend runner emits a scope containing PP rank,
 microbatch ID, request count, and context tokens. CANN device traces are
