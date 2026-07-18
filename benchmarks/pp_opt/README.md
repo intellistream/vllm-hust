@@ -20,18 +20,20 @@ Each full run replays 1,000 requests with a 131,072-token model limit. The
 conversation trace is submitted as fast as the client-side KV budget allows.
 BurstGPT preserves the timestamps in the trace.
 
-The conversation trace is small and remains in the repository. The processed
-BurstGPT trace is generated locally from the public HPMLL/BurstGPT dataset and
-is intentionally excluded from Git history. Prepare it explicitly with:
+The processed traces are generated locally from their public source datasets
+and are intentionally excluded from Git history. Prepare them explicitly with:
 
 ```bash
+python benchmarks/pp_opt/prepare_conversation_trace.py
 python benchmarks/pp_opt/prepare_burstgpt.py
 ```
 
-`run_experiment.sh` invokes the same command automatically for BurstGPT runs.
-The preparation script verifies the upstream file checksum, converts it to the
-benchmark client's three-column schema, and verifies the generated checksum
-and row count before installing it.
+The conversation workload comes from Mooncake's FAST '25
+`conversation_trace.jsonl`; BurstGPT comes from HPMLL/BurstGPT.
+`run_experiment.sh` invokes the appropriate preparation command automatically.
+Both scripts pin an upstream commit, verify the source checksum, convert to the
+benchmark client's three-column schema, and verify the generated checksum and
+row count before installing the trace.
 
 The optimized scheduler is decode-benchmark specific. If its environment flag
 is set without `DecodeBenchConnector`, vLLM falls back to the default scheduler

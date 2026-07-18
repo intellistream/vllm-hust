@@ -45,6 +45,7 @@ ENFORCE_EAGER=0
 case "${TRACE_KEY}" in
   conversation)
     TRACE_FILE="${SCRIPT_DIR}/conversation_trace.csv"
+    python "${SCRIPT_DIR}/prepare_conversation_trace.py" --output "${TRACE_FILE}"
     TRACE_ARGS=(--ignore-timestamps)
     ;;
   burstgpt)
