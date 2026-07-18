@@ -29,6 +29,63 @@ def test_workflow_dispatch_input_count_stays_within_github_limit():
     assert "output_length" not in inputs
 
 
+def test_main_push_reaches_benchmark_and_baseline_store_jobs():
+    workflow = workflow_yaml()[True]
+    text = workflow_text()
+
+    assert workflow["push"]["branches"] == ["main"]
+    benchmark_job = text[
+        text.index("  ascend-benchmark:") : text.index(
+            "  store-main-perfgate-baseline:"
+        )
+    ]
+    assert (
+        "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+        in benchmark_job
+    )
+    store_job = text[text.index("  store-main-perfgate-baseline:") :]
+    assert (
+        "if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+        in store_job
+    )
+    assert "needs: ascend-benchmark" in store_job
+
+
+def test_main_perfgate_producer_uses_shared_pr_spec_without_changing_formal_defaults():
+    text = workflow_text()
+    producer = text[
+        text.index("      - name: Run main perfgate baseline producer") : text.index(
+            "      - name: Performance gate - Stage 1 comparison"
+        )
+    ]
+
+    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in producer
+    assert "Qwen/Qwen2.5-3B-Instruct" in producer
+    assert 'PERFGATE_MODEL_PRECISION: BF16' in producer
+    assert 'PERFGATE_NUM_PROMPTS: "8"' in producer
+    assert 'PERFGATE_INPUT_LEN: "64"' in producer
+    assert 'PERFGATE_OUTPUT_LEN: "16"' in producer
+    assert 'SAME_SPEC_BENCHMARK_ENABLED: "1"' in producer
+    assert 'PUBLISH_TO_BENCHMARK_REPO: "0"' in producer
+    assert 'PUBLISH_TO_HF: "0"' in producer
+    assert "max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}" in producer
+    assert "cleanup_ascend_ci_processes.sh" in producer
+    assert '--explicit-spec-file ""' in text
+    assert "vllm_hust_benchmark.perfgate_specs resolve" in producer
+    assert (
+        'SAME_SPEC_SPEC_FILE="${VLLM_HUST_BENCHMARK_REPO}/${perfgate_spec_file}"'
+        in producer
+    )
+    assert (
+        "RESULT_ROOT: ${{ github.workspace }}/.benchmarks/ci/ci-"
+        "${{ github.run_id }}-${{ github.run_attempt }}-"
+        "${{ env.TARGET_REPO_SHA }}/perfgate"
+        in text
+    )
+    assert "--scenario \"$PERFGATE_BASELINE_SCENARIO\"" in text
+    assert "Qwen/Qwen2.5-14B-Instruct" in text
+
+
 def test_pr_comment_update_job_has_job_level_issues_write_permission():
     text = workflow_text()
 
@@ -72,12 +129,12 @@ def test_main_baseline_store_has_spec_file_and_benchmark_repo_checkout():
     assert "TARGET_REPO_SHA: ${{ github.sha }}" in store_job
     assert (
         "RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-"
-        "${{ env.TARGET_REPO_SHA }}"
+        "${{ env.TARGET_REPO_SHA }}-perfgate"
     ) in store_job
     assert (
         "RESULT_ROOT: ${{ github.workspace }}/.benchmarks/ci/ci-"
         "${{ github.run_id }}-${{ github.run_attempt }}-"
-        "${{ env.TARGET_REPO_SHA }}"
+        "${{ env.TARGET_REPO_SHA }}/perfgate"
     ) in store_job
     assert "PERFGATE_SPEC_FILE:" not in store_job
     assert "MAIN_SAME_SPEC_SPEC_FILE:" not in store_job
@@ -88,12 +145,8 @@ def test_main_baseline_store_has_spec_file_and_benchmark_repo_checkout():
     assert "BENCHMARK_REPO_REF:" in store_job
     assert "Checkout benchmark repo" in store_job
     assert "git@github.com:vLLM-HUST/vllm-hust-benchmark.git" not in store_job
-    assert (
-        "vllm-hust-benchmark/${{ vars.VLLM_HUST_SAME_SPEC_SPEC_FILE || "
-        "vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || "
-        "'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-"
-        "qwen25-14b-910b2.json' }}"
-    ) in store_job
+    assert 'PERFGATE_BASELINE_SCENARIO: random-online' in store_job
+    assert '--scenario "$PERFGATE_BASELINE_SCENARIO"' in store_job
 
 
 def test_benchmark_repo_default_ref_is_main():
@@ -159,7 +212,9 @@ def test_main_benchmark_defaults_match_ascend_main_config():
     assert "steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1'" in text
     assert "multi_scenario_results.tsv" in text
     assert "Perfgate comparison: `skipped for multi-scenario run" in text
-    assert "vars.VLLM_HUST_MAIN_BENCHMARK_SCENARIOS == ''" in text
+    assert "vars.VLLM_HUST_MAIN_BENCHMARK_SCENARIOS == ''" not in text[
+        text.index("  store-main-perfgate-baseline:") :
+    ]
     assert (
         "github.event_name == 'pull_request' || github.event_name == 'issue_comment'"
     ) in text
