@@ -64,4 +64,3 @@ def test_summary_and_pr_comment_include_rebase_conflict_details(tmp_path: Path) 
     for text in (summary, comment):
         assert "Stage 2 rebase conflict details" in text
         assert "CONFLICT (content)" in text
-
