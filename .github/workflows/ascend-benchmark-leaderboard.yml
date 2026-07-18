@@ -297,7 +297,7 @@ jobs:
       CHIP_COUNT: "1"
       NODE_COUNT: "1"
       SAME_SPEC_BENCHMARK_ENABLED: ${{ vars.VLLM_HUST_SAME_SPEC_BENCHMARK_ENABLED || '1' }}
-      PERFGATE_MODE: ${{ vars.VLLM_HUST_PERFGATE_MODE || 'report' }}
+      PERFGATE_MODE: ${{ github.event_name == 'pull_request' && 'enforce' || (vars.VLLM_HUST_PERFGATE_MODE || 'report') }}
       PERFGATE_SPEC_FILE: ${{ vars.VLLM_HUST_PERFGATE_SPEC_FILE || '' }}
       MAIN_SAME_SPEC_SPEC_FILE: ${{ vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || 'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-qwen25-14b-910b2.json' }}
       SAME_SPEC_SPEC_FILE: ${{ vars.VLLM_HUST_SAME_SPEC_SPEC_FILE || '' }}
@@ -628,6 +628,19 @@ jobs:
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
         run: |
           python3 .github/workflows/scripts/resolve_ascend_benchmark_scenario.py
+
+      - name: Validate required PR perfgate scenario
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          if [[ "${BENCH_SCENARIO_COUNT:-0}" != "1" ]]; then
+            echo "Required PR perfgate supports exactly one scenario; got ${BENCH_SCENARIO_COUNT:-unset}." >&2
+            exit 2
+          fi
+          if [[ "${BENCH_SCENARIO:-}" != "random-online" ]]; then
+            echo "Required PR perfgate currently supports only random-online; got ${BENCH_SCENARIO:-unset}." >&2
+            exit 2
+          fi
 
       - name: Resolve perfgate spec for Ascend runner
         if: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
@@ -1215,9 +1228,16 @@ jobs:
           bash .github/workflows/scripts/perfgate_stage2_rebase_and_benchmark.sh
 
       - name: Performance gate - two-stage comparison
-        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
+        if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
         shell: bash
         run: bash .github/workflows/scripts/perfgate_compare.sh
+
+      - name: Validate required performance gate completion
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        shell: bash
+        env:
+          PERFGATE_REQUIRED: "1"
+        run: bash .github/workflows/scripts/perfgate_validate_required.sh
 
       - name: Cleanup leftover Ascend CI processes
         if: always()
@@ -1418,19 +1438,43 @@ jobs:
             baseline_notes.append(
               f"- Stage 1 baseline: `{stage1_commit or 'unknown'}` source `{stage1_source or 'unknown'}`"
             )
+          stage1_unavailable_reason = os.environ.get('PERFGATE_BASELINE_UNAVAILABLE_REASON', '').strip()
+          if stage1_unavailable_reason:
+            baseline_notes.append(f"- Stage 1 baseline unavailable: `{stage1_unavailable_reason}`")
           stage2_source = os.environ.get('PERFGATE_STAGE2_M2_BASELINE_SOURCE')
           stage2_commit = os.environ.get('PERFGATE_STAGE2_M2_BASELINE_COMMIT')
           if stage2_source or stage2_commit:
             baseline_notes.append(
               f"- Stage 2 baseline: `{stage2_commit or 'unknown'}` source `{stage2_source or 'unknown'}`"
             )
+          stage2_not_run_reason = os.environ.get('PERFGATE_STAGE2_NOT_RUN_REASON', '').strip()
+          if stage2_not_run_reason:
+            baseline_notes.append(f"- Stage 2 not run: `{stage2_not_run_reason}`")
           if baseline_notes:
             lines.extend(baseline_notes)
             comment_lines.extend(baseline_notes)
+          perfgate_markdown = ''
           if perfgate_report.is_file():
             perfgate_markdown = perfgate_report.read_text(encoding='utf-8').strip()
             lines.extend(['', perfgate_markdown])
             comment_lines.extend(['', perfgate_markdown])
+          conflict_file = os.environ.get('PERFGATE_STAGE2_REBASE_CONFLICT_FILE', '').strip()
+          if conflict_file:
+            conflict_path = Path(conflict_file)
+            if conflict_path.is_file():
+              conflict_details = conflict_path.read_text(encoding='utf-8', errors='replace').strip()[:12000]
+              if conflict_details and conflict_details not in perfgate_markdown:
+                conflict_details = conflict_details.replace('```', "'''")
+                conflict_block = [
+                  '',
+                  '### Stage 2 rebase conflict details',
+                  '',
+                  '```text',
+                  conflict_details,
+                  '```',
+                ]
+                lines.extend(conflict_block)
+                comment_lines.extend(conflict_block)
 
           if raw_result.is_file():
             payload = json.loads(raw_result.read_text(encoding='utf-8'))
