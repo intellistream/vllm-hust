@@ -1,0 +1,44 @@
+{
+  "dates": {
+    "baseline": "2026-07-16",
+    "pp_opt": "2026-07-17"
+  },
+  "model": "Qwen3-32B",
+  "trace": "conversation",
+  "request_count": 1000,
+  "successful_requests": 1000,
+  "failed_requests": 0,
+  "actual_output_tokens": 349357,
+  "pipeline_parallel_size": 4,
+  "tensor_parallel_size": 2,
+  "layer_partition": [16, 16, 16, 16],
+  "hardware": "8x Ascend 910C per mode",
+  "kv_cache_size": 1490000,
+  "max_model_len": 131072,
+  "max_num_seqs": 512,
+  "max_num_batched_tokens": 512,
+  "full_transformer_execution": true,
+  "parameter_loading": "dummy with real input embedding",
+  "baseline": {
+    "duration_s": 1446.9131202697754,
+    "request_throughput_per_s": 0.6911262648634005,
+    "output_goodput_tokens_per_s": 241.44988051173576,
+    "mean_server_generation_tokens_per_s": 247.75664335664337,
+    "peak_server_generation_tokens_per_s": 454.2,
+    "mean_latency_ms": 125773.27642583847,
+    "p50_latency_ms": 131073.3163356781,
+    "p99_latency_ms": 356085.4604244232
+  },
+  "pp_opt": {
+    "duration_s": 1187.7344217300415,
+    "request_throughput_per_s": 0.8419386905944904,
+    "output_goodput_tokens_per_s": 294.13730343112417,
+    "mean_server_generation_tokens_per_s": 299.9588487972508,
+    "peak_server_generation_tokens_per_s": 493.7,
+    "mean_latency_ms": 101703.98205637932,
+    "p50_latency_ms": 107633.37111473083,
+    "p99_latency_ms": 278524.3692398071
+  },
+  "speedup_factor": 1.2182126692617168,
+  "speedup_percent": 21.821266926171678
+}
