@@ -4,6 +4,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
 
+from vllm.compilation.trace import emit_compilation_trace
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
@@ -173,6 +174,12 @@ class CudagraphDispatcher:
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:
             self.keys_initialized = True
+            emit_compilation_trace(
+                "cudagraph_keys_initialized",
+                configured_mode=str(cudagraph_mode),
+                full_key_count=0,
+                piecewise_key_count=0,
+            )
             return
 
         self._compute_bs_to_padded_graph_size()
@@ -231,6 +238,49 @@ class CudagraphDispatcher:
                 )
 
         self.keys_initialized = True
+        emit_compilation_trace(
+            "cudagraph_keys_initialized",
+            configured_mode=str(cudagraph_mode),
+            full_key_count=len(self.cudagraph_keys[CUDAGraphMode.FULL]),
+            piecewise_key_count=len(self.cudagraph_keys[CUDAGraphMode.PIECEWISE]),
+        )
+
+    @staticmethod
+    def _descriptor_fields(descriptor: BatchDescriptor) -> dict[str, object]:
+        return {
+            "num_tokens": descriptor.num_tokens,
+            "num_reqs": descriptor.num_reqs,
+            "uniform": descriptor.uniform,
+            "has_lora": descriptor.has_lora,
+            "num_active_loras": descriptor.num_active_loras,
+        }
+
+    def _trace_dispatch(
+        self,
+        *,
+        requested_num_tokens: int,
+        requested_uniform_decode: bool,
+        requested_has_lora: bool,
+        requested_num_active_loras: int,
+        mode: CUDAGraphMode,
+        descriptor: BatchDescriptor,
+        fallback_reason: str | None = None,
+    ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+        emit_compilation_trace(
+            "cudagraph_dispatch",
+            requested_num_tokens=requested_num_tokens,
+            requested_uniform_decode=requested_uniform_decode,
+            requested_has_lora=requested_has_lora,
+            requested_num_active_loras=requested_num_active_loras,
+            selected_mode=str(mode),
+            selected_key=self._descriptor_fields(descriptor),
+            hit=mode != CUDAGraphMode.NONE,
+            fallback_reason=fallback_reason,
+            configured_key_cardinality=sum(
+                len(keys) for keys in self.cudagraph_keys.values()
+            ),
+        )
+        return mode, descriptor
 
     def dispatch(
         self,
@@ -278,7 +328,25 @@ class CudagraphDispatcher:
             or num_tokens > max_size
             or allowed_modes <= {CUDAGraphMode.NONE}
         ):
-            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            if not self.keys_initialized:
+                reason = "keys_not_initialized"
+            elif self.cudagraph_mode == CUDAGraphMode.NONE:
+                reason = "graphs_disabled"
+            elif max_size is None:
+                reason = "max_capture_size_unset"
+            elif num_tokens > max_size:
+                reason = "request_exceeds_max_capture_size"
+            else:
+                reason = "runtime_mode_forced_none"
+            return self._trace_dispatch(
+                requested_num_tokens=num_tokens,
+                requested_uniform_decode=uniform_decode,
+                requested_has_lora=has_lora,
+                requested_num_active_loras=num_active_loras,
+                mode=CUDAGraphMode.NONE,
+                descriptor=BatchDescriptor(num_tokens),
+                fallback_reason=reason,
+            )
 
         effective_num_active_loras = num_active_loras
         if has_lora and num_active_loras > 0:
@@ -308,20 +376,42 @@ class CudagraphDispatcher:
             # check if key exists for full cudagraph
             batch_desc_to_check = batch_desc
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
-                return CUDAGraphMode.FULL, batch_desc_to_check
+                return self._trace_dispatch(
+                    requested_num_tokens=num_tokens,
+                    requested_uniform_decode=uniform_decode,
+                    requested_has_lora=has_lora,
+                    requested_num_active_loras=num_active_loras,
+                    mode=CUDAGraphMode.FULL,
+                    descriptor=batch_desc_to_check,
+                )
 
         if CUDAGraphMode.PIECEWISE in allowed_modes:
             # also check if the relaxed key exists for more "general"
             # piecewise cudagraph
             batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
-                return CUDAGraphMode.PIECEWISE, batch_desc_to_check
+                return self._trace_dispatch(
+                    requested_num_tokens=num_tokens,
+                    requested_uniform_decode=uniform_decode,
+                    requested_has_lora=has_lora,
+                    requested_num_active_loras=num_active_loras,
+                    mode=CUDAGraphMode.PIECEWISE,
+                    descriptor=batch_desc_to_check,
+                )
 
         assert CUDAGraphMode.NONE in allowed_modes, (
             f"No matching cudagraph found and NONE is not in "
             f"allowed_modes={allowed_modes}"
         )
-        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+        return self._trace_dispatch(
+            requested_num_tokens=num_tokens,
+            requested_uniform_decode=uniform_decode,
+            requested_has_lora=has_lora,
+            requested_num_active_loras=num_active_loras,
+            mode=CUDAGraphMode.NONE,
+            descriptor=BatchDescriptor(num_tokens),
+            fallback_reason="no_matching_graph_key",
+        )
 
     def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
         """

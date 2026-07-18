@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import time
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -14,6 +15,7 @@ import torch
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+from vllm.compilation.trace import emit_compilation_trace
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import (
@@ -228,6 +230,13 @@ class CUDAGraphWrapper:
         return self
 
     def clear_graphs(self) -> None:
+        if self.concrete_cudagraph_entries:
+            emit_compilation_trace(
+                "cudagraph_cache_eviction",
+                runtime_mode=str(self.runtime_mode),
+                evicted_key_count=len(self.concrete_cudagraph_entries),
+                reason="clear_graphs",
+            )
         self.concrete_cudagraph_entries.clear()
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
@@ -282,6 +291,8 @@ class CUDAGraphWrapper:
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
+            capture_start = time.perf_counter()
+            capture_start_timestamp_ns = time.time_ns()
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
                     # during every model forward for piecewise cudagraph
@@ -337,6 +348,14 @@ class CUDAGraphWrapper:
             entry.cudagraph = cudagraph
 
             compilation_counter.num_cudagraph_captured += 1
+            emit_compilation_trace(
+                "cudagraph_capture",
+                runtime_mode=str(self.runtime_mode),
+                key=dataclasses.asdict(entry.batch_descriptor),
+                start_timestamp_ns=capture_start_timestamp_ns,
+                duration_s=time.perf_counter() - capture_start,
+                concrete_key_cardinality=len(self.concrete_cudagraph_entries),
+            )
 
             # important: we need to return the output, rather than
             # the weak ref of the output, so that pytorch can correctly
@@ -357,5 +376,13 @@ class CUDAGraphWrapper:
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
+        replay_start = time.perf_counter()
         entry.cudagraph.replay()
+        emit_compilation_trace(
+            "cudagraph_replay",
+            runtime_mode=str(self.runtime_mode),
+            key=dataclasses.asdict(entry.batch_descriptor),
+            host_enqueue_duration_s=time.perf_counter() - replay_start,
+            concrete_key_cardinality=len(self.concrete_cudagraph_entries),
+        )
         return entry.output

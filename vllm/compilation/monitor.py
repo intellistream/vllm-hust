@@ -5,6 +5,7 @@ import contextlib
 import time
 from collections.abc import Generator
 
+from vllm.compilation.trace import emit_compilation_trace
 from vllm.config import CompilationMode, VllmConfig
 from vllm.logger import init_logger
 
@@ -51,6 +52,12 @@ def monitor_torch_compile(
             else:
                 compilation_config.compilation_time += total_compile_time
             logger.info_once(message, total_compile_time)
+        emit_compilation_trace(
+            "torch_compile_total",
+            duration_s=total_compile_time,
+            compilation_mode=str(compilation_config.mode),
+            is_encoder=is_encoder,
+        )
     finally:
         if depyf_cm is not None:
             try:

@@ -52,6 +52,7 @@ from .partition_rules import (
 from .passes.inductor_pass import InductorPass, pass_context
 from .passes.ir.inplace_functionalization import VllmIRInplaceFunctionalizationPass
 from .passes.pass_manager import PostGradPassManager
+from .trace import emit_compilation_trace
 
 logger = init_logger(__name__)
 
@@ -211,6 +212,14 @@ class CompilerManager:
         self.compiler.initialize_cache(
             cache_dir=cache_dir, disable_cache=disable_cache, prefix=prefix
         )
+        emit_compilation_trace(
+            "compile_cache_initialized",
+            cache_dir=cache_dir,
+            cache_disabled=disable_cache,
+            cache_entry_count=len(self.cache),
+            compiler=self.compiler.name,
+            prefix=prefix,
+        )
 
     def save_to_file(self) -> None:
         if self.disable_cache or not self.is_cache_updated:
@@ -283,7 +292,21 @@ class CompilerManager:
         handle = None
 
         # try to load from the cache
+        logical_key = {
+            "range_start": compile_range.start,
+            "range_end": compile_range.end,
+            "graph_index": graph_index,
+            "compiler": self.compiler.name,
+        }
+        lookup_start = time.perf_counter()
         compiled_graph = self.load(graph, example_inputs, graph_index, compile_range)
+        emit_compilation_trace(
+            "compile_cache_lookup",
+            key=logical_key,
+            hit=compiled_graph is not None,
+            duration_s=time.perf_counter() - lookup_start,
+            cache_entry_count=len(self.cache),
+        )
         if compiled_graph is not None:
             if graph_index == num_graphs - 1:
                 # after loading the last graph for this shape, record the time.
@@ -326,6 +349,7 @@ class CompilerManager:
             # should expose the cache_key function that we can just call
             # directly before invoking backend compilation.
             cache_key = None
+            reused_loaded_artifact = False
             orig = torch._functorch._aot_autograd.autograd_cache.autograd_cache_key
 
             def autograd_cache_key(*args, **kwargs):
@@ -350,6 +374,8 @@ class CompilerManager:
                 ),
             ):
                 try:
+                    backend_compile_start = time.perf_counter()
+                    backend_compile_start_timestamp_ns = time.time_ns()
                     compiled_graph, handle = self.compiler.compile(
                         graph,
                         example_inputs,
@@ -360,6 +386,16 @@ class CompilerManager:
                 except StopCompiling:
                     assert cache_key is not None
                     compiled_graph = self.loaded_artifacts[cache_key]
+                    reused_loaded_artifact = True
+                finally:
+                    emit_compilation_trace(
+                        "backend_compile",
+                        key=logical_key,
+                        backend_cache_key=cache_key,
+                        start_timestamp_ns=backend_compile_start_timestamp_ns,
+                        duration_s=time.perf_counter() - backend_compile_start,
+                        reused_loaded_artifact=reused_loaded_artifact,
+                    )
             if cache_key is not None and compiled_graph is not None:
                 self.loaded_artifacts[cache_key] = compiled_graph
 
@@ -373,6 +409,12 @@ class CompilerManager:
             }
             compilation_counter.num_cache_entries_updated += 1
             self.is_cache_updated = True
+            emit_compilation_trace(
+                "compile_cache_update",
+                key=logical_key,
+                backend_cache_key=cache_key,
+                cache_entry_count=len(self.cache),
+            )
             if graph_index == 0:
                 # adds some info logging for the first graph
                 logger.info_once(
