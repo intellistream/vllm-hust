@@ -190,7 +190,8 @@ class EngineCore:
         # Batch queue for scheduled batches. This enables us to asynchronously
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
-        if envs.VLLM_USE_PP_OPT_SCHEDULER and envs.VLLM_PP_OPT_BATCH_QUEUE_SIZE:
+        use_pp_opt_scheduler = vllm_config.is_pp_opt_scheduler_enabled()
+        if use_pp_opt_scheduler and envs.VLLM_PP_OPT_BATCH_QUEUE_SIZE:
             assert envs.VLLM_PP_OPT_BATCH_QUEUE_SIZE > 0
             self.batch_queue_size = envs.VLLM_PP_OPT_BATCH_QUEUE_SIZE
         else:
@@ -198,7 +199,7 @@ class EngineCore:
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
-        if self.batch_queue_size > 1 or envs.VLLM_USE_PP_OPT_SCHEDULER:
+        if self.batch_queue_size > 1 or use_pp_opt_scheduler:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
 
@@ -219,7 +220,7 @@ class EngineCore:
                 hash_block_size, caching_hash_fn
             )
 
-        if envs.VLLM_USE_PP_OPT_SCHEDULER:
+        if use_pp_opt_scheduler:
             self.in_flight_microbatch_ids: set[int] = set()
             assert self.batch_queue is not None
             logger.info("PP optimization scheduler is enabled")

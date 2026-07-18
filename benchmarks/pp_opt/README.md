@@ -20,6 +20,40 @@ Each full run replays 1,000 requests with a 131,072-token model limit. The
 conversation trace is submitted as fast as the client-side KV budget allows.
 BurstGPT preserves the timestamps in the trace.
 
+The conversation trace is small and remains in the repository. The processed
+BurstGPT trace is generated locally from the public HPMLL/BurstGPT dataset and
+is intentionally excluded from Git history. Prepare it explicitly with:
+
+```bash
+python benchmarks/pp_opt/prepare_burstgpt.py
+```
+
+`run_experiment.sh` invokes the same command automatically for BurstGPT runs.
+The preparation script verifies the upstream file checksum, converts it to the
+benchmark client's three-column schema, and verifies the generated checksum
+and row count before installing it.
+
+The optimized scheduler is decode-benchmark specific. If its environment flag
+is set without `DecodeBenchConnector`, vLLM falls back to the default scheduler
+and executes normal prefill/decode scheduling. A short compatibility smoke can
+exercise that fallback with the otherwise identical launch configuration:
+
+```bash
+USE_DECODE_BENCH_CONNECTOR=0 REQUEST_NUM=10 \
+  srun --job-name=ppopt-prefill-smoke \
+  -N 1 --ntasks-per-node=1 --cpus-per-task=32 \
+  --gres=npu:8 --partition=a320m2tn910cu \
+  benchmarks/pp_opt/run_experiment.sh \
+  qwen3_32b conversation pp_opt
+```
+
+This fallback was validated on Qwen3-32B with PP4 + TP2 on eight Ascend 910C
+NPUs. All 10 requests completed successfully with prompt lengths from 2,290 to
+26,888 tokens and generated their full requested outputs. The server reported
+normal prompt throughput, continued mixed prefill/decode execution, and drained
+to zero running and waiting requests. This is a compatibility check, not a
+performance comparison.
+
 ## Repository layout
 
 Place the two editable repositories, virtual environment, and model metadata

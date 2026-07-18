@@ -709,6 +709,15 @@ class VllmConfig:
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
 
+    def is_pp_opt_scheduler_enabled(self) -> bool:
+        """Return whether the decode-only PP scheduler is active."""
+        kv_transfer_config = self.kv_transfer_config
+        return bool(
+            envs.VLLM_USE_PP_OPT_SCHEDULER
+            and kv_transfer_config is not None
+            and kv_transfer_config.kv_connector == "DecodeBenchConnector"
+        )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -771,9 +780,16 @@ class VllmConfig:
         executor_class = Executor.get_class(self)
         executor_supports_async_sched = executor_class.supports_async_scheduling()
 
+        use_pp_opt_scheduler = self.is_pp_opt_scheduler_enabled()
+        if envs.VLLM_USE_PP_OPT_SCHEDULER and not use_pp_opt_scheduler:
+            logger.warning_once(
+                "PP optimization scheduling requires DecodeBenchConnector; "
+                "using the default scheduler for normal prefill/decode execution."
+            )
+
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
-            if envs.VLLM_USE_PP_OPT_SCHEDULER:
+            if use_pp_opt_scheduler:
                 raise ValueError(
                     "PP optimization scheduling owns the pipeline batch queue "
                     "and is not compatible with async scheduling."
@@ -802,7 +818,7 @@ class VllmConfig:
                 )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
-            if envs.VLLM_USE_PP_OPT_SCHEDULER:
+            if use_pp_opt_scheduler:
                 logger.info_once(
                     "Disabling asynchronous scheduling because PP optimization "
                     "scheduling owns the pipeline batch queue."
