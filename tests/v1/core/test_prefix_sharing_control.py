@@ -56,6 +56,7 @@ def _manager(num_blocks: int = 8):
         make_kv_cache_config(BLOCK_SIZE, num_blocks),
         max_model_len=64,
         enable_caching=True,
+        hash_block_size=BLOCK_SIZE,
     )
 
 
@@ -87,7 +88,7 @@ def test_native_attach_consumes_kv_and_releases_ownership() -> None:
         )
         is not None
     )
-    assert manager.get_block_ids(consumer)[0][:2] == hit_ids
+    assert manager.get_block_ids(consumer.request_id)[0][:2] == hit_ids
     assert all(manager.block_pool.blocks[block_id].ref_cnt == 1 for block_id in hit_ids)
 
     stats = manager.make_prefix_sharing_runtime_stats()
