@@ -251,6 +251,8 @@ def test_required_pr_perfgate_is_enforced_and_validated():
     assert "perfgate_validate_required.sh" in text
     assert "PERFGATE_BASELINE_UNAVAILABLE_REASON" in text
     assert "PERFGATE_STAGE2_NOT_RUN_REASON" in text
+    assert "always() && (github.event_name == 'pull_request' || github.event_name == 'issue_comment')" in text
+    assert "PERFGATE_STAGE2_REBASE_CONFLICT_FILE" in text
 
 
 def test_required_perfgate_scripts_fail_fast():
