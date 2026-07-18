@@ -11,6 +11,7 @@ def test_restore_gate_records_computed_tokens_reduced_before_prefill_planning():
         request_id="restore-gate",
         num_tokens=64,
         kv_restore_computed_tokens_reduced=0,
+        kv_restore_local_computed_tokens=0,
         kv_restore_fallback_reason=None,
     )
     computed_tokens_reduced: dict[str, int] = {}
@@ -40,6 +41,7 @@ def test_restore_gate_emits_reduction_only_after_scheduled_forward():
         request_id="restore-forward",
         num_tokens=64,
         kv_restore_computed_tokens_reduced=0,
+        kv_restore_local_computed_tokens=0,
         kv_restore_fallback_reason=None,
     )
     computed_tokens_reduced: dict[str, int] = {}
@@ -74,6 +76,7 @@ def test_restore_gate_records_fallback_reason_when_registration_fails():
         request_id="restore-fallback",
         num_tokens=64,
         kv_restore_computed_tokens_reduced=16,
+        kv_restore_local_computed_tokens=0,
         kv_restore_fallback_reason=None,
     )
     computed_tokens_reduced: dict[str, int] = {}
@@ -100,6 +103,7 @@ def test_restore_gate_emits_fallback_reason_without_reduction():
         request_id="restore-forward-fallback",
         num_tokens=64,
         kv_restore_computed_tokens_reduced=0,
+        kv_restore_local_computed_tokens=0,
         kv_restore_fallback_reason="connector_match_unavailable",
     )
     computed_tokens_reduced: dict[str, int] = {}
@@ -131,3 +135,44 @@ def test_restore_gate_reads_connector_specific_fallback_reason():
         Scheduler._get_connector_restore_fallback_reason(connector, request)
         == "prefix_chain_incomplete"
     )
+
+
+def test_restore_gate_requires_explicit_connector_candidate():
+    request = SimpleNamespace(request_id="restore-candidate")
+    ordinary_connector = SimpleNamespace()
+    tiered_connector = SimpleNamespace(
+        has_restore_candidate=lambda req: req.request_id == request.request_id
+    )
+
+    assert not Scheduler._connector_has_restore_candidate(
+        ordinary_connector, request
+    )
+    assert Scheduler._connector_has_restore_candidate(tiered_connector, request)
+
+
+def test_complete_restore_load_failure_revokes_avoided_tokens():
+    request = SimpleNamespace(
+        num_computed_tokens=16,
+        kv_restore_local_computed_tokens=16,
+        kv_restore_computed_tokens_reduced=32,
+        kv_restore_fallback_reason=None,
+    )
+
+    Scheduler._record_restore_load_failure(request)
+
+    assert request.kv_restore_computed_tokens_reduced == 0
+    assert request.kv_restore_fallback_reason == "restore_load_failure"
+
+
+def test_partial_restore_load_failure_keeps_only_valid_prefix_credit():
+    request = SimpleNamespace(
+        num_computed_tokens=32,
+        kv_restore_local_computed_tokens=16,
+        kv_restore_computed_tokens_reduced=32,
+        kv_restore_fallback_reason=None,
+    )
+
+    Scheduler._record_restore_load_failure(request)
+
+    assert request.kv_restore_computed_tokens_reduced == 16
+    assert request.kv_restore_fallback_reason == "restore_load_partial_failure"

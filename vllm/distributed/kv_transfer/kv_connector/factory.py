@@ -236,6 +236,11 @@ KVConnectorFactory.register_connector(
     "SimpleCPUOffloadConnector",
 )
 KVConnectorFactory.register_connector(
+    "TieredKVCacheConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.tiered_kv_cache_connector",
+    "TieredKVCacheConnector",
+)
+KVConnectorFactory.register_connector(
     "HF3FSKVConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector",
     "HF3FSKVConnector",

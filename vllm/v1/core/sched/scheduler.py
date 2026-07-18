@@ -760,6 +760,11 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
+                        has_restore_candidate = (
+                            self._connector_has_restore_candidate(
+                                self.connector, request
+                            )
+                        )
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
@@ -775,30 +780,38 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            self._record_restore_planning_gate(
-                                request,
-                                None,
-                                computed_tokens_reduced,
-                                restore_fallback_reasons,
-                                fallback_reason=(
-                                    restore_fallback_reason
-                                    or "connector_match_unavailable"
-                                ),
-                            )
+                            if has_restore_candidate:
+                                self._record_restore_planning_gate(
+                                    request,
+                                    None,
+                                    computed_tokens_reduced,
+                                    restore_fallback_reasons,
+                                    num_local_computed_tokens=(
+                                        num_new_local_computed_tokens
+                                    ),
+                                    fallback_reason=(
+                                        restore_fallback_reason
+                                        or "connector_match_unavailable"
+                                    ),
+                                )
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
 
                         num_external_computed_tokens = ext_tokens
-                        self._record_restore_planning_gate(
-                            request,
-                            num_external_computed_tokens,
-                            computed_tokens_reduced,
-                            restore_fallback_reasons,
-                            fallback_reason=restore_fallback_reason
-                            if num_external_computed_tokens <= 0
-                            else None,
-                        )
+                        if has_restore_candidate:
+                            self._record_restore_planning_gate(
+                                request,
+                                num_external_computed_tokens,
+                                computed_tokens_reduced,
+                                restore_fallback_reasons,
+                                num_local_computed_tokens=(
+                                    num_new_local_computed_tokens
+                                ),
+                                fallback_reason=restore_fallback_reason
+                                if num_external_computed_tokens <= 0
+                                else None,
+                            )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -1193,6 +1206,7 @@ class Scheduler(SchedulerInterface):
         num_external_computed_tokens: int | None,
         computed_tokens_reduced: dict[str, int],
         restore_fallback_reasons: dict[str, str],
+        num_local_computed_tokens: int = 0,
         fallback_reason: str | None = None,
     ) -> None:
         """Record whether restored KV changed prefill planning.
@@ -1203,6 +1217,7 @@ class Scheduler(SchedulerInterface):
         before local prefill tokens are selected.
         """
         request.kv_restore_computed_tokens_reduced = 0
+        request.kv_restore_local_computed_tokens = num_local_computed_tokens
         request.kv_restore_fallback_reason = None
 
         if fallback_reason is not None:
@@ -1212,6 +1227,14 @@ class Scheduler(SchedulerInterface):
 
         if num_external_computed_tokens and num_external_computed_tokens > 0:
             request.kv_restore_computed_tokens_reduced = num_external_computed_tokens
+
+    @staticmethod
+    def _connector_has_restore_candidate(
+        connector: KVConnectorBase_V1,
+        request: Request,
+    ) -> bool:
+        candidate_fn = getattr(connector, "has_restore_candidate", None)
+        return bool(callable(candidate_fn) and candidate_fn(request))
 
     @staticmethod
     def _get_connector_restore_fallback_reason(
@@ -1245,6 +1268,26 @@ class Scheduler(SchedulerInterface):
             restore_fallback_reasons[request.request_id] = (
                 request.kv_restore_fallback_reason
             )
+
+    @staticmethod
+    def _record_restore_load_failure(request: Request) -> None:
+        """Reduce restore credit to the longest prefix that remains valid."""
+        restored_tokens = getattr(
+            request, "kv_restore_computed_tokens_reduced", 0
+        )
+        if restored_tokens <= 0:
+            return
+        local_tokens = getattr(request, "kv_restore_local_computed_tokens", 0)
+        valid_restored_tokens = max(
+            min(request.num_computed_tokens - local_tokens, restored_tokens),
+            0,
+        )
+        request.kv_restore_computed_tokens_reduced = valid_restored_tokens
+        request.kv_restore_fallback_reason = (
+            "restore_load_partial_failure"
+            if valid_restored_tokens > 0
+            else "restore_load_failure"
+        )
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -2720,6 +2763,7 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = req_num_computed_tokens
 
                 affected_req_ids.add(request.request_id)
+                self._record_restore_load_failure(request)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 

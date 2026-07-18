@@ -1641,6 +1641,7 @@ def test_scheduler_reports_computed_tokens_reduced_for_async_restore():
         use_kv_connector=mock_kv(matched_tokens=restored_tokens, is_async=True),
         block_size=block_size,
     )
+    scheduler.connector.has_restore_candidate = Mock(return_value=True)
     (request,) = create_requests(
         num_requests=1,
         num_tokens=total_tokens,
@@ -1678,6 +1679,7 @@ def test_scheduler_reports_restore_fallback_when_connector_cannot_match():
     scheduler.add_request(request)
 
     scheduler.connector = Mock()
+    scheduler.connector.has_restore_candidate.return_value = True
     scheduler.connector.get_num_new_matched_tokens.return_value = (None, False)
     scheduler.connector.build_connector_meta.return_value = SimpleNamespace(requests=[])
 
