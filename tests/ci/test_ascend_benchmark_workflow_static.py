@@ -506,6 +506,21 @@ def test_benchmark_script_does_not_force_max_model_len():
     assert script.count('"${max_model_len_args[@]}"') == 2
 
 
+def test_benchmark_script_disables_torch_backend_autoload_for_server_processes():
+    script = (
+        Path(__file__).resolve().parents[2]
+        / ".github/workflows/scripts/run_ascend_benchmark_ci.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "export TORCH_DEVICE_BACKEND_AUTOLOAD=0" in script
+    sudo_env = script[
+        script.index("SUDO_PRESERVE_ENV_VARS=(") : script.index(
+            ")", script.index("SUDO_PRESERVE_ENV_VARS=(")
+        )
+    ]
+    assert "TORCH_DEVICE_BACKEND_AUTOLOAD" in sudo_env
+
+
 def test_benchmark_script_does_not_default_pr_hardware_to_b3():
     script = (
         Path(__file__).resolve().parents[2]
