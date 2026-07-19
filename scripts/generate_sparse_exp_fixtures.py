@@ -9,7 +9,6 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 
-
 ROOT = Path(".cache/ascend_sparse_experiments")
 MODEL_DIR = ROOT / "tiny_llama_model"
 TEAL_ROOT = ROOT / "teal_tiny_s0.50"

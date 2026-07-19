@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from pathlib import Path
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 SCRIPT_DIR = Path(__file__).resolve().parents[2] / "scripts"

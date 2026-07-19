@@ -10,7 +10,6 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
 
-
 FORCE_FIRST_TOKEN_EXTRA_ARG = "force_first_token_id"
 
 

@@ -24,8 +24,14 @@ def test_llama_mlp_sparsity_injection():
     from vllm.sparsity.layers import build_sparsifier
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        torch.save(torch.tensor(0.3), os.path.join(tmpdir, "layers.2.mlp.gate_up.threshold.pt"))
-        torch.save(torch.tensor(0.4), os.path.join(tmpdir, "layers.2.mlp.down.threshold.pt"))
+        torch.save(
+            torch.tensor(0.3),
+            os.path.join(tmpdir, "layers.2.mlp.gate_up.threshold.pt"),
+        )
+        torch.save(
+            torch.tensor(0.4),
+            os.path.join(tmpdir, "layers.2.mlp.down.threshold.pt"),
+        )
 
         cfg = ActivationSparsityConfig(enable=True, calibration_path=tmpdir)
         gate_up = build_sparsifier(cfg, layer_idx=2, proj_name="mlp.gate_up")
@@ -46,8 +52,14 @@ def test_llama_attention_sparsity_injection():
     from vllm.sparsity.layers import build_sparsifier
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        torch.save(torch.tensor(0.3), os.path.join(tmpdir, "layers.0.self_attn.qkv.threshold.pt"))
-        torch.save(torch.tensor(0.4), os.path.join(tmpdir, "layers.0.self_attn.o.threshold.pt"))
+        torch.save(
+            torch.tensor(0.3),
+            os.path.join(tmpdir, "layers.0.self_attn.qkv.threshold.pt"),
+        )
+        torch.save(
+            torch.tensor(0.4),
+            os.path.join(tmpdir, "layers.0.self_attn.o.threshold.pt"),
+        )
 
         cfg = ActivationSparsityConfig(enable=True, calibration_path=tmpdir)
         qkv = build_sparsifier(cfg, layer_idx=0, proj_name="self_attn.qkv")

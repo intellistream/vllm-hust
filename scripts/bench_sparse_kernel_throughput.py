@@ -18,7 +18,6 @@ from typing import Any
 
 import torch
 
-
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 SPARSE_MARKER_ENV_NAMES = (

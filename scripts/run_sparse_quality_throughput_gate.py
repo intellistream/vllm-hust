@@ -18,7 +18,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = Path(".cache/sparse_kernel_results")
 SUPPORTED_PROJECTIONS = (
@@ -334,7 +333,11 @@ def build_throughput_command(args: argparse.Namespace, output_path: Path) -> lis
     append_repeated(command, "--inline-text", args.inline_text)
     append_repeated(command, "--target-projection", args.target_projection)
     append_repeated(command, "--target-layer", args.target_layer)
-    append_if_value(command, "--sparse-gemv-min-sparsity", args.sparse_gemv_min_sparsity)
+    append_if_value(
+        command,
+        "--sparse-gemv-min-sparsity",
+        args.sparse_gemv_min_sparsity,
+    )
     append_if_value(command, "--sparse-marker-limit", args.sparse_marker_limit)
     if args.trust_remote_code:
         command.append("--trust-remote-code")
@@ -447,10 +450,13 @@ def validate_ppl_result(
         return metrics, failures
 
     if setup.get("model") != args.model:
-        failures.append(f"PPL model mismatch: expected {args.model}, got {setup.get('model')}")
+        failures.append(
+            f"PPL model mismatch: expected {args.model}, got {setup.get('model')}"
+        )
     if not math.isclose(float(setup.get("sparsity", -1.0)), args.sparsity):
         failures.append(
-            f"PPL sparsity mismatch: expected {args.sparsity}, got {setup.get('sparsity')}"
+            "PPL sparsity mismatch: "
+            f"expected {args.sparsity}, got {setup.get('sparsity')}"
         )
     if setup.get("vllm_score_mode") != args.vllm_score_mode:
         failures.append(
@@ -469,7 +475,12 @@ def validate_ppl_result(
         "vllm_target_projections",
         setup.get("target_projections"),
     )
-    compare_optional_list(failures, "PPL target layers", args.target_layer, setup_layers)
+    compare_optional_list(
+        failures,
+        "PPL target layers",
+        args.target_layer,
+        setup_layers,
+    )
     compare_optional_list(
         failures,
         "PPL target projections",
@@ -519,7 +530,8 @@ def validate_throughput_result(
 
     if data.get("method") != args.method:
         failures.append(
-            f"throughput method mismatch: expected {args.method}, got {data.get('method')}"
+            "throughput method mismatch: "
+            f"expected {args.method}, got {data.get('method')}"
         )
     if data.get("model") != args.model:
         failures.append(

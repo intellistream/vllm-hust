@@ -14,7 +14,7 @@ available. Other backends use a dense masked fallback for correctness.
 
 import json
 import os
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -279,7 +279,7 @@ def _record_sparse_gemv_invocation(
         return
 
     marker_limit = _marker_record_limit()
-    if _SPARSE_GEMV_MARKER_RECORDS >= marker_limit:
+    if marker_limit <= _SPARSE_GEMV_MARKER_RECORDS:
         _SPARSE_GEMV_MARKED = marker_limit > 0
         return
     marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
@@ -307,7 +307,7 @@ def _record_sparse_gemv_invocation(
         with open(marker_path, "a", encoding="utf-8") as marker_file:
             marker_file.write(json.dumps(payload, sort_keys=True) + "\n")
         _SPARSE_GEMV_MARKER_RECORDS += 1
-        _SPARSE_GEMV_MARKED = _SPARSE_GEMV_MARKER_RECORDS >= marker_limit
+        _SPARSE_GEMV_MARKED = marker_limit <= _SPARSE_GEMV_MARKER_RECORDS
     except OSError:
         logger.warning("Failed to write sparse GEMV marker to %s", marker_path)
 
@@ -326,7 +326,7 @@ def _record_ascend_sparse_linear_marker(
         return
 
     marker_limit = _marker_record_limit()
-    if _ASCEND_SPARSE_LINEAR_MARKER_RECORDS >= marker_limit:
+    if marker_limit <= _ASCEND_SPARSE_LINEAR_MARKER_RECORDS:
         _ASCEND_SPARSE_LINEAR_MARKED = marker_limit > 0
         return
 
@@ -351,7 +351,7 @@ def _record_ascend_sparse_linear_marker(
             marker_file.write(json.dumps(payload, sort_keys=True) + "\n")
         _ASCEND_SPARSE_LINEAR_MARKER_RECORDS += 1
         _ASCEND_SPARSE_LINEAR_MARKED = (
-            _ASCEND_SPARSE_LINEAR_MARKER_RECORDS >= marker_limit
+            marker_limit <= _ASCEND_SPARSE_LINEAR_MARKER_RECORDS
         )
     except OSError:
         return
@@ -650,7 +650,7 @@ def sparse_gemv_direct_t_cached_impl(
 
 def can_use_sparse_gemv(
     tp_size: int,
-    quant_config: Optional[Any],
+    quant_config: Any | None,
     dtype: torch.dtype,
     use_sparse_gemv_flag: bool = False,
 ) -> bool:
@@ -661,6 +661,4 @@ def can_use_sparse_gemv(
         return False
     if quant_config is not None:
         return False
-    if dtype not in (torch.float16, torch.bfloat16):
-        return False
-    return True
+    return dtype in (torch.float16, torch.bfloat16)

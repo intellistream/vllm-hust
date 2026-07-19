@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import json
 import os
 import tempfile
 
@@ -24,9 +23,8 @@ def test_load_threshold_success():
 
 
 def test_load_threshold_missing():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with pytest.raises(FileNotFoundError):
-            load_threshold(tmpdir, layer_idx=0, proj_name="mlp.down")
+    with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(FileNotFoundError):
+        load_threshold(tmpdir, layer_idx=0, proj_name="mlp.down")
 
 
 def test_compute_thresholds_from_histograms():
