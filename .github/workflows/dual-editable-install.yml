@@ -1,0 +1,55 @@
+name: Dual Editable Install
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_hust_ref:
+        description: vllm-hust ref to validate
+        required: false
+        default: main
+      vllm_ascend_hust_ref:
+        description: vllm-ascend-hust ref to validate
+        required: false
+        default: main
+      keep_work_dir:
+        description: Keep temporary work directory after failure
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-dual-editable-install:
+    runs-on:
+      - self-hosted
+      - ascend
+      - 910b
+      - docker
+    timeout-minutes: 60
+    env:
+      VLLM_HUST_REPO: ${{ github.workspace }}/vllm-hust
+      VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
+      PYTHON_VERSION: "3.12"
+      KEEP_WORK_DIR: ${{ inputs.keep_work_dir }}
+      UV_NO_CACHE: "1"
+
+    steps:
+      - name: Checkout vllm-hust
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: vllm-hust
+          ref: ${{ inputs.vllm_hust_ref }}
+
+      - name: Checkout vllm-ascend-hust
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: vLLM-HUST/vllm-ascend-hust
+          path: vllm-ascend-hust
+          ref: ${{ inputs.vllm_ascend_hust_ref }}
+
+      - name: Install uv
+        run: python3 -m pip install --user uv
+
+      - name: Validate clean dual editable install
+        run: bash vllm-hust/scripts/ci/validate_dual_editable_install.sh
