@@ -16,8 +16,8 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
-    KIVIInt4FullAttentionSpec,
     HiddenStateCacheSpec,
+    KIVIInt4FullAttentionSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -1460,20 +1460,6 @@ class SinkFullAttentionManager(FullAttentionManager):
 
 
 
-spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
-    FullAttentionSpec: FullAttentionManager,
-    TQFullAttentionSpec: FullAttentionManager,
-    MLAAttentionSpec: FullAttentionManager,
-    KIVIInt4FullAttentionSpec: FullAttentionManager,
-    SlidingWindowSpec: SlidingWindowManager,
-    SlidingWindowMLASpec: SlidingWindowManager,
-    ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
-    MambaSpec: MambaManager,
-    CrossAttentionSpec: CrossAttentionManager,
-    SinkFullAttentionSpec: SinkFullAttentionManager,
-}
-
-
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
     max_num_batched_tokens: int,
@@ -1566,7 +1552,14 @@ def register_all_kvcache_specs(vllm_config):
         uniform_type_base_spec=FullAttentionSpec,
     )
     KVCacheSpecRegistry.register(
-        MLAAttentionSpec, full_attention_manager, uniform_type_base_spec=FullAttentionSpec
+        KIVIInt4FullAttentionSpec,
+        full_attention_manager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
+    KVCacheSpecRegistry.register(
+        MLAAttentionSpec,
+        full_attention_manager,
+        uniform_type_base_spec=FullAttentionSpec,
     )
     KVCacheSpecRegistry.register(
         RSWASpec, RSWAManager, uniform_type_base_spec=FullAttentionSpec

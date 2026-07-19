@@ -415,7 +415,9 @@ class KIVIInt4FullAttentionSpec(FullAttentionSpec):
 
         merged = super().merge(specs)
 
-        assert all(spec.kivi_group_size == specs[0].kivi_group_size for spec in specs), (
+        assert all(
+            spec.kivi_group_size == specs[0].kivi_group_size for spec in specs
+        ), (
             "All merged KIVI specs must share group size."
         )
         assert all(spec.quant_bits == specs[0].quant_bits for spec in specs), (

@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KIVIInt4FullAttentionSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -173,6 +174,29 @@ def are_uniform_specs(*specs: KVCacheSpec) -> bool:
 
 class TestKVCacheSpecRegistry:
     """Test the core registry functionality."""
+
+    def test_kivi_registered_with_full_attention_manager(self):
+        spec = KIVIInt4FullAttentionSpec(
+            block_size=64,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.bfloat16,
+            kivi_group_size=32,
+        )
+        full_spec = FullAttentionSpec(
+            block_size=64,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+
+        assert KVCacheSpecRegistry.get_manager_class(
+            spec
+        ) is KVCacheSpecRegistry.get_manager_class(full_spec)
+        assert (
+            KVCacheSpecRegistry.get_uniform_type_base_spec(spec)
+            is FullAttentionSpec
+        )
 
     def test_builtin_kvcache_specs_registered(self):
         assert set(spec_manager_map) <= set(_REGISTRY_KVCACHESPEC_LIST)

@@ -41,10 +41,10 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KIVIInt4FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
     get_kv_quant_mode,
-    KIVIInt4FullAttentionSpec,
 )
 
 if TYPE_CHECKING:
