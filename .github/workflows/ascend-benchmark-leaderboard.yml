@@ -305,6 +305,7 @@ jobs:
       CHIP_COUNT: "1"
       NODE_COUNT: "1"
       SAME_SPEC_BENCHMARK_ENABLED: ${{ vars.VLLM_HUST_SAME_SPEC_BENCHMARK_ENABLED || '1' }}
+      SAME_SPEC_READY_TIMEOUT_SECONDS: ${{ (github.ref == 'refs/heads/e2e/perfgate-integration-20260719' || github.event.pull_request.base.ref == 'e2e/perfgate-integration-20260719') && '1800' || '600' }}
       PERFGATE_MODE: ${{ github.event_name == 'pull_request' && 'enforce' || (vars.VLLM_HUST_PERFGATE_MODE || 'report') }}
       PERFGATE_BASELINE_BRANCH: ${{ (github.ref == 'refs/heads/e2e/perfgate-integration-20260719' || github.event.pull_request.base.ref == 'e2e/perfgate-integration-20260719') && 'benchmark-baselines-e2e-vllm-hust-20260719' || 'benchmark-baselines' }}
       PERFGATE_STAGE2_BASE_BRANCH: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'e2e/perfgate-integration-20260719' && 'e2e/perfgate-integration-20260719' || 'main' }}
