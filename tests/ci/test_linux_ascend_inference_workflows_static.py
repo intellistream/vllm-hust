@@ -125,6 +125,12 @@ def test_inference_scripts_disable_backend_autoload_for_server_processes():
             )
         ]
         assert "TORCH_DEVICE_BACKEND_AUTOLOAD" in sudo_env
+        assert "append_python_library_path()" in text
+        assert (
+            'LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}'
+            '${python_library_path}"'
+            in text
+        )
 
 
 def test_inference_workflows_fetch_target_sha_without_default_branch_clone():

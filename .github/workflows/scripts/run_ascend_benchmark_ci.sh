@@ -67,6 +67,20 @@ if [[ -z "$PYTHON_BIN" ]]; then
   exit 127
 fi
 
+append_python_library_path() {
+  local python_library_path
+
+  python_library_path=$("$PYTHON_BIN" -c 'import os, sys; print(os.path.join(sys.prefix, "lib"))')
+  [[ -d "$python_library_path" ]] || return 0
+
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *":$python_library_path:"*) ;;
+    *) export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${python_library_path}" ;;
+  esac
+}
+
+append_python_library_path
+
 VLLM_CLI=("$PYTHON_BIN" -m vllm.entrypoints.cli.main)
 CURL_BIN=${CURL_BIN:-$(command -v curl || true)}
 if [[ -z "$CURL_BIN" ]]; then
