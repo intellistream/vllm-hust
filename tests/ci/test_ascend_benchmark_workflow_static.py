@@ -540,6 +540,9 @@ def test_ascend_torch_stack_is_installed_before_preinstall_preflight():
         'ASCEND_TORCH_NPU_VERSION="${ASCEND_TORCH_NPU_VERSION:-2.10.0}"'
         in ensure_script
     )
+    assert 'ASCEND_NUMPY_SPEC="${ASCEND_NUMPY_SPEC:-numpy}"' in ensure_script
+    assert 'numpy_version = dist_version("numpy")' in ensure_script
+    assert '"$ASCEND_NUMPY_SPEC"' in ensure_script
     assert "import torch" in ensure_script
     assert "import torch_npu" in ensure_script
 
