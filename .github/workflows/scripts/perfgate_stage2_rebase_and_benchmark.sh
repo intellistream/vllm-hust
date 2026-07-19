@@ -5,7 +5,9 @@ GITHUB_ENV=${GITHUB_ENV:-/dev/null}
 MODE=${PERFGATE_MODE:-report}
 ORIGINAL_REF=$(git rev-parse HEAD)
 FORK_POINT=${FORK_POINT:-}
-M2_COMMIT=$(git rev-parse origin/main 2>/dev/null || true)
+BASE_BRANCH=${PERFGATE_STAGE2_BASE_BRANCH:-main}
+BASE_REF="origin/$BASE_BRANCH"
+M2_COMMIT=$(git rev-parse "$BASE_REF" 2>/dev/null || true)
 RUN_ID_BASE=${RUN_ID:-ci-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-${GITHUB_SHA:-local}}
 STAGE2_RUN_ID=${PERFGATE_STAGE2_RUN_ID:-${RUN_ID_BASE}-stage2}
 STAGE2_RESULT_ROOT=${PERFGATE_STAGE2_RESULT_ROOT:-${GITHUB_WORKSPACE:-$PWD}/.benchmarks/ci/$STAGE2_RUN_ID}
@@ -63,8 +65,8 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$STAGE2_RESULT_ROOT"
-git fetch origin main
-M2_COMMIT=$(git rev-parse origin/main)
+git fetch origin "$BASE_BRANCH"
+M2_COMMIT=$(git rev-parse "$BASE_REF")
 write_env PERFGATE_M2_COMMIT "$M2_COMMIT"
 
 if [[ -n "$FORK_POINT" && "$FORK_POINT" == "$M2_COMMIT" && "$MODE" != "enforce" ]]; then
@@ -79,7 +81,7 @@ fi
 
 git checkout -B "$TEMP_BRANCH" "$ORIGINAL_REF"
 set +e
-git rebase origin/main >"$CONFLICT_FILE" 2>&1
+git rebase "$BASE_REF" >"$CONFLICT_FILE" 2>&1
 rebase_rc=$?
 set -e
 if [[ "$rebase_rc" -ne 0 ]]; then

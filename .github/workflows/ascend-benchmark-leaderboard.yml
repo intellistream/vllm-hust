@@ -2,7 +2,9 @@ name: Ascend Benchmark Leaderboard
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - e2e/perfgate-integration-20260719
   pull_request:
     types: [labeled]
   issue_comment:
@@ -244,7 +246,10 @@ jobs:
     if: >-
       always() &&
       (
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/e2e/perfgate-integration-20260719')
+        ) ||
         github.event_name == 'workflow_dispatch' ||
         github.event_name == 'schedule' ||
         (
@@ -301,6 +306,8 @@ jobs:
       NODE_COUNT: "1"
       SAME_SPEC_BENCHMARK_ENABLED: ${{ vars.VLLM_HUST_SAME_SPEC_BENCHMARK_ENABLED || '1' }}
       PERFGATE_MODE: ${{ github.event_name == 'pull_request' && 'enforce' || (vars.VLLM_HUST_PERFGATE_MODE || 'report') }}
+      PERFGATE_BASELINE_BRANCH: ${{ (github.ref == 'refs/heads/e2e/perfgate-integration-20260719' || github.event.pull_request.base.ref == 'e2e/perfgate-integration-20260719') && 'benchmark-baselines-e2e-vllm-hust-20260719' || 'benchmark-baselines' }}
+      PERFGATE_STAGE2_BASE_BRANCH: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'e2e/perfgate-integration-20260719' && 'e2e/perfgate-integration-20260719' || 'main' }}
       PERFGATE_SPEC_FILE: ${{ vars.VLLM_HUST_PERFGATE_SPEC_FILE || '' }}
       MAIN_SAME_SPEC_SPEC_FILE: ${{ vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || 'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-qwen25-14b-910b2.json' }}
       SAME_SPEC_SPEC_FILE: ${{ vars.VLLM_HUST_SAME_SPEC_SPEC_FILE || '' }}
@@ -1213,7 +1220,7 @@ jobs:
           done
 
       - name: Run main perfgate baseline producer
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/e2e/perfgate-integration-20260719') }}
         env:
           WORKSPACE_ROOT: ${{ github.workspace }}
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
@@ -1693,11 +1700,12 @@ jobs:
 
   store-main-perfgate-baseline:
     name: Store main perfgate baseline
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/e2e/perfgate-integration-20260719') }}
     needs: ascend-benchmark
     runs-on: ubuntu-latest
     env:
       TARGET_REPO_SHA: ${{ github.sha }}
+      PERFGATE_BASELINE_BRANCH: ${{ github.ref == 'refs/heads/e2e/perfgate-integration-20260719' && 'benchmark-baselines-e2e-vllm-hust-20260719' || 'benchmark-baselines' }}
     permissions:
       contents: write
       actions: read

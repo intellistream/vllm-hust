@@ -37,7 +37,10 @@ def test_main_push_reaches_benchmark_and_baseline_store_jobs():
     workflow = workflow_yaml()[True]
     text = workflow_text()
 
-    assert workflow["push"]["branches"] == ["main"]
+    assert workflow["push"]["branches"] == [
+        "main",
+        "e2e/perfgate-integration-20260719",
+    ]
     benchmark_job = text[
         text.index("  ascend-benchmark:") : text.index(
             "  store-main-perfgate-baseline:"
@@ -49,10 +52,20 @@ def test_main_push_reaches_benchmark_and_baseline_store_jobs():
     )
     store_job = text[text.index("  store-main-perfgate-baseline:") :]
     assert (
-        "if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+        "github.ref == 'refs/heads/main' || "
+        "github.ref == 'refs/heads/e2e/perfgate-integration-20260719'"
         in store_job
     )
     assert "needs: ascend-benchmark" in store_job
+
+
+def test_e2e_branch_uses_isolated_baseline_and_stage2_base():
+    text = workflow_text()
+
+    assert "refs/heads/e2e/perfgate-integration-20260719" in text
+    assert "benchmark-baselines-e2e-vllm-hust-20260719" in text
+    assert "PERFGATE_STAGE2_BASE_BRANCH:" in text
+    assert "PERFGATE_BASELINE_BRANCH:" in text
 
 
 def test_main_perfgate_producer_uses_shared_pr_spec_without_changing_formal_defaults():
@@ -63,7 +76,9 @@ def test_main_perfgate_producer_uses_shared_pr_spec_without_changing_formal_defa
         )
     ]
 
-    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in producer
+    assert "github.event_name == 'push'" in producer
+    assert "github.ref == 'refs/heads/main'" in producer
+    assert "github.ref == 'refs/heads/e2e/perfgate-integration-20260719'" in producer
     assert "Qwen/Qwen2.5-3B-Instruct" in producer
     assert 'PERFGATE_MODEL_PRECISION: BF16' in producer
     assert 'PERFGATE_NUM_PROMPTS: "8"' in producer

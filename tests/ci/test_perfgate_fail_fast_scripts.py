@@ -152,6 +152,18 @@ def test_stage2_revalidates_latest_main_in_enforce_mode(tmp_path: Path) -> None:
     assert "PERFGATE_STAGE2_BASELINE_AVAILABLE" in github_env
 
 
+def test_stage2_accepts_an_explicit_base_branch(tmp_path: Path) -> None:
+    env = _stage2_env(tmp_path)
+    env["PERFGATE_STAGE2_BASE_BRANCH"] = "e2e/perfgate-integration-20260719"
+
+    result = _run_stage2(env)
+
+    assert result.returncode == 0
+    assert "PERFGATE_STAGE2_EXECUTED" in Path(env["GITHUB_ENV"]).read_text(
+        encoding="utf-8"
+    )
+
+
 def test_stage2_rebase_conflict_fails_only_in_enforce_mode(tmp_path: Path) -> None:
     enforce_env = _stage2_env(
         tmp_path / "enforce",
