@@ -9,6 +9,9 @@ WORKFLOW_PATHS = (
     REPO_ROOT / ".github/workflows/linux-ascend-inference-smoke.yml",
     REPO_ROOT / ".github/workflows/linux-ascend-inference-regression.yml",
 )
+TORCH_STACK_HELPER = (
+    REPO_ROOT / ".github/workflows/scripts/ensure_ascend_torch_stack.sh"
+)
 
 
 def test_pr_inference_workflows_checkout_with_https_without_ssh_known_hosts():
@@ -43,7 +46,7 @@ def test_inference_workflows_install_no_build_isolation_build_dependencies():
         assert '"setuptools-rust>=1.9.0"' in text
 
 
-def test_inference_workflows_remove_stale_torch_packages_and_verify_import():
+def test_inference_workflows_install_runtime_dependencies_and_verify_import():
     for workflow_path in WORKFLOW_PATHS:
         text = workflow_path.read_text(encoding="utf-8")
         install_step = text[
@@ -57,21 +60,35 @@ def test_inference_workflows_remove_stale_torch_packages_and_verify_import():
             )
         ]
 
-        assert (
-            '"$PYTHON_BIN" -m pip uninstall -y torchvision torchaudio' in install_step
-        )
+        assert "ensure_ascend_runtime_dependencies.sh" in install_step
         assert "import vllm.entrypoints.openai.api_server" in verify_step
         assert "torchvision importable:" in verify_step
         assert "torchaudio importable:" in verify_step
 
 
 def test_inference_workflows_install_matching_ascend_torch_stack():
+    helper_text = TORCH_STACK_HELPER.read_text(encoding="utf-8")
+
     for workflow_path in WORKFLOW_PATHS:
         text = workflow_path.read_text(encoding="utf-8")
 
         assert "Install Ascend torch stack for preflight" in text
-        assert '"$PYTHON_BIN" -c "import torch, torch_npu;' in text
-        assert '"$PYTHON_BIN" -m pip install "torch==2.9.0" "torch-npu==2.9.0"' in text
+        assert "ensure_ascend_torch_stack.sh" in text
+
+    assert 'ASCEND_TORCH_VERSION="${ASCEND_TORCH_VERSION:-2.10.0}"' in helper_text
+    assert (
+        'ASCEND_TORCH_NPU_VERSION="${ASCEND_TORCH_NPU_VERSION:-2.10.0}"'
+        in helper_text
+    )
+    assert (
+        'ASCEND_TORCHVISION_VERSION="${ASCEND_TORCHVISION_VERSION:-0.25.0}"'
+        in helper_text
+    )
+    assert (
+        'ASCEND_TORCHAUDIO_VERSION="${ASCEND_TORCHAUDIO_VERSION:-2.10.0}"'
+        in helper_text
+    )
+    assert 'ASCEND_NUMPY_SPEC="${ASCEND_NUMPY_SPEC:-numpy<2.0.0}"' in helper_text
 
 
 def test_inference_workflows_disable_backend_autoload_during_install_checks():
@@ -90,6 +107,24 @@ def test_inference_workflows_disable_backend_autoload_during_install_checks():
 
         assert 'TORCH_DEVICE_BACKEND_AUTOLOAD: "0"' in install_step
         assert 'TORCH_DEVICE_BACKEND_AUTOLOAD: "0"' in verify_step
+
+
+def test_inference_scripts_disable_backend_autoload_for_server_processes():
+    for script_name in (
+        "run_e2e_serve_smoke.sh",
+        "run_e2e_inference_regression.sh",
+    ):
+        text = (REPO_ROOT / ".github/workflows/scripts" / script_name).read_text(
+            encoding="utf-8"
+        )
+
+        assert "export TORCH_DEVICE_BACKEND_AUTOLOAD=0" in text
+        sudo_env = text[
+            text.index("SUDO_PRESERVE_ENV_VARS=(") : text.index(
+                ")", text.index("SUDO_PRESERVE_ENV_VARS=(")
+            )
+        ]
+        assert "TORCH_DEVICE_BACKEND_AUTOLOAD" in sudo_env
 
 
 def test_inference_workflows_fetch_target_sha_without_default_branch_clone():
