@@ -65,6 +65,8 @@ def test_e2e_branch_uses_isolated_baseline_and_stage2_base():
     assert "refs/heads/e2e/perfgate-integration-20260719" in text
     assert "benchmark-baselines-e2e-vllm-hust-20260719" in text
     assert "e2e/fix-incomplete-model-cache-20260719" in text
+    assert "HUST_ASCEND_MANAGER_REPO_REF:" in text
+    assert "fix/torch210-all-architectures" in text
     assert "SAME_SPEC_READY_TIMEOUT_SECONDS:" in text
     assert "&& '1800' || '600'" in text
     assert "PERFGATE_STAGE2_BASE_BRANCH:" in text

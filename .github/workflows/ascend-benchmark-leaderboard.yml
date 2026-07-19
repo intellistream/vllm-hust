@@ -331,6 +331,7 @@ jobs:
       ISSUE_COMMENT_PR_NUMBER: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_number || '' }}
       HUST_ASCEND_MANAGER_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/ascend-runtime-manager.git' || 'git@github.com:vLLM-HUST/ascend-runtime-manager.git' }}
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
+      HUST_ASCEND_MANAGER_REPO_REF: ${{ (github.ref == 'refs/heads/e2e/perfgate-integration-20260719' || github.event.pull_request.base.ref == 'e2e/perfgate-integration-20260719') && 'fix/torch210-all-architectures' || 'main' }}
       # Disable precompiled CUDA wheel fetch from wheels.vllm.ai.
       # The Ascend benchmark uses the vllm-ascend-hust plugin, not CUDA
       # precompiled wheels, so this avoids transient SSL failures.
@@ -686,13 +687,14 @@ jobs:
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
+            local target_ref=${3:-main}
             local attempts=4
             local delay_seconds=15
             local try=1
 
             rm -rf "$target_dir"
             while [[ "$try" -le "$attempts" ]]; do
-              if git clone --depth 1 "$repo_url" "$target_dir"; then
+              if git clone --depth 1 --branch "$target_ref" "$repo_url" "$target_dir"; then
                 return 0
               fi
               echo "Clone failed ($try/$attempts): $repo_url" >&2
@@ -830,7 +832,7 @@ jobs:
             return 1
           }
 
-          clone_with_retry "$HUST_ASCEND_MANAGER_REPO_URL" "$GITHUB_WORKSPACE/ascend-runtime-manager"
+          clone_with_retry "$HUST_ASCEND_MANAGER_REPO_URL" "$GITHUB_WORKSPACE/ascend-runtime-manager" "$HUST_ASCEND_MANAGER_REPO_REF"
 
       - name: Prepare Hugging Face cache directories
         run: |
