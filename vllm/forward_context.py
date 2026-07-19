@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,6 +25,38 @@ last_logging_time: float = 0
 forward_start_time: float = 0
 batchsize_logging_interval: float = envs.VLLM_LOG_BATCHSIZE_INTERVAL
 batchsize_forward_time: defaultdict = defaultdict(list)
+
+
+@dataclass(frozen=True)
+class CUDAGraphRuntimeMetadata:
+    """Opaque metadata that distinguishes runtime-registered graph keys."""
+
+    token_offset: int
+    variant: str
+    backend_tag: str
+    metadata_mode: str = ""
+
+    def is_valid(self) -> bool:
+        """Return whether the metadata satisfies the core schema."""
+
+        def valid_tag(value: object, *, required: bool) -> bool:
+            if not isinstance(value, str) or len(value) > 128:
+                return False
+            if required and not value:
+                return False
+            return not any(char.isspace() for char in value)
+
+        if (
+            not isinstance(self.token_offset, int)
+            or isinstance(self.token_offset, bool)
+            or self.token_offset <= 0
+        ):
+            return False
+        if not valid_tag(self.variant, required=True) or not valid_tag(
+            self.backend_tag, required=True
+        ):
+            return False
+        return valid_tag(self.metadata_mode, required=False)
 
 
 @dataclass(frozen=True)
@@ -57,26 +89,10 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
-    start_num_tokens: int = 0
+    runtime_metadata: CUDAGraphRuntimeMetadata | None = None
     """
-    For DUAL_INPLACE split-batch mode: the starting token offset for the
-    second split's offset view into the original buffer. When 0 (default),
-    the descriptor refers to a normal (non-offset) graph.
-    """
-    graph_variant: str = ""
-    """
-    For DUAL_INPLACE: identifies the split mode variant, e.g.
-    "inplace_serial" or "inplace_parallel". Empty string for normal graphs.
-    """
-    attention_backend: str = ""
-    """
-    For DUAL_INPLACE: the attention backend tag (e.g. "fia", "pa") used
-    during graph capture. Empty string for normal graphs.
-    """
-    capture_metadata_mode: str = ""
-    """
-    For DUAL_INPLACE: the metadata mode used during graph capture.
-    Empty string for normal graphs.
+    Opaque metadata for an explicitly registered runtime graph key. None for
+    statically captured and eager batches.
     """
 
 
@@ -206,20 +222,13 @@ class ForwardContext:
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
-    split_inplace_mode: str | None = None
+    is_secondary_stream: bool = False
     """
-    For DUAL_INPLACE: the current split mode, e.g. "inplace_serial" or
-    "inplace_parallel". None when not in a split-batch execution path.
+    Whether the forward pass is executing on a secondary device stream.
     """
-    in_parallel_streams: bool = False
+    allow_runtime_graph_capture: bool = False
     """
-    For DUAL_INPLACE: whether the current forward pass is executing on
-    the secondary (parallel) stream.
-    """
-    allow_inplace_lazy_capture: bool = False
-    """
-    For DUAL_INPLACE: whether lazy capture of an offset graph is allowed
-    during this forward pass.
+    Whether the backend may capture a runtime-registered graph for this pass.
     """
 
     def __post_init__(self):
@@ -228,15 +237,13 @@ class ForwardContext:
         )
 
 
-_forward_context_local = threading.local()
+_forward_context: ContextVar[ForwardContext | None] = ContextVar(
+    "forward_context", default=None
+)
 
 
 def _get_current_forward_context() -> ForwardContext | None:
-    return getattr(_forward_context_local, "value", None)
-
-
-def _set_current_forward_context(forward_context: ForwardContext | None) -> None:
-    _forward_context_local.value = forward_context
+    return _forward_context.get()
 
 
 def get_forward_context() -> ForwardContext:
@@ -264,9 +271,8 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
-    split_inplace_mode: str | None = None,
-    in_parallel_streams: bool = False,
-    allow_inplace_lazy_capture: bool = False,
+    is_secondary_stream: bool = False,
+    allow_runtime_graph_capture: bool = False,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -285,9 +291,8 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
-        split_inplace_mode=split_inplace_mode,
-        in_parallel_streams=in_parallel_streams,
-        allow_inplace_lazy_capture=allow_inplace_lazy_capture,
+        is_secondary_stream=is_secondary_stream,
+        allow_runtime_graph_capture=allow_runtime_graph_capture,
     )
 
 
@@ -297,12 +302,11 @@ def override_forward_context(forward_context: ForwardContext | None):
     This is used to override the forward context for a specific
     forward pass.
     """
-    prev_context = _get_current_forward_context()
-    _set_current_forward_context(forward_context)
+    token = _forward_context.set(forward_context)
     try:
         yield
     finally:
-        _set_current_forward_context(prev_context)
+        _forward_context.reset(token)
 
 
 @contextmanager
@@ -317,9 +321,8 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
-    split_inplace_mode: str | None = None,
-    in_parallel_streams: bool = False,
-    allow_inplace_lazy_capture: bool = False,
+    is_secondary_stream: bool = False,
+    allow_runtime_graph_capture: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -380,9 +383,8 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
-        split_inplace_mode=split_inplace_mode,
-        in_parallel_streams=in_parallel_streams,
-        allow_inplace_lazy_capture=allow_inplace_lazy_capture,
+        is_secondary_stream=is_secondary_stream,
+        allow_runtime_graph_capture=allow_runtime_graph_capture,
     )
 
     try:

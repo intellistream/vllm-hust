@@ -5,7 +5,7 @@ from dataclasses import replace
 from itertools import product
 
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import BatchDescriptor
+from vllm.forward_context import BatchDescriptor, CUDAGraphRuntimeMetadata
 from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
 
@@ -135,10 +135,6 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
-        start_num_tokens: int = 0,
-        graph_variant: str = "",
-        attention_backend: str = "",
-        capture_metadata_mode: str = "",
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         uniform_decode_query_len = self.uniform_decode_query_len
@@ -157,140 +153,57 @@ class CudagraphDispatcher:
             uniform=uniform_decode,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
-            start_num_tokens=start_num_tokens,
-            graph_variant=graph_variant,
-            attention_backend=attention_backend,
-            capture_metadata_mode=capture_metadata_mode,
         )
 
-    def _create_inplace_offset_batch_descriptor(
+    def _create_runtime_batch_descriptor(
         self,
         num_tokens: int,
-        uniform_decode: bool,
-        has_lora: bool,
-        start_num_tokens: int,
-        graph_variant: str = "",
-        attention_backend: str = "",
-        capture_metadata_mode: str = "",
+        runtime_metadata: CUDAGraphRuntimeMetadata,
     ) -> BatchDescriptor:
-        """Create a BatchDescriptor for inplace offset graph keys.
-
-        Inplace offset keys are used by DUAL_INPLACE split-batch mode where
-        the second split replays from an offset view into the original buffer.
-        Unlike normal padded descriptors, offset descriptors use the exact
-        num_tokens (no padding lookup) and require uniform decode with
-        request-aligned token counts.
-        """
-        if num_tokens <= 0:
-            raise ValueError(
-                "num_tokens must be positive for inplace offset keys")
-        if start_num_tokens <= 0:
-            raise ValueError(
-                "start_num_tokens must be positive for inplace offset keys")
-        if not uniform_decode:
-            raise ValueError(
-                "inplace offset keys only support uniform decode")
-        if num_tokens % self.uniform_decode_query_len != 0:
-            raise ValueError(
-                "num_tokens must be divisible by uniform_decode_query_len "
-                "for inplace offset keys")
-
+        """Create an exact descriptor for a validated runtime graph key."""
         return BatchDescriptor(
             num_tokens=num_tokens,
             num_reqs=num_tokens // self.uniform_decode_query_len,
             uniform=True,
-            has_lora=has_lora,
-            start_num_tokens=start_num_tokens,
-            graph_variant=graph_variant,
-            attention_backend=attention_backend,
-            capture_metadata_mode=capture_metadata_mode,
+            runtime_metadata=runtime_metadata,
         )
 
-    def _create_descriptor_aware_batch_descriptor(
+    def _dispatch_runtime_key(
         self,
         num_tokens: int,
         uniform_decode: bool,
         has_lora: bool,
-        *,
-        num_active_loras: int = 0,
-        graph_variant: str = "",
-        attention_backend: str = "",
-        capture_metadata_mode: str = "",
-    ) -> BatchDescriptor:
-        """Create a BatchDescriptor for descriptor-aware graph keys.
-
-        Descriptor-aware keys carry variant/backend metadata that
-        differentiates them from normal graph keys with the same num_tokens.
-        Unlike inplace offset keys, they do not require start_num_tokens.
-        """
-        if num_tokens <= 0:
-            raise ValueError(
-                "num_tokens must be positive for descriptor-aware keys")
-        num_reqs: int | None = None
-        if uniform_decode:
-            if num_tokens % self.uniform_decode_query_len != 0:
-                raise ValueError(
-                    "num_tokens must be divisible by "
-                    "uniform_decode_query_len for uniform descriptor-aware "
-                    "keys")
-            num_reqs = num_tokens // self.uniform_decode_query_len
-
-        return BatchDescriptor(
+        num_active_loras: int,
+        allowed_modes: AbstractSet[CUDAGraphMode],
+        runtime_metadata: CUDAGraphRuntimeMetadata,
+        allow_runtime_key_registration: bool,
+    ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+        """Dispatch an explicitly registered runtime graph key."""
+        fallback = BatchDescriptor(
             num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            uniform=uniform_decode,
-            has_lora=has_lora,
-            num_active_loras=num_active_loras,
-            graph_variant=graph_variant,
-            attention_backend=attention_backend,
-            capture_metadata_mode=capture_metadata_mode,
+            runtime_metadata=runtime_metadata,
         )
-
-    def _dispatch_inplace_offset_key(
-        self,
-        num_tokens: int,
-        uniform_decode: bool,
-        has_lora: bool,
-        start_num_tokens: int,
-        allow_inplace_lazy_key: bool,
-        graph_variant: str = "",
-        attention_backend: str = "",
-        capture_metadata_mode: str = "",
-    ) -> tuple[CUDAGraphMode, BatchDescriptor] | None:
-        """Try to dispatch an inplace offset key.
-
-        Returns None if start_num_tokens is 0 (not an offset key),
-        otherwise returns the dispatch result.
-        """
-        if start_num_tokens == 0:
-            return None
-
-        no_graph_desc = BatchDescriptor(
-            num_tokens=num_tokens,
-            start_num_tokens=start_num_tokens,
-            graph_variant=graph_variant,
-            attention_backend=attention_backend,
-            capture_metadata_mode=capture_metadata_mode,
-        )
-        if not allow_inplace_lazy_key:
-            return CUDAGraphMode.NONE, no_graph_desc
-
         runtime_mode = self.cudagraph_mode.decode_mode()
-        if runtime_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE):
-            return CUDAGraphMode.NONE, no_graph_desc
-
-        batch_desc = self._create_inplace_offset_batch_descriptor(
-            num_tokens=num_tokens,
-            uniform_decode=uniform_decode,
-            has_lora=has_lora,
-            start_num_tokens=start_num_tokens,
-            graph_variant=graph_variant,
-            attention_backend=attention_backend,
-            capture_metadata_mode=capture_metadata_mode,
+        invalid_request = (
+            not allow_runtime_key_registration
+            or not runtime_metadata.is_valid()
+            or not uniform_decode
+            or has_lora
+            or num_active_loras != 0
+            or num_tokens <= 0
+            or num_tokens % self.uniform_decode_query_len != 0
+            or runtime_metadata.token_offset % self.uniform_decode_query_len != 0
+            or num_tokens // self.uniform_decode_query_len
+            > self.vllm_config.scheduler_config.max_num_seqs
+            or runtime_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE)
+            or runtime_mode not in allowed_modes
         )
-        if batch_desc not in self.cudagraph_keys[runtime_mode]:
-            self.add_cudagraph_key(runtime_mode, batch_desc)
-        return runtime_mode, batch_desc
+        if invalid_request:
+            return CUDAGraphMode.NONE, fallback
+
+        descriptor = self._create_runtime_batch_descriptor(num_tokens, runtime_metadata)
+        self.add_cudagraph_key(runtime_mode, descriptor)
+        return runtime_mode, descriptor
 
     def add_cudagraph_key(
         self, runtime_mode: CUDAGraphMode, batch_descriptor: BatchDescriptor
@@ -306,6 +219,7 @@ class CudagraphDispatcher:
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
         self.cudagraph_mode = cudagraph_mode
+        self.uniform_decode_query_len = uniform_decode_query_len
 
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:
@@ -377,11 +291,8 @@ class CudagraphDispatcher:
         num_active_loras: int = 0,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
-        start_num_tokens: int = 0,
-        allow_inplace_lazy_key: bool = False,
-        graph_variant: str = "",
-        attention_backend: str = "",
-        capture_metadata_mode: str = "",
+        runtime_metadata: CUDAGraphRuntimeMetadata | None = None,
+        allow_runtime_key_registration: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -401,19 +312,10 @@ class CudagraphDispatcher:
                 valid_modes to compute allowed modes. (e.g., {FULL} for
                 features like cascade attention not supported by full
                 cudagraphs). None means no modes are excluded.
-            start_num_tokens: For DUAL_INPLACE: the starting token offset for
-                the second split's offset view. When 0 (default), normal
-                dispatch is used.
-            allow_inplace_lazy_key: For DUAL_INPLACE: whether lazy capture of
-                an offset graph is allowed. When True and start_num_tokens > 0,
-                the dispatcher will register the offset key if not already
-                present.
-            graph_variant: For DUAL_INPLACE: identifies the split mode variant
-                (e.g. "inplace_serial", "inplace_parallel").
-            attention_backend: For DUAL_INPLACE: the attention backend tag
-                (e.g. "fia", "pa").
-            capture_metadata_mode: For DUAL_INPLACE: the metadata mode used
-                during graph capture.
+            runtime_metadata: Opaque metadata for a runtime graph key. None
+                keeps the static dispatch path unchanged.
+            allow_runtime_key_registration: Whether a validated runtime key may
+                be registered. False fails closed to eager execution.
         """
         allowed_modes = valid_modes or CUDAGraphMode.valid_runtime_modes()
 
@@ -431,53 +333,23 @@ class CudagraphDispatcher:
             or self.cudagraph_mode == CUDAGraphMode.NONE
             or max_size is None
             or num_tokens > max_size
-            or allowed_modes <= set([CUDAGraphMode.NONE])
+            or allowed_modes <= {CUDAGraphMode.NONE}
         ):
             return CUDAGraphMode.NONE, BatchDescriptor(
                 num_tokens=num_tokens,
-                start_num_tokens=start_num_tokens,
-                graph_variant=graph_variant,
-                attention_backend=attention_backend,
-                capture_metadata_mode=capture_metadata_mode,
+                runtime_metadata=runtime_metadata,
             )
 
-        # Try inplace offset dispatch first if start_num_tokens > 0
-        inplace_offset_dispatch = self._dispatch_inplace_offset_key(
-            num_tokens=num_tokens,
-            uniform_decode=uniform_decode,
-            has_lora=has_lora,
-            start_num_tokens=start_num_tokens,
-            allow_inplace_lazy_key=allow_inplace_lazy_key,
-            graph_variant=graph_variant,
-            attention_backend=attention_backend,
-            capture_metadata_mode=capture_metadata_mode,
-        )
-        if inplace_offset_dispatch is not None:
-            return inplace_offset_dispatch
-
-        # Handle descriptor-aware keys (non-offset keys with variant/backend)
-        has_descriptor_variant = bool(
-            graph_variant or attention_backend or capture_metadata_mode)
-        if has_descriptor_variant:
-            descriptor = self._create_descriptor_aware_batch_descriptor(
+        if runtime_metadata is not None:
+            return self._dispatch_runtime_key(
                 num_tokens=num_tokens,
                 uniform_decode=uniform_decode,
                 has_lora=has_lora,
                 num_active_loras=num_active_loras,
-                graph_variant=graph_variant,
-                attention_backend=attention_backend,
-                capture_metadata_mode=capture_metadata_mode,
+                allowed_modes=allowed_modes,
+                runtime_metadata=runtime_metadata,
+                allow_runtime_key_registration=allow_runtime_key_registration,
             )
-            if not allow_inplace_lazy_key:
-                return CUDAGraphMode.NONE, descriptor
-
-            runtime_mode = self.cudagraph_mode.decode_mode()
-            if runtime_mode not in (CUDAGraphMode.FULL,
-                                    CUDAGraphMode.PIECEWISE):
-                return CUDAGraphMode.NONE, descriptor
-            if descriptor not in self.cudagraph_keys[runtime_mode]:
-                self.add_cudagraph_key(runtime_mode, descriptor)
-            return runtime_mode, descriptor
 
         # Standard dispatch path
         effective_num_active_loras = num_active_loras
