@@ -293,7 +293,7 @@ if TYPE_CHECKING:
     VLLM_ADAPTIVE_STATE_PROBE_JSONL: str = ""
     VLLM_TELEMETRY_RUN_ID: str = ""
     VLLM_ADAPTIVE_STATE_PROBE_ALL_RANKS: bool = False
-    VLLM_ADAPTIVE_STATE_PROBE_EVERY: int = 1
+    VLLM_ADAPTIVE_STATE_PROBE_EVERY: int = 64
     VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS: int = 10_000
     VLLM_ADAPTIVE_STATE_PROBE_MAX_BYTES: int = 16 * 1024 * 1024
     VLLM_ADAPTIVE_STATE_PROBE_FLUSH_EVERY: int = 64
@@ -1106,7 +1106,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Record one scheduling-state row every N model-runner steps.
     "VLLM_ADAPTIVE_STATE_PROBE_EVERY": lambda: int(
-        os.environ.get("VLLM_ADAPTIVE_STATE_PROBE_EVERY", "1")
+        os.environ.get("VLLM_ADAPTIVE_STATE_PROBE_EVERY", "64")
     ),
     # Maximum detailed rows per process. Zero writes only a summary.
     "VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS": lambda: int(

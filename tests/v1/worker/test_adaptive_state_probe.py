@@ -129,6 +129,7 @@ def test_invalid_integer_env_uses_finite_defaults(monkeypatch, tmp_path):
     probe = AdaptiveStateProbe.from_env(ProbeTopology())
 
     assert probe is not None
+    assert probe._every_n_steps == 64
     assert probe._max_records == 10_000
     assert probe._max_bytes == 16 * 1024 * 1024
     probe.close()
