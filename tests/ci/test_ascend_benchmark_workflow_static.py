@@ -73,10 +73,8 @@ def test_main_perfgate_producer_uses_shared_pr_spec_without_changing_formal_defa
     assert "cleanup_ascend_ci_processes.sh" in producer
     assert '--explicit-spec-file ""' in text
     assert "vllm_hust_benchmark.perfgate_specs resolve" in producer
-    assert (
-        'SAME_SPEC_SPEC_FILE="${VLLM_HUST_BENCHMARK_REPO}/${perfgate_spec_file}"'
-        in producer
-    )
+    assert 'SAME_SPEC_SPEC_FILE="${perfgate_spec_file}"' in producer
+    assert '${VLLM_HUST_BENCHMARK_REPO}/${perfgate_spec_file}' not in producer
     assert (
         "RESULT_ROOT: ${{ github.workspace }}/.benchmarks/ci/ci-"
         "${{ github.run_id }}-${{ github.run_attempt }}-"
@@ -85,6 +83,13 @@ def test_main_perfgate_producer_uses_shared_pr_spec_without_changing_formal_defa
     )
     assert "--scenario \"$PERFGATE_BASELINE_SCENARIO\"" in text
     assert "Qwen/Qwen2.5-14B-Instruct" in text
+
+    store_job = text[text.index("  store-main-perfgate-baseline:") :]
+    assert 'SAME_SPEC_SPEC_FILE="${perfgate_spec_file}"' in store_job
+    assert (
+        '${GITHUB_WORKSPACE}/vllm-hust-benchmark/${perfgate_spec_file}'
+        not in store_job
+    )
 
 
 def test_pr_comment_update_job_has_job_level_issues_write_permission():

@@ -1243,7 +1243,7 @@ jobs:
               BENCH_RANDOM_OUTPUT_LEN="$PERFGATE_OUTPUT_LEN" \
               BENCH_INPUT_LEN="$PERFGATE_INPUT_LEN" \
               BENCH_OUTPUT_LEN="$PERFGATE_OUTPUT_LEN" \
-              SAME_SPEC_SPEC_FILE="${VLLM_HUST_BENCHMARK_REPO}/${perfgate_spec_file}" \
+              SAME_SPEC_SPEC_FILE="${perfgate_spec_file}" \
               bash .github/workflows/scripts/run_ascend_benchmark_scenario_list.sh
           }
           max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}
@@ -1701,5 +1701,5 @@ jobs:
             --scenario "$PERFGATE_BASELINE_SCENARIO" \
             --hardware-chip-model "$HARDWARE_CHIP_MODEL" \
             --repo-root "${GITHUB_WORKSPACE}/vllm-hust-benchmark")"
-          SAME_SPEC_SPEC_FILE="${GITHUB_WORKSPACE}/vllm-hust-benchmark/${perfgate_spec_file}" \
+          SAME_SPEC_SPEC_FILE="${perfgate_spec_file}" \
             bash .github/workflows/scripts/perfgate_store_baseline.sh
