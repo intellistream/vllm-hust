@@ -53,6 +53,20 @@ def test_same_spec_benchmark_failure_prints_server_log_tail():
     assert 'return "$same_spec_status"' in same_spec_block
 
 
+def test_benchmark_cancellation_cleans_process_group_and_orphaned_engine():
+    text = script_text("run_ascend_benchmark_ci.sh")
+    cleanup_block = text[text.index("cleanup() {") : text.index("run_runner_npu_preflight_once()")]
+
+    assert "find_orphaned_engine_pids()" in text
+    assert 'kill -TERM -- "-$server_group_pid"' in cleanup_block
+    assert 'kill -0 -- "-$server_group_pid"' in cleanup_block
+    assert "kill_matching_pids TERM $orphaned_engine_pids" in cleanup_block
+    assert "kill_matching_pids KILL $orphaned_engine_pids" in cleanup_block
+    assert "trap cleanup EXIT" in text
+    assert "trap 'exit 130' INT" in text
+    assert "trap 'exit 143' TERM" in text
+
+
 def test_same_spec_pr_preview_uses_ascend_compatibility_overlay():
     text = script_text("run_ascend_benchmark_ci.sh")
     same_spec_block = text[text.index("run_same_spec_current_benchmark() {") :]
