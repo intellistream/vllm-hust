@@ -4,15 +4,21 @@ set -euo pipefail
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 ASCEND_TORCH_VERSION="${ASCEND_TORCH_VERSION:-2.10.0}"
 ASCEND_TORCH_NPU_VERSION="${ASCEND_TORCH_NPU_VERSION:-2.10.0}"
+ASCEND_TORCHVISION_VERSION="${ASCEND_TORCHVISION_VERSION:-0.25.0}"
+ASCEND_TORCHAUDIO_VERSION="${ASCEND_TORCHAUDIO_VERSION:-2.10.0}"
 ASCEND_SETUPTOOLS_SPEC="${ASCEND_SETUPTOOLS_SPEC:-setuptools>=77.0.3,<81.0.0}"
-ASCEND_NUMPY_SPEC="${ASCEND_NUMPY_SPEC:-numpy}"
+ASCEND_NUMPY_SPEC="${ASCEND_NUMPY_SPEC:-numpy<2.0.0}"
 
 check_stack() {
-  TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PYTHON_BIN" - "$ASCEND_TORCH_VERSION" "$ASCEND_TORCH_NPU_VERSION" <<'PY'
+  TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PYTHON_BIN" - \
+    "$ASCEND_TORCH_VERSION" "$ASCEND_TORCH_NPU_VERSION" \
+    "$ASCEND_TORCHVISION_VERSION" "$ASCEND_TORCHAUDIO_VERSION" <<'PY'
 import importlib.metadata as md
 import sys
 
-expected_torch, expected_torch_npu = sys.argv[1:3]
+expected_torch, expected_torch_npu, expected_torchvision, expected_torchaudio = (
+    sys.argv[1:5]
+)
 
 def normalize(version: str) -> str:
     return version.split("+", 1)[0]
@@ -25,17 +31,25 @@ def dist_version(name: str) -> str | None:
 
 torch_version = dist_version("torch")
 torch_npu_version = dist_version("torch-npu") or dist_version("torch_npu")
+torchvision_version = dist_version("torchvision")
+torchaudio_version = dist_version("torchaudio")
 setuptools_version = dist_version("setuptools")
 numpy_version = dist_version("numpy")
 
 print(f"torch={torch_version}")
 print(f"torch-npu={torch_npu_version}")
+print(f"torchvision={torchvision_version}")
+print(f"torchaudio={torchaudio_version}")
 print(f"setuptools={setuptools_version}")
 print(f"numpy={numpy_version}")
 
 if normalize(torch_version or "") != expected_torch:
     raise SystemExit(1)
 if normalize(torch_npu_version or "") != expected_torch_npu:
+    raise SystemExit(1)
+if normalize(torchvision_version or "") != expected_torchvision:
+    raise SystemExit(1)
+if normalize(torchaudio_version or "") != expected_torchaudio:
     raise SystemExit(1)
 if setuptools_version is None:
     raise SystemExit(1)
@@ -53,6 +67,8 @@ else
   echo "Installing pinned Ascend torch stack:"
   echo "  torch==$ASCEND_TORCH_VERSION"
   echo "  torch-npu==$ASCEND_TORCH_NPU_VERSION"
+  echo "  torchvision==$ASCEND_TORCHVISION_VERSION"
+  echo "  torchaudio==$ASCEND_TORCHAUDIO_VERSION"
   echo "  $ASCEND_SETUPTOOLS_SPEC"
   echo "  $ASCEND_NUMPY_SPEC"
 
@@ -60,6 +76,8 @@ else
   PIP_DISABLE_PIP_VERSION_CHECK=1 "$PYTHON_BIN" -m pip install --upgrade --force-reinstall \
     "torch==$ASCEND_TORCH_VERSION" \
     "torch-npu==$ASCEND_TORCH_NPU_VERSION" \
+    "torchvision==$ASCEND_TORCHVISION_VERSION" \
+    "torchaudio==$ASCEND_TORCHAUDIO_VERSION" \
     "$ASCEND_SETUPTOOLS_SPEC" \
     "$ASCEND_NUMPY_SPEC"
 fi
