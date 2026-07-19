@@ -5,6 +5,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 ASCEND_TORCH_VERSION="${ASCEND_TORCH_VERSION:-2.10.0}"
 ASCEND_TORCH_NPU_VERSION="${ASCEND_TORCH_NPU_VERSION:-2.10.0}"
 ASCEND_SETUPTOOLS_SPEC="${ASCEND_SETUPTOOLS_SPEC:-setuptools>=77.0.3,<81.0.0}"
+ASCEND_NUMPY_SPEC="${ASCEND_NUMPY_SPEC:-numpy}"
 
 check_stack() {
   TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PYTHON_BIN" - "$ASCEND_TORCH_VERSION" "$ASCEND_TORCH_NPU_VERSION" <<'PY'
@@ -25,16 +26,20 @@ def dist_version(name: str) -> str | None:
 torch_version = dist_version("torch")
 torch_npu_version = dist_version("torch-npu") or dist_version("torch_npu")
 setuptools_version = dist_version("setuptools")
+numpy_version = dist_version("numpy")
 
 print(f"torch={torch_version}")
 print(f"torch-npu={torch_npu_version}")
 print(f"setuptools={setuptools_version}")
+print(f"numpy={numpy_version}")
 
 if normalize(torch_version or "") != expected_torch:
     raise SystemExit(1)
 if normalize(torch_npu_version or "") != expected_torch_npu:
     raise SystemExit(1)
 if setuptools_version is None:
+    raise SystemExit(1)
+if numpy_version is None:
     raise SystemExit(1)
 major = int(setuptools_version.split(".", 1)[0])
 if major >= 81:
@@ -49,12 +54,14 @@ else
   echo "  torch==$ASCEND_TORCH_VERSION"
   echo "  torch-npu==$ASCEND_TORCH_NPU_VERSION"
   echo "  $ASCEND_SETUPTOOLS_SPEC"
+  echo "  $ASCEND_NUMPY_SPEC"
 
   "$PYTHON_BIN" -m pip uninstall -y torchvision torchaudio 2>/dev/null || true
   PIP_DISABLE_PIP_VERSION_CHECK=1 "$PYTHON_BIN" -m pip install --upgrade --force-reinstall \
     "torch==$ASCEND_TORCH_VERSION" \
     "torch-npu==$ASCEND_TORCH_NPU_VERSION" \
-    "$ASCEND_SETUPTOOLS_SPEC"
+    "$ASCEND_SETUPTOOLS_SPEC" \
+    "$ASCEND_NUMPY_SPEC"
 fi
 
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PYTHON_BIN" - <<'PY'
