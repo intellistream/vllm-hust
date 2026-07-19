@@ -2,7 +2,7 @@ name: Ascend Benchmark Leaderboard
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/perfgate-main-producer-validation]
   pull_request:
     types: [labeled]
   issue_comment:
@@ -244,7 +244,7 @@ jobs:
     if: >-
       always() &&
       (
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/perfgate-main-producer-validation')) ||
         github.event_name == 'workflow_dispatch' ||
         github.event_name == 'schedule' ||
         (
@@ -1203,7 +1203,7 @@ jobs:
           done
 
       - name: Run main perfgate baseline producer
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/perfgate-main-producer-validation') }}
         env:
           WORKSPACE_ROOT: ${{ github.workspace }}
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
@@ -1652,7 +1652,7 @@ jobs:
 
   store-main-perfgate-baseline:
     name: Store main perfgate baseline
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/perfgate-main-producer-validation') }}
     needs: ascend-benchmark
     runs-on: ubuntu-latest
     env:
@@ -1696,6 +1696,7 @@ jobs:
           BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
           BENCHMARK_REPO_REF: main
           PERFGATE_BASELINE_SCENARIO: random-online
+          PERFGATE_BASELINE_BRANCH: validation-perfgate-main-producer
           HARDWARE_CHIP_MODEL: 910B2
         run: |
           set -euo pipefail
