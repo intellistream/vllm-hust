@@ -67,6 +67,16 @@ def test_e2e_branch_uses_isolated_baseline_and_stage2_base():
     assert "e2e/fix-incomplete-model-cache-20260719" in text
     assert "HUST_ASCEND_MANAGER_REPO_REF:" in text
     assert "fix/torch210-all-architectures" in text
+
+    manager_checkout = text[
+        text.index("      - name: Checkout ascend-runtime-manager repo") : text.index(
+            "      - name: Prepare Hugging Face cache directories"
+        )
+    ]
+    assert 'local target_ref=${3:-main}' in manager_checkout
+    assert 'git clone --depth 1 --branch "$target_ref"' in manager_checkout
+    assert '"$HUST_ASCEND_MANAGER_REPO_REF"' in manager_checkout
+    assert "assert expected == '2.10.0'" in text
     assert "SAME_SPEC_READY_TIMEOUT_SECONDS:" in text
     assert "&& '1800' || '600'" in text
     assert "PERFGATE_STAGE2_BASE_BRANCH:" in text
