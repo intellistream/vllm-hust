@@ -10,10 +10,18 @@ WORKFLOW_PATH = (
     Path(__file__).resolve().parents[2]
     / ".github/workflows/ascend-benchmark-leaderboard.yml"
 )
+RUNNER_SCRIPT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / ".github/workflows/scripts/run_ascend_benchmark_scenario_list.sh"
+)
 
 
 def workflow_text() -> str:
     return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+
+def runner_script_text() -> str:
+    return RUNNER_SCRIPT_PATH.read_text(encoding="utf-8")
 
 
 def workflow_yaml() -> dict:
@@ -201,6 +209,19 @@ def test_schedule_runs_registered_multi_scenario_benchmark_publish():
         "visionarena-online",
     ):
         assert scenario in text
+
+
+def test_multi_scenario_runner_prints_failure_diagnostics():
+    text = runner_script_text()
+
+    assert "scenario.log" in text
+    assert ') 2>&1 | tee "$scenario_log"' in text
+    assert "scenario_exit_code=${PIPESTATUS[0]}" in text
+    assert "print_multi_scenario_summary" in text
+    assert "Failed Ascend benchmark scenario diagnostics" in text
+    assert 'print_file_tail "scenario output"' in text
+    assert 'print_file_tail "vLLM server log"' in text
+    assert 'print_file_tail "runner preflight failure"' in text
 
 
 def test_benchmark_script_does_not_force_max_model_len():
@@ -458,6 +479,10 @@ def test_target_checkout_uses_resilient_git_http_retry_settings():
 
 def test_ascend_torch_stack_is_installed_before_preinstall_preflight():
     text = workflow_text()
+    ensure_script = (
+        Path(__file__).resolve().parents[2]
+        / ".github/workflows/scripts/ensure_ascend_torch_stack.sh"
+    ).read_text(encoding="utf-8")
 
     install_step = text.index("      - name: Install Ascend torch stack for preflight")
     preinstall_preflight_step = text.index(
@@ -465,8 +490,15 @@ def test_ascend_torch_stack_is_installed_before_preinstall_preflight():
     )
 
     assert install_step < preinstall_preflight_step
-    assert '"torch==2.9.0" "torch-npu==2.9.0"' in text
-    assert "import torch, torch_npu" in text
+    assert "bash .github/workflows/scripts/ensure_ascend_torch_stack.sh" in text
+    assert 'ASCEND_TORCH_VERSION="${ASCEND_TORCH_VERSION:-2.10.0}"' in ensure_script
+    assert (
+        'ASCEND_TORCH_NPU_VERSION="${ASCEND_TORCH_NPU_VERSION:-2.10.0}"'
+        in ensure_script
+    )
+    assert "import torch" in ensure_script
+    assert "import torch_npu" in ensure_script
+    assert "torch_npu probe failed" in text
 
 
 def test_l2_targeted_scenario_registry_is_covered_by_parser_tests():
