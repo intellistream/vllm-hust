@@ -64,6 +64,8 @@ def test_main_push_reaches_benchmark_and_baseline_store_jobs():
         "github.ref == 'refs/heads/e2e/perfgate-integration-20260719'"
         in store_job
     )
+    assert "always()" in store_job
+    assert "needs.ascend-benchmark.result == 'success'" in store_job
     assert "needs: ascend-benchmark" in store_job
 
 

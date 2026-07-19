@@ -1716,7 +1716,11 @@ jobs:
 
   store-main-perfgate-baseline:
     name: Store main perfgate baseline
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/e2e/perfgate-integration-20260719') }}
+    if: >-
+      always() &&
+      needs.ascend-benchmark.result == 'success' &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/e2e/perfgate-integration-20260719')
     needs: ascend-benchmark
     runs-on: ubuntu-latest
     env:
