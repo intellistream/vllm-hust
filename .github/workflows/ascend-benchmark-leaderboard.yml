@@ -304,7 +304,7 @@ jobs:
       SAME_SPEC_BENCHMARK_ENABLED: ${{ vars.VLLM_HUST_SAME_SPEC_BENCHMARK_ENABLED || '1' }}
       PERFGATE_MODE: ${{ vars.VLLM_HUST_PERFGATE_MODE || 'report' }}
       PERFGATE_SPEC_FILE: ${{ vars.VLLM_HUST_PERFGATE_SPEC_FILE || '' }}
-      MAIN_SAME_SPEC_SPEC_FILE: ${{ vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || 'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-qwen25-14b-910b2.json' }}
+      MAIN_SAME_SPEC_SPEC_FILE: ${{ github.ref == 'refs/heads/feature/perfgate-main-producer-validation' && 'docs/official-baselines/perfgate-ascend-qwen25-3b-910b2.json' || vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || 'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-qwen25-14b-910b2.json' }}
       SAME_SPEC_SPEC_FILE: ${{ vars.VLLM_HUST_SAME_SPEC_SPEC_FILE || '' }}
       SAME_SPEC_CONSTRAINTS_FILE: ${{ vars.VLLM_HUST_SAME_SPEC_CONSTRAINTS_FILE || '' }}
       ASCEND_BENCHMARK_USE_SUDO: ${{ vars.VLLM_HUST_BENCHMARK_USE_SUDO || '1' }}
