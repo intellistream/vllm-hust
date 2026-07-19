@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
     DecodeBenchConnector,
     DecodeBenchConnectorMetadata,
+    DecodeBenchConnectorWorker,
 )
 from vllm.forward_context import ForwardContext
 from vllm.utils.hashing import sha256
@@ -133,6 +134,72 @@ class DecodeBenchTestRunner:
         self.scheduler.update_from_output(scheduler_output, model_runner_output)
 
         return scheduler_output, kv_connector_metadata
+
+
+def test_fill_ascend_tuple_kv_cache():
+    worker = object.__new__(DecodeBenchConnectorWorker)
+    worker.fill_mean = 0.25
+    worker.fill_std = 0.0
+    worker.group_to_layers = {0: ["layer_0"]}
+    key_cache = torch.zeros(4, 2, 3)
+    value_cache = torch.zeros(4, 2, 3)
+    worker.kv_caches = {"layer_0": (key_cache, value_cache)}
+
+    worker._fill_blocks(group_idx=0, block_ids=[1, 3, 5], num_tokens=6)
+
+    expected = torch.zeros(4, 2, 3)
+    expected[[1, 3]] = 0.25
+    torch.testing.assert_close(key_cache, expected)
+    torch.testing.assert_close(value_cache, expected)
+
+
+def test_fill_batches_concurrent_requests_by_group(monkeypatch):
+    worker = object.__new__(DecodeBenchConnectorWorker)
+    worker.kv_caches = {}
+    worker.group_to_layers = {}
+    fill_calls = []
+    monkeypatch.setattr(
+        worker,
+        "_fill_blocks",
+        lambda group_idx, block_ids, num_tokens: fill_calls.append(
+            (group_idx, block_ids, num_tokens)
+        ),
+    )
+    metadata = DecodeBenchConnectorMetadata(
+        reqs_to_fill={
+            "request_0": (([1, 2], [5]), 3),
+            "request_1": (([3], [6, 7]), 4),
+        }
+    )
+
+    worker.start_fill_kv(metadata)
+
+    assert fill_calls == [(0, [1, 2, 3], 7), (1, [5, 6, 7], 7)]
+
+
+def test_fill_bfloat16_kv_cache_generates_supported_random_dtype(monkeypatch):
+    worker = object.__new__(DecodeBenchConnectorWorker)
+    worker.fill_mean = 0.0
+    worker.fill_std = 0.15
+    worker.group_to_layers = {0: ["layer_0"]}
+    worker.kv_caches = {"layer_0": torch.zeros(2, 3, dtype=torch.bfloat16)}
+
+    original_normal = torch.normal
+
+    def normal_with_dtype_check(*args, **kwargs):
+        assert kwargs["dtype"] == torch.float32
+        assert kwargs["size"] == (3,)
+        return original_normal(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "normal", normal_with_dtype_check)
+
+    worker._fill_blocks(group_idx=0, block_ids=[0, 1], num_tokens=2)
+
+    assert worker.kv_caches["layer_0"][0].dtype == torch.bfloat16
+    assert torch.count_nonzero(worker.kv_caches["layer_0"][0]) > 0
+    torch.testing.assert_close(
+        worker.kv_caches["layer_0"][0], worker.kv_caches["layer_0"][1]
+    )
 
 
 def test_decode_bench_connector_basic():

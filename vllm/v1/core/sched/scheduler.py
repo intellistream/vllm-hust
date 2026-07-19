@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -64,6 +66,48 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class MicroBatchCostModel:
+    """Rank-local linear model for microbatch execution cost."""
+
+    p0: float
+    p1: float
+    p2: float
+    p3: float
+    p4: float
+    p5: float
+    pp_rank: int
+    layer_num: int
+
+    def predict(self, request_num: int, aggregated_ctx_length: int) -> float:
+        layer_num = self.layer_num
+        return (
+            self.p0 * request_num * layer_num
+            + self.p1 * request_num
+            + self.p2 * aggregated_ctx_length * layer_num
+            + self.p3 * aggregated_ctx_length
+            + self.p4 * layer_num
+            + self.p5
+        )
+
+
+@dataclass
+class MicroBatch:
+    microbatch_id: int
+    requests: list[Request]
+
+    @property
+    def request_num(self) -> int:
+        return len(self.requests)
+
+    @property
+    def aggregated_ctx_length(self) -> int:
+        aggregated_ctx_length: int = 0
+        for r in self.requests:
+            aggregated_ctx_length += len(r._all_token_ids)
+        return aggregated_ctx_length
 
 
 class Scheduler(SchedulerInterface):
@@ -286,6 +330,93 @@ class Scheduler(SchedulerInterface):
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
         self.prefill_capacity_bound = False
+
+        if envs.VLLM_USE_PP_OPT_SCHEDULER:
+            self.pp_opt_microbatch_num = (
+                envs.VLLM_PP_OPT_BATCH_QUEUE_SIZE
+                or self.parallel_config.pipeline_parallel_size
+            )
+            if self.pp_opt_microbatch_num <= 0:
+                raise ValueError(
+                    "VLLM_PP_OPT_BATCH_QUEUE_SIZE must be positive when set."
+                )
+            self.pp_opt_max_microbatch_num = self.pp_opt_microbatch_num
+            configured_min_microbatch_num = envs.VLLM_PP_OPT_MIN_MICROBATCHES
+            if configured_min_microbatch_num is not None:
+                if configured_min_microbatch_num <= 0:
+                    raise ValueError(
+                        "VLLM_PP_OPT_MIN_MICROBATCHES must be positive when set."
+                    )
+                if configured_min_microbatch_num > self.pp_opt_max_microbatch_num:
+                    logger.warning(
+                        "VLLM_PP_OPT_MIN_MICROBATCHES=%d exceeds the PP "
+                        "optimization queue capacity %d; clamping to the "
+                        "queue capacity.",
+                        configured_min_microbatch_num,
+                        self.pp_opt_max_microbatch_num,
+                    )
+            self.pp_opt_min_microbatch_num = min(
+                configured_min_microbatch_num
+                or self.parallel_config.pipeline_parallel_size,
+                self.pp_opt_max_microbatch_num,
+            )
+            self.pp_opt_dynamic_microbatches = envs.VLLM_PP_OPT_DYNAMIC_MICROBATCHES
+            self.pp_opt_target_microbatch_size = envs.VLLM_PP_OPT_TARGET_MICROBATCH_SIZE
+            if (
+                self.pp_opt_target_microbatch_size is not None
+                and self.pp_opt_target_microbatch_size <= 0
+            ):
+                raise ValueError(
+                    "VLLM_PP_OPT_TARGET_MICROBATCH_SIZE must be positive when set."
+                )
+            self.pp_opt_active_microbatch_num = (
+                self.pp_opt_min_microbatch_num
+                if self.pp_opt_dynamic_microbatches
+                else self.pp_opt_max_microbatch_num
+            )
+            self.pp_opt_monitor_interval = max(0, envs.VLLM_PP_OPT_MONITOR_INTERVAL)
+            self._pp_opt_schedule_decisions = 0
+            self.pp_opt_microbatches: dict[int, MicroBatch] = {
+                microbatch_id: MicroBatch(microbatch_id, [])
+                for microbatch_id in range(self.pp_opt_microbatch_num)
+            }
+            self.microbatch_id_to_request_ids: dict[int, set[str]] = {}
+            self.request_id_to_microbatch_id: dict[str, int] = {}
+            self.pp_opt_first_scheduled_req_ids: set[str] = set()
+            self._pp_opt_last_in_flight_ids: set[int] = set()
+            self.cost_model_path: str | None = envs.VLLM_PP_OPT_COST_MODEL_PATH
+            if self.cost_model_path:
+                with open(self.cost_model_path, encoding="utf-8") as f:
+                    fit_result = json.load(f)
+                self.forward_cost_models = self._load_pp_opt_cost_models(
+                    fit_result, "forward"
+                )
+                self.total_cost_models = self._load_pp_opt_cost_models(
+                    fit_result, "total"
+                )
+            else:
+                logger.warning(
+                    "VLLM_PP_OPT_COST_MODEL_PATH is not set; PP optimization "
+                    "will use the synthetic fallback cost model. Run profile "
+                    "calibration before using this path for performance numbers."
+                )
+                self.forward_cost_models = self._default_pp_opt_cost_models()
+                self.total_cost_models = self._default_pp_opt_cost_models()
+
+            missing_cost_models = [
+                cost
+                for cost, attr in (
+                    ("forward", "forward_cost_models"),
+                    ("total", "total_cost_models"),
+                )
+                if not hasattr(self, attr)
+            ]
+            if missing_cost_models:
+                raise ValueError(
+                    f"Cost model file {self.cost_model_path} missing required "
+                    f"model(s): {', '.join(missing_cost_models)}"
+                )
+            self._log_pp_opt_cost_models()
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -415,6 +546,796 @@ class Scheduler(SchedulerInterface):
                 # keep alignment to block_size
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
+
+    def _default_pp_opt_cost_models(self) -> dict[int, MicroBatchCostModel]:
+        layer_nums = self._get_pp_opt_layer_partition()
+        return {
+            pp_rank: MicroBatchCostModel(
+                p0=0.0,
+                p1=1.0,
+                p2=0.0,
+                p3=100.0,
+                p4=0.0,
+                p5=100.0,
+                pp_rank=pp_rank,
+                layer_num=layer_nums[pp_rank] if layer_nums is not None else 1,
+            )
+            for pp_rank in range(self.parallel_config.pipeline_parallel_size)
+        }
+
+    def _get_pp_opt_layer_partition(self) -> list[int] | None:
+        partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+        if partition_list_str is None:
+            return None
+
+        try:
+            partitions = [int(layer) for layer in partition_list_str.split(",")]
+        except ValueError as err:
+            raise ValueError(
+                f"Invalid VLLM_PP_LAYER_PARTITION: {partition_list_str}"
+            ) from err
+
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if len(partitions) != pp_size:
+            raise ValueError(
+                "VLLM_PP_LAYER_PARTITION length "
+                f"({len(partitions)}) does not match pipeline_parallel_size "
+                f"({pp_size})."
+            )
+        if any(layer_num <= 0 for layer_num in partitions):
+            raise ValueError(
+                "VLLM_PP_LAYER_PARTITION must contain positive layer counts: "
+                f"{partition_list_str}"
+            )
+        return partitions
+
+    def _create_pp_opt_cost_model(
+        self,
+        model: dict[str, Any],
+        cost_name: str,
+        pp_rank: int,
+        layer_num: int,
+    ) -> MicroBatchCostModel:
+        coefficients = model["coefficients"]
+        if all(name in coefficients for name in ("p0", "p1", "p2", "p3", "p4", "p5")):
+            return MicroBatchCostModel(
+                p0=float(coefficients["p0"]),
+                p1=float(coefficients["p1"]),
+                p2=float(coefficients["p2"]),
+                p3=float(coefficients["p3"]),
+                p4=float(coefficients["p4"]),
+                p5=float(coefficients["p5"]),
+                pp_rank=pp_rank,
+                layer_num=layer_num,
+            )
+
+        if all(name in coefficients for name in ("a", "b", "c")):
+            return MicroBatchCostModel(
+                p0=0.0,
+                p1=float(coefficients["a"]),
+                p2=0.0,
+                p3=float(coefficients["b"]),
+                p4=0.0,
+                p5=float(coefficients["c"]),
+                pp_rank=pp_rank,
+                layer_num=layer_num,
+            )
+
+        missing = [
+            name
+            for name in ("p0", "p1", "p2", "p3", "p4", "p5")
+            if name not in coefficients
+        ]
+        raise ValueError(
+            f"Cost model file {self.cost_model_path} contains "
+            f"{cost_name!r} model for pp_rank={model.get('pp_rank', 0)} "
+            f"missing coefficient(s): {', '.join(missing)}"
+        )
+
+    def _log_pp_opt_cost_models(self) -> None:
+        for cost_name, models in (
+            ("forward", self.forward_cost_models),
+            ("total", self.total_cost_models),
+        ):
+            for pp_rank, model in sorted(models.items()):
+                logger.debug(
+                    "PP optimization %s cost model initialized: "
+                    "pp_rank=%d layer_num=%d "
+                    "p0=%f p1=%f p2=%f p3=%f p4=%f p5=%f",
+                    cost_name,
+                    pp_rank,
+                    model.layer_num,
+                    model.p0,
+                    model.p1,
+                    model.p2,
+                    model.p3,
+                    model.p4,
+                    model.p5,
+                )
+
+    def _load_pp_opt_cost_models(
+        self,
+        fit_result: dict[str, Any],
+        cost_name: str,
+    ) -> dict[int, MicroBatchCostModel]:
+        source_models: dict[int, dict[str, Any]] = {}
+        for model in fit_result["models"]:
+            if model["cost"] != cost_name:
+                continue
+
+            pp_rank = int(model.get("pp_rank", 0))
+            if pp_rank in source_models:
+                raise ValueError(
+                    f"Cost model file {self.cost_model_path} contains "
+                    f"duplicate {cost_name!r} model for pp_rank={pp_rank}."
+                )
+            source_models[pp_rank] = model
+
+        if 0 not in source_models:
+            raise ValueError(
+                f"Cost model file {self.cost_model_path} missing {cost_name!r} "
+                "model for pp_rank 0."
+            )
+
+        layer_nums = self._get_pp_opt_layer_partition()
+        expected_ranks = set(range(self.parallel_config.pipeline_parallel_size))
+        extra_ranks = sorted(set(source_models) - expected_ranks)
+        if extra_ranks:
+            raise ValueError(
+                f"Cost model file {self.cost_model_path} contains {cost_name!r} "
+                f"model(s) for unexpected pp_rank(s): "
+                f"{', '.join(str(rank) for rank in extra_ranks)}"
+            )
+
+        models: dict[int, MicroBatchCostModel] = {}
+        for pp_rank in range(self.parallel_config.pipeline_parallel_size):
+            source_model = (
+                source_models.get(pp_rank, source_models[0])
+                if layer_nums is not None
+                else source_models[0]
+            )
+            layer_num = (
+                layer_nums[pp_rank]
+                if layer_nums is not None
+                else int(source_model.get("layer_num", 1))
+            )
+            models[pp_rank] = self._create_pp_opt_cost_model(
+                source_model,
+                cost_name,
+                pp_rank,
+                layer_num,
+            )
+        return models
+
+    def microbatch_cost(self, microbatch: MicroBatch) -> float:
+        return max(
+            model.predict(
+                microbatch.request_num,
+                microbatch.aggregated_ctx_length,
+            )
+            for model in self.forward_cost_models.values()
+        )
+
+    def _get_pp_opt_microbatch(self, microbatch_id: int) -> MicroBatch:
+        if microbatch_id not in self.pp_opt_microbatches:
+            self.pp_opt_microbatches[microbatch_id] = MicroBatch(microbatch_id, [])
+        return self.pp_opt_microbatches[microbatch_id]
+
+    def _get_pp_opt_num_running_reqs(self) -> int:
+        return sum(
+            microbatch.request_num for microbatch in self.pp_opt_microbatches.values()
+        )
+
+    def _get_pp_opt_target_microbatch_size(self) -> int:
+        configured_target = getattr(self, "pp_opt_target_microbatch_size", None)
+        if configured_target is not None:
+            return min(self.max_num_scheduled_tokens, configured_target)
+
+        max_microbatch_num = max(
+            1,
+            getattr(
+                self,
+                "pp_opt_max_microbatch_num",
+                getattr(self, "pp_opt_microbatch_num", 1),
+            ),
+        )
+        return max(
+            1,
+            min(
+                self.max_num_scheduled_tokens,
+                (self.max_num_running_reqs + max_microbatch_num - 1)
+                // max_microbatch_num,
+            ),
+        )
+
+    def _update_pp_opt_active_microbatch_num(
+        self, in_flight_ids: set[int] | None = None
+    ) -> bool:
+        in_flight_ids = set() if in_flight_ids is None else in_flight_ids
+        max_microbatch_num = getattr(
+            self,
+            "pp_opt_max_microbatch_num",
+            getattr(self, "pp_opt_microbatch_num", len(self.pp_opt_microbatches)),
+        )
+        if not getattr(self, "pp_opt_dynamic_microbatches", False):
+            new_active_microbatch_num = max_microbatch_num
+        else:
+            running_request_count = self._get_pp_opt_num_running_reqs()
+            effective_request_count = running_request_count
+            if self.waiting:
+                effective_request_count = min(
+                    self.max_num_running_reqs,
+                    effective_request_count + len(self.waiting),
+                )
+            target_size = self._get_pp_opt_target_microbatch_size()
+            new_active_microbatch_num = (
+                effective_request_count + target_size - 1
+            ) // target_size
+            new_active_microbatch_num = max(
+                getattr(self, "pp_opt_min_microbatch_num", 1),
+                new_active_microbatch_num,
+            )
+            new_active_microbatch_num = min(
+                max_microbatch_num, new_active_microbatch_num
+            )
+
+        old_active_microbatch_num = getattr(
+            self, "pp_opt_active_microbatch_num", max_microbatch_num
+        )
+        if old_active_microbatch_num == new_active_microbatch_num:
+            return False
+
+        self.pp_opt_active_microbatch_num = new_active_microbatch_num
+        logger.info(
+            "PP optimization dynamic microbatch count changed: "
+            "active=%d/%d running=%d waiting=%d in_flight_ids=%s "
+            "target_request_count=%d",
+            new_active_microbatch_num,
+            max_microbatch_num,
+            self._get_pp_opt_num_running_reqs(),
+            len(self.waiting),
+            sorted(in_flight_ids),
+            self._get_pp_opt_target_microbatch_size(),
+        )
+        return True
+
+    def _get_pp_opt_base_active_microbatch_ids(self) -> list[int]:
+        active_microbatch_num = getattr(
+            self,
+            "pp_opt_active_microbatch_num",
+            len(self.pp_opt_microbatches),
+        )
+        return [
+            microbatch_id
+            for microbatch_id in range(active_microbatch_num)
+            if microbatch_id in self.pp_opt_microbatches
+        ]
+
+    def _get_pp_opt_active_microbatch_ids(
+        self, in_flight_ids: set[int] | None = None
+    ) -> list[int]:
+        active_ids = set(self._get_pp_opt_base_active_microbatch_ids())
+        if in_flight_ids is None:
+            in_flight_ids = getattr(self, "_pp_opt_last_in_flight_ids", set())
+        first_scheduled_req_ids = getattr(self, "pp_opt_first_scheduled_req_ids", set())
+        active_ids.update(
+            microbatch_id
+            for microbatch_id in in_flight_ids
+            if microbatch_id in self.pp_opt_microbatches
+        )
+        active_ids.update(
+            microbatch_id
+            for microbatch_id, microbatch in self.pp_opt_microbatches.items()
+            if any(
+                request.request_id not in first_scheduled_req_ids
+                for request in microbatch.requests
+            )
+        )
+        return sorted(active_ids)
+
+    def _select_pp_opt_target_microbatch(self, _request: Request) -> MicroBatch:
+        active_microbatch_ids = self._get_pp_opt_active_microbatch_ids()
+        if not active_microbatch_ids:
+            active_microbatch_ids = sorted(self.pp_opt_microbatches)
+
+        return self._select_pp_opt_lowest_cost_microbatch(active_microbatch_ids)
+
+    def _select_pp_opt_lowest_cost_microbatch(
+        self, candidate_microbatch_ids: list[int] | None = None
+    ) -> MicroBatch:
+        if candidate_microbatch_ids is None:
+            candidate_microbatch_ids = self._get_pp_opt_active_microbatch_ids()
+        if not candidate_microbatch_ids:
+            candidate_microbatch_ids = sorted(self.pp_opt_microbatches)
+        return min(
+            (
+                self.pp_opt_microbatches[microbatch_id]
+                for microbatch_id in candidate_microbatch_ids
+            ),
+            key=lambda microbatch: (
+                self.microbatch_cost(microbatch),
+                microbatch.microbatch_id,
+            ),
+        )
+
+    def _add_request_to_pp_opt_microbatch(
+        self,
+        request: Request,
+        microbatch: MicroBatch,
+    ) -> None:
+        microbatch.requests.append(request)
+        self.microbatch_id_to_request_ids.setdefault(
+            microbatch.microbatch_id, set()
+        ).add(request.request_id)
+        self.request_id_to_microbatch_id[request.request_id] = microbatch.microbatch_id
+        self.running.append(request)
+        request.status = RequestStatus.RUNNING
+
+    def _admit_waiting_requests_pp_opt(self) -> None:
+        self._update_pp_opt_active_microbatch_num(self._pp_opt_last_in_flight_ids)
+        while self.waiting:
+            if self._get_pp_opt_num_running_reqs() >= self.max_num_running_reqs:
+                logger.debug(
+                    "PP optimization admission stopped: max_num_seqs reached (%d)",
+                    self.max_num_running_reqs,
+                )
+                break
+
+            request = self.waiting.peek_request()
+            if request.status != RequestStatus.WAITING:
+                logger.debug(
+                    "PP optimization admission stopped: head request %s has status %s",
+                    request.request_id,
+                    request.status,
+                )
+                break
+
+            microbatch = self._select_pp_opt_target_microbatch(request)
+            num_external_computed_tokens = max(request.num_tokens - 1, 0)
+            num_new_tokens = 1
+            num_tokens_to_allocate = num_new_tokens + num_external_computed_tokens
+
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                request,
+                num_tokens_to_allocate,
+                0,
+                self.kv_cache_manager.empty_kv_cache_blocks,
+            )
+            if new_blocks is None:
+                logger.debug(
+                    "PP optimization admission stopped: KV allocation "
+                    "failed for request %s",
+                    request.request_id,
+                )
+                break
+
+            if self.connector is not None:
+                self.connector.update_state_after_alloc(
+                    request,
+                    self.kv_cache_manager.get_blocks(request.request_id),
+                    num_external_computed_tokens,
+                )
+
+            request = self.waiting.pop_request()
+            if self.log_stats:
+                request.record_event(EngineCoreEventType.SCHEDULED)
+            request.num_external_computed_tokens = num_external_computed_tokens
+            request.num_computed_tokens = num_external_computed_tokens
+            if getattr(request, "num_cached_tokens", -1) < 0:
+                request.num_cached_tokens = num_external_computed_tokens
+            self._add_request_to_pp_opt_microbatch(request, microbatch)
+            logger.debug(
+                "PP optimization admitted request %s to microbatch %d: "
+                "external_computed_tokens=%d new_tokens=%d",
+                request.request_id,
+                microbatch.microbatch_id,
+                num_external_computed_tokens,
+                num_new_tokens,
+            )
+
+    def _pp_opt_request_needs_work(self, request: Request) -> bool:
+        return (
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        ) > 0
+
+    def _get_pp_opt_schedulable_request_count(self) -> int:
+        return sum(
+            1
+            for microbatch in self.pp_opt_microbatches.values()
+            for request in microbatch.requests
+            if self._pp_opt_request_needs_work(request)
+        )
+
+    def _get_pp_opt_idle_running_request_count(self) -> int:
+        return sum(
+            1
+            for microbatch in self.pp_opt_microbatches.values()
+            for request in microbatch.requests
+            if request.status == RequestStatus.RUNNING
+            and not self._pp_opt_request_needs_work(request)
+        )
+
+    def _maybe_log_pp_opt_monitor(
+        self,
+        selected_microbatch_id: int | None,
+        ready_microbatches: list[MicroBatch],
+        in_flight_ids: set[int],
+    ) -> None:
+        monitor_interval = getattr(self, "pp_opt_monitor_interval", 0)
+        if monitor_interval <= 0:
+            return
+
+        self._pp_opt_schedule_decisions = (
+            getattr(self, "_pp_opt_schedule_decisions", 0) + 1
+        )
+        if self._pp_opt_schedule_decisions % monitor_interval != 0:
+            return
+
+        max_microbatch_num = getattr(
+            self,
+            "pp_opt_max_microbatch_num",
+            getattr(self, "pp_opt_microbatch_num", len(self.pp_opt_microbatches)),
+        )
+        active_microbatch_ids = self._get_pp_opt_active_microbatch_ids(in_flight_ids)
+        active_microbatches = [
+            self.pp_opt_microbatches[microbatch_id]
+            for microbatch_id in active_microbatch_ids
+        ]
+        request_counts = [microbatch.request_num for microbatch in active_microbatches]
+        costs = [self.microbatch_cost(microbatch) for microbatch in active_microbatches]
+        request_count_min = min(request_counts, default=0)
+        request_count_max = max(request_counts, default=0)
+        request_count_avg = (
+            sum(request_counts) / len(request_counts) if request_counts else 0.0
+        )
+        request_count_imbalance = (
+            request_count_max / request_count_avg if request_count_avg > 0 else 0.0
+        )
+        cost_min = min(costs, default=0.0)
+        cost_max = max(costs, default=0.0)
+        cost_avg = sum(costs) / len(costs) if costs else 0.0
+        cost_imbalance = cost_max / cost_avg if cost_avg > 0 else 0.0
+
+        logger.info(
+            "PP optimization monitor: decision=%d selected_microbatch_id=%s "
+            "active=%d/%d active_ids=%s in_flight_ids=%s waiting=%d "
+            "running=%d schedulable=%d idle=%d ready_ids=%s "
+            "request_count_min=%d request_count_max=%d "
+            "request_count_avg=%.2f request_count_imbalance=%.2f "
+            "cost_min=%.2f cost_max=%.2f cost_avg=%.2f "
+            "cost_imbalance=%.2f",
+            self._pp_opt_schedule_decisions,
+            selected_microbatch_id,
+            len(active_microbatch_ids),
+            max_microbatch_num,
+            active_microbatch_ids,
+            sorted(in_flight_ids),
+            len(self.waiting),
+            self._get_pp_opt_num_running_reqs(),
+            self._get_pp_opt_schedulable_request_count(),
+            self._get_pp_opt_idle_running_request_count(),
+            [microbatch.microbatch_id for microbatch in ready_microbatches],
+            request_count_min,
+            request_count_max,
+            request_count_avg,
+            request_count_imbalance,
+            cost_min,
+            cost_max,
+            cost_avg,
+            cost_imbalance,
+        )
+
+    def _cleanup_pp_opt_microbatches(self) -> None:
+        removed_req_ids: set[str] = set()
+        for microbatch in self.pp_opt_microbatches.values():
+            kept_requests = []
+            for request in microbatch.requests:
+                if request.request_id in self.requests and not request.is_finished():
+                    kept_requests.append(request)
+                else:
+                    removed_req_ids.add(request.request_id)
+            microbatch.requests = kept_requests
+
+        if not removed_req_ids:
+            return
+
+        for req_id in removed_req_ids:
+            microbatch_id = self.request_id_to_microbatch_id.pop(req_id, None)
+            if microbatch_id is not None:
+                request_ids = self.microbatch_id_to_request_ids.get(microbatch_id)
+                if request_ids is not None:
+                    request_ids.discard(req_id)
+                    if not request_ids:
+                        self.microbatch_id_to_request_ids.pop(microbatch_id, None)
+            self.pp_opt_first_scheduled_req_ids.discard(req_id)
+
+        self.running = [
+            request
+            for request in self.running
+            if request.request_id not in removed_req_ids
+        ]
+
+    def _rebalance_pp_opt_free_microbatches(self, in_flight_ids: set[int]) -> None:
+        free_microbatch_ids = [
+            microbatch_id
+            for microbatch_id in sorted(self.pp_opt_microbatches)
+            if microbatch_id not in in_flight_ids
+        ]
+        if len(free_microbatch_ids) <= 1:
+            return
+        target_microbatch_ids = [
+            microbatch_id
+            for microbatch_id in self._get_pp_opt_base_active_microbatch_ids()
+            if microbatch_id not in in_flight_ids
+        ]
+        if not target_microbatch_ids:
+            return
+
+        free_requests = [
+            request
+            for microbatch_id in free_microbatch_ids
+            for request in self.pp_opt_microbatches[microbatch_id].requests
+        ]
+        if not free_requests:
+            return
+        if any(
+            request.request_id not in self.pp_opt_first_scheduled_req_ids
+            for request in free_requests
+        ):
+            return
+
+        target_size = self._get_pp_opt_target_microbatch_size()
+        target_microbatch_count = min(
+            len(target_microbatch_ids),
+            max(1, (len(free_requests) + target_size - 1) // target_size),
+        )
+        target_microbatch_ids = target_microbatch_ids[:target_microbatch_count]
+
+        old_layout = {
+            microbatch_id: [
+                request.request_id
+                for request in self.pp_opt_microbatches[microbatch_id].requests
+            ]
+            for microbatch_id in free_microbatch_ids
+        }
+
+        assignments: dict[int, list[Request]] = {
+            microbatch_id: [] for microbatch_id in free_microbatch_ids
+        }
+        base_size, remainder = divmod(len(free_requests), target_microbatch_count)
+        request_index = 0
+        for index, microbatch_id in enumerate(target_microbatch_ids):
+            chunk_size = base_size + (1 if index < remainder else 0)
+            assignments[microbatch_id] = free_requests[
+                request_index : request_index + chunk_size
+            ]
+            request_index += chunk_size
+
+        new_layout: dict[int, list[str]] = {}
+        for microbatch_id in free_microbatch_ids:
+            assigned_requests = assignments[microbatch_id]
+            self.pp_opt_microbatches[microbatch_id].requests = assigned_requests
+            if assigned_requests:
+                request_ids = {request.request_id for request in assigned_requests}
+                self.microbatch_id_to_request_ids[microbatch_id] = request_ids
+                for request in assigned_requests:
+                    self.request_id_to_microbatch_id[request.request_id] = microbatch_id
+                new_layout[microbatch_id] = [
+                    request.request_id for request in assigned_requests
+                ]
+            else:
+                self.microbatch_id_to_request_ids.pop(microbatch_id, None)
+                new_layout[microbatch_id] = []
+
+        if old_layout != new_layout:
+            logger.debug(
+                "PP optimization compacted free microbatches: "
+                "in_flight_ids=%s free_microbatch_ids=%s "
+                "target_microbatch_ids=%s request_count=%d "
+                "target_microbatch_count=%d target_size=%d",
+                sorted(in_flight_ids),
+                free_microbatch_ids,
+                target_microbatch_ids,
+                len(free_requests),
+                target_microbatch_count,
+                target_size,
+            )
+
+    def _make_pp_opt_scheduler_output(
+        self,
+        microbatch_id: int,
+        scheduled_reqs: list[Request],
+        new_reqs: list[Request],
+        cached_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+    ) -> SchedulerOutput:
+        req_to_all_blocks = {
+            request.request_id: self.kv_cache_manager.get_blocks(request.request_id)
+            for request in new_reqs
+        }
+
+        if self.use_v2_model_runner:
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req,
+                    req_to_all_blocks[req.request_id].get_block_ids(),
+                    req._all_token_ids,
+                )
+                for req in new_reqs
+            ]
+        else:
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req,
+                    req_to_all_blocks[req.request_id].get_block_ids(),
+                )
+                for req in new_reqs
+            ]
+
+        cached_reqs_data = self._make_cached_request_data(
+            cached_reqs,
+            [],
+            num_scheduled_tokens,
+            {},
+            req_to_new_blocks,
+        )
+        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+
+        num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
+        if scheduled_reqs:
+            num_common_prefix_blocks = (
+                self.kv_cache_manager.get_num_common_prefix_blocks(
+                    scheduled_reqs[0].request_id
+                )
+            )
+
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=new_reqs_data,
+            scheduled_cached_reqs=cached_reqs_data,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=num_common_prefix_blocks,
+            preempted_req_ids=set(),
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            microbatch_id=microbatch_id,
+        )
+
+        if self.connector is not None:
+            meta: KVConnectorMetadata = self.connector.build_connector_meta(
+                scheduler_output
+            )
+            scheduler_output.kv_connector_metadata = meta
+
+        if self.ec_connector is not None:
+            ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
+                scheduler_output
+            )
+            scheduler_output.ec_connector_metadata = ec_meta
+
+        self.prev_step_scheduled_req_ids.clear()
+        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+        self.pp_opt_first_scheduled_req_ids.update(num_scheduled_tokens.keys())
+        self._update_after_schedule(scheduler_output)
+        return scheduler_output
+
+    def schedule_pp_opt(self, microbatch_id: int) -> SchedulerOutput:
+        self._cleanup_pp_opt_microbatches()
+        self._admit_waiting_requests_pp_opt()
+        microbatch = self._get_pp_opt_microbatch(microbatch_id)
+        scheduled_reqs: list[Request] = []
+        new_reqs: list[Request] = []
+        cached_reqs: list[Request] = []
+        req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        num_scheduled_tokens: dict[str, int] = {}
+
+        for request in microbatch.requests:
+            if not self._pp_opt_request_needs_work(request):
+                continue
+
+            req_id = request.request_id
+            is_first_schedule = req_id not in self.pp_opt_first_scheduled_req_ids
+            if is_first_schedule:
+                new_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                new_reqs.append(request)
+            else:
+                new_blocks = self.kv_cache_manager.allocate_slots(request, 1)
+                if new_blocks is None:
+                    logger.debug(
+                        "PP optimization KV allocation failed: microbatch_id=%d "
+                        "request_id=%s",
+                        microbatch_id,
+                        req_id,
+                    )
+                    continue
+                cached_reqs.append(request)
+
+            scheduled_reqs.append(request)
+            req_to_new_blocks[req_id] = new_blocks
+            num_scheduled_tokens[req_id] = 1
+
+        return self._make_pp_opt_scheduler_output(
+            microbatch_id,
+            scheduled_reqs,
+            new_reqs,
+            cached_reqs,
+            num_scheduled_tokens,
+            req_to_new_blocks,
+        )
+
+    def update_from_output_pp_opt(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> dict[int, EngineCoreOutputs]:
+        engine_core_outputs = self.update_from_output(
+            scheduler_output,
+            model_runner_output,
+        )
+        self._cleanup_pp_opt_microbatches()
+        return engine_core_outputs
+
+    def has_requests_pp_opt(self) -> bool:
+        has_requests = (
+            bool(self.waiting)
+            or any(
+                microbatch.request_num > 0
+                for microbatch in self.pp_opt_microbatches.values()
+            )
+            or self.has_finished_requests()
+        )
+        return has_requests
+
+    def select_microbatch_pp_opt(self, in_flight_ids: set[int]) -> int | None:
+        self._pp_opt_last_in_flight_ids = set(in_flight_ids)
+        self._cleanup_pp_opt_microbatches()
+        self._admit_waiting_requests_pp_opt()
+        self._update_pp_opt_active_microbatch_num(in_flight_ids)
+        if getattr(self, "pp_opt_dynamic_microbatches", False):
+            self._rebalance_pp_opt_free_microbatches(in_flight_ids)
+
+        active_microbatch_ids = self._get_pp_opt_active_microbatch_ids(in_flight_ids)
+        free_microbatches = [
+            self.pp_opt_microbatches[microbatch_id]
+            for microbatch_id in active_microbatch_ids
+            if microbatch_id not in in_flight_ids
+        ]
+        ready_microbatches = []
+        if free_microbatches:
+            ready_microbatches = [
+                microbatch
+                for microbatch in free_microbatches
+                if any(
+                    self._pp_opt_request_needs_work(req) for req in microbatch.requests
+                )
+            ]
+        selected: int | None = None
+        if ready_microbatches:
+            selected = min(
+                ready_microbatches,
+                key=lambda microbatch: (
+                    self.microbatch_cost(microbatch),
+                    microbatch.microbatch_id,
+                ),
+            ).microbatch_id
+        elif free_microbatches and self.has_finished_requests():
+            selected = min(microbatch.microbatch_id for microbatch in free_microbatches)
+            logger.debug(
+                "PP optimization selected microbatch %d to flush finished request ids",
+                selected,
+            )
+
+        self._maybe_log_pp_opt_monitor(
+            selected,
+            ready_microbatches,
+            in_flight_ids,
+        )
+        return selected
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -2122,6 +3043,9 @@ class Scheduler(SchedulerInterface):
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
+
+        if envs.VLLM_USE_PP_OPT_SCHEDULER:
+            self._cleanup_pp_opt_microbatches()
 
         return [(r.request_id, r.client_index) for r in valid_requests]
 

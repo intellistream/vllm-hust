@@ -75,6 +75,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker import pp_opt_profile
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -952,11 +953,13 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     @with_gpu_sync_check
+    @pp_opt_profile.profile_worker_execute
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
+        # PP-opt waits for the previous send immediately before issuing the
+        # next send, allowing it to overlap with this iteration's model forward.
+        if self._pp_send_work and not envs.VLLM_USE_PP_OPT_SCHEDULER:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
