@@ -153,7 +153,7 @@ class Qwen2MLP(nn.Module):
                 gate_up, _ = sparse_gate_up
             else:
                 if self.sparsify_gate_up is not None:
-                    x = self.sparsify_gate_up.apply_dense_fallback(x)
+                    x = self.sparsify_gate_up.apply_dense_fallback(x, self.gate_up_proj)
                 gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
         sparse_down = (
@@ -165,7 +165,7 @@ class Qwen2MLP(nn.Module):
             x, _ = sparse_down
             return x
         if self.sparsify_down is not None:
-            x = self.sparsify_down.apply_dense_fallback(x)
+            x = self.sparsify_down.apply_dense_fallback(x, self.down_proj)
         x, _ = self.down_proj(x)
         return x
 
@@ -294,7 +294,7 @@ class Qwen2Attention(nn.Module):
         else:
             if self.sparsify_qkv is not None:
                 hidden_states = self.sparsify_qkv.apply_dense_fallback(
-                    hidden_states
+                    hidden_states, self.qkv_proj
                 )
             qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -326,7 +326,7 @@ class Qwen2Attention(nn.Module):
             output, _ = sparse_o
             return output
         if self.sparsify_o is not None:
-            attn_output = self.sparsify_o.apply_dense_fallback(attn_output)
+            attn_output = self.sparsify_o.apply_dense_fallback(attn_output, self.o_proj)
         output, _ = self.o_proj(attn_output)
         return output
 

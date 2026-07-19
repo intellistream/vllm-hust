@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Layer helpers for injecting activation sparsity."""
 
 import os
@@ -69,12 +70,11 @@ def build_sparsifier(
     if not targets_projection(sparsity_config, proj_name):
         return None
 
-    if not sparsity_config.calibration_path:
-        logger.warning_once(
-            "activation_sparsity.enable=True but calibration_path is not set. "
-            "Sparsity will not be applied."
+    calibration_path = sparsity_config.calibration_path
+    if not calibration_path:
+        raise ValueError(
+            "activation_sparsity.enable=True requires an explicit calibration_path."
         )
-        return None
 
     if sparsity_config.method == "larosa":
         sparsify_fn = _build_larosa_sparsifier(
@@ -89,7 +89,7 @@ def build_sparsifier(
     # Load pre-computed TEAL threshold for this layer/proj
     threshold_device = _threshold_load_device(device, sparsity_config)
     threshold = load_threshold(
-        sparsity_config.calibration_path,
+        calibration_path,
         layer_idx,
         proj_name,
         device=str(threshold_device),
@@ -128,13 +128,18 @@ def _build_larosa_sparsifier(
     device: torch.device | str = "cpu",
 ) -> LaRosaSparsifyFn | None:
     """Build La RoSA's official runtime top-k sparsifier for a projection."""
+    calibration_path = sparsity_config.calibration_path
+    if not calibration_path:
+        raise ValueError(
+            "activation_sparsity.enable=True requires an explicit calibration_path."
+        )
     first_site_projs = {"self_attn.qkv", "mlp.gate_up"}
     second_site_projs = {"self_attn.o", "mlp.down"}
 
     if proj_name in first_site_projs:
         sparse_level = sparsity_config.uniform_sparsity * 0.8
         rotation_path = find_rotation_matrix_path(
-            sparsity_config.calibration_path,
+            calibration_path,
             layer_idx,
             proj_name,
         )

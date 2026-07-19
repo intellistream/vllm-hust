@@ -22,6 +22,10 @@ from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
 from vllm.logger import enable_trace_function_call, init_logger
+from vllm.sparsity.config import (
+    ActivationSparsityConfig,
+    validate_activation_sparsity_compatibility,
+)
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
@@ -50,9 +54,6 @@ from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
-
-# Avoid circular import: ActivationSparsityConfig lives in vllm.sparsity.config
-from vllm.sparsity.config import ActivationSparsityConfig
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -1599,51 +1600,17 @@ class VllmConfig:
 
         self._verify_kv_transfer_compat()
 
-        # Auto-discover activation sparsity config from model directory
-        if (
-            self.activation_sparsity_config is None
-            and self.model_config is not None
-            and self.load_config is not None
-        ):
-            from vllm.model_executor.model_loader.weight_utils import (
-                get_activation_sparsity_config,
-            )
-
-            sparsity_json = get_activation_sparsity_config(
-                self.model_config, self.load_config
-            )
-            if sparsity_json:
-                self.activation_sparsity_config = ActivationSparsityConfig(
-                    **sparsity_json
-                )
-
         # Activation sparsity unsupported-combination guard
-        if (
-            self.activation_sparsity_config is not None
-            and self.activation_sparsity_config.enable
-            and self.activation_sparsity_config.strict_unsupported_check
-        ):
-            if (
-                self.parallel_config is not None
-                and self.parallel_config.tensor_parallel_size > 1
-            ):
-                raise ValueError(
-                    "Activation sparsity (TEAL / La RoSA) does not yet support "
-                    "tensor parallelism (tp_size > 1). Please set tp_size=1 or "
-                    "disable strict_unsupported_check."
-                )
-            if self.quant_config is not None:
-                raise ValueError(
-                    "Activation sparsity (TEAL / La RoSA) does not yet support "
-                    "quantization. Please use an unquantized model or disable "
-                    "strict_unsupported_check."
-                )
-            if self.lora_config is not None:
-                raise ValueError(
-                    "Activation sparsity (TEAL / La RoSA) does not yet support "
-                    "LoRA. Please disable LoRA or disable "
-                    "strict_unsupported_check."
-                )
+        validate_activation_sparsity_compatibility(
+            self.activation_sparsity_config,
+            tensor_parallel_size=(
+                self.parallel_config.tensor_parallel_size
+                if self.parallel_config is not None
+                else 1
+            ),
+            has_quantization=self.quant_config is not None,
+            has_lora=self.lora_config is not None,
+        )
 
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()

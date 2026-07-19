@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
 import tempfile
@@ -19,8 +20,8 @@ def test_build_sparsifier_disabled():
 
 def test_build_sparsifier_no_calibration_path():
     cfg = ActivationSparsityConfig(enable=True, calibration_path=None)
-    sparsifier = build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
-    assert sparsifier is None
+    with pytest.raises(ValueError, match="calibration_path"):
+        build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
 
 
 def test_build_sparsifier_missing_threshold():

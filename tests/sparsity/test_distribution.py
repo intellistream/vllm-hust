@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
 from types import SimpleNamespace
@@ -344,6 +345,81 @@ def test_larosa_sparse_linear_rotated_input_matches_unrotation_math():
     expected = (larosa_topk(x.float() @ q.float(), 0.5) @ q.float().t()) @ weight.t()
 
     assert inclusive is True
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
+def test_larosa_merged_weight_dense_fallback_stays_in_rotated_basis():
+    torch.manual_seed(7)
+    weight = torch.randn(6, 4)
+    rotation, _ = torch.linalg.qr(torch.randn(4, 4))
+    merged_weight = merge_rotation_into_weight(weight, rotation)
+    linear = SimpleNamespace(_larosa_sparse_weight_merged=True)
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.5,
+        rotation=rotation,
+        rotate_input=True,
+        apply_all_tokens=True,
+        use_sparse_gemv=True,
+    )
+    x = torch.randn(3, 4)
+
+    fallback_input = sparsify.apply_dense_fallback(x, linear)
+    actual = fallback_input @ merged_weight.t()
+    expected = (
+        larosa_topk(x.float() @ rotation.float(), 0.5) @ rotation.float().t()
+    ) @ weight.t()
+
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
+def test_larosa_merged_weight_identity_fallback_stays_dense(monkeypatch):
+    monkeypatch.setenv("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", "identity")
+    torch.manual_seed(8)
+    weight = torch.randn(6, 4)
+    rotation, _ = torch.linalg.qr(torch.randn(4, 4))
+    merged_weight = merge_rotation_into_weight(weight, rotation)
+    linear = SimpleNamespace(_larosa_sparse_weight_merged=True)
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.5,
+        rotation=rotation,
+        rotate_input=True,
+        apply_all_tokens=True,
+        use_sparse_gemv=True,
+    )
+    x = torch.randn(3, 4)
+
+    fallback_input = sparsify.apply_dense_fallback(x, linear)
+
+    assert torch.allclose(fallback_input, x @ rotation, atol=1e-5)
+    assert torch.allclose(
+        fallback_input @ merged_weight.t(),
+        x @ weight.t(),
+        atol=1e-5,
+    )
+
+
+def test_larosa_merged_weight_partial_fallback_rotates_every_row():
+    torch.manual_seed(9)
+    weight = torch.randn(6, 4)
+    rotation, _ = torch.linalg.qr(torch.randn(4, 4))
+    merged_weight = merge_rotation_into_weight(weight, rotation)
+    linear = SimpleNamespace(_larosa_sparse_weight_merged=True)
+    sparsify = LaRosaSparsifyFn(
+        sparsity_level=0.5,
+        rotation=rotation,
+        rotate_input=True,
+        apply_all_tokens=False,
+        prefill_sparsify="half",
+        use_sparse_gemv=True,
+    )
+    x = torch.randn(4, 4)
+
+    fallback_input = sparsify.apply_dense_fallback(x, linear)
+    actual = fallback_input @ merged_weight.t()
+    rotated = x @ rotation
+    expected_input = torch.cat((rotated[:2], larosa_topk(rotated[2:], 0.5)))
+    expected = expected_input @ rotation.t() @ weight.t()
+
     assert torch.allclose(actual, expected, atol=1e-5)
 
 

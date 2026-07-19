@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TEAL and La RoSA distribution/sparsify functions."""
 
 import os
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from torch import nn
@@ -172,20 +175,27 @@ class SparsifyFn(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._apply_sparsity_policy(x, self._apply_mask)
+
+    def _apply_sparsity_policy(
+        self,
+        x: torch.Tensor,
+        apply_mask: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
         if self.apply_all_tokens:
-            return self._apply_mask(x)
+            return apply_mask(x)
 
         if self.decode_only:
-            return self._apply_decode_only(x)
+            return self._apply_decode_only(x, apply_mask)
 
         if self.prefill_sparsify == "all":
-            return self._apply_mask(x)
+            return apply_mask(x)
 
         if self.prefill_sparsify == "none":
-            return self._apply_decode_only(x)
+            return self._apply_decode_only(x, apply_mask)
 
         if self.prefill_sparsify == "half":
-            return self._apply_prefill_half(x)
+            return self._apply_prefill_half(x, apply_mask)
 
         raise ValueError(
             "prefill_sparsify must be one of 'half', 'all', or 'none', "
@@ -199,7 +209,11 @@ class SparsifyFn(nn.Module):
             torch.zeros_like(x),
         )
 
-    def apply_dense_fallback(self, x: torch.Tensor) -> torch.Tensor:
+    def apply_dense_fallback(
+        self,
+        x: torch.Tensor,
+        linear_layer: nn.Module | None = None,
+    ) -> torch.Tensor:
         """Apply the dense fallback for projections without a sparse kernel.
 
         ``mask`` preserves TEAL/La RoSA semantics by applying the sparsifier
@@ -208,6 +222,7 @@ class SparsifyFn(nn.Module):
         the sparse linear policy rejected this projection, leave it dense so
         unprofitable dense masking does not dominate model throughput.
         """
+        del linear_layer
         if (
             self.use_sparse_gemv
             and type(self) is SparsifyFn
@@ -651,58 +666,71 @@ class SparsifyFn(nn.Module):
             return {}
         return {"marker_metadata": metadata}
 
-    def _apply_rows(self, x: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
+    def _apply_rows(
+        self,
+        x: torch.Tensor,
+        row_mask: torch.Tensor,
+        apply_mask: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
         if row_mask.numel() != x.shape[0]:
             raise ValueError(
                 f"row_mask length ({row_mask.numel()}) must equal "
                 f"input rows ({x.shape[0]})."
             )
-        masked = self._apply_mask(x)
+        masked = apply_mask(x)
         view_shape = (row_mask.numel(),) + (1,) * (x.dim() - 1)
         row_mask = row_mask.to(device=x.device).view(view_shape)
         return torch.where(row_mask, masked, x)
 
-    def _apply_prefill_half(self, x: torch.Tensor) -> torch.Tensor:
+    def _apply_prefill_half(
+        self,
+        x: torch.Tensor,
+        apply_mask: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
         if x.dim() == 3:
             seq_len = x.shape[1]
             if seq_len == 1:
-                return self._apply_mask(x)
+                return apply_mask(x)
             half_seq_len = seq_len // 2
             if half_seq_len == 0:
                 return x
             return torch.cat(
                 (
                     x[:, :-half_seq_len, :],
-                    self._apply_mask(x[:, -half_seq_len:, :]),
+                    apply_mask(x[:, -half_seq_len:, :]),
                 ),
                 dim=1,
             )
 
         if x.dim() != 2:
-            return self._apply_mask(x)
+            return apply_mask(x)
 
         row_mask = self._get_vllm_prefill_half_row_mask(x)
         if row_mask is None:
             if x.shape[0] == 1:
-                return self._apply_mask(x)
+                return apply_mask(x)
             half_seq_len = x.shape[0] // 2
             if half_seq_len == 0:
                 return x
             row_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
             row_mask[-half_seq_len:] = True
-        return self._apply_rows(x, row_mask)
+        return self._apply_rows(x, row_mask, apply_mask)
 
-    def _apply_decode_only(self, x: torch.Tensor) -> torch.Tensor:
+    def _apply_decode_only(
+        self,
+        x: torch.Tensor,
+        apply_mask: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
         if x.dim() == 3:
-            return self._apply_mask(x) if x.shape[1] == 1 else x
+            return apply_mask(x) if x.shape[1] == 1 else x
 
         if x.dim() != 2:
-            return self._apply_mask(x)
+            return apply_mask(x)
 
         row_mask = self._get_vllm_decode_row_mask(x)
         if row_mask is None:
-            return self._apply_mask(x) if x.shape[0] == 1 else x
-        return self._apply_rows(x, row_mask)
+            return apply_mask(x) if x.shape[0] == 1 else x
+        return self._apply_rows(x, row_mask, apply_mask)
 
     def _get_vllm_decode_row_mask(self, x: torch.Tensor) -> torch.Tensor | None:
         request_slices = self._get_vllm_request_slices(x)
@@ -799,7 +827,7 @@ class SparsifyFn(nn.Module):
             return None
 
         context = get_forward_context()
-        metadata = context.attn_metadata
+        metadata: Any = context.attn_metadata
         if isinstance(metadata, list):
             metadata = metadata[0] if metadata else None
         if isinstance(metadata, dict):
@@ -854,8 +882,7 @@ def larosa_topk(x: torch.Tensor, sparsity_level: float) -> torch.Tensor:
         return x
     if sparsity_level >= 1.0:
         raise ValueError(
-            "La RoSA sparsity_level must be lower than 1.0, "
-            f"got {sparsity_level}."
+            f"La RoSA sparsity_level must be lower than 1.0, got {sparsity_level}."
         )
 
     keep = int((1.0 - sparsity_level) * x.shape[-1])
@@ -983,6 +1010,41 @@ class LaRosaSparsifyFn(SparsifyFn):
         sparse_rotated_x = larosa_topk(rotated_x, self.sparsity_level)
         unrotated_x = torch.matmul(sparse_rotated_x, rotation.t())
         return unrotated_x.to(dtype=original_dtype)
+
+    def apply_dense_fallback(
+        self,
+        x: torch.Tensor,
+        linear_layer: nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Return activations in the basis expected by the dense weight.
+
+        A first-site La RoSA weight is loaded as ``W @ Q``. If sparse-kernel
+        admission rejects a call, the dense linear must therefore consume
+        ``x @ Q`` (with any top-k mask applied in that basis), not the normal
+        sparsifier output that rotates back by ``Q.T``.
+        """
+        if not self.rotate_input or not getattr(
+            linear_layer, "_larosa_sparse_weight_merged", False
+        ):
+            return super().apply_dense_fallback(x, linear_layer)
+
+        rotation = self._rotation_for(x)
+        if x.shape[-1] != rotation.shape[0]:
+            raise ValueError(
+                "La RoSA rotation hidden size mismatch: "
+                f"input hidden={x.shape[-1]}, rotation={tuple(rotation.shape)}."
+            )
+        rotated_x = torch.matmul(x.to(dtype=torch.float32), rotation).to(dtype=x.dtype)
+        if (
+            self.use_sparse_gemv
+            and self._dense_fallback_policy() == "identity"
+            and self._sparse_linear_applies_to_all_rows(rotated_x)
+        ):
+            return rotated_x
+        return self._apply_sparsity_policy(
+            rotated_x,
+            lambda value: larosa_topk(value, self.sparsity_level),
+        )
 
     def _sparse_linear_input(
         self,

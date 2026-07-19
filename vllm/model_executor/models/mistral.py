@@ -3,6 +3,7 @@
 """Mistral adaptation of the LLaMA architecture."""
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -27,6 +28,9 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
 from .utils import AutoWeightsLoader
+
+if TYPE_CHECKING:
+    from vllm.sparsity.config import ActivationSparsityConfig
 
 
 class MistralMLP(nn.Module):
@@ -88,6 +92,7 @@ class MistralAttention(LlamaAttention):
         cache_config: CacheConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        sparsity_config: "ActivationSparsityConfig | None" = None,
     ) -> None:
         super().__init__(
             config=config,
@@ -101,6 +106,7 @@ class MistralAttention(LlamaAttention):
             cache_config=cache_config,
             prefix=prefix,
             attn_type=attn_type,
+            sparsity_config=sparsity_config,
         )
 
         llama_4_scaling_config: dict[str, int | float | str] | None = getattr(
@@ -130,13 +136,35 @@ class MistralAttention(LlamaAttention):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        sparse_qkv = (
+            self.sparsify_qkv.try_apply_linear(hidden_states, self.qkv_proj)
+            if self.sparsify_qkv is not None
+            else None
+        )
+        if sparse_qkv is not None:
+            qkv, _ = sparse_qkv
+        else:
+            if self.sparsify_qkv is not None:
+                hidden_states = self.sparsify_qkv.apply_dense_fallback(
+                    hidden_states, self.qkv_proj
+                )
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         if self.do_llama_4_scaling:
             attn_scale = self._get_llama_4_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
         attn_output = self.attn(q, k, v)
+        sparse_o = (
+            self.sparsify_o.try_apply_linear(attn_output, self.o_proj)
+            if self.sparsify_o is not None
+            else None
+        )
+        if sparse_o is not None:
+            output, _ = sparse_o
+            return output
+        if self.sparsify_o is not None:
+            attn_output = self.sparsify_o.apply_dense_fallback(attn_output, self.o_proj)
         output, _ = self.o_proj(attn_output)
         return output
 
