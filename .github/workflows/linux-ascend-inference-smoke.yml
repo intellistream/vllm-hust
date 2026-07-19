@@ -31,6 +31,7 @@ jobs:
     timeout-minutes: 30
     env:
       DEFAULT_SYSTEM_ASCEND_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
+      HF_HUB_DISABLE_XET: "1"
       HF_HUB_DISABLE_TELEMETRY: "1"
       HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
       HF_HOME: ${{ github.workspace }}/../.hf-cache
