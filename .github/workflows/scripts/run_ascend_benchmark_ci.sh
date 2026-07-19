@@ -4,6 +4,30 @@ set -euo pipefail
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}
 
+append_loopback_no_proxy() {
+  local combined=${NO_PROXY:-}
+  local host
+
+  if [[ -n "${no_proxy:-}" ]]; then
+    combined="${combined:+${combined},}${no_proxy}"
+  fi
+
+  for host in 127.0.0.1 localhost ::1; do
+    case ",${combined}," in
+      *",${host},"*) ;;
+      *) combined="${combined:+${combined},}${host}" ;;
+    esac
+  done
+
+  export NO_PROXY="$combined"
+  export no_proxy="$combined"
+}
+
+# Self-hosted runners may require an outbound proxy. Keep loopback health
+# probes and benchmark traffic local even when inherited proxy settings do not
+# include localhost.
+append_loopback_no_proxy
+
 WORKSPACE_ROOT=${WORKSPACE_ROOT:-${GITHUB_WORKSPACE:-$PWD}}
 VLLM_HUST_REPO=${VLLM_HUST_REPO:-$WORKSPACE_ROOT}
 VLLM_ASCEND_HUST_REPO=${VLLM_ASCEND_HUST_REPO:-$WORKSPACE_ROOT/vllm-ascend-hust}

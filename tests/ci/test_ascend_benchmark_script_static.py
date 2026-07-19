@@ -23,6 +23,15 @@ def test_run_ascend_benchmark_propagates_benchmark_repo_publish_env():
     assert 'BENCHMARK_REPO_SSH_KEY="${BENCHMARK_REPO_SSH_KEY:-}" \\' in text
 
 
+def test_benchmark_script_bypasses_proxies_for_loopback_traffic():
+    text = script_text("run_ascend_benchmark_ci.sh")
+
+    assert "append_loopback_no_proxy" in text
+    assert "for host in 127.0.0.1 localhost ::1" in text
+    assert 'export NO_PROXY="$combined"' in text
+    assert 'export no_proxy="$combined"' in text
+
+
 def test_perfgate_store_baseline_cleans_worktree_on_exit():
     text = script_text("perfgate_store_baseline.sh")
 
