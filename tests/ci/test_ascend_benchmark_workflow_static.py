@@ -20,6 +20,10 @@ def workflow_yaml() -> dict:
     return yaml.safe_load(workflow_text())
 
 
+def test_ascend_benchmark_does_not_require_optional_cann_tbe():
+    assert 'HUST_REQUIRE_CANN_TBE: "0"' in workflow_text()
+
+
 def test_workflow_dispatch_input_count_stays_within_github_limit():
     inputs = workflow_yaml()[True]["workflow_dispatch"]["inputs"]
 
