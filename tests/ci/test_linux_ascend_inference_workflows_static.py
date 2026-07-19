@@ -46,6 +46,13 @@ def test_inference_workflows_install_no_build_isolation_build_dependencies():
         assert '"setuptools-rust>=1.9.0"' in text
 
 
+def test_inference_workflows_disable_hugging_face_xet_downloads():
+    for workflow_path in WORKFLOW_PATHS:
+        text = workflow_path.read_text(encoding="utf-8")
+
+        assert 'HF_HUB_DISABLE_XET: "1"' in text
+
+
 def test_inference_workflows_install_runtime_dependencies_and_verify_import():
     for workflow_path in WORKFLOW_PATHS:
         text = workflow_path.read_text(encoding="utf-8")
@@ -125,6 +132,8 @@ def test_inference_scripts_disable_backend_autoload_for_server_processes():
             )
         ]
         assert "TORCH_DEVICE_BACKEND_AUTOLOAD" in sudo_env
+        assert "export HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}" in text
+        assert "HF_HUB_DISABLE_XET" in sudo_env
         assert "append_python_library_path()" in text
         assert (
             'LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}'

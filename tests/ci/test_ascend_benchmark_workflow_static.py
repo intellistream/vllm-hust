@@ -24,6 +24,10 @@ def test_ascend_benchmark_does_not_require_optional_cann_tbe():
     assert 'HUST_REQUIRE_CANN_TBE: "0"' in workflow_text()
 
 
+def test_ascend_benchmark_disables_hugging_face_xet_downloads():
+    assert 'HF_HUB_DISABLE_XET: "1"' in workflow_text()
+
+
 def test_workflow_dispatch_input_count_stays_within_github_limit():
     inputs = workflow_yaml()[True]["workflow_dispatch"]["inputs"]
 
@@ -330,6 +334,8 @@ def test_benchmark_script_disables_torch_backend_autoload_for_server_processes()
         )
     ]
     assert "TORCH_DEVICE_BACKEND_AUTOLOAD" in sudo_env
+    assert "export HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}" in script
+    assert "HF_HUB_DISABLE_XET" in sudo_env
     assert "append_python_library_path()" in script
     assert (
         'LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}'
