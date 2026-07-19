@@ -604,6 +604,10 @@ class Attention(nn.Module, AttentionLayerBase):
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
         if self.sliding_window is not None:
+            if self.kv_cache_dtype == "kivi_int4":
+                raise NotImplementedError(
+                    "KIVI INT4 KV cache does not support sliding-window attention yet."
+                )
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
             )

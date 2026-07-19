@@ -193,10 +193,17 @@ class TestKVCacheSpecRegistry:
         assert KVCacheSpecRegistry.get_manager_class(
             spec
         ) is KVCacheSpecRegistry.get_manager_class(full_spec)
-        assert (
-            KVCacheSpecRegistry.get_uniform_type_base_spec(spec)
-            is FullAttentionSpec
-        )
+        assert KVCacheSpecRegistry.get_uniform_type_base_spec(spec) is FullAttentionSpec
+
+    def test_kivi_rejects_group_size_incompatible_with_packing(self):
+        with pytest.raises(ValueError, match="int32 packing factor"):
+            KIVIInt4FullAttentionSpec(
+                block_size=64,
+                num_kv_heads=8,
+                head_size=128,
+                dtype=torch.bfloat16,
+                kivi_group_size=4,
+            )
 
     def test_builtin_kvcache_specs_registered(self):
         assert set(spec_manager_map) <= set(_REGISTRY_KVCACHESPEC_LIST)

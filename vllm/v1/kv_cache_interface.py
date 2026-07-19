@@ -323,6 +323,7 @@ class FullAttentionSpec(AttentionSpec):
             self.block_size * self.num_kv_heads * last_dim * get_dtype_size(self.dtype)
         )
 
+
 @dataclass(frozen=True, kw_only=True)
 class KIVIInt4FullAttentionSpec(FullAttentionSpec):
     kivi_group_size: int = 32
@@ -339,10 +340,15 @@ class KIVIInt4FullAttentionSpec(FullAttentionSpec):
         if self.quant_bits != 4:
             raise ValueError("Current KIVI spec only supports 4-bit history cache.")
 
-        if self.head_size != self.head_size_v:
+        pack_factor = 32 // self.quant_bits
+        if self.kivi_group_size % pack_factor != 0:
             raise ValueError(
-                "KIVI INT4 does not support head_size != head_size_v yet."
+                "KIVI group size must be divisible by the int32 packing factor "
+                f"({pack_factor})."
             )
+
+        if self.head_size != self.head_size_v:
+            raise ValueError("KIVI INT4 does not support head_size != head_size_v yet.")
 
         if self.block_size % self.kivi_group_size != 0:
             raise ValueError(
@@ -417,17 +423,13 @@ class KIVIInt4FullAttentionSpec(FullAttentionSpec):
 
         assert all(
             spec.kivi_group_size == specs[0].kivi_group_size for spec in specs
-        ), (
-            "All merged KIVI specs must share group size."
-        )
+        ), "All merged KIVI specs must share group size."
         assert all(spec.quant_bits == specs[0].quant_bits for spec in specs), (
             "All merged KIVI specs must share quant bits."
         )
         assert all(
             spec.quant_packed_dtype == specs[0].quant_packed_dtype for spec in specs
-        ), (
-            "All merged KIVI specs must share quant_packed_dtype."
-        )
+        ), "All merged KIVI specs must share quant_packed_dtype."
         assert all(spec.scale_dtype == specs[0].scale_dtype for spec in specs), (
             "All merged KIVI specs must share scale dtype."
         )
@@ -439,7 +441,8 @@ class KIVIInt4FullAttentionSpec(FullAttentionSpec):
             quant_packed_dtype=specs[0].quant_packed_dtype,
             scale_dtype=specs[0].scale_dtype,
         )
-        
+
+
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
     if spec.alignment is None:
         return

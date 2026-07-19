@@ -272,6 +272,7 @@ class SingleTypeKVCacheManager(ABC):
         if type(self.kv_cache_spec) in (
             FullAttentionSpec,
             TQFullAttentionSpec,
+            KIVIInt4FullAttentionSpec,
             MLAAttentionSpec,
             HiddenStateCacheSpec,
         ):
@@ -305,6 +306,7 @@ class SingleTypeKVCacheManager(ABC):
             if type(self.kv_cache_spec) in (
                 FullAttentionSpec,
                 TQFullAttentionSpec,
+                KIVIInt4FullAttentionSpec,
                 MLAAttentionSpec,
                 HiddenStateCacheSpec,
             ):
@@ -1457,7 +1459,6 @@ class SinkFullAttentionManager(FullAttentionManager):
         assert sink_len is not None and sink_len > 0 and sink_len % self.block_size == 0
         num_sink_block = sink_len // self.block_size
         self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
-
 
 
 def get_manager_for_kv_cache_spec(
