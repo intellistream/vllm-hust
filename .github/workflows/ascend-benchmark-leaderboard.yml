@@ -695,7 +695,7 @@ jobs:
 
             rm -rf "$target_dir"
             while [[ "$try" -le "$attempts" ]]; do
-              if git clone --depth 1 --branch feature/conda-runtime-library-priority \
+              if git clone --depth 1 --branch codex/fix-ascend-benchmark-ci \
                 --single-branch "$repo_url" "$target_dir"; then
                 return 0
               fi
