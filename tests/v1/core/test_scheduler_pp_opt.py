@@ -72,6 +72,7 @@ def _create_pp_opt_scheduler(
         scheduler_config=scheduler_config,
         model_config=SimpleNamespace(
             is_encoder_decoder=False,
+            is_diffusion=False,
             max_model_len=max_num_batched_tokens,
             enable_return_routed_experts=False,
         ),
@@ -94,6 +95,8 @@ def _create_pp_opt_scheduler(
         kv_transfer_config=None,
         speculative_config=None,
         ec_transfer_config=None,
+        num_speculative_tokens=0,
+        use_v2_model_runner=False,
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
