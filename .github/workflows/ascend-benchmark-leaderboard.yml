@@ -1217,6 +1217,7 @@ jobs:
           SAME_SPEC_BENCHMARK_ENABLED: "1"
           PUBLISH_TO_BENCHMARK_REPO: "0"
           PUBLISH_TO_HF: "0"
+          SYNC_GITHUB_SNAPSHOTS: "0"
         run: |
           set -euo pipefail
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"

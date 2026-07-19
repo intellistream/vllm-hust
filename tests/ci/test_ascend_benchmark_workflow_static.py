@@ -68,6 +68,7 @@ def test_main_perfgate_producer_uses_shared_pr_spec_without_changing_formal_defa
     assert 'SAME_SPEC_BENCHMARK_ENABLED: "1"' in producer
     assert 'PUBLISH_TO_BENCHMARK_REPO: "0"' in producer
     assert 'PUBLISH_TO_HF: "0"' in producer
+    assert 'SYNC_GITHUB_SNAPSHOTS: "0"' in producer
     assert "max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}" in producer
     assert "cleanup_ascend_ci_processes.sh" in producer
     assert '--explicit-spec-file ""' in text
