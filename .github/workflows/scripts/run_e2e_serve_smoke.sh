@@ -14,6 +14,21 @@ PROMPT=${PROMPT:-The capital of France is}
 SERVER_LOG=${SERVER_LOG:-/tmp/vllm-e2e-smoke.log}
 RUNTIME_READY_LOG=${RUNTIME_READY_LOG:-/tmp/vllm-e2e-smoke-runtime-ready.log}
 PYTHON_BIN=${PYTHON_BIN:-python}
+
+append_python_library_path() {
+  local python_library_path
+
+  python_library_path=$("$PYTHON_BIN" -c 'import os, sys; print(os.path.join(sys.prefix, "lib"))')
+  [[ -d "$python_library_path" ]] || return 0
+
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *":$python_library_path:"*) ;;
+    *) export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${python_library_path}" ;;
+  esac
+}
+
+append_python_library_path
+
 VLLM_ASCEND_HUST_REPO=${VLLM_ASCEND_HUST_REPO:-${GITHUB_WORKSPACE:-$PWD}/vllm-ascend-hust}
 SUDO_AUTH_EXIT_CODE=${SUDO_AUTH_EXIT_CODE:-76}
 ASCEND_E2E_USE_SUDO=${ASCEND_E2E_USE_SUDO:-0}

@@ -330,6 +330,12 @@ def test_benchmark_script_disables_torch_backend_autoload_for_server_processes()
         )
     ]
     assert "TORCH_DEVICE_BACKEND_AUTOLOAD" in sudo_env
+    assert "append_python_library_path()" in script
+    assert (
+        'LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}'
+        '${python_library_path}"'
+        in script
+    )
 
 
 def test_benchmark_script_does_not_default_pr_hardware_to_b3():
