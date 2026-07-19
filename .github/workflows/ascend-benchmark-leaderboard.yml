@@ -584,6 +584,11 @@ jobs:
           echo "FORK_POINT=$fork_point" >> "$GITHUB_ENV"
           echo "Fork point: $fork_point"
 
+      - name: Select isolated E2E benchmark repo ref
+        if: ${{ github.ref == 'refs/heads/e2e/perfgate-integration-20260719' || github.event.pull_request.base.ref == 'e2e/perfgate-integration-20260719' }}
+        shell: bash
+        run: echo "BENCHMARK_REPO_REF=e2e/fix-incomplete-model-cache-20260719" >> "$GITHUB_ENV"
+
       - name: Checkout benchmark repo
         run: |
           clone_with_retry() {
@@ -1719,7 +1724,7 @@ jobs:
         shell: bash
         env:
           BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
-          BENCHMARK_REPO_REF: main
+          BENCHMARK_REPO_REF: ${{ github.ref == 'refs/heads/e2e/perfgate-integration-20260719' && 'e2e/fix-incomplete-model-cache-20260719' || 'main' }}
         run: |
           set -euo pipefail
           git clone --depth 1 "$BENCHMARK_REPO_URL" vllm-hust-benchmark

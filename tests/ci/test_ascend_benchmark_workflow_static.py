@@ -64,6 +64,7 @@ def test_e2e_branch_uses_isolated_baseline_and_stage2_base():
 
     assert "refs/heads/e2e/perfgate-integration-20260719" in text
     assert "benchmark-baselines-e2e-vllm-hust-20260719" in text
+    assert "e2e/fix-incomplete-model-cache-20260719" in text
     assert "PERFGATE_STAGE2_BASE_BRANCH:" in text
     assert "PERFGATE_BASELINE_BRANCH:" in text
 
