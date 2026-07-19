@@ -185,6 +185,10 @@ def test_pr_checkout_urls_use_https_without_publish_ssh_key():
 
 def test_benchmark_install_removes_conflicting_vllm_provider():
     text = workflow_text()
+    runtime_dependencies_script = (
+        Path(__file__).resolve().parents[2]
+        / ".github/workflows/scripts/ensure_ascend_runtime_dependencies.sh"
+    ).read_text(encoding="utf-8")
 
     install_step = text[
         text.index(
@@ -193,6 +197,39 @@ def test_benchmark_install_removes_conflicting_vllm_provider():
     ]
 
     assert '"${PYTHON_BIN}" -m pip uninstall -y vllm vllm-hust' in install_step
+    assert "ensure_ascend_runtime_dependencies.sh" in install_step
+    assert install_step.index("ensure_ascend_runtime_dependencies.sh") < (
+        install_step.index("install_local_ascend_plugin.sh")
+    )
+    assert 'ASCEND_NUMPY_SPEC="${ASCEND_NUMPY_SPEC:-numpy<2.0.0}"' in (
+        runtime_dependencies_script
+    )
+    assert 'printf \'torch==%s\\n\'' in runtime_dependencies_script
+    assert 'printf \'torch-npu==%s\\n\'' in runtime_dependencies_script
+    for requirement in (
+        '"$ASCEND_NUMPY_SPEC"',
+        "attrs",
+        "decorator",
+        "psutil",
+        "scipy",
+        '"transformers==5.5.4"',
+        '"compressed-tensors>=0.11.0"',
+    ):
+        assert requirement in runtime_dependencies_script
+    assert '-r "$COMMON_REQUIREMENTS"' in runtime_dependencies_script
+    assert 'ASCEND_TRITON_VERSION="${ASCEND_TRITON_VERSION:-3.2.1}"' in (
+        runtime_dependencies_script
+    )
+    assert 'ASCEND_TRITON_SPEC="triton-ascend==$ASCEND_TRITON_VERSION"' in (
+        runtime_dependencies_script
+    )
+    assert '"$ASCEND_TRITON_SPEC"' in runtime_dependencies_script
+    assert "import regex" in runtime_dependencies_script
+    assert "import torch_npu" in runtime_dependencies_script
+    assert "torch changed from the pinned version" in runtime_dependencies_script
+    assert "NumPy is outside the supported Ascend range" in (
+        runtime_dependencies_script
+    )
     assert (
         '"${PYTHON_BIN}" scripts/ensure_vllm_provider.py --remove-conflicts'
         in install_step
@@ -540,11 +577,37 @@ def test_ascend_torch_stack_is_installed_before_preinstall_preflight():
         'ASCEND_TORCH_NPU_VERSION="${ASCEND_TORCH_NPU_VERSION:-2.10.0}"'
         in ensure_script
     )
-    assert 'ASCEND_NUMPY_SPEC="${ASCEND_NUMPY_SPEC:-numpy}"' in ensure_script
+    assert (
+        'ASCEND_TORCHVISION_VERSION="${ASCEND_TORCHVISION_VERSION:-0.25.0}"'
+        in ensure_script
+    )
+    assert (
+        'ASCEND_TORCHAUDIO_VERSION="${ASCEND_TORCHAUDIO_VERSION:-2.10.0}"'
+        in ensure_script
+    )
+    assert 'ASCEND_NUMPY_SPEC="${ASCEND_NUMPY_SPEC:-numpy<2.0.0}"' in ensure_script
     assert 'numpy_version = dist_version("numpy")' in ensure_script
     assert '"$ASCEND_NUMPY_SPEC"' in ensure_script
     assert "import torch" in ensure_script
     assert "import torch_npu" in ensure_script
+
+
+def test_all_ascend_workflows_install_runtime_dependencies_before_plugin():
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow_paths = (
+        repo_root / ".github/workflows/ascend-benchmark-leaderboard.yml",
+        repo_root / ".github/workflows/linux-ascend-inference-smoke.yml",
+        repo_root / ".github/workflows/linux-ascend-inference-regression.yml",
+    )
+
+    for workflow_path in workflow_paths:
+        text = workflow_path.read_text(encoding="utf-8")
+        prepare_start = text.index("      - name: Prepare Ascend runtime")
+        verify_start = text.index("      - name: Verify installation", prepare_start)
+        prepare_step = text[prepare_start:verify_start]
+        assert prepare_step.index("ensure_ascend_runtime_dependencies.sh") < (
+            prepare_step.index("install_local_ascend_plugin.sh")
+        )
 
 
 def test_l2_targeted_scenario_registry_is_covered_by_parser_tests():
