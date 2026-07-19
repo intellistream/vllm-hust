@@ -1193,6 +1193,7 @@ jobs:
         run: bash .github/workflows/scripts/perfgate_fetch_baseline.sh "$FORK_POINT"
 
       - name: Run benchmark CI and optional formal publish
+        if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/e2e/perfgate-integration-20260719') }}
         env:
           WORKSPACE_ROOT: ${{ github.workspace }}
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
