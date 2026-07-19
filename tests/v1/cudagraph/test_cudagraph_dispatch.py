@@ -317,6 +317,7 @@ class TestCudagraphDispatcher:
     @pytest.mark.parametrize(
         ("metadata", "dispatch_kwargs"),
         [
+            ("invalid_metadata", {}),
             (
                 CUDAGraphRuntimeMetadata(0, "parallel_replay", "test_backend"),
                 {},
@@ -361,7 +362,7 @@ class TestCudagraphDispatcher:
     )
     def test_invalid_runtime_key_fails_without_mutation(
         self,
-        metadata: CUDAGraphRuntimeMetadata,
+        metadata: object,
         dispatch_kwargs: dict,
     ):
         comp_config = CompilationConfig(

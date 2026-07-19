@@ -186,6 +186,7 @@ class CudagraphDispatcher:
         runtime_mode = self.cudagraph_mode.decode_mode()
         invalid_request = (
             not allow_runtime_key_registration
+            or not isinstance(runtime_metadata, CUDAGraphRuntimeMetadata)
             or not runtime_metadata.is_valid()
             or not uniform_decode
             or has_lora
