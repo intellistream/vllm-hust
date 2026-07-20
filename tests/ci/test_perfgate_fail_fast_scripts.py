@@ -218,3 +218,85 @@ def test_fetch_baseline_preserves_reason_in_enforce_mode(tmp_path: Path) -> None
     written_env = github_env.read_text(encoding="utf-8")
     assert "PERFGATE_BASELINE_AVAILABLE" in written_env
     assert "Perfgate baseline branch not found" in written_env
+
+
+def _run_compare_with_fake_python(
+    tmp_path: Path,
+    report: str,
+    python_rc: str,
+    extra_env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    fake_python = tmp_path / "fake-python"
+    _write_executable(
+        fake_python,
+        f"""#!/bin/bash
+set -euo pipefail
+report_file=""
+while (( $# > 0 )); do
+  if [[ "$1" == "--report-file" ]]; then
+    report_file=$2
+    break
+  fi
+  shift
+done
+printf '%s\\n' '{report}' > "$report_file"
+exit {python_rc}
+""",
+    )
+    baseline = tmp_path / "baseline.json"
+    current = tmp_path / "current.json"
+    baseline.write_text("{}\n", encoding="utf-8")
+    current.write_text("{}\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "PYTHON_BIN": str(fake_python),
+        "PERFGATE_MODE": "enforce",
+        "PERFGATE_BASELINE_AVAILABLE": "1",
+        "PERFGATE_BASELINE_FILE": str(baseline),
+        "PERFGATE_STAGE1_CURRENT_FILE": str(current),
+        "PERFGATE_REPORT_FILE": str(tmp_path / "report.md"),
+        "GITHUB_ENV": str(tmp_path / "github-env"),
+        **extra_env,
+    }
+    return subprocess.run(
+        ["/bin/bash", str(SCRIPT_DIR / "perfgate_compare.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env=env,
+    )
+
+
+def test_final_compare_reports_rebase_conflict_and_fails(tmp_path: Path) -> None:
+    conflict_file = tmp_path / "rebase-conflict.txt"
+    conflict_file.write_text("CONFLICT (content): workflow.yml\n", encoding="utf-8")
+
+    result = _run_compare_with_fake_python(
+        tmp_path,
+        "**Overall: FAIL**\n**Stage 2: FAIL**",
+        "1",
+        {
+            "PERFGATE_STAGE2_REBASE_CONFLICT": "1",
+            "PERFGATE_STAGE2_REBASE_CONFLICT_FILE": str(conflict_file),
+        },
+    )
+
+    assert result.returncode == 1
+    github_env = Path(tmp_path / "github-env").read_text(encoding="utf-8")
+    assert "PERFGATE_STAGE2_COMPLETED" in github_env
+    assert "PERFGATE_STAGE2_RESULT" in github_env
+
+
+def test_final_compare_reports_stage2_not_run_and_fails(tmp_path: Path) -> None:
+    result = _run_compare_with_fake_python(
+        tmp_path,
+        "**Overall: FAIL**\n**Stage 2: NOT RUN**",
+        "1",
+        {"PERFGATE_STAGE2_NOT_RUN_REASON": "Stage 1 did not pass"},
+    )
+
+    assert result.returncode == 1
+    github_env = Path(tmp_path / "github-env").read_text(encoding="utf-8")
+    assert "PERFGATE_STAGE2_COMPLETED" in github_env
+    assert "PERFGATE_STAGE2_RESULT" in github_env

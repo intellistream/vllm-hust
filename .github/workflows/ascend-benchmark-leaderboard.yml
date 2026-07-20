@@ -1228,7 +1228,7 @@ jobs:
           bash .github/workflows/scripts/perfgate_stage2_rebase_and_benchmark.sh
 
       - name: Performance gate - two-stage comparison
-        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
+        if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
         shell: bash
         run: bash .github/workflows/scripts/perfgate_compare.sh
 
@@ -1453,10 +1453,28 @@ jobs:
           if baseline_notes:
             lines.extend(baseline_notes)
             comment_lines.extend(baseline_notes)
+          perfgate_markdown = ''
           if perfgate_report.is_file():
             perfgate_markdown = perfgate_report.read_text(encoding='utf-8').strip()
             lines.extend(['', perfgate_markdown])
             comment_lines.extend(['', perfgate_markdown])
+          conflict_file = os.environ.get('PERFGATE_STAGE2_REBASE_CONFLICT_FILE', '').strip()
+          if conflict_file:
+            conflict_path = Path(conflict_file)
+            if conflict_path.is_file():
+              conflict_details = conflict_path.read_text(encoding='utf-8', errors='replace').strip()[:12000]
+              if conflict_details and conflict_details not in perfgate_markdown:
+                conflict_details = conflict_details.replace('```', "'''")
+                conflict_block = [
+                  '',
+                  '### Stage 2 rebase conflict details',
+                  '',
+                  '```text',
+                  conflict_details,
+                  '```',
+                ]
+                lines.extend(conflict_block)
+                comment_lines.extend(conflict_block)
 
           if raw_result.is_file():
             payload = json.loads(raw_result.read_text(encoding='utf-8'))
