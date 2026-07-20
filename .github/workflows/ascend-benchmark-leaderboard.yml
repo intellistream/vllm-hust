@@ -1,6 +1,8 @@
 name: Ascend Benchmark Leaderboard
 
 on:
+  push:
+    branches: [main]
   pull_request:
     types: [labeled]
   issue_comment:
@@ -242,6 +244,7 @@ jobs:
     if: >-
       always() &&
       (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
         github.event_name == 'workflow_dispatch' ||
         github.event_name == 'schedule' ||
         (
@@ -637,7 +640,7 @@ jobs:
           "${PYTHON_BIN:-python3}" .github/workflows/scripts/resolve_perfgate_spec_file.py
 
       - name: Resolve main same-spec file
-        if: ${{ github.event_name != 'pull_request' && github.event_name != 'issue_comment' && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
+        if: ${{ github.event_name != 'push' && github.event_name != 'pull_request' && github.event_name != 'issue_comment' && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
         run: |
           spec_file="${SAME_SPEC_SPEC_FILE:-$MAIN_SAME_SPEC_SPEC_FILE}"
           if [[ "$spec_file" = /* ]]; then
@@ -1161,6 +1164,7 @@ jobs:
         run: bash .github/workflows/scripts/perfgate_fetch_baseline.sh "$FORK_POINT"
 
       - name: Run benchmark CI and optional formal publish
+        if: ${{ github.event_name != 'push' }}
         env:
           WORKSPACE_ROOT: ${{ github.workspace }}
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
@@ -1194,6 +1198,96 @@ jobs:
 
             exit "$rc"
           done
+
+      - name: Run and publish main perfgate baseline
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          WORKSPACE_ROOT: ${{ github.workspace }}
+          VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
+          VLLM_HUST_REPO: ${{ github.workspace }}
+          VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
+          VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
+          PERFGATE_MODEL_NAME: Qwen/Qwen2.5-3B-Instruct
+          PERFGATE_MODEL_PARAMETERS: 3B
+          PERFGATE_MODEL_PRECISION: BF16
+          PERFGATE_DTYPE: bfloat16
+          PERFGATE_NUM_PROMPTS: "8"
+          PERFGATE_INPUT_LEN: "64"
+          PERFGATE_OUTPUT_LEN: "16"
+          CENTRAL_BASELINE_BRANCH: benchmark-baselines
+        run: |
+          set -euo pipefail
+          source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
+
+          perfgate_run_id="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TARGET_REPO_SHA}-perfgate"
+          perfgate_result_root="${GITHUB_WORKSPACE}/.benchmarks/ci/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TARGET_REPO_SHA}/perfgate"
+          perfgate_spec_file="$(${PYTHON_BIN:-python3} -m vllm_hust_benchmark.perfgate_specs resolve \
+            --scenario random-online \
+            --hardware-chip-model "${HARDWARE_CHIP_MODEL}" \
+            --repo-root "${VLLM_HUST_BENCHMARK_REPO}")"
+          echo "Resolved main perfgate producer spec: ${perfgate_spec_file}"
+
+          run_main_perfgate_benchmark() {
+            RUN_ID="$perfgate_run_id" \
+              RESULT_ROOT="$perfgate_result_root" \
+              BENCH_SCENARIO=random-online \
+              BENCH_SCENARIOS=random-online \
+              BENCH_SCENARIO_COUNT=1 \
+              MODEL_NAME="$PERFGATE_MODEL_NAME" \
+              MODEL_PARAMETERS="$PERFGATE_MODEL_PARAMETERS" \
+              MODEL_PRECISION="$PERFGATE_MODEL_PRECISION" \
+              DTYPE="$PERFGATE_DTYPE" \
+              BENCH_NUM_PROMPTS="$PERFGATE_NUM_PROMPTS" \
+              BENCH_RANDOM_INPUT_LEN="$PERFGATE_INPUT_LEN" \
+              BENCH_RANDOM_OUTPUT_LEN="$PERFGATE_OUTPUT_LEN" \
+              BENCH_INPUT_LEN="$PERFGATE_INPUT_LEN" \
+              BENCH_OUTPUT_LEN="$PERFGATE_OUTPUT_LEN" \
+              SAME_SPEC_BENCHMARK_ENABLED=1 \
+              SAME_SPEC_SPEC_FILE="${VLLM_HUST_BENCHMARK_REPO}/${perfgate_spec_file}" \
+              PUBLISH_TO_BENCHMARK_REPO=0 \
+              PUBLISH_TO_HF=0 \
+              bash .github/workflows/scripts/run_ascend_benchmark_scenario_list.sh
+          }
+
+          max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}
+          retry_delay_seconds=${NODE_ENV_RETRY_DELAY_SECONDS:-30}
+          attempt=1
+          while [[ "$attempt" -le "$max_attempts" ]]; do
+            echo "[main-perfgate-producer] attempt ${attempt}/${max_attempts}"
+            set +e
+            run_main_perfgate_benchmark
+            rc=$?
+            set -e
+            if [[ "$rc" -eq 0 ]]; then
+              break
+            fi
+            if [[ "$rc" -eq 86 && "$attempt" -lt "$max_attempts" ]]; then
+              bash .github/workflows/scripts/cleanup_ascend_ci_processes.sh || true
+              sleep "$retry_delay_seconds"
+              attempt=$((attempt + 1))
+              continue
+            fi
+            exit "$rc"
+          done
+
+          baseline_artifact="${perfgate_result_root}/submissions/${perfgate_run_id}/run_leaderboard.json"
+          if [[ ! -f "$baseline_artifact" ]]; then
+            echo "Main perfgate producer artifact not found: $baseline_artifact" >&2
+            exit 2
+          fi
+
+          export PYTHONPATH="${VLLM_HUST_BENCHMARK_REPO}/src${PYTHONPATH:+:$PYTHONPATH}"
+          "${PYTHON_BIN:-python3}" \
+            .github/workflows/scripts/publish_central_perfgate_baseline.py \
+            --source "$baseline_artifact" \
+            --target-git-repository "$VLLM_HUST_REPO" \
+            --benchmark-git-repository "$VLLM_HUST_BENCHMARK_REPO" \
+            --central-remote "$BENCHMARK_REPO_URL" \
+            --branch "$CENTRAL_BASELINE_BRANCH" \
+            --main-ref origin/main \
+            --hardware-chip-model "$HARDWARE_CHIP_MODEL" \
+            --cann-version "${CANN_VERSION:?CANN_VERSION is required}" \
+            --update-latest-pointer
 
       - name: Performance gate - Stage 1 comparison
         if: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
@@ -1256,6 +1350,9 @@ jobs:
           target_repo_sha = os.environ.get('TARGET_REPO_SHA') or os.environ['GITHUB_SHA']
           run_id = f"ci-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{target_repo_sha}"
           result_root = Path(os.environ['GITHUB_WORKSPACE']) / '.benchmarks' / 'ci' / run_id
+          if os.environ.get('GITHUB_EVENT_NAME') == 'push':
+            run_id += '-perfgate'
+            result_root /= 'perfgate'
           raw_result = result_root / 'raw_benchmark.json'
           leaderboard_entry = result_root / 'submissions' / run_id / 'run_leaderboard.json'
           runner_preflight_failure = result_root / 'runner_preflight_failure.txt'
@@ -1575,51 +1672,3 @@ jobs:
               });
               core.info('Created benchmark PR comment');
             }
-
-  store-main-perfgate-baseline:
-    name: Store main perfgate baseline
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.VLLM_HUST_MAIN_BENCHMARK_SCENARIOS == '' }}
-    needs: ascend-benchmark
-    runs-on: ubuntu-latest
-    env:
-      TARGET_REPO_SHA: ${{ github.sha }}
-    permissions:
-      contents: write
-      actions: read
-    steps:
-      - name: Checkout target repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Checkout benchmark repo
-        shell: bash
-        env:
-          BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
-          BENCHMARK_REPO_REF: main
-        run: |
-          set -euo pipefail
-          git clone --depth 1 "$BENCHMARK_REPO_URL" vllm-hust-benchmark
-          if ! git -C vllm-hust-benchmark rev-parse --verify --quiet "$BENCHMARK_REPO_REF^{commit}" >/dev/null; then
-            git -C vllm-hust-benchmark fetch --depth 1 origin "$BENCHMARK_REPO_REF"
-            git -C vllm-hust-benchmark checkout --force FETCH_HEAD
-          else
-            git -C vllm-hust-benchmark checkout --force "$BENCHMARK_REPO_REF"
-          fi
-
-      - name: Download benchmark artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ascend-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .benchmarks/ci
-
-      - name: Store perfgate baseline
-        shell: bash
-        env:
-          RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}
-          RESULT_ROOT: ${{ github.workspace }}/.benchmarks/ci/ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}
-          PYTHON_BIN: python3
-          BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
-          BENCHMARK_REPO_REF: main
-          SAME_SPEC_SPEC_FILE: ${{ github.workspace }}/vllm-hust-benchmark/${{ vars.VLLM_HUST_SAME_SPEC_SPEC_FILE || vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || 'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-qwen25-14b-910b2.json' }}
-        run: bash .github/workflows/scripts/perfgate_store_baseline.sh

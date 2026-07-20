@@ -73,35 +73,32 @@ def test_fork_pr_security_note_is_blocking():
     )
 
 
-def test_main_baseline_store_has_spec_file_and_benchmark_repo_checkout():
+def test_main_push_runs_only_the_central_perfgate_producer():
     text = workflow_text()
-    store_job = text[text.index("  store-main-perfgate-baseline:") :]
+    standard_step = text[
+        text.index("      - name: Run benchmark CI and optional formal publish") :
+        text.index("      - name: Run and publish main perfgate baseline")
+    ]
+    producer_step = text[
+        text.index("      - name: Run and publish main perfgate baseline") :
+        text.index("      - name: Performance gate - Stage 1 comparison")
+    ]
 
-    assert "TARGET_REPO_SHA: ${{ github.sha }}" in store_job
-    assert (
-        "RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-"
-        "${{ env.TARGET_REPO_SHA }}"
-    ) in store_job
-    assert (
-        "RESULT_ROOT: ${{ github.workspace }}/.benchmarks/ci/ci-"
-        "${{ github.run_id }}-${{ github.run_attempt }}-"
-        "${{ env.TARGET_REPO_SHA }}"
-    ) in store_job
-    assert "PERFGATE_SPEC_FILE:" not in store_job
-    assert "MAIN_SAME_SPEC_SPEC_FILE:" not in store_job
-    assert (
-        "BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git"
-        in store_job
-    )
-    assert "BENCHMARK_REPO_REF:" in store_job
-    assert "Checkout benchmark repo" in store_job
-    assert "git@github.com:vLLM-HUST/vllm-hust-benchmark.git" not in store_job
-    assert (
-        "vllm-hust-benchmark/${{ vars.VLLM_HUST_SAME_SPEC_SPEC_FILE || "
-        "vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || "
-        "'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-"
-        "qwen25-14b-910b2.json' }}"
-    ) in store_job
+    assert "push:" in text[: text.index("jobs:")]
+    assert "branches: [main]" in text[: text.index("jobs:")]
+    assert "if: ${{ github.event_name != 'push' }}" in standard_step
+    assert "github.event_name == 'push'" in producer_step
+    assert "Qwen/Qwen2.5-3B-Instruct" in producer_step
+    assert "BENCH_SCENARIO=random-online" in producer_step
+    assert "vllm_hust_benchmark.perfgate_specs resolve" in producer_step
+    assert "publish_central_perfgate_baseline.py" in producer_step
+    assert '--central-remote "$BENCHMARK_REPO_URL"' in producer_step
+    assert '--branch "$CENTRAL_BASELINE_BRANCH"' in producer_step
+    assert "--update-latest-pointer" in producer_step
+    assert 'if [[ "$rc" -eq 86' in producer_step
+    assert 'if [[ "$rc" -eq 87' not in producer_step
+    assert "store-main-perfgate-baseline:" not in text
+    assert "perfgate_store_baseline.sh" not in text
 
 
 def test_benchmark_repo_default_ref_is_main():
@@ -167,7 +164,6 @@ def test_main_benchmark_defaults_match_ascend_main_config():
     assert "steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1'" in text
     assert "multi_scenario_results.tsv" in text
     assert "Perfgate comparison: `skipped for multi-scenario run" in text
-    assert "vars.VLLM_HUST_MAIN_BENCHMARK_SCENARIOS == ''" in text
     assert (
         "github.event_name == 'pull_request' || github.event_name == 'issue_comment'"
     ) in text
@@ -179,7 +175,8 @@ def test_main_benchmark_defaults_match_ascend_main_config():
     assert "PERFGATE_SPEC_FILE: ${{ vars.VLLM_HUST_PERFGATE_SPEC_FILE || '' }}" in text
     assert "VLLM_HUST_PERFGATE_HARDWARE_CHIP_MODEL" in text
     assert (
-        "HARDWARE_CHIP_MODEL: ${{ vars.VLLM_HUST_PERFGATE_HARDWARE_CHIP_MODEL || '910B2' }}"
+        "HARDWARE_CHIP_MODEL: ${{ "
+        "vars.VLLM_HUST_PERFGATE_HARDWARE_CHIP_MODEL || '910B2' }}"
         in text
     )
     assert "Resolve perfgate spec for Ascend runner" in text
@@ -252,16 +249,18 @@ def test_benchmark_runner_supports_registry_same_spec_scenarios():
         / ".github/workflows/scripts/run_ascend_benchmark_ci.sh"
     ).read_text(encoding="utf-8")
 
-    assert 'if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then' in script
+    same_spec_marker = 'if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'
+    assert same_spec_marker in script
     same_spec_block = script[
-        script.index('if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then') :
-        script.index('else', script.index('if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'))
+        script.index(same_spec_marker) :
+        script.index("else", script.index(same_spec_marker))
     ]
     assert "EFFECTIVE_CONSTRAINTS_FILE=$SAME_SPEC_CONSTRAINTS_FILE" in same_spec_block
     assert "bench_args=()" in same_spec_block
     assert 'Unsupported BENCH_SCENARIO without same-spec mode' in script
     assert (
-        'if [[ "$BENCH_SCENARIO" == "random-online" && "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'
+        'if [[ "$BENCH_SCENARIO" == "random-online" && '
+        '"$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'
         not in script
     )
 
