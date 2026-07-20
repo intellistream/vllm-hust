@@ -64,6 +64,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker import pp_state_flow
 
 logger = init_logger(__name__)
 
@@ -463,6 +464,73 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+
+    def _emit_pp_state_flow_scheduler(
+        self,
+        event: str,
+        *,
+        path: str,
+        microbatch_id: int | None = None,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> None:
+        if not pp_state_flow.enabled():
+            return
+
+        request_ids = sorted(self.requests)
+        request_states = []
+        for request_id in request_ids:
+            request = self.requests[request_id]
+            try:
+                block_ids = [
+                    list(group)
+                    for group in self.kv_cache_manager.get_block_ids(request_id)
+                ]
+            except KeyError:
+                block_ids = []
+            request_states.append(
+                {
+                    "request_id": request_id,
+                    "status": request.status.name,
+                    "num_prompt_tokens": request.num_prompt_tokens,
+                    "num_computed_tokens": request.num_computed_tokens,
+                    "num_output_tokens": request.num_output_tokens,
+                    "last_output_token": (
+                        request.output_token_ids[-1]
+                        if request.num_output_tokens > 0
+                        else None
+                    ),
+                    "last_sched_seq": request.last_sched_seq,
+                    "next_decode_eligible_step": request.next_decode_eligible_step,
+                    "block_ids": block_ids,
+                }
+            )
+
+        output_state = None
+        if scheduler_output is not None:
+            output_state = {
+                "num_scheduled_tokens": dict(scheduler_output.num_scheduled_tokens),
+                "total_num_scheduled_tokens": (
+                    scheduler_output.total_num_scheduled_tokens
+                ),
+                "finished_req_ids": sorted(scheduler_output.finished_req_ids),
+                "new_block_ids_to_zero": scheduler_output.new_block_ids_to_zero,
+                "kv_cache_usage": scheduler_output.kv_cache_usage,
+            }
+
+        pp_state_flow.emit(
+            event,
+            component="scheduler",
+            path=path,
+            microbatch_id=microbatch_id,
+            current_step=self.current_step,
+            sched_step_seq=self.sched_step_seq,
+            processed_step_seq=self.processed_step_seq,
+            defer_block_free=self.defer_block_free,
+            needs_kv_cache_zeroing=self.needs_kv_cache_zeroing,
+            finished_req_ids=sorted(self.finished_req_ids),
+            request_states=request_states,
+            scheduler_output=output_state,
+        )
 
     def _should_get_num_common_prefix_blocks(self) -> bool:
         device_config = getattr(self.vllm_config, "device_config", None)
@@ -1236,6 +1304,9 @@ class Scheduler(SchedulerInterface):
         return scheduler_output
 
     def schedule_pp_opt(self, microbatch_id: int) -> SchedulerOutput:
+        self._emit_pp_state_flow_scheduler(
+            "scheduler_entry", path="pp_opt", microbatch_id=microbatch_id
+        )
         self.current_step += 1
         self.kv_cache_manager.new_step_starts()
         self._cleanup_pp_opt_microbatches()
@@ -1272,7 +1343,7 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[req_id] = new_blocks
             num_scheduled_tokens[req_id] = 1
 
-        return self._make_pp_opt_scheduler_output(
+        scheduler_output = self._make_pp_opt_scheduler_output(
             microbatch_id,
             scheduled_reqs,
             new_reqs,
@@ -1280,6 +1351,13 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens,
             req_to_new_blocks,
         )
+        self._emit_pp_state_flow_scheduler(
+            "scheduler_exit",
+            path="pp_opt",
+            microbatch_id=microbatch_id,
+            scheduler_output=scheduler_output,
+        )
+        return scheduler_output
 
     def update_from_output_pp_opt(
         self,
@@ -1351,6 +1429,7 @@ class Scheduler(SchedulerInterface):
         return selected
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._emit_pp_state_flow_scheduler("scheduler_entry", path="baseline")
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -2084,6 +2163,9 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._emit_pp_state_flow_scheduler(
+            "scheduler_exit", path="baseline", scheduler_output=scheduler_output
+        )
         return scheduler_output
 
     def _build_kv_connector_meta(

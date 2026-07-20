@@ -271,6 +271,8 @@ if TYPE_CHECKING:
     VLLM_PP_OPT_OVERLAP_SENDS: bool = False
     VLLM_PROFILE_PP_OPT_ENABLED: bool = False
     VLLM_PROFILE_PP_OPT_OUTPUT_PATH: str | None = None
+    VLLM_DIAGNOSE_PP_STATE_FLOW: bool = False
+    VLLM_DIAGNOSE_PP_STATE_FLOW_OUTPUT_PATH: str | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1911,6 +1913,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PROFILE_PP_OPT_OUTPUT_PATH": lambda: os.getenv(
         "VLLM_PROFILE_PP_OPT_OUTPUT_PATH"
     ),
+    # Bounded, process-local JSONL diagnostics for PP state-flow correctness.
+    "VLLM_DIAGNOSE_PP_STATE_FLOW": lambda: bool(
+        int(os.getenv("VLLM_DIAGNOSE_PP_STATE_FLOW", "0"))
+    ),
+    "VLLM_DIAGNOSE_PP_STATE_FLOW_OUTPUT_PATH": lambda: os.getenv(
+        "VLLM_DIAGNOSE_PP_STATE_FLOW_OUTPUT_PATH"
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2007,9 +2016,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_KNORM_SCORE_AGGREGATION", "min"
     ),
     # How to reduce norms across heads: 'mean', 'max', or 'sum'.
-    "VLLM_KNORM_NORM_REDUCE_OP": lambda: os.getenv(
-        "VLLM_KNORM_NORM_REDUCE_OP", "mean"
-    ),
+    "VLLM_KNORM_NORM_REDUCE_OP": lambda: os.getenv("VLLM_KNORM_NORM_REDUCE_OP", "mean"),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).

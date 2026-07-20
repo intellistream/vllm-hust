@@ -89,6 +89,10 @@ def record_active() -> bool:
     return _current_record is not None
 
 
+def current_profile_step() -> int | None:
+    return _current_record.profile_step if _current_record is not None else None
+
+
 def _local_layer_num(vllm_config) -> int:
     model_config = getattr(vllm_config, "model_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)

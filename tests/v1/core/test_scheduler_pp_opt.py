@@ -637,6 +637,39 @@ def test_pp_opt_schedule_advances_deferred_free_fence():
     assert request.last_sched_seq == scheduler.sched_step_seq
 
 
+@pytest.mark.skip_global_cleanup
+def test_pp_opt_state_flow_reports_entry_exit_and_exact_blocks(monkeypatch):
+    from vllm.v1.worker import pp_state_flow
+
+    scheduler = _create_pp_opt_scheduler(pipeline_parallel_size=1)
+    request = create_requests(1, num_tokens=4, max_tokens=2, req_ids=["r"])[0]
+    scheduler.add_request(request)
+    events = []
+    monkeypatch.setattr(pp_state_flow, "enabled", lambda: True)
+    monkeypatch.setattr(
+        pp_state_flow,
+        "emit",
+        lambda event, **payload: events.append({"event": event, **payload}),
+    )
+
+    output = scheduler.schedule_pp_opt(0)
+
+    assert [event["event"] for event in events] == [
+        "scheduler_entry",
+        "scheduler_exit",
+    ]
+    assert events[0]["path"] == "pp_opt"
+    assert events[0]["current_step"] == 0
+    assert events[1]["current_step"] == 1
+    assert events[1]["scheduler_output"]["num_scheduled_tokens"] == {"r": 1}
+    assert events[1]["scheduler_output"]["new_block_ids_to_zero"] is None
+    assert events[1]["request_states"][0]["request_id"] == "r"
+    assert events[1]["request_states"][0]["block_ids"] == [
+        list(group) for group in scheduler.kv_cache_manager.get_block_ids("r")
+    ]
+    assert output.total_num_scheduled_tokens == 1
+
+
 def test_pp_opt_finished_requests_are_removed_from_owning_microbatch():
     scheduler = _create_pp_opt_scheduler(pipeline_parallel_size=1)
     request = create_requests(1, num_tokens=4, max_tokens=1, req_ids=["r"])[0]

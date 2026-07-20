@@ -195,7 +195,7 @@ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.worker import mamba_utils, pp_opt_profile
+from vllm.v1.worker import mamba_utils, pp_opt_profile, pp_state_flow
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
@@ -925,6 +925,7 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+        pp_state_flow.install_model_runner_wrappers(self)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
