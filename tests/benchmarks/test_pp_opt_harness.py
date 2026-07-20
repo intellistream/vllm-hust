@@ -52,6 +52,27 @@ def test_client_records_output_token_checksum(client_module):
     assert result["success"] is True
     assert result["actual_output_length"] == len(token_ids)
     assert result["output_token_ids_sha256"] == expected
+    assert result["output_token_ids"] is None
+
+
+def test_client_optionally_records_output_token_ids(client_module):
+    token_ids = [4, 8, 15, 16, 23, 42]
+    completions = SimpleNamespace(
+        create=lambda **_: SimpleNamespace(
+            choices=[SimpleNamespace(token_ids=token_ids)]
+        )
+    )
+    client = object.__new__(client_module.VLLMClient)
+    client._client = SimpleNamespace(completions=completions)
+    client.model_name = "test-model"
+    client.verbose = False
+    client.store_output_token_ids = True
+    request = SimpleNamespace(input_tokens=[1, 2], output_length=len(token_ids))
+
+    result = client.send_request(request, request_id=0)
+
+    assert result["success"] is True
+    assert result["output_token_ids"] == token_ids
 
 
 def test_client_leaves_checksum_empty_on_failure(client_module):
@@ -69,6 +90,7 @@ def test_client_leaves_checksum_empty_on_failure(client_module):
     assert result["success"] is False
     assert result["actual_output_length"] == 0
     assert result["output_token_ids_sha256"] is None
+    assert result["output_token_ids"] is None
 
 
 def test_load_config_supports_explicit_model_dir_override(tmp_path):
@@ -136,6 +158,8 @@ def test_run_experiment_records_reproducibility_and_determinism_controls():
     assert "DECODE_BENCH_FILL_STD" in text
     assert "urllib.request.ProxyHandler({})" in text
     assert "--no-async-scheduling" in text
+    assert 'STORE_OUTPUT_TOKEN_IDS="${STORE_OUTPUT_TOKEN_IDS:-0}"' in text
+    assert "--store-output-token-ids" in text
 
 
 def test_profile_server_disables_async_scheduling():

@@ -25,6 +25,7 @@ DECODE_BENCH_FILL_MEAN="${DECODE_BENCH_FILL_MEAN:-0.0}"
 DECODE_BENCH_FILL_STD="${DECODE_BENCH_FILL_STD:-0.15}"
 REQUIRE_CLEAN_GIT="${REQUIRE_CLEAN_GIT:-1}"
 BATCH_INVARIANT="${BATCH_INVARIANT:-0}"
+STORE_OUTPUT_TOKEN_IDS="${STORE_OUTPUT_TOKEN_IDS:-0}"
 
 for path in "${CANN_ENV}" "${VENV_DIR}/bin/activate" "${ATB_ENV}"; do
   if [[ ! -f "${path}" ]]; then
@@ -47,6 +48,14 @@ case "${BATCH_INVARIANT}" in
     ;;
 esac
 export VLLM_BATCH_INVARIANT="${BATCH_INVARIANT}"
+
+case "${STORE_OUTPUT_TOKEN_IDS}" in
+  0|1) ;;
+  *)
+    echo "STORE_OUTPUT_TOKEN_IDS must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 
 source "${SCRIPT_DIR}/load_config.sh"
 load_pp_opt_config "${MODEL_KEY}"
@@ -298,6 +307,7 @@ export MODEL_CONFIG_PATH MODEL_CONFIG_SHA256 DEPLOYMENT HARDWARE
 export MODEL_WEIGHT_INDEX_PATH MODEL_WEIGHT_INDEX_SHA256
 export CORE_GIT_SHA ASCEND_GIT_SHA CORE_GIT_CLEAN ASCEND_GIT_CLEAN
 export REQUIRE_CLEAN_GIT BATCH_INVARIANT VLLM_BATCH_INVARIANT
+export STORE_OUTPUT_TOKEN_IDS
 export PP_LAYER_PARTITION COST_MODEL_PATH PP_OPT_BATCH_QUEUE_SIZE
 export PP_OPT_DYNAMIC_MICROBATCHES PP_OPT_MIN_MICROBATCHES
 export PP_OPT_TARGET_MICROBATCH_SIZE
@@ -333,7 +343,7 @@ keys = (
     "VLLM_PP_OPT_OVERLAP_SENDS",
     "VLLM_PP_LAYER_PARTITION",
     "USE_DECODE_BENCH_CONNECTOR", "DECODE_BENCH_FILL_MEAN",
-    "DECODE_BENCH_FILL_STD",
+    "DECODE_BENCH_FILL_STD", "STORE_OUTPUT_TOKEN_IDS",
     "TRACE_FILE", "MODEL_DIR", "SLURM_JOB_ID", "SLURM_JOB_NODELIST",
 )
 payload = {key.lower(): os.environ.get(key) for key in keys}
@@ -431,6 +441,9 @@ client_command=(python "${SCRIPT_DIR}/client.py" \
   "${TRACE_ARGS[@]}" \
   --verbose \
 )
+if [[ "${STORE_OUTPUT_TOKEN_IDS}" == "1" ]]; then
+  client_command+=(--store-output-token-ids)
+fi
 
 if (( PIPELINE_PROFILE_SECONDS > 0 )); then
   "${client_command[@]}" >"${CLIENT_STDOUT}" 2>&1 &

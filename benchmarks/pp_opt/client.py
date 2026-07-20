@@ -106,6 +106,7 @@ class RequestResult:
     output_length: int
     actual_output_length: int
     output_token_ids_sha256: str | None
+    output_token_ids: list[int] | None
     scheduled_time_ms: float  # when the request was scheduled to be sent
     actual_send_time_ms: float  # when it was actually sent (after KV wait)
     actual_send_timestamp_s: float  # absolute Unix timestamp when sent
@@ -148,12 +149,14 @@ class VLLMClient:
         max_workers: int = 256,
         request_timeout: float = 7200.0,
         verbose: bool = False,
+        store_output_token_ids: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.kv_cache_size = kv_cache_size
         self.model_name = model_name
         self.max_workers = max_workers
         self.verbose = verbose
+        self.store_output_token_ids = store_output_token_ids
         openai_base = self.base_url + "/v1"
         self._client = openai.OpenAI(
             base_url=openai_base,
@@ -183,6 +186,11 @@ class VLLMClient:
                 "output_token_ids_sha256": hashlib.sha256(
                     json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
                 ).hexdigest(),
+                "output_token_ids": (
+                    token_ids
+                    if getattr(self, "store_output_token_ids", False)
+                    else None
+                ),
             }
         except Exception as e:
             latency = time.time() - start
@@ -195,6 +203,7 @@ class VLLMClient:
                 "error": error,
                 "actual_output_length": 0,
                 "output_token_ids_sha256": None,
+                "output_token_ids": None,
             }
 
 
@@ -413,6 +422,7 @@ class TimedWorkloadRunner:
                 output_length=entry.output_length,
                 actual_output_length=result["actual_output_length"],
                 output_token_ids_sha256=result["output_token_ids_sha256"],
+                output_token_ids=result["output_token_ids"],
                 scheduled_time_ms=scheduled_time_ms,
                 actual_send_time_ms=actual_send_time_ms,
                 actual_send_timestamp_s=actual_send_timestamp_s,
@@ -432,6 +442,7 @@ class TimedWorkloadRunner:
                 output_length=entry.output_length,
                 actual_output_length=0,
                 output_token_ids_sha256=None,
+                output_token_ids=None,
                 scheduled_time_ms=scheduled_time_ms,
                 actual_send_time_ms=actual_send_time_ms,
                 actual_send_timestamp_s=actual_send_timestamp_s,
@@ -745,6 +756,11 @@ Examples:
         ),
         required=True,
     )
+    parser.add_argument(
+        "--store-output-token-ids",
+        action="store_true",
+        help="Store raw output token IDs for correctness diagnosis",
+    )
 
     args = parser.parse_args()
 
@@ -824,6 +840,7 @@ Examples:
         max_workers=args.max_workers,
         request_timeout=args.request_timeout,
         verbose=args.verbose,
+        store_output_token_ids=args.store_output_token_ids,
     )
 
     # Configuration for output
@@ -839,6 +856,7 @@ Examples:
         "max_output_len": args.max_output_len,
         "max_model_len": args.max_model_len,
         "request_num": args.request_num,
+        "store_output_token_ids": args.store_output_token_ids,
     }
 
     # Print configuration
@@ -850,6 +868,7 @@ Examples:
     print(f"  Max workers:      {args.max_workers}")
     print(f"  Min output len:   {args.min_output_length}")
     print(f"  Max output len:   {args.max_output_len}")
+    print(f"  Store token IDs:  {args.store_output_token_ids}")
     print()
 
     # Create callbacks for real-time logging
