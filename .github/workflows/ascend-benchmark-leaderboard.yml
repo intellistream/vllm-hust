@@ -1652,7 +1652,11 @@ jobs:
 
   store-main-perfgate-baseline:
     name: Store main perfgate baseline
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: >-
+      always() &&
+      needs.ascend-benchmark.result == 'success' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
     needs: ascend-benchmark
     runs-on: ubuntu-latest
     env:

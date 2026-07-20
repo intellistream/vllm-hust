@@ -52,10 +52,10 @@ def test_main_push_reaches_benchmark_and_baseline_store_jobs():
         in benchmark_job
     )
     store_job = text[text.index("  store-main-perfgate-baseline:") :]
-    assert (
-        "if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
-        in store_job
-    )
+    assert "always()" in store_job
+    assert "needs.ascend-benchmark.result == 'success'" in store_job
+    assert "github.event_name == 'push'" in store_job
+    assert "github.ref == 'refs/heads/main'" in store_job
     assert "needs: ascend-benchmark" in store_job
 
 
