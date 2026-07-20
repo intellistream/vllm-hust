@@ -366,9 +366,7 @@ class DecodeBenchConnectorWorker:
         # Fill each group once so a large concurrent batch does not issue the
         # same cache-fill kernels separately for every request.
         for group_idx, block_ids in block_ids_by_group.items():
-            self._fill_blocks(
-                group_idx, block_ids, num_tokens_by_group[group_idx]
-            )
+            self._fill_blocks(group_idx, block_ids, num_tokens_by_group[group_idx])
 
     def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
         """
@@ -397,16 +395,18 @@ class DecodeBenchConnectorWorker:
                 continue
 
             kv_cache = self.kv_caches[layer_name]
-            # Attention layers store KV as a single block-indexed tensor whose
-            # first dim is num_blocks; fill the requested block rows. Hybrid /
-            # linear-attention layers (e.g. Mamba, Kimi Delta Attention) store
-            # their state as a list/tuple of tensors that are NOT block-indexed
-            # — each tensor is a single state buffer with no num_blocks
-            # dimension — so fill each tensor in its entirety with the same
-            # dummy values.
+            # Attention layers store KV as either one block-indexed tensor or,
+            # on Ascend, a tuple of separate key/value tensors. Hybrid /
+            # linear-attention layers are materialized by the model runner as
+            # a list of state tensors and must be filled in their entirety.
             if isinstance(kv_cache, torch.Tensor):
                 self._fill_block_tensor(kv_cache, block_ids)
-            elif isinstance(kv_cache, (list, tuple)) and all(
+            elif isinstance(kv_cache, tuple) and all(
+                isinstance(t, torch.Tensor) for t in kv_cache
+            ):
+                for cache_tensor in kv_cache:
+                    self._fill_block_tensor(cache_tensor, block_ids)
+            elif isinstance(kv_cache, list) and all(
                 isinstance(t, torch.Tensor) for t in kv_cache
             ):
                 for state_tensor in kv_cache:
@@ -453,22 +453,21 @@ class DecodeBenchConnectorWorker:
         # Create fill values - either constant or random
         block_shape = kv_cache.shape[1:]
         if self.fill_std > 0:
-            # Random normal sampling
+            # Ascend normal generation does not support BF16 output. Generate
+            # one block in a supported dtype, cast once, and broadcast it to
+            # all selected rows without a full-cache FP32 temporary.
+            random_dtype = (
+                torch.float32 if kv_cache.dtype == torch.bfloat16 else kv_cache.dtype
+            )
             fill_values = torch.normal(
                 mean=self.fill_mean,
                 std=self.fill_std,
-                size=(len(valid_block_ids),) + block_shape,
-                dtype=kv_cache.dtype,
+                size=block_shape,
+                dtype=random_dtype,
                 device=kv_cache.device,
-            )
+            ).to(kv_cache.dtype)
         else:
-            # Constant fill value
-            fill_values = torch.full(
-                (len(valid_block_ids),) + block_shape,
-                self.fill_mean,
-                dtype=kv_cache.dtype,
-                device=kv_cache.device,
-            )
+            fill_values = self.fill_mean
 
         # Batch fill operation
         kv_cache[valid_block_ids] = fill_values

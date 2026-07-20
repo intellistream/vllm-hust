@@ -153,6 +153,21 @@ def test_fill_ascend_tuple_kv_cache():
     torch.testing.assert_close(value_cache, expected)
 
 
+def test_fill_hybrid_state_list_fills_entire_tensors():
+    worker = object.__new__(DecodeBenchConnectorWorker)
+    worker.fill_mean = 0.25
+    worker.fill_std = 0.0
+    worker.group_to_layers = {0: ["layer_0"]}
+    conv_state = torch.zeros(4, 2, 3)
+    ssm_state = torch.zeros(4, 5)
+    worker.kv_caches = {"layer_0": [conv_state, ssm_state]}
+
+    worker._fill_blocks(group_idx=0, block_ids=[1], num_tokens=1)
+
+    torch.testing.assert_close(conv_state, torch.full_like(conv_state, 0.25))
+    torch.testing.assert_close(ssm_state, torch.full_like(ssm_state, 0.25))
+
+
 def test_fill_batches_concurrent_requests_by_group(monkeypatch):
     worker = object.__new__(DecodeBenchConnectorWorker)
     worker.kv_caches = {}
