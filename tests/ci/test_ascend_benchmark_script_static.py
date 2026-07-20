@@ -67,6 +67,17 @@ def test_same_spec_pr_preview_uses_ascend_compatibility_overlay():
     assert '"$effective_same_spec_file"' in same_spec_block
 
 
+def test_same_spec_runner_resolves_spec_from_shared_registry():
+    text = script_text("run_ascend_benchmark_ci.sh")
+    same_spec_block = text[text.index("run_same_spec_current_benchmark() {") :]
+
+    assert "SAME_SPEC_SPEC_FILE=${SAME_SPEC_SPEC_FILE:-}" in text
+    assert "vllm_hust_benchmark.perfgate_specs resolve" in same_spec_block
+    assert '--scenario "$BENCH_SCENARIO"' in same_spec_block
+    assert '--hardware-chip-model "$HARDWARE_CHIP_MODEL"' in same_spec_block
+    assert '--repo-root "$VLLM_HUST_BENCHMARK_REPO"' in same_spec_block
+
+
 def test_e2e_inference_scripts_retry_http_requests_and_print_server_log():
     for script_name in (
         "run_e2e_serve_smoke.sh",
@@ -75,13 +86,16 @@ def test_e2e_inference_scripts_retry_http_requests_and_print_server_log():
         text = script_text(script_name)
 
         assert "print_server_log_tail() {" in text
-        assert "curl_with_server_log() {" in text
+        assert "http_request() {" in text
+        assert "http_request_with_server_log() {" in text
+        assert "urllib.request.ProxyHandler({})" in text
         assert "E2E_HTTP_REQUEST_ATTEMPTS" in text
+        assert "E2E_HTTP_REQUEST_TIMEOUT_SECONDS" in text
         assert "else\n      rc=$?\n    fi" in text
         assert "failed after ${max_attempts} attempts" in text
-        assert 'done\n\ncurl -fsS "http://$HOST:$PORT/v1/models" >/dev/null' not in text
+        assert "curl -fsS" not in text
         assert "vLLM models endpoint readiness confirmation" in text
         assert (
-            "curl_with_server_log"
+            "http_request_with_server_log"
             in text[text.index("completion_response=$(mktemp)") :]
         )
