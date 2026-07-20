@@ -893,13 +893,10 @@ class Scheduler(SchedulerInterface):
             microbatch = self._select_pp_opt_target_microbatch(request)
             num_external_computed_tokens = max(request.num_tokens - 1, 0)
             num_new_tokens = 1
-            num_tokens_to_allocate = num_new_tokens + num_external_computed_tokens
-
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
-                num_tokens_to_allocate,
-                0,
-                self.kv_cache_manager.empty_kv_cache_blocks,
+                num_new_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
             )
             if new_blocks is None:
                 logger.debug(
@@ -1175,12 +1172,19 @@ class Scheduler(SchedulerInterface):
                 for req in new_reqs
             ]
 
+        block_table_replaced_req_ids = {
+            request.request_id
+            for request in cached_reqs
+            if req_to_new_blocks[request.request_id].get_block_ids(allow_none=True)
+            is not None
+        }
         cached_reqs_data = self._make_cached_request_data(
             cached_reqs,
             [],
             num_scheduled_tokens,
             {},
             req_to_new_blocks,
+            block_table_replaced_req_ids=block_table_replaced_req_ids,
         )
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
 
@@ -2214,6 +2218,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int],
         spec_decode_tokens: dict[str, list[int]],
         req_to_new_blocks: dict[str, KVCacheBlocks],
+        block_table_replaced_req_ids: set[str] | None = None,
     ) -> CachedRequestData:
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
@@ -2224,6 +2229,7 @@ class Scheduler(SchedulerInterface):
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
+        block_table_replaced_req_ids = block_table_replaced_req_ids or set()
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
             req_ids.append(req_id)
@@ -2248,9 +2254,12 @@ class Scheduler(SchedulerInterface):
             if not self.use_v2_model_runner:  # noqa: SIM102
                 if req_id not in self.prev_step_scheduled_req_ids:
                     all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+            if req_id in block_table_replaced_req_ids:
+                new_block_ids.append(self.kv_cache_manager.get_block_ids(req_id))
+            else:
+                new_block_ids.append(
+                    req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -2264,6 +2273,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            block_table_replaced_req_ids=block_table_replaced_req_ids,
         )
 
     def _try_schedule_encoder_inputs(
