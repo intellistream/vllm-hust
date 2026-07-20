@@ -315,11 +315,13 @@ jobs:
       BENCHMARK_REPO_GH_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN || '' }}
       BENCHMARK_REPO_SSH_KEY: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY || '' }}
       BENCHMARK_REPO_REF: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && (vars.VLLM_HUST_BENCHMARK_REPO_REF || 'main') || 'main' }}
+      VALIDATION_BENCHMARK_REPO_REF: a0c88ed86cfbd0dc193503420f7fc6c6c4197bd3
       WEBSITE_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-hust-website.git' || 'git@github.com:vLLM-HUST/vllm-hust-website.git' }}
       VLLM_ASCEND_HUST_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-ascend-hust.git' || 'git@github.com:vLLM-HUST/vllm-ascend-hust.git' }}
       ISSUE_COMMENT_PR_NUMBER: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_number || '' }}
       HUST_ASCEND_MANAGER_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/ascend-runtime-manager.git' || 'git@github.com:vLLM-HUST/ascend-runtime-manager.git' }}
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
+      HUST_ASCEND_MANAGER_REPO_REF: fa7ff4a537ddbe3b722bd6afb8a68ca245c79a47
       # Disable precompiled CUDA wheel fetch from wheels.vllm.ai.
       # The Ascend benchmark uses the vllm-ascend-hust plugin, not CUDA
       # precompiled wheels, so this avoids transient SSL failures.
@@ -619,7 +621,8 @@ jobs:
             return 1
           }
 
-          clone_with_retry "$BENCHMARK_REPO_URL" "$GITHUB_WORKSPACE/vllm-hust-benchmark" "$BENCHMARK_REPO_REF"
+          clone_with_retry "$BENCHMARK_REPO_URL" "$GITHUB_WORKSPACE/vllm-hust-benchmark" "$VALIDATION_BENCHMARK_REPO_REF"
+          echo "vllm-hust-benchmark HEAD=$(git -C "$GITHUB_WORKSPACE/vllm-hust-benchmark" rev-parse HEAD)"
 
       - name: Resolve L1/L2 benchmark scenario
         id: resolve-scenario
@@ -801,6 +804,9 @@ jobs:
           }
 
           clone_with_retry "$HUST_ASCEND_MANAGER_REPO_URL" "$GITHUB_WORKSPACE/ascend-runtime-manager"
+          git -C "$GITHUB_WORKSPACE/ascend-runtime-manager" fetch --depth 1 origin "$HUST_ASCEND_MANAGER_REPO_REF"
+          git -C "$GITHUB_WORKSPACE/ascend-runtime-manager" checkout --force FETCH_HEAD
+          echo "ascend-runtime-manager HEAD=$(git -C "$GITHUB_WORKSPACE/ascend-runtime-manager" rev-parse HEAD)"
 
       - name: Prepare Hugging Face cache directories
         run: |

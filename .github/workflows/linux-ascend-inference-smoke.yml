@@ -47,6 +47,7 @@ jobs:
       VLLM_ASCEND_HUST_REPO_URL: https://github.com/vLLM-HUST/vllm-ascend-hust.git
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
       HUST_ASCEND_MANAGER_REPO_URL: https://github.com/vLLM-HUST/ascend-runtime-manager.git
+      HUST_ASCEND_MANAGER_REPO_REF: fa7ff4a537ddbe3b722bd6afb8a68ca245c79a47
       VLLM_USE_PRECOMPILED: "0"
 
     steps:
@@ -231,6 +232,9 @@ jobs:
           }
 
           clone_with_retry "$HUST_ASCEND_MANAGER_REPO_URL" "$HUST_ASCEND_MANAGER_REPO"
+          git -C "$HUST_ASCEND_MANAGER_REPO" fetch --depth 1 origin "$HUST_ASCEND_MANAGER_REPO_REF"
+          git -C "$HUST_ASCEND_MANAGER_REPO" checkout --force FETCH_HEAD
+          echo "ascend-runtime-manager HEAD=$(git -C "$HUST_ASCEND_MANAGER_REPO" rev-parse HEAD)"
 
       - name: Resolve Ascend Python runtime
         run: |
