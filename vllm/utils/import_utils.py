@@ -16,6 +16,7 @@ from types import ModuleType
 from typing import Any
 
 import regex as re
+import torch
 from typing_extensions import Never
 
 from vllm.logger import init_logger
@@ -489,6 +490,13 @@ def has_nixl_ep() -> bool:
 
 def has_triton_kernels() -> bool:
     """Whether the optional `triton_kernels` package is available."""
+    # Vendored triton_kernels target CUDA/ROCm Triton backends. On Ascend and
+    # other non-CUDA/ROCm environments, probing them only produces noisy import
+    # failures such as missing ``triton.language.target_info`` without enabling
+    # any usable kernel path.
+    if torch.version.cuda is None and torch.version.hip is None:
+        return False
+
     is_available = _has_module("triton_kernels") or _has_module(
         "vllm.third_party.triton_kernels"
     )

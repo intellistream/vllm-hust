@@ -5,12 +5,13 @@ import time
 from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import ClassVar, Generic, TypeVar
+from typing import ClassVar, Generic, TypeVar, Any
 
 from fastapi import Request
 from pydantic import ConfigDict
 from starlette.datastructures import Headers
 
+from vllm import PromptType, SamplingParams, envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -28,6 +29,11 @@ from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.renderers.inputs.preprocess import (
+    extract_prompt_components,
+    extract_prompt_len,
+)
+from vllm.sampling_params import BeamSearchParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import (
     contains_trace_headers,
