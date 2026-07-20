@@ -1184,6 +1184,12 @@ class Scheduler(SchedulerInterface):
         )
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
 
+        new_block_ids_to_zero = (
+            (self.kv_cache_manager.take_new_block_ids() or None)
+            if self.needs_kv_cache_zeroing
+            else None
+        )
+
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         if scheduled_reqs:
             num_common_prefix_blocks = (
@@ -1203,6 +1209,9 @@ class Scheduler(SchedulerInterface):
             preempted_req_ids=set(),
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            new_block_ids_to_zero=new_block_ids_to_zero,
+            num_spec_tokens_to_schedule=self.num_spec_tokens,
+            kv_cache_usage=self.kv_cache_manager.usage,
             microbatch_id=microbatch_id,
         )
 
@@ -1221,10 +1230,14 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
         self.pp_opt_first_scheduled_req_ids.update(num_scheduled_tokens.keys())
+        if self.defer_block_free and total_num_scheduled_tokens > 0:
+            self.sched_step_seq += 1
         self._update_after_schedule(scheduler_output)
         return scheduler_output
 
     def schedule_pp_opt(self, microbatch_id: int) -> SchedulerOutput:
+        self.current_step += 1
+        self.kv_cache_manager.new_step_starts()
         self._cleanup_pp_opt_microbatches()
         self._admit_waiting_requests_pp_opt()
         microbatch = self._get_pp_opt_microbatch(microbatch_id)

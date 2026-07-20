@@ -584,6 +584,59 @@ def test_pp_opt_first_schedule_emits_new_request_then_cached_request():
     assert second_output.num_scheduled_tokens == {"r": 1}
 
 
+@pytest.mark.skip_global_cleanup
+def test_pp_opt_schedule_preserves_scheduler_step_lifecycle(monkeypatch):
+    scheduler = _create_pp_opt_scheduler(pipeline_parallel_size=1)
+    request = create_requests(1, num_tokens=4, max_tokens=2, req_ids=["r"])[0]
+    scheduler.add_request(request)
+    new_step_starts = Mock(wraps=scheduler.kv_cache_manager.new_step_starts)
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager,
+        "new_step_starts",
+        new_step_starts,
+    )
+
+    first_output = scheduler.schedule_pp_opt(0)
+
+    assert scheduler.current_step == 1
+    new_step_starts.assert_called_once_with()
+    assert first_output.kv_cache_usage == scheduler.kv_cache_manager.usage
+    assert first_output.num_spec_tokens_to_schedule == scheduler.num_spec_tokens
+
+
+@pytest.mark.skip_global_cleanup
+def test_pp_opt_schedule_exports_new_blocks_for_zeroing(monkeypatch):
+    scheduler = _create_pp_opt_scheduler(pipeline_parallel_size=1)
+    request = create_requests(1, num_tokens=4, max_tokens=2, req_ids=["r"])[0]
+    scheduler.add_request(request)
+    scheduler.needs_kv_cache_zeroing = True
+    take_new_block_ids = Mock(return_value=[7, 11])
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager,
+        "take_new_block_ids",
+        take_new_block_ids,
+    )
+
+    output = scheduler.schedule_pp_opt(0)
+
+    assert output.new_block_ids_to_zero == [7, 11]
+    take_new_block_ids.assert_called_once_with()
+
+
+@pytest.mark.skip_global_cleanup
+def test_pp_opt_schedule_advances_deferred_free_fence():
+    scheduler = _create_pp_opt_scheduler(pipeline_parallel_size=1)
+    scheduler.defer_block_free = True
+    request = create_requests(1, num_tokens=4, max_tokens=2, req_ids=["r"])[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule_pp_opt(0)
+
+    assert output.total_num_scheduled_tokens > 0
+    assert scheduler.sched_step_seq == 1
+    assert request.last_sched_seq == scheduler.sched_step_seq
+
+
 def test_pp_opt_finished_requests_are_removed_from_owning_microbatch():
     scheduler = _create_pp_opt_scheduler(pipeline_parallel_size=1)
     request = create_requests(1, num_tokens=4, max_tokens=1, req_ids=["r"])[0]
@@ -833,8 +886,8 @@ def test_engine_core_pp_opt_path_calls_scheduler_pp_opt_methods():
     calls: list[str] = []
     scheduler = Mock()
     scheduler.has_requests_pp_opt.side_effect = lambda: calls.append("has") or True
-    scheduler.select_microbatch_pp_opt.side_effect = (
-        lambda in_flight_ids: calls.append(f"select:{sorted(in_flight_ids)}") or 2
+    scheduler.select_microbatch_pp_opt.side_effect = lambda in_flight_ids: (
+        calls.append(f"select:{sorted(in_flight_ids)}") or 2
     )
 
     def schedule_pp_opt(microbatch_id: int):
