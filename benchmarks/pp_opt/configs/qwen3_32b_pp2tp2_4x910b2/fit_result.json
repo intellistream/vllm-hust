@@ -1,0 +1,139 @@
+{
+  "metadata": {
+    "model_name": "qwen3_32b",
+    "deployment": "pp2tp2",
+    "hardware": "4x910B2-npu1-4",
+    "input_dir": "calibration/runs/qwen3_32b_pp2tp2_4x910b2/910b2-pp2tp2-20260720T0244Z",
+    "config_key": "qwen3_32b_pp2tp2_4x910b2",
+    "config_sha256": "0bb9470a5ad5f4bebfe7c55c157a0087dc5ed5c9bcfa0327427760e6e09edc8c",
+    "model_config_sha256": "97e295b63283935788fac5e4f8860862a56d4089538cafc93f0431f2ebe483bb",
+    "pipeline_parallel_size": 2,
+    "tensor_parallel_size": 2,
+    "layer_partition": [
+      32,
+      32
+    ],
+    "calibration_run_id": "910b2-pp2tp2-20260720T0244Z",
+    "installed_at": "2026-07-20T07:07:35.284294+00:00"
+  },
+  "cost_definitions": {
+    "forward": "t3_ns-t2_ns",
+    "total": "t5_ns-t1_ns"
+  },
+  "filters": {
+    "loading": {
+      "raw_rows": 56548,
+      "excluded_rows": 51504
+    },
+    "preprocessing": {
+      "warmup_fraction": 0.1,
+      "warmup_excluded": 234,
+      "trim_extremes": 1,
+      "trim_excluded": 48,
+      "final_samples": 2240
+    }
+  },
+  "sample_count": 2240,
+  "models": [
+    {
+      "cost": "forward",
+      "pp_rank": 0,
+      "layer_num": 32,
+      "profiled_layer_nums": [
+        32
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 9001.234765490775,
+        "p1": 281.28858648548857,
+        "p2": 1.0490609571398448,
+        "p3": 0.03278520759480456,
+        "p4": 1098922.194447209,
+        "p5": 34341.31857647524
+      },
+      "sample_count": 1119,
+      "rmse": 9048212.924841475,
+      "r2": 0.32843794393270254,
+      "success": true,
+      "message": "numpy.linalg.lstsq completed",
+      "optimizer": {
+        "method": "numpy.linalg.lstsq"
+      }
+    },
+    {
+      "cost": "total",
+      "pp_rank": 0,
+      "layer_num": 32,
+      "profiled_layer_nums": [
+        32
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 16923.043550819977,
+        "p1": 528.8451109874356,
+        "p2": 3.3729671851182164,
+        "p3": 0.10540711235294574,
+        "p4": 1012234.6970539824,
+        "p5": 31632.33428293691
+      },
+      "sample_count": 1119,
+      "rmse": 9729756.803839942,
+      "r2": 0.690925890460111,
+      "success": true,
+      "message": "numpy.linalg.lstsq completed",
+      "optimizer": {
+        "method": "numpy.linalg.lstsq"
+      }
+    },
+    {
+      "cost": "forward",
+      "pp_rank": 1,
+      "layer_num": 32,
+      "profiled_layer_nums": [
+        32
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 1119.4448560347664,
+        "p1": 34.982651743633866,
+        "p2": 1.4133958317385809,
+        "p3": 0.04416669233584717,
+        "p4": 1061422.8623714042,
+        "p5": 33169.46444910637
+      },
+      "sample_count": 1121,
+      "rmse": 9348832.009298788,
+      "r2": 0.16586362372540264,
+      "success": true,
+      "message": "numpy.linalg.lstsq completed",
+      "optimizer": {
+        "method": "numpy.linalg.lstsq"
+      }
+    },
+    {
+      "cost": "total",
+      "pp_rank": 1,
+      "layer_num": 32,
+      "profiled_layer_nums": [
+        32
+      ],
+      "formula": "cost = p0 * request_num * layer_num + p1 * request_num + p2 * aggregated_ctx_len * layer_num + p3 * aggregated_ctx_len + p4 * layer_num + p5",
+      "coefficients": {
+        "p0": 32334.114311801575,
+        "p1": 1010.4410722166774,
+        "p2": 6.526989237133774,
+        "p3": 0.2039647702915101,
+        "p4": 2012752.0187989445,
+        "p5": 62898.50058746699
+      },
+      "sample_count": 1121,
+      "rmse": 13086058.615821747,
+      "r2": 0.8198523927917827,
+      "success": true,
+      "message": "numpy.linalg.lstsq completed",
+      "optimizer": {
+        "method": "numpy.linalg.lstsq"
+      }
+    }
+  ]
+}

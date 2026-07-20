@@ -30,7 +30,9 @@ load_pp_opt_config() {
   CONFIG_KEY=$(jq -er '.config_key' "${CONFIG_PATH}")
   CONFIG_SHA256=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
   MODEL_NAME=$(jq -er '.model_name' "${CONFIG_PATH}")
-  MODEL_DIR="${WORKSPACE_ROOT}/$(jq -er '.model_dir' "${CONFIG_PATH}")"
+  local configured_model_dir
+  configured_model_dir=$(jq -er '.model_dir' "${CONFIG_PATH}")
+  MODEL_DIR="${MODEL_DIR_OVERRIDE:-${WORKSPACE_ROOT}/${configured_model_dir}}"
   MODEL_CONFIG_PATH="${MODEL_DIR}/config.json"
   MODEL_CONFIG_SHA256=$(
     if [[ -f "${MODEL_CONFIG_PATH}" ]]; then

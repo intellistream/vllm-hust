@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import sys
@@ -104,6 +105,7 @@ class RequestResult:
     input_length: int
     output_length: int
     actual_output_length: int
+    output_token_ids_sha256: str | None
     scheduled_time_ms: float  # when the request was scheduled to be sent
     actual_send_time_ms: float  # when it was actually sent (after KV wait)
     actual_send_timestamp_s: float  # absolute Unix timestamp when sent
@@ -172,11 +174,15 @@ class VLLMClient:
                 extra_body={"ignore_eos": True, "return_token_ids": True},
             )
             latency = time.time() - start
+            token_ids = response.choices[0].token_ids
             return {
                 "success": True,
                 "latency": latency,
                 "error": None,
-                "actual_output_length": len(response.choices[0].token_ids),
+                "actual_output_length": len(token_ids),
+                "output_token_ids_sha256": hashlib.sha256(
+                    json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
             }
         except Exception as e:
             latency = time.time() - start
@@ -188,6 +194,7 @@ class VLLMClient:
                 "latency": latency,
                 "error": error,
                 "actual_output_length": 0,
+                "output_token_ids_sha256": None,
             }
 
 
@@ -405,6 +412,7 @@ class TimedWorkloadRunner:
                 input_length=entry.input_length,
                 output_length=entry.output_length,
                 actual_output_length=result["actual_output_length"],
+                output_token_ids_sha256=result["output_token_ids_sha256"],
                 scheduled_time_ms=scheduled_time_ms,
                 actual_send_time_ms=actual_send_time_ms,
                 actual_send_timestamp_s=actual_send_timestamp_s,
@@ -423,6 +431,7 @@ class TimedWorkloadRunner:
                 input_length=entry.input_length,
                 output_length=entry.output_length,
                 actual_output_length=0,
+                output_token_ids_sha256=None,
                 scheduled_time_ms=scheduled_time_ms,
                 actual_send_time_ms=actual_send_time_ms,
                 actual_send_timestamp_s=actual_send_timestamp_s,

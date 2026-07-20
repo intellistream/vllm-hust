@@ -218,6 +218,15 @@ def _fit_rank(samples: list[Sample], cost: str, pp_rank: int) -> dict:
     }
 
 
+def _portable_input_dir(input_dir: Path) -> str:
+    resolved = input_dir.resolve()
+    benchmark_dir = Path(__file__).resolve().parent
+    try:
+        return str(resolved.relative_to(benchmark_dir))
+    except ValueError:
+        return str(resolved)
+
+
 def main() -> None:
     args = parse_args()
     samples, load_stats = _load_samples(args.input_dir)
@@ -238,7 +247,7 @@ def main() -> None:
             "model_name": args.model_name,
             "deployment": args.deployment,
             "hardware": args.hardware,
-            "input_dir": str(args.input_dir.resolve()),
+            "input_dir": _portable_input_dir(args.input_dir),
         },
         "cost_definitions": {
             "forward": "t3_ns-t2_ns",

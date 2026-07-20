@@ -25,6 +25,7 @@ exec vllm serve "${MODEL_DIR}" \
   --port "${PORT:-8000}" \
   --served-model-name "${MODEL_NAME}" \
   --no-enable-prefix-caching \
+  --no-async-scheduling \
   --pipeline-parallel-size "${PP_SIZE}" \
   --tensor-parallel-size "${TP_SIZE}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \

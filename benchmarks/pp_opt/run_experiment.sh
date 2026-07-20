@@ -21,6 +21,10 @@ PIPELINE_PROFILE_SECONDS="${PIPELINE_PROFILE_SECONDS:-0}"
 PIPELINE_PROFILE_DELAY="${PIPELINE_PROFILE_DELAY:-15}"
 PIPELINE_PROFILE_STOP_AFTER_CAPTURE="${PIPELINE_PROFILE_STOP_AFTER_CAPTURE:-0}"
 USE_DECODE_BENCH_CONNECTOR="${USE_DECODE_BENCH_CONNECTOR:-1}"
+DECODE_BENCH_FILL_MEAN="${DECODE_BENCH_FILL_MEAN:-0.0}"
+DECODE_BENCH_FILL_STD="${DECODE_BENCH_FILL_STD:-0.15}"
+REQUIRE_CLEAN_GIT="${REQUIRE_CLEAN_GIT:-1}"
+BATCH_INVARIANT="${BATCH_INVARIANT:-0}"
 
 for path in "${CANN_ENV}" "${VENV_DIR}/bin/activate" "${ATB_ENV}"; do
   if [[ ! -f "${path}" ]]; then
@@ -35,12 +39,28 @@ source "${ATB_ENV}" --cxx_abi=1
 set -u
 unset TASK_QUEUE_ENABLE
 
+case "${BATCH_INVARIANT}" in
+  0|1) ;;
+  *)
+    echo "BATCH_INVARIANT must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+export VLLM_BATCH_INVARIANT="${BATCH_INVARIANT}"
+
 source "${SCRIPT_DIR}/load_config.sh"
 load_pp_opt_config "${MODEL_KEY}"
+MODEL_WEIGHT_INDEX_PATH="${MODEL_DIR}/model.safetensors.index.json"
+MODEL_WEIGHT_INDEX_SHA256=$(
+  if [[ -f "${MODEL_WEIGHT_INDEX_PATH}" ]]; then
+    sha256sum "${MODEL_WEIGHT_INDEX_PATH}" | awk '{print $1}'
+  fi
+)
 PP_OPT_DYNAMIC_MICROBATCHES="${PP_OPT_DYNAMIC_MICROBATCHES_OVERRIDE:-${PP_OPT_DYNAMIC_MICROBATCHES}}"
 PP_OPT_OVERLAP_SENDS="${PP_OPT_OVERLAP_SENDS_OVERRIDE:-${PP_OPT_OVERLAP_SENDS}}"
 KV_CACHE_MEMORY=""
 ENFORCE_EAGER=0
+MODEL_LOAD_FORMAT="${MODEL_LOAD_FORMAT:-dummy}"
 
 case "${TRACE_KEY}" in
   conversation)
@@ -110,14 +130,47 @@ export VLLM_PP_LAYER_PARTITION="${PP_LAYER_PARTITION}"
 
 KV_TRANSFER_ARGS=()
 if [[ "${USE_DECODE_BENCH_CONNECTOR}" == "1" ]]; then
+  KV_TRANSFER_CONFIG=$(jq -cn \
+    --argjson fill_mean "${DECODE_BENCH_FILL_MEAN}" \
+    --argjson fill_std "${DECODE_BENCH_FILL_STD}" \
+    '{
+      kv_connector: "DecodeBenchConnector",
+      kv_role: "kv_both",
+      kv_connector_extra_config: {
+        fill_mean: $fill_mean,
+        fill_std: $fill_std
+      }
+    }')
   KV_TRANSFER_ARGS+=(
     --kv-transfer-config
-    '{"kv_connector":"DecodeBenchConnector","kv_role":"kv_both","kv_connector_extra_config":{"fill_mean":0.0,"fill_std":0.15}}'
+    "${KV_TRANSFER_CONFIG}"
   )
 elif [[ "${USE_DECODE_BENCH_CONNECTOR}" != "0" ]]; then
   echo "USE_DECODE_BENCH_CONNECTOR must be 0 or 1" >&2
   exit 2
 fi
+
+MODEL_LOADING_ARGS=()
+case "${MODEL_LOAD_FORMAT}" in
+  dummy)
+    MODEL_LOADING_ARGS+=(
+      --load-format dummy
+      --model-loader-extra-config
+      "{\"embedding_weight_path\":\"${EMBEDDING_SHARD}\",\"embedding_weight_name\":\"model.embed_tokens.weight\",\"share_dummy_weights\":${SHARE_DUMMY_WEIGHTS}}"
+    )
+    ;;
+  auto)
+    if [[ ! -f "${MODEL_WEIGHT_INDEX_PATH}" ]]; then
+      echo "Real-weight index is required: ${MODEL_WEIGHT_INDEX_PATH}" >&2
+      exit 2
+    fi
+    MODEL_LOADING_ARGS+=(--load-format auto)
+    ;;
+  *)
+    echo "MODEL_LOAD_FORMAT must be dummy or auto" >&2
+    exit 2
+    ;;
+esac
 
 if [[ -n "${SLURM_GPUS_ON_NODE:-}" && "${SLURM_GPUS_ON_NODE}" != "${NPU_COUNT}" ]]; then
   echo "Expected ${NPU_COUNT} NPUs, got SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE}" >&2
@@ -157,7 +210,7 @@ distributions = {
     for dist in importlib.metadata.distributions(path=sorted(site_paths))
 }
 for distribution_name, source_root in zip(
-    ("vllm-hust", "vllm-ascend-hust"), expected
+    ("vllm", "vllm-ascend-hust"), expected
 ):
     dist = distributions.get(distribution_name)
     direct_url_text = dist.read_text("direct_url.json") if dist else None
@@ -176,6 +229,28 @@ for distribution_name, source_root in zip(
         )
     print(f"editable {distribution_name}: {installed_source}")
 PY
+
+CORE_GIT_SHA=$(git -C "${REPO_ROOT}" rev-parse HEAD)
+ASCEND_GIT_SHA=$(git -C "${ASCEND_REPO}" rev-parse HEAD)
+CORE_GIT_STATUS=$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal)
+ASCEND_GIT_STATUS=$(
+  git -C "${ASCEND_REPO}" status --porcelain --untracked-files=normal
+)
+CORE_GIT_CLEAN=$([[ -z "${CORE_GIT_STATUS}" ]] && echo 1 || echo 0)
+ASCEND_GIT_CLEAN=$([[ -z "${ASCEND_GIT_STATUS}" ]] && echo 1 || echo 0)
+case "${REQUIRE_CLEAN_GIT}" in
+  0) ;;
+  1)
+    if [[ "${CORE_GIT_CLEAN}" != "1" || "${ASCEND_GIT_CLEAN}" != "1" ]]; then
+      echo "Formal benchmark requires clean core and Ascend worktrees" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "REQUIRE_CLEAN_GIT must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 
 export VLLM_PLUGINS=ascend
 export VLLM_LOG_STATS_INTERVAL=1
@@ -217,13 +292,18 @@ export EXPERIMENT_ID MODEL_KEY TRACE_KEY MODE MODEL_NAME PP_SIZE TP_SIZE
 export KV_CACHE_SIZE REQUEST_NUM PORT GPU_MEMORY_UTILIZATION MAX_MODEL_LEN
 export MAX_NUM_SEQS
 export KV_CACHE_MEMORY ENFORCE_EAGER MAX_BATCHED_TOKENS TRACE_FILE MODEL_DIR
+export MODEL_DIR_OVERRIDE MODEL_LOAD_FORMAT
 export SHARE_DUMMY_WEIGHTS CONFIG_KEY CONFIG_PATH CONFIG_SHA256
 export MODEL_CONFIG_PATH MODEL_CONFIG_SHA256 DEPLOYMENT HARDWARE
+export MODEL_WEIGHT_INDEX_PATH MODEL_WEIGHT_INDEX_SHA256
+export CORE_GIT_SHA ASCEND_GIT_SHA CORE_GIT_CLEAN ASCEND_GIT_CLEAN
+export REQUIRE_CLEAN_GIT BATCH_INVARIANT VLLM_BATCH_INVARIANT
 export PP_LAYER_PARTITION COST_MODEL_PATH PP_OPT_BATCH_QUEUE_SIZE
 export PP_OPT_DYNAMIC_MICROBATCHES PP_OPT_MIN_MICROBATCHES
 export PP_OPT_TARGET_MICROBATCH_SIZE
 export PP_OPT_OVERLAP_SENDS
 export USE_DECODE_BENCH_CONNECTOR
+export DECODE_BENCH_FILL_MEAN DECODE_BENCH_FILL_STD
 python - "${METADATA}" <<'PY'
 import json
 import os
@@ -235,10 +315,15 @@ keys = (
     "EXPERIMENT_ID", "MODEL_KEY", "TRACE_KEY", "MODE", "MODEL_NAME",
     "PP_SIZE", "TP_SIZE", "KV_CACHE_SIZE", "REQUEST_NUM", "PORT",
     "GPU_MEMORY_UTILIZATION", "MAX_MODEL_LEN", "MAX_NUM_SEQS",
-    "KV_CACHE_MEMORY", "ENFORCE_EAGER",
+    "KV_CACHE_MEMORY", "ENFORCE_EAGER", "MODEL_DIR_OVERRIDE",
+    "MODEL_LOAD_FORMAT",
     "MAX_BATCHED_TOKENS", "SHARE_DUMMY_WEIGHTS",
     "CONFIG_KEY", "CONFIG_PATH", "CONFIG_SHA256", "MODEL_CONFIG_PATH",
-    "MODEL_CONFIG_SHA256", "DEPLOYMENT", "HARDWARE",
+    "MODEL_CONFIG_SHA256", "MODEL_WEIGHT_INDEX_PATH",
+    "MODEL_WEIGHT_INDEX_SHA256", "DEPLOYMENT", "HARDWARE",
+    "CORE_GIT_SHA", "ASCEND_GIT_SHA", "CORE_GIT_CLEAN",
+    "ASCEND_GIT_CLEAN", "REQUIRE_CLEAN_GIT", "BATCH_INVARIANT",
+    "VLLM_BATCH_INVARIANT",
     "PP_LAYER_PARTITION", "COST_MODEL_PATH", "PP_OPT_BATCH_QUEUE_SIZE",
     "PP_OPT_DYNAMIC_MICROBATCHES", "PP_OPT_MIN_MICROBATCHES",
     "PP_OPT_TARGET_MICROBATCH_SIZE", "PP_OPT_OVERLAP_SENDS",
@@ -247,7 +332,8 @@ keys = (
     "VLLM_PP_OPT_MIN_MICROBATCHES", "VLLM_PP_OPT_TARGET_MICROBATCH_SIZE",
     "VLLM_PP_OPT_OVERLAP_SENDS",
     "VLLM_PP_LAYER_PARTITION",
-    "USE_DECODE_BENCH_CONNECTOR",
+    "USE_DECODE_BENCH_CONNECTOR", "DECODE_BENCH_FILL_MEAN",
+    "DECODE_BENCH_FILL_STD",
     "TRACE_FILE", "MODEL_DIR", "SLURM_JOB_ID", "SLURM_JOB_NODELIST",
 )
 payload = {key.lower(): os.environ.get(key) for key in keys}
@@ -285,6 +371,7 @@ vllm serve "${MODEL_DIR}" \
   --port "${PORT}" \
   --served-model-name "${MODEL_NAME}" \
   --no-enable-prefix-caching \
+  --no-async-scheduling \
   --pipeline-parallel-size "${PP_SIZE}" \
   --tensor-parallel-size "${TP_SIZE}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
@@ -297,15 +384,26 @@ vllm serve "${MODEL_DIR}" \
   --additional-config '{"ascend_compilation_config":{"fuse_norm_quant":false,"fuse_qknorm_rope":false}}' \
   --safetensors-load-strategy eager \
   --hf-overrides "${VLLM_HF_OVERRIDES}" \
-  --load-format dummy \
-  --model-loader-extra-config "{\"embedding_weight_path\":\"${EMBEDDING_SHARD}\",\"embedding_weight_name\":\"model.embed_tokens.weight\",\"share_dummy_weights\":${SHARE_DUMMY_WEIGHTS}}" \
+  "${MODEL_LOADING_ARGS[@]}" \
   --skip-tokenizer-init \
   "${SERVER_PROFILE_ARGS[@]}" \
   >"${SERVER_LOG}" 2>&1 &
 server_pid=$!
 
 health_deadline=$((SECONDS + ${HEALTH_TIMEOUT:-1800}))
-until curl --silent --fail "http://127.0.0.1:${PORT}/health" >/dev/null; do
+health_check() {
+  python - "http://127.0.0.1:${PORT}/health" <<'PY'
+import sys
+import urllib.request
+
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with opener.open(sys.argv[1], timeout=2) as response:
+    if response.status != 200:
+        raise SystemExit(1)
+PY
+}
+
+until health_check >/dev/null 2>&1; do
   if ! kill -0 "${server_pid}" 2>/dev/null; then
     wait "${server_pid}" || true
     echo "Server exited before becoming healthy; see ${SERVER_LOG}" >&2
