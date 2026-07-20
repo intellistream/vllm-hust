@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -54,6 +55,7 @@ def _create_pp_opt_scheduler(
     num_blocks: int = 10000,
     block_size: int = 16,
     pipeline_parallel_size: int = 1,
+    sliding_window: int | None = None,
 ) -> Scheduler:
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
@@ -98,18 +100,28 @@ def _create_pp_opt_scheduler(
         num_speculative_tokens=0,
         use_v2_model_runner=False,
     )
+    if sliding_window is None:
+        attention_spec = FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        )
+    else:
+        attention_spec = SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=sliding_window,
+        )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
+                attention_spec,
             )
         ],
     )
@@ -169,6 +181,69 @@ def test_pp_opt_admission_balances_waiting_requests_by_microbatch_cost():
 
     assert scheduler.request_id_to_microbatch_id["a"] == 1
     assert scheduler.request_id_to_microbatch_id["b"] == 1
+
+
+def test_pp_opt_admission_sends_external_kv_table_without_stale_aliases():
+    block_size = 4
+    scheduler = _create_pp_opt_scheduler(
+        max_num_batched_tokens=64,
+        num_blocks=100,
+        block_size=block_size,
+        pipeline_parallel_size=2,
+        sliding_window=8,
+    )
+    request = create_requests(
+        1,
+        num_tokens=20,
+        max_tokens=8,
+        req_ids=["r"],
+    )[0]
+    scheduler.add_request(request)
+
+    first_output = scheduler.schedule_pp_opt(0)
+    initial_blocks = list(first_output.scheduled_new_reqs[0].block_ids[0])
+    null_block_id = scheduler.kv_cache_manager.block_pool.null_block.block_id
+
+    # External tokens outside the attention window must already be represented
+    # by null blocks in the first full table sent to the worker.
+    assert initial_blocks.count(null_block_id) > 1
+    assert initial_blocks == scheduler.kv_cache_manager.get_block_ids("r")[0]
+
+    # Mirror the worker's full-table initialization followed by cached deltas.
+    worker_blocks = initial_blocks.copy()
+    previous_slot = None
+    reused_block_seen = False
+    for token_id in range(8):
+        scheduler.update_from_output_pp_opt(
+            first_output,
+            _model_output_for(first_output, [[token_id + 1]]),
+        )
+        if not scheduler.has_requests_pp_opt():
+            break
+        first_output = scheduler.schedule_pp_opt(0)
+        if not first_output.num_scheduled_tokens:
+            break
+        new_blocks = first_output.scheduled_cached_reqs.new_block_ids[0]
+        if new_blocks is not None:
+            if "r" in first_output.scheduled_cached_reqs.block_table_replaced_req_ids:
+                worker_blocks = list(new_blocks[0])
+            else:
+                worker_blocks.extend(new_blocks[0])
+
+        live_blocks = [block for block in worker_blocks if block != null_block_id]
+        assert len(live_blocks) == len(set(live_blocks))
+
+        position = first_output.scheduled_cached_reqs.num_computed_tokens[0]
+        slot = (
+            worker_blocks[position // block_size] * block_size + position % block_size
+        )
+        if previous_slot is not None and position % block_size:
+            assert slot == previous_slot + 1
+        if new_blocks is not None:
+            reused_block_seen |= new_blocks[0][-1] < max(initial_blocks)
+        previous_slot = slot
+
+    assert reused_block_seen
 
 
 def test_pp_opt_six_feature_cost_model_prediction():
