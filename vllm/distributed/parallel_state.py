@@ -1463,6 +1463,10 @@ def get_dcp_group() -> GroupCoordinator:
     return _DCP
 
 
+def get_decode_context_model_parallel_world_size() -> int:
+    return get_dcp_group().world_size
+
+
 _PP: GroupCoordinator | None = None
 
 
