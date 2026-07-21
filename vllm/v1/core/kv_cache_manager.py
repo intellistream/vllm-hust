@@ -190,6 +190,11 @@ class KVCacheManager:
             )
             for group in kv_cache_config.kv_cache_groups
         )
+        # A request enters this set when an existing block-table entry is
+        # replaced (for example, by sliding-window eviction). Appended blocks
+        # are already carried by allocate_slots() and do not need a full-table
+        # refresh.
+        self._block_table_replacement_req_ids: set[str] = set()
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -497,11 +502,12 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
-        self.coordinator.remove_skipped_blocks(
+        if self.coordinator.remove_skipped_blocks(
             request.request_id,
             total_computed_tokens,
             num_prompt_tokens=request.num_prompt_tokens,
-        )
+        ):
+            self._block_table_replacement_req_ids.add(request.request_id)
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
@@ -558,6 +564,7 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+        self._block_table_replacement_req_ids.discard(request.request_id)
 
     def remove_skipped_blocks(
         self,
@@ -574,9 +581,16 @@ class KVCacheManager:
                 local computed tokens and external computed tokens.
             num_prompt_tokens: Optional prompt length for R-SWA gap eviction.
         """
-        self.coordinator.remove_skipped_blocks(
+        if self.coordinator.remove_skipped_blocks(
             request_id, total_computed_tokens, num_prompt_tokens
-        )
+        ):
+            self._block_table_replacement_req_ids.add(request_id)
+
+    def block_table_replacement_required(self, request_id: str) -> bool:
+        return request_id in self._block_table_replacement_req_ids
+
+    def clear_block_table_replacement(self, request_id: str) -> None:
+        self._block_table_replacement_req_ids.discard(request_id)
 
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without
@@ -589,6 +603,7 @@ class KVCacheManager:
         Returns:
             The request's blocks in allocation order.
         """
+        self._block_table_replacement_req_ids.discard(request.request_id)
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:

@@ -251,6 +251,42 @@ def test_pp_opt_admission_sends_external_kv_table_without_stale_aliases():
     assert reused_block_seen
 
 
+def test_pp_opt_cached_decode_does_not_snapshot_unchanged_block_table(monkeypatch):
+    scheduler = _create_pp_opt_scheduler(
+        max_num_seqs=32,
+        max_num_batched_tokens=8192,
+        num_blocks=4096,
+        block_size=4,
+        pipeline_parallel_size=2,
+    )
+    requests = create_requests(
+        32,
+        num_tokens=256,
+        max_tokens=4,
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    first_outputs = [scheduler.schedule_pp_opt(i) for i in range(2)]
+    assert sum(len(output.num_scheduled_tokens) for output in first_outputs) == 32
+    for output in first_outputs:
+        scheduler.update_from_output_pp_opt(output, _model_output_for(output))
+
+    get_blocks = Mock(wraps=scheduler.kv_cache_manager.get_blocks)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "get_blocks", get_blocks)
+
+    # These cached decode steps only append allocation deltas. They must not
+    # materialize the full authoritative table just to compare it with the
+    # table sent in the preceding step.
+    cached_outputs = [scheduler.schedule_pp_opt(i) for i in range(2)]
+    assert sum(len(output.num_scheduled_tokens) for output in cached_outputs) == 32
+    for output in cached_outputs:
+        assert not output.scheduled_cached_reqs.block_table_replaced_req_ids
+        scheduler.update_from_output_pp_opt(output, _model_output_for(output))
+
+    get_blocks.assert_not_called()
+
+
 def test_pp_opt_six_feature_cost_model_prediction():
     model = MicroBatchCostModel(
         p0=1.0,

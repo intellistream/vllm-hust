@@ -336,7 +336,7 @@ class KVCacheCoordinator(ABC):
         request_id: str,
         total_computed_tokens: int,
         num_prompt_tokens: int | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Remove the blocks that are no longer needed from `blocks` and replace
         the removed blocks with null_block.
@@ -349,10 +349,13 @@ class KVCacheCoordinator(ABC):
                 free gap blocks between the prefill tail and decode window; other
                 manager types ignore it.
         """
+        block_table_replaced = False
         for manager in self.single_type_managers:
-            manager.remove_skipped_blocks(
+            if manager.remove_skipped_blocks(
                 request_id, total_computed_tokens, num_prompt_tokens
-            )
+            ):
+                block_table_replaced = True
+        return block_table_replaced
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
