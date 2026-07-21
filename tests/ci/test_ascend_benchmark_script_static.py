@@ -56,12 +56,19 @@ def test_same_spec_benchmark_failure_prints_server_log_tail():
 def test_same_spec_pr_preview_uses_ascend_compatibility_overlay():
     text = script_text("run_ascend_benchmark_ci.sh")
     same_spec_block = text[text.index("run_same_spec_current_benchmark() {") :]
+    helper = script_text("ascend_same_spec_compat.py")
 
     assert "SAME_SPEC_PR_PREVIEW_COMPAT=${SAME_SPEC_PR_PREVIEW_COMPAT:-1}" in text
+    assert (
+        "SAME_SPEC_FORCE_PR_PREVIEW_COMPAT=${SAME_SPEC_FORCE_PR_PREVIEW_COMPAT:-0}"
+        in text
+    )
     assert "prepare_same_spec_pr_preview_compat_file() {" in same_spec_block
-    assert 'server_parameters["no_enable_chunked_prefill"] = True' in same_spec_block
-    assert 'server_parameters["no_enable_prefix_caching"] = True' in same_spec_block
-    assert 'client_parameters.setdefault("temperature", 0)' in same_spec_block
+    assert "ascend_same_spec_compat.py" in same_spec_block
+    assert 'server_parameters["no_enable_chunked_prefill"] = True' in helper
+    assert 'server_parameters["no_enable_prefix_caching"] = True' in helper
+    assert 'client_parameters.setdefault("temperature", 0)' in helper
+    assert '"$SAME_SPEC_FORCE_PR_PREVIEW_COMPAT" == "1"' in same_spec_block
     assert '${GITHUB_EVENT_NAME:-}" == "pull_request"' in same_spec_block
     assert '${GITHUB_EVENT_NAME:-}" == "issue_comment"' in same_spec_block
     assert '"$effective_same_spec_file"' in same_spec_block

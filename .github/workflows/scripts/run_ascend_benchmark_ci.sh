@@ -27,6 +27,7 @@ SAME_SPEC_SPEC_FILE=${SAME_SPEC_SPEC_FILE:-}
 SAME_SPEC_CONSTRAINTS_FILE=${SAME_SPEC_CONSTRAINTS_FILE:-$VLLM_HUST_BENCHMARK_REPO/docs/official-baselines/official-ascend-constraints.stub.json}
 SAME_SPEC_READY_TIMEOUT_SECONDS=${SAME_SPEC_READY_TIMEOUT_SECONDS:-600}
 SAME_SPEC_PR_PREVIEW_COMPAT=${SAME_SPEC_PR_PREVIEW_COMPAT:-1}
+SAME_SPEC_FORCE_PR_PREVIEW_COMPAT=${SAME_SPEC_FORCE_PR_PREVIEW_COMPAT:-0}
 ALLOW_RANDOM_HF_PUBLISH=${ALLOW_RANDOM_HF_PUBLISH:-0}
 
 MODEL_NAME=${MODEL_NAME:-Qwen/Qwen2.5-14B-Instruct}
@@ -1000,55 +1001,13 @@ run_same_spec_current_benchmark() {
   prepare_same_spec_pr_preview_compat_file() {
     local output_file=$RESULT_ROOT/pr-preview-same-spec.compat.json
 
-    "$PYTHON_BIN" - "$SAME_SPEC_SPEC_FILE" "$output_file" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-source = Path(sys.argv[1])
-target = Path(sys.argv[2])
-payload = json.loads(source.read_text(encoding="utf-8"))
-
-server_parameters = dict(payload.get("server_parameters") or {})
-client_parameters = dict(payload.get("client_parameters") or {})
-
-# PR preview runs on self-hosted Ascend runners where the official same-spec
-# defaults can trip plugin paths that are not reliable for smoke gating.
-server_parameters["no_enable_chunked_prefill"] = True
-server_parameters["no_enable_prefix_caching"] = True
-preview_gpu_memory_utilization = 0.85
-requested_gpu_memory_utilization = server_parameters.get(
-    "gpu_memory_utilization")
-if requested_gpu_memory_utilization is None:
-    server_parameters["gpu_memory_utilization"] = preview_gpu_memory_utilization
-else:
-    try:
-        requested_gpu_memory_utilization = float(
-            requested_gpu_memory_utilization)
-    except (TypeError, ValueError):
-        requested_gpu_memory_utilization = None
-
-    if requested_gpu_memory_utilization is None:
-        server_parameters[
-            "gpu_memory_utilization"] = preview_gpu_memory_utilization
-    else:
-        server_parameters["gpu_memory_utilization"] = min(
-            requested_gpu_memory_utilization, preview_gpu_memory_utilization)
-client_parameters.setdefault("temperature", 0)
-
-payload["server_parameters"] = server_parameters
-payload["client_parameters"] = client_parameters
-
-target.parent.mkdir(parents=True, exist_ok=True)
-target.write_text(
-    json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-    encoding="utf-8",
-)
-print(target)
-PY
+    "$PYTHON_BIN" \
+      "$VLLM_HUST_REPO/.github/workflows/scripts/ascend_same_spec_compat.py" \
+      --source "$SAME_SPEC_SPEC_FILE" \
+      --output "$output_file"
   }
 
-  if [[ "$SAME_SPEC_PR_PREVIEW_COMPAT" == "1" && ( "${GITHUB_EVENT_NAME:-}" == "pull_request" || "${GITHUB_EVENT_NAME:-}" == "issue_comment" ) ]]; then
+  if [[ "$SAME_SPEC_PR_PREVIEW_COMPAT" == "1" && ( "$SAME_SPEC_FORCE_PR_PREVIEW_COMPAT" == "1" || "${GITHUB_EVENT_NAME:-}" == "pull_request" || "${GITHUB_EVENT_NAME:-}" == "issue_comment" ) ]]; then
     effective_same_spec_file=$(prepare_same_spec_pr_preview_compat_file)
     echo "Using PR preview same-spec compatibility overlay: $effective_same_spec_file"
   fi

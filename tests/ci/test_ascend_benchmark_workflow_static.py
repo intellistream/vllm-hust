@@ -97,6 +97,7 @@ def test_main_push_runs_only_the_central_perfgate_producer():
     assert "github.event_name == 'push'" in producer_step
     assert "Qwen/Qwen2.5-3B-Instruct" in producer_step
     assert "BENCH_SCENARIO=random-online" in producer_step
+    assert "SAME_SPEC_FORCE_PR_PREVIEW_COMPAT=1" in producer_step
     assert "vllm_hust_benchmark.perfgate_specs resolve" in producer_step
     assert "HUST_ASCEND_RUNTIME_VERSION" in producer_step
     assert 'if [[ "$rc" -eq 86' in producer_step
