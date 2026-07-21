@@ -76,16 +76,19 @@ def test_fork_pr_security_note_is_blocking():
 def test_main_push_runs_only_the_central_perfgate_producer():
     text = workflow_text()
     standard_step = text[
-        text.index("      - name: Run benchmark CI and optional formal publish") :
-        text.index("      - name: Run main perfgate baseline producer")
+        text.index(
+            "      - name: Run benchmark CI and optional formal publish"
+        ) : text.index("      - name: Run main perfgate baseline producer")
     ]
     producer_step = text[
-        text.index("      - name: Run main perfgate baseline producer") :
-        text.index("      - name: Publish main perfgate baseline")
+        text.index("      - name: Run main perfgate baseline producer") : text.index(
+            "      - name: Publish main perfgate baseline"
+        )
     ]
     publish_step = text[
-        text.index("      - name: Publish main perfgate baseline") :
-        text.index("      - name: Performance gate - Stage 1 comparison")
+        text.index("      - name: Publish main perfgate baseline") : text.index(
+            "      - name: Performance gate - Stage 1 comparison"
+        )
     ]
 
     assert "push:" in text[: text.index("jobs:")]
@@ -124,12 +127,14 @@ def test_main_producer_uses_public_pinned_runtime_dependencies():
     assert "CENTRAL_BASELINE_REMOTE: https://github.com" in text
 
     l3_step = text[
-        text.index("      - name: L3 benchmark publication preflight") :
-        text.index("      - name: Deepen clone for fork-point detection")
+        text.index("      - name: L3 benchmark publication preflight") : text.index(
+            "      - name: Deepen clone for fork-point detection"
+        )
     ]
     website_step = text[
-        text.index("      - name: Checkout website repo") :
-        text.index("      - name: Checkout vllm-ascend-hust repo")
+        text.index("      - name: Checkout website repo") : text.index(
+            "      - name: Checkout vllm-ascend-hust repo"
+        )
     ]
     assert "if: ${{ github.event_name != 'push' }}" in l3_step
     assert "if: ${{ github.event_name != 'push' }}" in website_step
@@ -147,6 +152,22 @@ def test_checkout_urls_are_public_and_read_only():
     assert "https://github.com/vLLM-HUST/vllm-ascend-hust.git" in text
     assert "git@github.com" not in text
     assert "BENCHMARK_REPO_SSH_KEY" not in text
+
+
+def test_external_actions_use_immutable_commit_shas():
+    text = workflow_text()
+
+    action_references = [
+        line.strip().removeprefix("uses: ").split(" #", maxsplit=1)[0]
+        for line in text.splitlines()
+        if line.strip().startswith("uses: actions/")
+    ]
+    assert action_references
+    for reference in action_references:
+        _action, separator, revision = reference.rpartition("@")
+        assert separator == "@"
+        assert len(revision) == 40
+        assert all(character in "0123456789abcdef" for character in revision)
 
 
 def test_benchmark_install_removes_conflicting_vllm_provider():
@@ -200,8 +221,7 @@ def test_main_benchmark_defaults_match_ascend_main_config():
     assert "VLLM_HUST_PERFGATE_HARDWARE_CHIP_MODEL" in text
     assert (
         "HARDWARE_CHIP_MODEL: ${{ "
-        "vars.VLLM_HUST_PERFGATE_HARDWARE_CHIP_MODEL || '910B2' }}"
-        in text
+        "vars.VLLM_HUST_PERFGATE_HARDWARE_CHIP_MODEL || '910B2' }}" in text
     )
     assert "Resolve perfgate spec for Ascend runner" in text
     assert "Resolve main same-spec file" in text
@@ -276,16 +296,16 @@ def test_benchmark_runner_supports_registry_same_spec_scenarios():
     same_spec_marker = 'if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'
     assert same_spec_marker in script
     same_spec_block = script[
-        script.index(same_spec_marker) :
-        script.index("else", script.index(same_spec_marker))
+        script.index(same_spec_marker) : script.index(
+            "else", script.index(same_spec_marker)
+        )
     ]
     assert "EFFECTIVE_CONSTRAINTS_FILE=$SAME_SPEC_CONSTRAINTS_FILE" in same_spec_block
     assert "bench_args=()" in same_spec_block
-    assert 'Unsupported BENCH_SCENARIO without same-spec mode' in script
+    assert "Unsupported BENCH_SCENARIO without same-spec mode" in script
     assert (
         'if [[ "$BENCH_SCENARIO" == "random-online" && '
-        '"$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'
-        not in script
+        '"$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then' not in script
     )
 
 

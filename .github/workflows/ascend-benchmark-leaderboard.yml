@@ -104,7 +104,7 @@ jobs:
       publish_to_benchmark_repo: ${{ steps.parse-command.outputs.PUBLISH_TO_BENCHMARK_REPO }}
     steps:
       - name: Checkout workflow scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -1601,7 +1601,7 @@ jobs:
       - name: Upload benchmark artifacts
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ascend-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ github.workspace }}/.benchmarks/ci/
