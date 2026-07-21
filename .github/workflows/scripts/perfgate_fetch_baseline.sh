@@ -64,14 +64,33 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 if [[ -z "${PERFGATE_CENTRAL_REPOSITORY_ROOT:-}" ]]; then
-  rm -rf "$CENTRAL_CHECKOUT"
-  if ! git clone \
-    --depth 1 \
-    --single-branch \
-    --no-tags \
-    --branch "$CENTRAL_BASELINE_BRANCH" \
-    "$CENTRAL_BASELINE_REMOTE" \
-    "$CENTRAL_CHECKOUT"; then
+  central_clone_attempts=${CENTRAL_BASELINE_CLONE_ATTEMPTS:-4}
+  central_clone_delay=${CENTRAL_BASELINE_CLONE_DELAY_SECONDS:-15}
+  central_clone_attempt=1
+  central_clone_status=1
+  while [[ "$central_clone_attempt" -le "$central_clone_attempts" ]]; do
+    echo "Central baseline clone attempt ${central_clone_attempt}/${central_clone_attempts}"
+    rm -rf "$CENTRAL_CHECKOUT"
+    if git \
+      -c http.version=HTTP/1.1 \
+      -c http.lowSpeedLimit=1024 \
+      -c http.lowSpeedTime=30 \
+      clone \
+      --depth 1 \
+      --single-branch \
+      --no-tags \
+      --branch "$CENTRAL_BASELINE_BRANCH" \
+      "$CENTRAL_BASELINE_REMOTE" \
+      "$CENTRAL_CHECKOUT"; then
+      central_clone_status=0
+      break
+    fi
+    if [[ "$central_clone_attempt" -lt "$central_clone_attempts" ]]; then
+      sleep "$central_clone_delay"
+    fi
+    central_clone_attempt=$((central_clone_attempt + 1))
+  done
+  if [[ "$central_clone_status" -ne 0 ]]; then
     baseline_unavailable "Unable to clone central baseline branch: $CENTRAL_BASELINE_BRANCH"
   fi
 fi

@@ -142,6 +142,8 @@ def test_perfgate_consumer_uses_central_exact_baseline_and_pinned_dependencies()
 
     assert "https://github.com/vLLM-HUST/vllm-hust-benchmark.git" in fetch_script
     assert '--branch "$CENTRAL_BASELINE_BRANCH"' in fetch_script
+    assert "http.lowSpeedLimit=1024" in fetch_script
+    assert "central_clone_attempts" in fetch_script
     assert "git remote get-url origin" not in fetch_script
     assert "CENTRAL_BASELINE_WRITER_TOKEN" not in fetch_script
     assert "perfgate_fetch_baseline.sh" in fetch_step

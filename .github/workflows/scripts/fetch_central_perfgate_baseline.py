@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                 "PERFGATE_BASELINE_FILE": str(output),
                 "PERFGATE_BASELINE_AVAILABLE": "1",
                 "PERFGATE_BASELINE_COMMIT": args.target_sha,
-                "PERFGATE_BASELINE_SOURCE": "central-exact",
+                "PERFGATE_BASELINE_SOURCE": "exact",
                 "PERFGATE_BASELINE_SPEC_ID": spec_id,
                 "PERFGATE_BASELINE_SPEC_HASH": spec_hash,
             },
@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "baseline": str(output),
-                "source": "central-exact",
+                "source": "exact",
                 "target_sha": args.target_sha,
                 "spec_id": spec_id,
                 "spec_hash": spec_hash,

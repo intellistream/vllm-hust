@@ -156,7 +156,7 @@ def test_main_fetches_exact_identity_and_writes_env(
         "spec_hash": SPEC_HASH,
     }
     env_text = env_file.read_text(encoding="utf-8")
-    assert "PERFGATE_BASELINE_SOURCE=central-exact" in env_text
+    assert "PERFGATE_BASELINE_SOURCE=exact" in env_text
     assert f"PERFGATE_BASELINE_COMMIT={TARGET_SHA}" in env_text
 
 
