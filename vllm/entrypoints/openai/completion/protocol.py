@@ -15,6 +15,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
     LegacyStructuralTagResponseFormat,
     OpenAIBaseModel,
+    QoSRequestParams,
     StreamOptions,
     StructuralTagResponseFormat,
     UsageInfo,
@@ -125,6 +126,7 @@ class CompletionRequest(OpenAIBaseModel):
             "if the served model does not use priority scheduling."
         ),
     )
+    qos: QoSRequestParams | None = None
     request_id: str = Field(
         default_factory=random_uuid,
         description=(

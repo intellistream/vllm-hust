@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Callable
 from dataclasses import InitVar
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -166,6 +167,13 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    enable_qos_scheduling: bool = False
+    """Enable the Phase 0-3 request-SLO scheduler controller."""
+
+    qos_hybrid_alpha: float = Field(default=0.0, ge=0.0)
+    """Remaining-work weight in seconds per token for hybrid ordering."""
+
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -253,6 +261,28 @@ class SchedulerConfig:
                 "Chunked prefill is enabled with max_num_batched_tokens=%d.",
                 self.max_num_batched_tokens,
             )
+
+        if not math.isfinite(self.qos_hybrid_alpha):
+            raise ValueError("qos_hybrid_alpha must be finite.")
+
+        if self.enable_qos_scheduling:
+            unsupported: list[str] = []
+            if not self.enable_chunked_prefill:
+                unsupported.append("chunked prefill must be enabled")
+            if self.runner_type != "generate":
+                unsupported.append("runner_type must be 'generate'")
+            if self.is_multimodal_model:
+                unsupported.append("multimodal models are not supported")
+            if is_encoder_decoder:
+                unsupported.append("encoder-decoder models are not supported")
+            if self.scheduler_cls is not None:
+                unsupported.append("scheduler_cls must be unset (stock V1 scheduler)")
+            if unsupported:
+                raise ValueError(
+                    "Invalid Phase 0-3 QoS configuration: "
+                    + "; ".join(unsupported)
+                    + "."
+                )
 
         if self.max_num_partial_prefills > 1:
             if self.long_prefill_token_threshold == 0:

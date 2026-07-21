@@ -129,6 +129,21 @@ class OpenAIServingCompletion(OpenAIServing):
         request: CompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
+        if request.qos is not None:
+            if not (
+                self.engine_client.vllm_config.scheduler_config.enable_qos_scheduling
+            ):
+                return self.create_error_response(
+                    "Request QoS requires the server to enable QoS scheduling."
+                )
+            if request.use_beam_search:
+                return self.create_error_response(
+                    "Request QoS does not support beam search in Phase 0-3."
+                )
+            if request.n != 1:
+                return self.create_error_response(
+                    "Request QoS does not support parallel sampling in Phase 0-3."
+                )
         if request.stream and request.use_beam_search:
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
@@ -139,6 +154,10 @@ class OpenAIServingCompletion(OpenAIServing):
             return result
 
         engine_inputs = result
+        if request.qos is not None and len(engine_inputs) != 1:
+            return self.create_error_response(
+                "Request QoS supports exactly one prompt in Phase 0-3."
+            )
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
         created_time = int(time.time())
@@ -208,6 +227,11 @@ class OpenAIServingCompletion(OpenAIServing):
                     trace_headers=trace_headers,
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
+                    **(
+                        {}
+                        if request.qos is None
+                        else {"qos_params": request.qos.to_internal()}
+                    ),
                 )
 
             generators.append(generator)

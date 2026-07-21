@@ -247,6 +247,21 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        if request.qos is not None:
+            if not (
+                self.engine_client.vllm_config.scheduler_config.enable_qos_scheduling
+            ):
+                return self.create_error_response(
+                    "Request QoS requires the server to enable QoS scheduling."
+                )
+            if request.use_beam_search:
+                return self.create_error_response(
+                    "Request QoS does not support beam search in Phase 0-3."
+                )
+            if request.n not in (None, 1):
+                return self.create_error_response(
+                    "Request QoS does not support parallel sampling in Phase 0-3."
+                )
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -264,6 +279,10 @@ class OpenAIServingChat(OpenAIServing):
             return result
 
         conversation, engine_inputs = result
+        if request.qos is not None and len(engine_inputs) != 1:
+            return self.create_error_response(
+                "Request QoS supports exactly one rendered prompt in Phase 0-3."
+            )
 
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
@@ -364,6 +383,11 @@ class OpenAIServingChat(OpenAIServing):
                     }
                     if parser is not None and parser.reasoning_parser is not None
                     else None,
+                    **(
+                        {}
+                        if request.qos is None
+                        else {"qos_params": request.qos.to_internal()}
+                    ),
                 )
 
             generators.append(generator)

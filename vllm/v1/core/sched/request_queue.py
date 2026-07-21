@@ -4,8 +4,10 @@
 import heapq
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from enum import Enum
+from itertools import count
+from typing import Any
 
 from vllm.v1.request import Request
 
@@ -198,8 +200,91 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
-def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
+class KeyedRequestQueue(RequestQueue):
+    """Heap queue ordered by an explicit scheduler-owned immutable key."""
+
+    def __init__(
+        self,
+        key: Callable[[Request], tuple[Any, ...]],
+        *,
+        preserve_prepend: bool,
+    ) -> None:
+        self._key = key
+        self._preserve_prepend = preserve_prepend
+        self._back_counter = count()
+        self._front_counter = count(start=-1, step=-1)
+        self._heap: list[tuple[tuple[Any, ...], int, int, Request]] = []
+
+    def add_request(self, request: Request) -> None:
+        heapq.heappush(
+            self._heap,
+            (self._key(request), 0, next(self._back_counter), request),
+        )
+
+    def pop_request(self) -> Request:
+        if not self._heap:
+            raise IndexError("pop from empty heap")
+        return heapq.heappop(self._heap)[3]
+
+    def peek_request(self) -> Request:
+        if not self._heap:
+            raise IndexError("peek from empty heap")
+        return self._heap[0][3]
+
+    def prepend_request(self, request: Request) -> None:
+        if not self._preserve_prepend:
+            self.add_request(request)
+            return
+        heapq.heappush(
+            self._heap,
+            (
+                self._key(request),
+                next(self._front_counter),
+                next(self._back_counter),
+                request,
+            ),
+        )
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        for request in requests:
+            self.prepend_request(request)
+
+    def remove_request(self, request: Request) -> None:
+        previous_size = len(self._heap)
+        self._heap = [entry for entry in self._heap if entry[3] is not request]
+        if len(self._heap) == previous_size:
+            raise ValueError("request is not in queue")
+        heapq.heapify(self._heap)
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        requests_to_remove = set(requests)
+        self._heap = [
+            entry for entry in self._heap if entry[3] not in requests_to_remove
+        ]
+        heapq.heapify(self._heap)
+
+    def __bool__(self) -> bool:
+        return bool(self._heap)
+
+    def __len__(self) -> int:
+        return len(self._heap)
+
+    def __iter__(self) -> Iterator[Request]:
+        heap_copy = self._heap[:]
+        while heap_copy:
+            yield heapq.heappop(heap_copy)[3]
+
+
+def create_request_queue(
+    policy: SchedulingPolicy,
+    key: Callable[[Request], tuple[Any, ...]] | None = None,
+) -> RequestQueue:
     """Create request queue based on scheduling policy."""
+    if key is not None:
+        return KeyedRequestQueue(
+            key,
+            preserve_prepend=policy == SchedulingPolicy.FCFS,
+        )
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:

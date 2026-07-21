@@ -651,6 +651,8 @@ class EngineArgs:
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
+    enable_qos_scheduling: bool = SchedulerConfig.enable_qos_scheduling
+    qos_hybrid_alpha: float = SchedulerConfig.qos_hybrid_alpha
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
@@ -1463,6 +1465,13 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--enable-qos-scheduling",
+            **scheduler_kwargs["enable_qos_scheduling"],
+        )
+        scheduler_group.add_argument(
+            "--qos-hybrid-alpha", **scheduler_kwargs["qos_hybrid_alpha"]
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -2163,6 +2172,8 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            enable_qos_scheduling=self.enable_qos_scheduling,
+            qos_hybrid_alpha=self.qos_hybrid_alpha,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

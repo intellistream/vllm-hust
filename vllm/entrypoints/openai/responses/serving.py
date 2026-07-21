@@ -104,6 +104,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
+from vllm.v1.qos import QoSParams
 
 logger = init_logger(__name__)
 
@@ -345,6 +346,17 @@ class OpenAIServingResponses(OpenAIServing):
         | ResponsesResponse
         | ErrorResponse
     ):
+        if request.qos is not None:
+            if not (
+                self.engine_client.vllm_config.scheduler_config.enable_qos_scheduling
+            ):
+                return self.create_error_response(
+                    "Request QoS requires the server to enable QoS scheduling."
+                )
+            if request.tools:
+                return self.create_error_response(
+                    "Request QoS does not support Responses tool loops in Phase 0-3."
+                )
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -387,6 +399,11 @@ class OpenAIServingResponses(OpenAIServing):
             )
         else:
             messages, engine_inputs = await self._make_request(request, prev_response)
+
+        if request.qos is not None and len(engine_inputs) != 1:
+            return self.create_error_response(
+                "Request QoS supports exactly one rendered prompt in Phase 0-3."
+            )
 
         request_metadata = RequestResponseMetadata(request_id=request.request_id)
         if raw_request:
@@ -519,6 +536,7 @@ class OpenAIServingResponses(OpenAIServing):
                 reasoning_parser_kwargs=reasoning_parser_kwargs
                 if self.parser and self.parser.reasoning_parser_cls is not None
                 else None,
+                qos_params=(None if request.qos is None else request.qos.to_internal()),
             )
             generators.append(generator)
 
@@ -664,6 +682,7 @@ class OpenAIServingResponses(OpenAIServing):
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        qos_params: QoSParams | None = None,
     ):
         max_model_len = self.model_config.max_model_len
 
@@ -688,6 +707,7 @@ class OpenAIServingResponses(OpenAIServing):
                 trace_headers=trace_headers,
                 priority=priority,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                **({} if qos_params is None else {"qos_params": qos_params}),
             )
 
             async for res in generator:

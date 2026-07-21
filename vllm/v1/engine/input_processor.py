@@ -29,6 +29,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.qos import QoSParams
 
 logger = init_logger(__name__)
 
@@ -252,9 +253,11 @@ class InputProcessor:
         priority: int = 0,
         data_parallel_rank: int | None = None,
         resumable: bool = False,
+        qos_params: QoSParams | None = None,
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
+        self._validate_qos_request(qos_params, params, resumable=resumable)
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size
@@ -382,7 +385,50 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            qos_params=qos_params,
         )
+
+    def validate_engine_core_request(self, request: EngineCoreRequest) -> None:
+        """Validate QoS on the deprecated direct EngineCoreRequest path."""
+
+        if request.sampling_params is not None and request.pooling_params is not None:
+            raise ValueError(
+                "EngineCoreRequest cannot contain both sampling and pooling parameters."
+            )
+        params = request.sampling_params or request.pooling_params
+        if params is None:
+            if request.qos_params is not None:
+                raise ValueError(
+                    "Request QoS requires text-generation sampling parameters."
+                )
+            return
+        self._validate_qos_request(
+            request.qos_params,
+            params,
+            resumable=request.resumable,
+        )
+
+    def _validate_qos_request(
+        self,
+        qos_params: QoSParams | None,
+        params: SamplingParams | PoolingParams,
+        *,
+        resumable: bool,
+    ) -> None:
+        if qos_params is None:
+            return
+        if not self.scheduler_config.enable_qos_scheduling:
+            raise ValueError("Request QoS parameters require --enable-qos-scheduling.")
+        if not isinstance(params, SamplingParams):
+            raise ValueError("Request QoS is supported only for text generation.")
+        if params.n != 1:
+            raise ValueError(
+                "Request QoS does not support parallel sampling in Phase 0-3."
+            )
+        if resumable:
+            raise ValueError(
+                "Request QoS does not support streaming-input sessions in Phase 0-3."
+            )
 
     def _validate_prompt_len(
         self,

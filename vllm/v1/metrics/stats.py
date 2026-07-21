@@ -199,6 +199,21 @@ class KVCacheEvictionEvent:
     reuse_gaps_seconds: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class QoSPolicyStats:
+    """Serializable QoS gauges and counter deltas for one stats flush."""
+
+    active: int
+    total_token_budget: int
+    min_decode_slack_ms: float
+    ttft_observations: int
+    tbt_observations: int
+    ttlt_observations: int
+    ttft_violations: int
+    tbt_violations: int
+    ttlt_violations: int
+
+
 @dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
@@ -230,6 +245,8 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    qos_stats: QoSPolicyStats | None = None
 
 
 @dataclass

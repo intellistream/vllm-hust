@@ -52,6 +52,7 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.qos import QoSParams
 
 logger = init_logger(__name__)
 
@@ -297,6 +298,7 @@ class AsyncLLM(EngineClient):
         prompt_text: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        qos_params: QoSParams | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
@@ -317,6 +319,11 @@ class AsyncLLM(EngineClient):
             )
 
         if isinstance(prompt, AsyncGenerator):
+            if qos_params is not None:
+                raise ValueError(
+                    "Request QoS does not support streaming-input sessions in "
+                    "Phase 0-3."
+                )
             if reasoning_ended is not None or reasoning_parser_kwargs is not None:
                 raise NotImplementedError
 
@@ -342,6 +349,11 @@ class AsyncLLM(EngineClient):
             )
 
             request = prompt
+            if qos_params is not None and request.qos_params != qos_params:
+                raise ValueError(
+                    "qos_params must be carried by a direct EngineCoreRequest."
+                )
+            self.input_processor.validate_engine_core_request(request)
             if request_id != request.request_id:
                 logger.warning_once(
                     "AsyncLLM.add_request() was passed a request_id parameter that "
@@ -360,6 +372,7 @@ class AsyncLLM(EngineClient):
                 trace_headers=trace_headers,
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
+                qos_params=qos_params,
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
@@ -541,6 +554,7 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        qos_params: QoSParams | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -571,6 +585,7 @@ class AsyncLLM(EngineClient):
                 prompt_text=prompt_text,
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                qos_params=qos_params,
             )
 
             # The output_handler task pushes items into the queue.

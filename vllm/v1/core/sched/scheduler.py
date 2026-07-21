@@ -46,6 +46,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.qos_policy import QoSSchedulingPolicy
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -94,6 +95,9 @@ class Scheduler(SchedulerInterface):
             )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+        # Validate the Phase 0-3 envelope before constructing unsupported
+        # connectors or other scheduler-side resources.
+        self.qos_policy = QoSSchedulingPolicy(vllm_config)
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -179,10 +183,11 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        qos_queue_key = self.qos_policy.waiting_key if self.qos_policy.enabled else None
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        self.waiting = create_request_queue(self.policy, qos_queue_key)
         # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.skipped_waiting = create_request_queue(self.policy, qos_queue_key)
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -436,6 +441,16 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        scheduled_timestamp = time.monotonic()
+        qos_decision = self.qos_policy.start_step(
+            running=self.running,
+            waiting=itertools.chain(self.waiting, self.skipped_waiting),
+            now=scheduled_timestamp,
+        )
+        original_running_positions = {
+            request: index for index, request in enumerate(self.running)
+        }
+        self.qos_policy.order_running(self.running, active=qos_decision.active)
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -448,9 +463,6 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
-
-        # For logging.
-        scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
 
@@ -658,7 +670,10 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
+            step_skipped_waiting = create_request_queue(
+                self.policy,
+                self.qos_policy.waiting_key if self.qos_policy.enabled else None,
+            )
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -1150,6 +1165,20 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if qos_decision.active:
+            current_positions = {
+                request: index for index, request in enumerate(self.running)
+            }
+            self.running.sort(
+                key=lambda request: (
+                    (
+                        0,
+                        original_running_positions[request],
+                    )
+                    if request in original_running_positions
+                    else (1, current_positions[request])
+                )
+            )
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1664,6 +1693,7 @@ class Scheduler(SchedulerInterface):
             num_output_tokens_before = len(request._output_token_ids)
 
             # Check for stop and update request status.
+            finished = False
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
@@ -1743,6 +1773,12 @@ class Scheduler(SchedulerInterface):
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
+
+            self.qos_policy.observe_request_output(
+                request,
+                num_new_tokens=len(new_token_ids),
+                finished=finished,
+            )
 
             # Extract sample logprobs if needed.
             if (
@@ -1894,6 +1930,16 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
+        if self.qos_policy.enabled and self.waiting and self.skipped_waiting:
+            waiting_req = self.waiting.peek_request()
+            skipped_req = self.skipped_waiting.peek_request()
+            if self.qos_policy.has_qos_request((waiting_req, skipped_req)):
+                if self.qos_policy.waiting_key(
+                    waiting_req
+                ) <= self.qos_policy.waiting_key(skipped_req):
+                    return self.waiting
+                return self.skipped_waiting
+
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
 
@@ -2039,6 +2085,12 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        if request.qos_params is not None and not self.qos_policy.enabled:
+            raise ValueError(
+                "Request QoS parameters require QoS scheduling to be enabled."
+            )
+        if request.qos_params is not None:
+            self.qos_policy.increment_qos_count()
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2120,6 +2172,10 @@ class Scheduler(SchedulerInterface):
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
 
+            # Decrement the QoS request counter for aborted / failed requests
+            # that never reached the normal observe_request_output path.
+            if request.qos_state is not None:
+                self.qos_policy.decrement_qos_count()
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
@@ -2343,6 +2399,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            qos_stats=self.qos_policy.drain_stats(),
         )
 
     def make_spec_decoding_stats(

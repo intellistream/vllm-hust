@@ -482,6 +482,53 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_scheduler_waiting, per_engine_labelvalues
         )
 
+        def make_qos_gauge(name: str, documentation: str):
+            gauge = self._gauge_cls(
+                name=name,
+                documentation=documentation,
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            return create_metric_per_engine(gauge, per_engine_labelvalues)
+
+        self.gauge_qos_active = make_qos_gauge(
+            "vllm:qos_scheduler_active",
+            "Whether the latest scheduler step contained request QoS work.",
+        )
+        self.gauge_qos_total_budget = make_qos_gauge(
+            "vllm:qos_total_token_budget",
+            "Global token budget selected by the QoS scheduler.",
+        )
+        self.gauge_qos_min_decode_slack = make_qos_gauge(
+            "vllm:qos_min_decode_slack_ms",
+            "Minimum next-token deadline slack in milliseconds.",
+        )
+        counter_qos_slo_violations = self._counter_cls(
+            name="vllm:qos_slo_violations_total",
+            documentation="Observed request SLO violations by fixed SLO type.",
+            labelnames=labelnames + ["slo"],
+        )
+        self.counter_qos_slo_violations = {}
+        counter_qos_slo_observations = self._counter_cls(
+            name="vllm:qos_slo_observations_total",
+            documentation=(
+                "Eligible request SLO observations by fixed SLO type; use as "
+                "the denominator for the violation counter."
+            ),
+            labelnames=labelnames + ["slo"],
+        )
+        self.counter_qos_slo_observations = {}
+        for slo in ("ttft", "tbt", "ttlt"):
+            labelvalues_with_slo = {
+                idx: values + [slo] for idx, values in per_engine_labelvalues.items()
+            }
+            self.counter_qos_slo_violations[slo] = create_metric_per_engine(
+                counter_qos_slo_violations, labelvalues_with_slo
+            )
+            self.counter_qos_slo_observations[slo] = create_metric_per_engine(
+                counter_qos_slo_observations, labelvalues_with_slo
+            )
+
         gauge_waiting_by_reason = self._gauge_cls(
             name="vllm:num_requests_waiting_by_reason",
             documentation=(
@@ -1168,6 +1215,33 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             if scheduler_stats.available_kv_cache_memory_bytes is not None:
                 self.gauge_available_kv_cache_memory[engine_idx].set(
                     scheduler_stats.available_kv_cache_memory_bytes
+                )
+
+            if (qos_stats := scheduler_stats.qos_stats) is not None:
+                self.gauge_qos_active[engine_idx].set(qos_stats.active)
+                self.gauge_qos_total_budget[engine_idx].set(
+                    qos_stats.total_token_budget
+                )
+                self.gauge_qos_min_decode_slack[engine_idx].set(
+                    qos_stats.min_decode_slack_ms
+                )
+                self.counter_qos_slo_observations["ttft"][engine_idx].inc(
+                    qos_stats.ttft_observations
+                )
+                self.counter_qos_slo_observations["tbt"][engine_idx].inc(
+                    qos_stats.tbt_observations
+                )
+                self.counter_qos_slo_observations["ttlt"][engine_idx].inc(
+                    qos_stats.ttlt_observations
+                )
+                self.counter_qos_slo_violations["ttft"][engine_idx].inc(
+                    qos_stats.ttft_violations
+                )
+                self.counter_qos_slo_violations["tbt"][engine_idx].inc(
+                    qos_stats.tbt_violations
+                )
+                self.counter_qos_slo_violations["ttlt"][engine_idx].inc(
+                    qos_stats.ttlt_violations
                 )
 
             self.counter_prefix_cache_queries[engine_idx].inc(

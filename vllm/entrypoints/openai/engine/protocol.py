@@ -3,6 +3,7 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+import math
 import time
 from http import HTTPStatus
 from typing import Any, ClassVar, Literal, TypeAlias
@@ -21,6 +22,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.v1.qos import MAX_EXPECTED_OUTPUT_TOKENS, QoSParams
 
 logger = init_logger(__name__)
 
@@ -55,6 +57,38 @@ class OpenAIBaseModel(BaseModel):
                 data.keys() - field_names,
             )
         return result
+
+
+class QoSRequestParams(OpenAIBaseModel):
+    """Request-level SLOs accepted by vLLM's OpenAI-compatible APIs."""
+
+    ttft_slo_ms: float | None = Field(default=None, gt=0.0)
+    tbt_slo_ms: float | None = Field(default=None, gt=0.0)
+    ttlt_slo_ms: float | None = Field(default=None, gt=0.0)
+    expected_output_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        le=MAX_EXPECTED_OUTPUT_TOKENS,
+    )
+    service_class: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_qos(self):
+        slos = (self.ttft_slo_ms, self.tbt_slo_ms, self.ttlt_slo_ms)
+        if all(value is None for value in slos):
+            raise ValueError("At least one QoS SLO must be specified.")
+        if any(value is not None and not math.isfinite(value) for value in slos):
+            raise ValueError("QoS SLOs must be finite positive numbers.")
+        return self
+
+    def to_internal(self) -> QoSParams:
+        return QoSParams(
+            ttft_slo_ms=self.ttft_slo_ms,
+            tbt_slo_ms=self.tbt_slo_ms,
+            ttlt_slo_ms=self.ttlt_slo_ms,
+            expected_output_tokens=self.expected_output_tokens,
+            service_class=self.service_class,
+        )
 
 
 class ErrorInfo(OpenAIBaseModel):

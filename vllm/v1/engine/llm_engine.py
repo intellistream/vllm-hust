@@ -36,9 +36,10 @@ from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
-from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.prometheus import shutdown_prometheus
+from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.qos import QoSParams
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.worker_base import WorkerBase
 
@@ -228,6 +229,7 @@ class LLMEngine:
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         prompt_text: str | None = None,
+        qos_params: QoSParams | None = None,
     ) -> str:
         # Validate the request_id type.
         if not isinstance(request_id, str):
@@ -242,6 +244,11 @@ class LLMEngine:
             )
 
             request = prompt
+            if qos_params is not None and request.qos_params != qos_params:
+                raise ValueError(
+                    "qos_params must be carried by a direct EngineCoreRequest."
+                )
+            self.input_processor.validate_engine_core_request(request)
             if request_id != request.request_id:
                 logger.warning_once(
                     "LLMEngine.add_request() was passed a request_id parameter that "
@@ -259,6 +266,7 @@ class LLMEngine:
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,
+                qos_params=qos_params,
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 

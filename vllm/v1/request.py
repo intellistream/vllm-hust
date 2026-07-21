@@ -21,6 +21,7 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.metrics.stats import PrefillStats
+from vllm.v1.qos import QoSParams, QoSRuntimeState
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
@@ -77,6 +78,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        qos_params: QoSParams | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -117,6 +119,19 @@ class Request:
                 )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
+
+        if qos_params is not None and sampling_params is None:
+            raise ValueError("Request QoS is supported only for text generation.")
+        self.qos_params = qos_params
+        self.qos_state = (
+            None
+            if qos_params is None
+            else QoSRuntimeState.from_params(
+                qos_params,
+                arrival_time=self.arrival_time,
+                default_expected_output_tokens=self.max_tokens,
+            )
+        )
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
@@ -219,6 +234,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            qos_params=request.qos_params,
         )
 
     def append_output_token_ids(

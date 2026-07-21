@@ -60,7 +60,7 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
 )
-from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel, QoSRequestParams
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
@@ -232,6 +232,7 @@ class ResponsesRequest(OpenAIBaseModel):
             "if the served model does not use priority scheduling."
         ),
     )
+    qos: QoSRequestParams | None = None
     cache_salt: str | None = Field(
         default=None,
         description=(

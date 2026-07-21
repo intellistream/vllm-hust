@@ -17,6 +17,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.qos import QoSParams
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -135,6 +136,9 @@ class EngineCoreRequest(
     # request_finished hook. Used to free P-side prefill blocks when a
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
+
+    # Appended to preserve positional compatibility of array-like IPC payloads.
+    qos_params: QoSParams | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:
