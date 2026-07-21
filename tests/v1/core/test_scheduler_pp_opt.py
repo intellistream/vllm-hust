@@ -230,6 +230,11 @@ def test_pp_opt_admission_sends_external_kv_table_without_stale_aliases():
             else:
                 worker_blocks.extend(new_blocks[0])
 
+        # A cached update must replace the worker table after any authoritative
+        # change, including sliding-window/external block nulling when no new
+        # physical block was appended in that step.
+        assert worker_blocks == scheduler.kv_cache_manager.get_block_ids("r")[0]
+
         live_blocks = [block for block in worker_blocks if block != null_block_id]
         assert len(live_blocks) == len(set(live_blocks))
 
