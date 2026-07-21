@@ -317,13 +317,13 @@ jobs:
       BENCHMARK_REPO_SLUG: vLLM-HUST/vllm-hust-benchmark
       BENCHMARK_REPO_GH_TOKEN: ${{ (((github.event_name == 'schedule' && vars.VLLM_HUST_SCHEDULE_PUBLISH_BENCHMARK == '1') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_benchmark_repo)) && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN) || '' }}
       # Trusted main producer dependencies are immutable; update these SHAs explicitly.
-      BENCHMARK_REPO_REF: ${{ github.event_name == 'push' && 'ce380ceb67bd904956d8ebb807a7691234022796' || ((github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && (vars.VLLM_HUST_BENCHMARK_REPO_REF || 'main') || 'main') }}
+      BENCHMARK_REPO_REF: ${{ (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'ce380ceb67bd904956d8ebb807a7691234022796' || (github.event_name == 'workflow_dispatch' && (vars.VLLM_HUST_BENCHMARK_REPO_REF || 'main') || 'main') }}
       WEBSITE_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-website.git
       VLLM_ASCEND_HUST_REPO_URL: https://github.com/vLLM-HUST/vllm-ascend-hust.git
-      VLLM_ASCEND_HUST_REPO_REF: ${{ github.event_name == 'push' && '328ab674dd6889b14441423b182b7fb8fe160fdb' || '' }}
+      VLLM_ASCEND_HUST_REPO_REF: ${{ (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '328ab674dd6889b14441423b182b7fb8fe160fdb' || '' }}
       ISSUE_COMMENT_PR_NUMBER: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_number || '' }}
       HUST_ASCEND_MANAGER_REPO_URL: https://github.com/vLLM-HUST/ascend-runtime-manager.git
-      HUST_ASCEND_MANAGER_REPO_REF: ${{ github.event_name == 'push' && '2a113e514fb4b5678483cb7efaa7fa56140f60d3' || '' }}
+      HUST_ASCEND_MANAGER_REPO_REF: ${{ (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '2a113e514fb4b5678483cb7efaa7fa56140f60d3' || '' }}
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
       # Disable precompiled CUDA wheel fetch from wheels.vllm.ai.
       # The Ascend benchmark uses the vllm-ascend-hust plugin, not CUDA
@@ -1114,7 +1114,11 @@ jobs:
         shell: bash
         env:
           PERFGATE_ALLOW_BASELINE_FALLBACK: "0"
-        run: bash .github/workflows/scripts/perfgate_fetch_baseline.sh "$FORK_POINT"
+          VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
+          VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
+        run: |
+          source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
+          bash .github/workflows/scripts/perfgate_fetch_baseline.sh "$FORK_POINT"
 
       - name: Run benchmark CI and optional formal publish
         if: ${{ github.event_name != 'push' }}

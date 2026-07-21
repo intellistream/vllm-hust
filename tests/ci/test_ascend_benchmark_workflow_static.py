@@ -127,6 +127,30 @@ def test_main_producer_uses_public_pinned_runtime_dependencies():
     assert "HUST_ASCEND_MANAGER_REPO_REF" in text
     assert "CENTRAL_BASELINE_REMOTE: https://github.com" in text
 
+
+def test_perfgate_consumer_uses_central_exact_baseline_and_pinned_dependencies():
+    text = workflow_text()
+    fetch_script = (
+        Path(__file__).resolve().parents[2]
+        / ".github/workflows/scripts/perfgate_fetch_baseline.sh"
+    ).read_text(encoding="utf-8")
+    fetch_step = text[
+        text.index(
+            "      - name: Performance gate - fetch Stage 1 baseline"
+        ) : text.index("      - name: Run benchmark CI and optional formal publish")
+    ]
+
+    assert "https://github.com/vLLM-HUST/vllm-hust-benchmark.git" in fetch_script
+    assert '--branch "$CENTRAL_BASELINE_BRANCH"' in fetch_script
+    assert "git remote get-url origin" not in fetch_script
+    assert "CENTRAL_BASELINE_WRITER_TOKEN" not in fetch_script
+    assert "perfgate_fetch_baseline.sh" in fetch_step
+    assert "use_single_ascend_env.sh" in fetch_step
+    assert 'PERFGATE_ALLOW_BASELINE_FALLBACK: "0"' in fetch_step
+    assert "ce380ceb67bd904956d8ebb807a7691234022796" in text
+    assert "328ab674dd6889b14441423b182b7fb8fe160fdb" in text
+    assert "2a113e514fb4b5678483cb7efaa7fa56140f60d3" in text
+
     l3_step = text[
         text.index("      - name: L3 benchmark publication preflight") : text.index(
             "      - name: Deepen clone for fork-point detection"
