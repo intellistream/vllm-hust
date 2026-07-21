@@ -77,10 +77,14 @@ def test_main_push_runs_only_the_central_perfgate_producer():
     text = workflow_text()
     standard_step = text[
         text.index("      - name: Run benchmark CI and optional formal publish") :
-        text.index("      - name: Run and publish main perfgate baseline")
+        text.index("      - name: Run main perfgate baseline producer")
     ]
     producer_step = text[
-        text.index("      - name: Run and publish main perfgate baseline") :
+        text.index("      - name: Run main perfgate baseline producer") :
+        text.index("      - name: Publish main perfgate baseline")
+    ]
+    publish_step = text[
+        text.index("      - name: Publish main perfgate baseline") :
         text.index("      - name: Performance gate - Stage 1 comparison")
     ]
 
@@ -91,38 +95,58 @@ def test_main_push_runs_only_the_central_perfgate_producer():
     assert "Qwen/Qwen2.5-3B-Instruct" in producer_step
     assert "BENCH_SCENARIO=random-online" in producer_step
     assert "vllm_hust_benchmark.perfgate_specs resolve" in producer_step
-    assert "publish_central_perfgate_baseline.py" in producer_step
-    assert '--central-remote "$BENCHMARK_REPO_URL"' in producer_step
-    assert '--branch "$CENTRAL_BASELINE_BRANCH"' in producer_step
-    assert "--update-latest-pointer" in producer_step
+    assert "HUST_ASCEND_RUNTIME_VERSION" in producer_step
     assert 'if [[ "$rc" -eq 86' in producer_step
     assert 'if [[ "$rc" -eq 87' not in producer_step
+    assert "publish_central_perfgate_baseline.py" in publish_step
+    assert '--central-remote "$CENTRAL_BASELINE_REMOTE"' in publish_step
+    assert '--branch "$CENTRAL_BASELINE_BRANCH"' in publish_step
+    assert '--cann-version "$CENTRAL_BASELINE_CANN_VERSION"' in publish_step
+    assert "--update-latest-pointer" in publish_step
+    assert "VLLM_HUST_CENTRAL_BASELINE_WRITER_TOKEN" in publish_step
+    assert text.count("secrets.VLLM_HUST_CENTRAL_BASELINE_WRITER_TOKEN") == 1
+    assert "GIT_ASKPASS" in publish_step
+    assert "CENTRAL_BASELINE_WRITER_TOKEN" not in producer_step
+    assert "${CANN_VERSION" not in producer_step
     assert "store-main-perfgate-baseline:" not in text
     assert "perfgate_store_baseline.sh" not in text
 
 
-def test_benchmark_repo_default_ref_is_main():
+def test_main_producer_uses_public_pinned_runtime_dependencies():
     text = workflow_text()
 
     assert "feature/perfgate-two-stage" not in text
-    assert (
-        "BENCHMARK_REPO_REF: ${{ (github.event_name == 'pull_request' || "
-        "github.event_name == 'issue_comment' || github.event_name == "
-        "'workflow_dispatch') && (vars.VLLM_HUST_BENCHMARK_REPO_REF || "
-        "'main') || 'main' }}"
-    ) in text
+    assert "ce380ceb67bd904956d8ebb807a7691234022796" in text
+    assert "328ab674dd6889b14441423b182b7fb8fe160fdb" in text
+    assert "2a113e514fb4b5678483cb7efaa7fa56140f60d3" in text
+    assert "VLLM_ASCEND_HUST_REPO_REF" in text
+    assert "HUST_ASCEND_MANAGER_REPO_REF" in text
+    assert "CENTRAL_BASELINE_REMOTE: https://github.com" in text
+
+    l3_step = text[
+        text.index("      - name: L3 benchmark publication preflight") :
+        text.index("      - name: Deepen clone for fork-point detection")
+    ]
+    website_step = text[
+        text.index("      - name: Checkout website repo") :
+        text.index("      - name: Checkout vllm-ascend-hust repo")
+    ]
+    assert "if: ${{ github.event_name != 'push' }}" in l3_step
+    assert "if: ${{ github.event_name != 'push' }}" in website_step
 
 
-def test_pr_checkout_urls_use_https_without_publish_ssh_key():
+def test_checkout_urls_are_public_and_read_only():
     text = workflow_text()
 
-    assert "format('https://github.com/{0}.git', github.repository)" in text
-    assert "format('git@github.com:{0}.git', github.repository)" in text
-    assert (
-        "github.event_name == 'pull_request' || github.event_name == 'issue_comment'"
-    ) in text
+    assert "TARGET_REPO_URL: https://github.com/${{ github.repository }}.git" in text
+    assert "BENCHMARK_REPO_URL: https://github.com" in text
+    assert "WEBSITE_REPO_URL: https://github.com" in text
+    assert "VLLM_ASCEND_HUST_REPO_URL: https://github.com" in text
+    assert "HUST_ASCEND_MANAGER_REPO_URL: https://github.com" in text
     assert "https://github.com/vLLM-HUST/vllm-hust-benchmark.git" in text
     assert "https://github.com/vLLM-HUST/vllm-ascend-hust.git" in text
+    assert "git@github.com" not in text
+    assert "BENCHMARK_REPO_SSH_KEY" not in text
 
 
 def test_benchmark_install_removes_conflicting_vllm_provider():
@@ -193,7 +217,7 @@ def test_schedule_runs_registered_multi_scenario_benchmark_publish():
     assert workflow["schedule"][0]["cron"] == "0 17 * * *"
     assert "github.event_name == 'schedule'" in text
     assert "VLLM_HUST_SCHEDULE_BENCHMARK_SCENARIOS" in text
-    assert "VLLM_HUST_SCHEDULE_PUBLISH_BENCHMARK != '0'" in text
+    assert "VLLM_HUST_SCHEDULE_PUBLISH_BENCHMARK == '1'" in text
     for scenario in (
         "random-online",
         "sharegpt-online",
@@ -347,14 +371,8 @@ def test_issue_comment_path_keeps_publish_secrets_disabled():
         "github.event_name == 'workflow_dispatch' && inputs.publish_to_hf) "
         "&& secrets.HF_TOKEN" in text
     )
-    assert (
-        "github.event_name != 'issue_comment') && "
-        "secrets.VLLM_HUST_BENCHMARK_GH_TOKEN" in text
-    )
-    assert (
-        "github.event_name != 'issue_comment') && "
-        "secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY" in text
-    )
+    assert text.count("secrets.VLLM_HUST_BENCHMARK_GH_TOKEN") == 1
+    assert "secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY" not in text
 
 
 def test_pr_comment_update_has_issues_write_permission():

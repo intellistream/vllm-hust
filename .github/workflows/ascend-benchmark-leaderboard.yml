@@ -309,19 +309,21 @@ jobs:
       ASCEND_BENCHMARK_ROOT_HELPER: ${{ vars.VLLM_HUST_BENCHMARK_ROOT_HELPER || '' }}
       ALLOW_RANDOM_HF_PUBLISH: ${{ vars.VLLM_HUST_ALLOW_RANDOM_HF_PUBLISH || '0' }}
       WEBSITE_LEADERBOARD_URL: ${{ vars.VLLM_HUST_LEADERBOARD_URL || '' }}
-      PUBLISH_TO_BENCHMARK_REPO: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.VLLM_HUST_PUBLISH_BENCHMARK_ON_MAIN == '1') || (github.event_name == 'schedule' && vars.VLLM_HUST_SCHEDULE_PUBLISH_BENCHMARK != '0') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_benchmark_repo)) && '1' || '0' }}
+      PUBLISH_TO_BENCHMARK_REPO: ${{ ((github.event_name == 'schedule' && vars.VLLM_HUST_SCHEDULE_PUBLISH_BENCHMARK == '1') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_benchmark_repo)) && '1' || '0' }}
       PUBLISH_TO_HF: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_to_hf && secrets.HF_TOKEN != '') && '1' || '0' }}
-      TARGET_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && format('https://github.com/{0}.git', github.repository) || format('git@github.com:{0}.git', github.repository) }}
+      TARGET_REPO_URL: https://github.com/${{ github.repository }}.git
       TARGET_REPO_SHA: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_head_sha || github.sha }}
-      BENCHMARK_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-hust-benchmark.git' || 'git@github.com:vLLM-HUST/vllm-hust-benchmark.git' }}
+      BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
       BENCHMARK_REPO_SLUG: vLLM-HUST/vllm-hust-benchmark
-      BENCHMARK_REPO_GH_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN || '' }}
-      BENCHMARK_REPO_SSH_KEY: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY || '' }}
-      BENCHMARK_REPO_REF: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && (vars.VLLM_HUST_BENCHMARK_REPO_REF || 'main') || 'main' }}
-      WEBSITE_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-hust-website.git' || 'git@github.com:vLLM-HUST/vllm-hust-website.git' }}
-      VLLM_ASCEND_HUST_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-ascend-hust.git' || 'git@github.com:vLLM-HUST/vllm-ascend-hust.git' }}
+      BENCHMARK_REPO_GH_TOKEN: ${{ (((github.event_name == 'schedule' && vars.VLLM_HUST_SCHEDULE_PUBLISH_BENCHMARK == '1') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_benchmark_repo)) && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN) || '' }}
+      # Trusted main producer dependencies are immutable; update these SHAs explicitly.
+      BENCHMARK_REPO_REF: ${{ github.event_name == 'push' && 'ce380ceb67bd904956d8ebb807a7691234022796' || ((github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && (vars.VLLM_HUST_BENCHMARK_REPO_REF || 'main') || 'main') }}
+      WEBSITE_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-website.git
+      VLLM_ASCEND_HUST_REPO_URL: https://github.com/vLLM-HUST/vllm-ascend-hust.git
+      VLLM_ASCEND_HUST_REPO_REF: ${{ github.event_name == 'push' && '328ab674dd6889b14441423b182b7fb8fe160fdb' || '' }}
       ISSUE_COMMENT_PR_NUMBER: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_number || '' }}
-      HUST_ASCEND_MANAGER_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/ascend-runtime-manager.git' || 'git@github.com:vLLM-HUST/ascend-runtime-manager.git' }}
+      HUST_ASCEND_MANAGER_REPO_URL: https://github.com/vLLM-HUST/ascend-runtime-manager.git
+      HUST_ASCEND_MANAGER_REPO_REF: ${{ github.event_name == 'push' && '2a113e514fb4b5678483cb7efaa7fa56140f60d3' || '' }}
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
       # Disable precompiled CUDA wheel fetch from wheels.vllm.ai.
       # The Ascend benchmark uses the vllm-ascend-hust plugin, not CUDA
@@ -418,73 +420,6 @@ jobs:
             exit 1
           }
 
-      - name: Configure GitHub SSH checkout
-        if: ${{ env.BENCHMARK_REPO_SSH_KEY != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # The runner container may not have HOME set; default to /root for root user.
-          export HOME="${HOME:-/root}"
-
-          ssh_state_dir="${RUNNER_TEMP:-/tmp}/vllm-hust-github-ssh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p "$ssh_state_dir"
-          chmod 700 "$ssh_state_dir"
-
-          key_file="$ssh_state_dir/vllm_hust_benchmark_key"
-          printf '%s\n' "$BENCHMARK_REPO_SSH_KEY" > "$key_file"
-          chmod 600 "$key_file"
-
-          known_hosts_file="$ssh_state_dir/known_hosts.github"
-          known_hosts_tmp="$(mktemp)"
-          {
-            ssh-keyscan -t rsa,ecdsa,ed25519 github.com 2>/dev/null
-            ssh-keyscan -p 443 -t rsa,ecdsa,ed25519 ssh.github.com 2>/dev/null
-          } > "$known_hosts_tmp"
-          if [[ ! -s "$known_hosts_tmp" ]]; then
-            echo "Unable to scan ssh.github.com host keys." >&2
-            exit 2
-          fi
-          sort -u "$known_hosts_tmp" > "$known_hosts_file"
-          rm -f "$known_hosts_tmp"
-          chmod 600 "$known_hosts_file"
-
-          ssh_wrapper="$ssh_state_dir/github-ssh-wrapper.sh"
-          cat > "$ssh_wrapper" <<EOF
-          #!/usr/bin/env bash
-          exec ssh -F /dev/null \\
-            -o BatchMode=yes \\
-            -o HostName=ssh.github.com \\
-            -o Port=443 \\
-            -o User=git \\
-            -o IdentityFile="$key_file" \\
-            -o IdentitiesOnly=yes \\
-            -o StrictHostKeyChecking=yes \\
-            -o HostKeyAlias='[ssh.github.com]:443' \\
-            -o UserKnownHostsFile="$known_hosts_file" \\
-            "\$@"
-          EOF
-          chmod 700 "$ssh_wrapper"
-          echo "GIT_SSH_COMMAND=$ssh_wrapper" >> "$GITHUB_ENV"
-
-          ssh_output="$("$ssh_wrapper" -T git@github.com 2>&1)" && ssh_status=$? || ssh_status=$?
-          echo "$ssh_output"
-          if [[ "$ssh_output" == *"Host key verification failed"* ]]; then
-            echo "GitHub SSH host key probe failed. Effective non-secret SSH config:" >&2
-            "$ssh_wrapper" -G git@github.com 2>/dev/null \
-              | grep -E '^(hostname|port|user|hostkeyalias|stricthostkeychecking|userknownhostsfile) ' >&2 || true
-            echo "Known-hosts lookup for [ssh.github.com]:443:" >&2
-            ssh-keygen -F '[ssh.github.com]:443' -f "$known_hosts_file" >&2 || true
-          fi
-          if [[ "$ssh_output" == *"Permission denied"* ]]; then
-            echo "GitHub SSH authentication failed for the configured key." >&2
-            exit 2
-          fi
-          if [[ "$ssh_status" -ne 0 && "$ssh_status" -ne 1 ]]; then
-            echo "GitHub SSH probe failed with status $ssh_status." >&2
-            exit "$ssh_status"
-          fi
-
       - name: Checkout target repo with retry
         run: |
           clone_with_retry() {
@@ -536,6 +471,7 @@ jobs:
           clone_with_retry "$TARGET_REPO_URL" "$GITHUB_WORKSPACE" "$TARGET_REPO_SHA"
 
       - name: L3 benchmark publication preflight
+        if: ${{ github.event_name != 'push' }}
         shell: bash
         run: bash .github/workflows/scripts/l3_benchmark_publish_preflight.sh
 
@@ -655,6 +591,7 @@ jobs:
           echo "SAME_SPEC_SPEC_FILE=$resolved_spec_file" >> "$GITHUB_ENV"
 
       - name: Checkout website repo
+        if: ${{ github.event_name != 'push' }}
         run: |
           clone_with_retry() {
             local repo_url=$1
@@ -686,6 +623,7 @@ jobs:
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
+            local target_ref=${3:-}
             local attempts=4
             local delay_seconds=15
             local try=1
@@ -693,6 +631,10 @@ jobs:
             rm -rf "$target_dir"
             while [[ "$try" -le "$attempts" ]]; do
               if git clone --depth 1 "$repo_url" "$target_dir"; then
+                if [[ -n "$target_ref" ]]; then
+                  git -C "$target_dir" fetch --depth 1 origin "$target_ref"
+                  git -C "$target_dir" checkout --force FETCH_HEAD
+                fi
                 return 0
               fi
               echo "Clone failed ($try/$attempts): $repo_url" >&2
@@ -706,7 +648,10 @@ jobs:
             return 1
           }
 
-          clone_with_retry "$VLLM_ASCEND_HUST_REPO_URL" "$GITHUB_WORKSPACE/vllm-ascend-hust"
+          clone_with_retry \
+            "$VLLM_ASCEND_HUST_REPO_URL" \
+            "$GITHUB_WORKSPACE/vllm-ascend-hust" \
+            "$VLLM_ASCEND_HUST_REPO_REF"
 
       - name: Preflight benchmark root helper
         shell: bash
@@ -783,6 +728,7 @@ jobs:
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
+            local target_ref=${3:-}
             local attempts=4
             local delay_seconds=15
             local try=1
@@ -790,6 +736,10 @@ jobs:
             rm -rf "$target_dir"
             while [[ "$try" -le "$attempts" ]]; do
               if git clone --depth 1 "$repo_url" "$target_dir"; then
+                if [[ -n "$target_ref" ]]; then
+                  git -C "$target_dir" fetch --depth 1 origin "$target_ref"
+                  git -C "$target_dir" checkout --force FETCH_HEAD
+                fi
                 return 0
               fi
               echo "Clone failed ($try/$attempts): $repo_url" >&2
@@ -803,7 +753,10 @@ jobs:
             return 1
           }
 
-          clone_with_retry "$HUST_ASCEND_MANAGER_REPO_URL" "$GITHUB_WORKSPACE/ascend-runtime-manager"
+          clone_with_retry \
+            "$HUST_ASCEND_MANAGER_REPO_URL" \
+            "$GITHUB_WORKSPACE/ascend-runtime-manager" \
+            "$HUST_ASCEND_MANAGER_REPO_REF"
 
       - name: Prepare Hugging Face cache directories
         run: |
@@ -1199,7 +1152,7 @@ jobs:
             exit "$rc"
           done
 
-      - name: Run and publish main perfgate baseline
+      - name: Run main perfgate baseline producer
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         env:
           WORKSPACE_ROOT: ${{ github.workspace }}
@@ -1214,7 +1167,6 @@ jobs:
           PERFGATE_NUM_PROMPTS: "8"
           PERFGATE_INPUT_LEN: "64"
           PERFGATE_OUTPUT_LEN: "16"
-          CENTRAL_BASELINE_BRANCH: benchmark-baselines
         run: |
           set -euo pipefail
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
@@ -1276,17 +1228,55 @@ jobs:
             exit 2
           fi
 
-          export PYTHONPATH="${VLLM_HUST_BENCHMARK_REPO}/src${PYTHONPATH:+:$PYTHONPATH}"
+          : "${HUST_ASCEND_RUNTIME_VERSION:?HUST_ASCEND_RUNTIME_VERSION is required}"
+          {
+            echo "CENTRAL_BASELINE_ARTIFACT=$baseline_artifact"
+            echo "CENTRAL_BASELINE_CANN_VERSION=$HUST_ASCEND_RUNTIME_VERSION"
+          } >> "$GITHUB_ENV"
+
+      - name: Publish main perfgate baseline
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          CENTRAL_BASELINE_BRANCH: benchmark-baselines
+          CENTRAL_BASELINE_REMOTE: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
+          CENTRAL_BASELINE_WRITER_TOKEN: ${{ secrets.VLLM_HUST_CENTRAL_BASELINE_WRITER_TOKEN }}
+          VLLM_HUST_REPO: ${{ github.workspace }}
+          VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
+        run: |
+          set -euo pipefail
+          if [[ -z "$CENTRAL_BASELINE_WRITER_TOKEN" ]]; then
+            echo "Missing scoped central baseline writer credential: VLLM_HUST_CENTRAL_BASELINE_WRITER_TOKEN" >&2
+            exit 2
+          fi
+
+          askpass_dir="${RUNNER_TEMP}/central-baseline-askpass-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          askpass_script="$askpass_dir/askpass.sh"
+          mkdir -p "$askpass_dir"
+          chmod 700 "$askpass_dir"
+          cat > "$askpass_script" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "${CENTRAL_BASELINE_WRITER_TOKEN:?}" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$askpass_script"
+          trap 'rm -rf "$askpass_dir"' EXIT
+
+          GIT_ASKPASS="$askpass_script" \
+          GIT_TERMINAL_PROMPT=0 \
+          PYTHONPATH="${VLLM_HUST_BENCHMARK_REPO}/src${PYTHONPATH:+:$PYTHONPATH}" \
           "${PYTHON_BIN:-python3}" \
             .github/workflows/scripts/publish_central_perfgate_baseline.py \
-            --source "$baseline_artifact" \
+            --source "$CENTRAL_BASELINE_ARTIFACT" \
             --target-git-repository "$VLLM_HUST_REPO" \
             --benchmark-git-repository "$VLLM_HUST_BENCHMARK_REPO" \
-            --central-remote "$BENCHMARK_REPO_URL" \
+            --central-remote "$CENTRAL_BASELINE_REMOTE" \
             --branch "$CENTRAL_BASELINE_BRANCH" \
             --main-ref origin/main \
             --hardware-chip-model "$HARDWARE_CHIP_MODEL" \
-            --cann-version "${CANN_VERSION:?CANN_VERSION is required}" \
+            --cann-version "$CENTRAL_BASELINE_CANN_VERSION" \
             --update-latest-pointer
 
       - name: Performance gate - Stage 1 comparison
