@@ -1007,7 +1007,7 @@ run_same_spec_current_benchmark() {
       --output "$output_file"
   }
 
-  if [[ "$SAME_SPEC_PR_PREVIEW_COMPAT" == "1" && ( "$SAME_SPEC_FORCE_PR_PREVIEW_COMPAT" == "1" || "${GITHUB_EVENT_NAME:-}" == "pull_request" || "${GITHUB_EVENT_NAME:-}" == "issue_comment" ) ]]; then
+  if [[ "$SAME_SPEC_FORCE_PR_PREVIEW_COMPAT" == "1" || ( "$SAME_SPEC_PR_PREVIEW_COMPAT" == "1" && ( "${GITHUB_EVENT_NAME:-}" == "pull_request" || "${GITHUB_EVENT_NAME:-}" == "issue_comment" ) ) ]]; then
     effective_same_spec_file=$(prepare_same_spec_pr_preview_compat_file)
     echo "Using PR preview same-spec compatibility overlay: $effective_same_spec_file"
   fi

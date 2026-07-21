@@ -68,7 +68,7 @@ def test_same_spec_pr_preview_uses_ascend_compatibility_overlay():
     assert 'server_parameters["no_enable_chunked_prefill"] = True' in helper
     assert 'server_parameters["no_enable_prefix_caching"] = True' in helper
     assert 'client_parameters.setdefault("temperature", 0)' in helper
-    assert '"$SAME_SPEC_FORCE_PR_PREVIEW_COMPAT" == "1"' in same_spec_block
+    assert '"$SAME_SPEC_FORCE_PR_PREVIEW_COMPAT" == "1" || (' in same_spec_block
     assert '${GITHUB_EVENT_NAME:-}" == "pull_request"' in same_spec_block
     assert '${GITHUB_EVENT_NAME:-}" == "issue_comment"' in same_spec_block
     assert '"$effective_same_spec_file"' in same_spec_block
