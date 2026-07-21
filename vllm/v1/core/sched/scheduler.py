@@ -383,6 +383,7 @@ class Scheduler(SchedulerInterface):
             self.microbatch_id_to_request_ids: dict[int, set[str]] = {}
             self.request_id_to_microbatch_id: dict[str, int] = {}
             self.pp_opt_first_scheduled_req_ids: set[str] = set()
+            self.pp_opt_sent_block_tables: dict[str, tuple[tuple[int, ...], ...]] = {}
             self._pp_opt_last_in_flight_ids: set[int] = set()
             self.cost_model_path: str | None = envs.VLLM_PP_OPT_COST_MODEL_PATH
             if self.cost_model_path:
@@ -1047,6 +1048,7 @@ class Scheduler(SchedulerInterface):
                     if not request_ids:
                         self.microbatch_id_to_request_ids.pop(microbatch_id, None)
             self.pp_opt_first_scheduled_req_ids.discard(req_id)
+            self.pp_opt_sent_block_tables.pop(req_id, None)
 
         self.running = [
             request
@@ -1154,6 +1156,19 @@ class Scheduler(SchedulerInterface):
             for request in new_reqs
         }
 
+        block_table_replaced_req_ids = set()
+        current_cached_block_tables: dict[str, tuple[tuple[int, ...], ...]] = {}
+        for request in cached_reqs:
+            req_id = request.request_id
+            current_blocks = self.kv_cache_manager.get_blocks(req_id)
+            current_snapshot = tuple(
+                tuple(group) for group in current_blocks.get_block_ids(allow_none=False)
+            )
+            current_cached_block_tables[req_id] = current_snapshot
+            if self.pp_opt_sent_block_tables.get(req_id) != current_snapshot:
+                block_table_replaced_req_ids.add(req_id)
+                req_to_new_blocks[req_id] = current_blocks
+
         if self.use_v2_model_runner:
             new_reqs_data = [
                 NewRequestData.from_request(
@@ -1172,12 +1187,6 @@ class Scheduler(SchedulerInterface):
                 for req in new_reqs
             ]
 
-        block_table_replaced_req_ids = {
-            request.request_id
-            for request in cached_reqs
-            if req_to_new_blocks[request.request_id].get_block_ids(allow_none=True)
-            is not None
-        }
         cached_reqs_data = self._make_cached_request_data(
             cached_reqs,
             [],
@@ -1186,6 +1195,13 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks,
             block_table_replaced_req_ids=block_table_replaced_req_ids,
         )
+        for request in new_reqs:
+            req_id = request.request_id
+            self.pp_opt_sent_block_tables[req_id] = tuple(
+                tuple(group)
+                for group in req_to_all_blocks[req_id].get_block_ids(allow_none=False)
+            )
+        self.pp_opt_sent_block_tables.update(current_cached_block_tables)
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
 
         new_block_ids_to_zero = (
