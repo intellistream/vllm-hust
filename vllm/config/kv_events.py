@@ -4,8 +4,6 @@
 
 from typing import Literal
 
-from pydantic import ValidationInfo, field_validator
-
 from vllm.config.utils import config
 
 
@@ -64,38 +62,8 @@ class KVEventsConfig:
     prefix_cache_upload_timeout: float = 5.0
     """HTTP request timeout in seconds for prefix-cache upload."""
 
-    prefix_cache_upload_snapshot_interval: float = 30.0
-    """Interval in seconds for periodic full prefix-cache snapshots.
-    Set to 0 to disable periodic snapshots.
-    """
-
     prefix_cache_upload_token: str | None = None
     """Bearer token used to authenticate prefix-cache HTTP uploads."""
-
-    @field_validator(
-        "prefix_cache_upload_max_queue_size",
-        "prefix_cache_upload_timeout",
-        "prefix_cache_upload_snapshot_interval",
-        mode="before",
-    )
-    @classmethod
-    def reject_boolean_upload_limits(
-        cls, value: object, info: ValidationInfo
-    ) -> object:
-        if not isinstance(value, bool):
-            return value
-        errors = {
-            "prefix_cache_upload_max_queue_size": (
-                "prefix_cache_upload_max_queue_size must be a positive integer"
-            ),
-            "prefix_cache_upload_timeout": (
-                "prefix_cache_upload_timeout must be positive"
-            ),
-            "prefix_cache_upload_snapshot_interval": (
-                "prefix_cache_upload_snapshot_interval must be non-negative"
-            ),
-        }
-        raise ValueError(errors[info.field_name])
 
     def __post_init__(self):
         if self.publisher is None:
@@ -122,11 +90,3 @@ class KVEventsConfig:
             or self.prefix_cache_upload_timeout <= 0
         ):
             raise ValueError("prefix_cache_upload_timeout must be positive")
-        if self.prefix_cache_upload_endpoint is not None and (
-            not isinstance(self.prefix_cache_upload_snapshot_interval, int | float)
-            or isinstance(self.prefix_cache_upload_snapshot_interval, bool)
-            or self.prefix_cache_upload_snapshot_interval < 0
-        ):
-            raise ValueError(
-                "prefix_cache_upload_snapshot_interval must be non-negative"
-            )
