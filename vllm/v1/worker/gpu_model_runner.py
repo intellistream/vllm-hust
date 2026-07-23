@@ -4393,7 +4393,7 @@ class GPUModelRunner(
                 )
             finally:
                 if pp_opt_profile.record_active():
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                 pp_opt_profile.mark_t3()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):

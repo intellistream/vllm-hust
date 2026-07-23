@@ -9,13 +9,14 @@ import argparse
 import csv
 import json
 import math
-import re
 import statistics
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 SCOPE_RE = re.compile(
     r"^pp_forward\|pp=(?P<pp>\d+)\|mb=(?P<mb>-?\d+)"

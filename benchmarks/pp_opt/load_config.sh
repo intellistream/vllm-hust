@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034
 
 load_pp_opt_config() {
   local model_key=${1:?model key is required}

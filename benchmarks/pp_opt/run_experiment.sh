@@ -33,8 +33,11 @@ for path in "${CANN_ENV}" "${VENV_DIR}/bin/activate" "${ATB_ENV}"; do
   fi
 done
 
+# shellcheck source=/dev/null
 source "${CANN_ENV}"
+# shellcheck source=/dev/null
 source "${VENV_DIR}/bin/activate"
+# shellcheck source=/dev/null
 source "${ATB_ENV}" --cxx_abi=1
 set -u
 unset TASK_QUEUE_ENABLE

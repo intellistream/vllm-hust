@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import re
 from pathlib import Path
 
+import regex as re
 import torch
 import torch.nn as nn
 from safetensors import safe_open

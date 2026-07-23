@@ -7,10 +7,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import re
 import time
 from datetime import datetime
 from pathlib import Path
+
+import regex as re
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RESULT_DIR = SCRIPT_DIR / "results" / "pp4tp2"
