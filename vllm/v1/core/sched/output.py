@@ -235,6 +235,12 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # Full block-table replacements committed by the scheduler after KV cache
+    # compression. ``None`` on the disabled/default path.
+    kv_cache_compression_block_table_updates: (
+        dict[str, tuple[list[int], ...]] | None
+    ) = None
+
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.

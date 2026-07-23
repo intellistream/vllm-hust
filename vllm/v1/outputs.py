@@ -11,6 +11,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_compression import KVCacheCompressionPlan
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -267,6 +268,10 @@ class ModelRunnerOutput:
     kv_connector_output: KVConnectorOutput | None = None
 
     ec_connector_output: ECConnectorOutput | None = None
+
+    # Worker-to-scheduler cache compression transactions. ``None`` on the
+    # disabled/default path.
+    kv_cache_compression_plans: list[KVCacheCompressionPlan] | None = None
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None

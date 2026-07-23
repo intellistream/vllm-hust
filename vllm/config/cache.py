@@ -92,24 +92,23 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
-    prefix_caching_hash_algo: PrefixCachingHashAlgo = "xxhash"
+    prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
+    - "sha256" uses Pickle for object serialization before hashing. This is the
+      default and does not require an optional hashing dependency.
+    - "sha256_cbor" provides a reproducible, cross-language compatible hash. It
+      serializes objects using canonical CBOR and hashes them with SHA-256.
     - "xxhash" uses Pickle serialization with xxHash (128-bit) for faster,
-      non-cryptographic hashing. This is the HUST default because prefix-cache
-      block hashing is a hot path in long-context and repeated-prefix workloads.
+      non-cryptographic hashing. It requires the optional ``xxhash`` package.
       IMPORTANT: Use of a hashing algorithm that is not considered cryptographically
       secure theoretically increases the risk of hash collisions, which can cause
       undefined behavior or even leak private information in multi-tenant environments.
       Even if collisions are still very unlikely, it is important to consider your
       security risk tolerance against the performance benefits. Use sha256 or
       sha256_cbor in security-sensitive deployments.
-    - "sha256" uses Pickle for object serialization before hashing. SHA256 is the
-      most secure choice to avoid potential hash collisions.
-    - "sha256_cbor" provides a reproducible, cross-language compatible hash. It
-      serializes objects using canonical CBOR and hashes them with SHA-256.
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
-      reproducible hashing."""
+      reproducible hashing. It also requires the optional ``xxhash`` package."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.
     It enables dynamic calculation of `k_scale` and `v_scale` when

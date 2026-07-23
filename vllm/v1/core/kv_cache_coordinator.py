@@ -363,6 +363,48 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def truncate_request_tail_blocks(
+        self,
+        request_id: str,
+        num_blocks_to_keep: int,
+        expected_block_ids: tuple[tuple[int, ...], ...],
+    ) -> tuple[int, ...]:
+        """Release a single cache group's contiguous request tail."""
+        if len(self.single_type_managers) != 1:
+            raise ValueError(
+                "KV cache compression currently requires exactly one cache group"
+            )
+        if len(expected_block_ids) != 1:
+            raise ValueError(
+                "KV cache compression plan must contain exactly one block table"
+            )
+        return self.single_type_managers[0].truncate_request_tail_blocks(
+            request_id,
+            num_blocks_to_keep,
+            expected_block_ids[0],
+        )
+
+    def validate_request_tail_truncation(
+        self,
+        request_id: str,
+        num_blocks_to_keep: int,
+        expected_block_ids: tuple[tuple[int, ...], ...],
+    ) -> None:
+        """Validate a single cache group's tail transaction without mutation."""
+        if len(self.single_type_managers) != 1:
+            raise ValueError(
+                "KV cache compression currently requires exactly one cache group"
+            )
+        if len(expected_block_ids) != 1:
+            raise ValueError(
+                "KV cache compression plan must contain exactly one block table"
+            )
+        self.single_type_managers[0].validate_request_tail_truncation(
+            request_id,
+            num_blocks_to_keep,
+            expected_block_ids[0],
+        )
+
     @abstractmethod
     def find_longest_cache_hit(
         self,

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal, overload
 
 from vllm import envs
+from vllm.config.kv_cache_compression import KVCacheCompressionConfig
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
@@ -14,8 +15,13 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
+    KVCacheSpecKind,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
+)
+from vllm.v1.kv_cache_compression import (
+    KVCacheCompressionError,
+    KVCacheCompressionPlan,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
@@ -141,6 +147,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        kv_cache_compression_config: KVCacheCompressionConfig | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -178,6 +185,8 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self.kv_cache_compression_config = kv_cache_compression_config
+        self._compressed_request_physical_tokens: dict[str, int] = {}
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -220,6 +229,151 @@ class KVCacheManager:
         stats = self.prefix_cache_stats
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
+
+    def validate_compression_plan(
+        self,
+        request: Request,
+        plan: KVCacheCompressionPlan,
+    ) -> int:
+        """Validate one request compression plan without changing pool state."""
+        config = self.kv_cache_compression_config
+        if config is None:
+            raise KVCacheCompressionError(
+                "received a KV cache compression plan while the feature is disabled"
+            )
+        if plan.schema_version != config.schema_version:
+            raise KVCacheCompressionError(
+                f"request {plan.request_id!r} plan schema_version "
+                f"{plan.schema_version} does not match {config.schema_version}"
+            )
+        if plan.provider != config.provider:
+            raise KVCacheCompressionError(
+                f"request {plan.request_id!r} plan provider {plan.provider!r} "
+                f"does not match {config.provider!r}"
+            )
+        if plan.request_id != request.request_id:
+            raise KVCacheCompressionError(
+                f"plan request_id {plan.request_id!r} does not match request "
+                f"{request.request_id!r}"
+            )
+        if request.status != RequestStatus.RUNNING:
+            raise KVCacheCompressionError(
+                f"request {request.request_id!r} is not running"
+            )
+        if request.request_id in self._compressed_request_physical_tokens:
+            raise KVCacheCompressionError(
+                f"request {request.request_id!r} is already compressed"
+            )
+        if self.enable_caching:
+            raise KVCacheCompressionError(
+                "KV cache compression does not support prefix caching"
+            )
+        if request.kv_transfer_params is not None:
+            raise KVCacheCompressionError(
+                "KV cache compression does not support KV transfer"
+            )
+        if self.num_kv_cache_groups != 1 or plan.kv_cache_group_id != 0:
+            raise KVCacheCompressionError(
+                "KV cache compression currently requires cache group 0 as "
+                "the only cache group"
+            )
+        spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        if get_kv_cache_spec_kind(spec) != KVCacheSpecKind.FULL_ATTENTION:
+            raise KVCacheCompressionError(
+                "KV cache compression currently requires a full-attention cache group"
+            )
+        if spec.block_size != 128:
+            raise KVCacheCompressionError(
+                "KV cache compression currently requires block_size 128, "
+                f"got {spec.block_size}"
+            )
+        if not (
+            plan.semantic_num_tokens
+            == request.num_computed_tokens
+            == request.num_prompt_tokens
+        ):
+            raise KVCacheCompressionError(
+                f"request {request.request_id!r} is not at the completed full-prefill "
+                "boundary: "
+                f"plan={plan.semantic_num_tokens}, "
+                f"computed={request.num_computed_tokens}, "
+                f"prompt={request.num_prompt_tokens}"
+            )
+        if not 0 < plan.physical_num_tokens <= plan.semantic_num_tokens:
+            raise KVCacheCompressionError(
+                f"request {request.request_id!r} has invalid physical length "
+                f"{plan.physical_num_tokens} for semantic length "
+                f"{plan.semantic_num_tokens}"
+            )
+
+        layer_lengths = plan.per_layer_physical_num_tokens
+        if not layer_lengths:
+            raise KVCacheCompressionError("compression plan has no layer lengths")
+        layer_names = [name for name, _ in layer_lengths]
+        if len(set(layer_names)) != len(layer_names) or any(
+            not name for name in layer_names
+        ):
+            raise KVCacheCompressionError(
+                "compression plan layer names must be non-empty and unique"
+            )
+        expected_layer_names = self.kv_cache_config.kv_cache_groups[0].layer_names
+        if set(layer_names) != set(expected_layer_names):
+            raise KVCacheCompressionError(
+                "compression plan layers do not match the cache group: "
+                f"expected {expected_layer_names}, got {layer_names}"
+            )
+        lengths = [length for _, length in layer_lengths]
+        if any(
+            length <= 0 or length > plan.semantic_num_tokens for length in lengths
+        ):
+            raise KVCacheCompressionError(
+                "compression plan contains an invalid per-layer physical length"
+            )
+        if max(lengths) != plan.physical_num_tokens:
+            raise KVCacheCompressionError(
+                "compression plan physical_num_tokens must equal the maximum "
+                "per-layer physical length"
+            )
+
+        block_size = spec.block_size
+        num_blocks_to_keep = (
+            plan.physical_num_tokens + block_size - 1
+        ) // block_size
+        try:
+            self.coordinator.validate_request_tail_truncation(
+                request.request_id,
+                num_blocks_to_keep,
+                plan.expected_block_ids,
+            )
+        except ValueError as error:
+            raise KVCacheCompressionError(str(error)) from error
+
+        return num_blocks_to_keep
+
+    def apply_compression_plan(
+        self,
+        request: Request,
+        plan: KVCacheCompressionPlan,
+    ) -> tuple[int, ...]:
+        """Validate and atomically commit one request compression plan."""
+        num_blocks_to_keep = self.validate_compression_plan(request, plan)
+        try:
+            released_ids = self.coordinator.truncate_request_tail_blocks(
+                request.request_id,
+                num_blocks_to_keep,
+                plan.expected_block_ids,
+            )
+        except ValueError as error:
+            raise KVCacheCompressionError(str(error)) from error
+
+        self._compressed_request_physical_tokens[request.request_id] = (
+            plan.physical_num_tokens
+        )
+        return released_ids
+
+    def get_compressed_physical_num_tokens(self, request_id: str) -> int | None:
+        """Return the committed physical length for a compressed request."""
+        return self._compressed_request_physical_tokens.get(request_id)
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
@@ -437,6 +591,27 @@ class KVCacheManager:
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )
+        compressed_physical_tokens = self._compressed_request_physical_tokens.get(
+            request.request_id
+        )
+        if compressed_physical_tokens is not None:
+            if (
+                num_new_computed_tokens
+                or any(new_computed_block_list)
+                or num_lookahead_tokens
+                or num_external_computed_tokens
+                or delay_cache_blocks
+                or num_encoder_tokens
+                or full_sequence_must_fit
+            ):
+                raise KVCacheCompressionError(
+                    "compressed requests support only ordinary single-token decode"
+                )
+            if num_new_tokens != 1:
+                raise KVCacheCompressionError(
+                    "compressed requests support exactly one decode token per step"
+                )
+            num_local_computed_tokens = compressed_physical_tokens
         total_computed_tokens = min(
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
@@ -530,6 +705,10 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if compressed_physical_tokens is not None:
+            self._compressed_request_physical_tokens[request.request_id] = (
+                num_tokens_main_model
+            )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -557,6 +736,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self._compressed_request_physical_tokens.pop(request.request_id, None)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -589,6 +769,7 @@ class KVCacheManager:
         Returns:
             The request's blocks in allocation order.
         """
+        self._compressed_request_physical_tokens.pop(request.request_id, None)
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:

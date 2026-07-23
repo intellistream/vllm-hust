@@ -271,6 +271,14 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            kv_cache_compression_config=(
+                vllm_config.kv_cache_compression_config
+            ),
+        )
+        self._pending_kv_cache_compression_block_table_updates: set[str] | None = (
+            set()
+            if vllm_config.kv_cache_compression_config is not None
+            else None
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1090,6 +1098,12 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks,
             )
 
+        kv_cache_compression_block_table_updates = (
+            self._take_kv_cache_compression_block_table_updates(
+                num_scheduled_tokens
+            )
+        )
+
         # Record the request ids that were scheduled in this step (MRV1-only).
         if not self.use_v2_model_runner:
             self.prev_step_scheduled_req_ids.clear()
@@ -1123,6 +1137,9 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            kv_cache_compression_block_table_updates=(
+                kv_cache_compression_block_table_updates
+            ),
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
@@ -1150,6 +1167,24 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _take_kv_cache_compression_block_table_updates(
+        self,
+        num_scheduled_tokens: dict[str, int],
+    ) -> dict[str, tuple[list[int], ...]] | None:
+        pending = self._pending_kv_cache_compression_block_table_updates
+        if not pending:
+            return None
+
+        scheduled_pending = pending.intersection(num_scheduled_tokens)
+        if not scheduled_pending:
+            return None
+        updates = {
+            request_id: self.kv_cache_manager.get_block_ids(request_id)
+            for request_id in scheduled_pending
+        }
+        pending.difference_update(scheduled_pending)
+        return updates
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -1549,6 +1584,8 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        self._apply_kv_cache_compression_plans(model_runner_output)
+
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
@@ -1878,6 +1915,57 @@ class Scheduler(SchedulerInterface):
 
         return engine_core_outputs
 
+    def _apply_kv_cache_compression_plans(
+        self, model_runner_output: ModelRunnerOutput
+    ) -> None:
+        plans = model_runner_output.kv_cache_compression_plans
+        if not plans:
+            return
+
+        pending = self._pending_kv_cache_compression_block_table_updates
+        if pending is None:
+            raise RuntimeError(
+                "received KV cache compression plans while the feature is disabled"
+            )
+        live_plans = []
+        seen_request_ids: set[str] = set()
+        for plan in plans:
+            request = self.requests.get(plan.request_id)
+            if request is None or request.is_finished():
+                logger.info(
+                    "Ignoring KV cache compression plan for finished request %s",
+                    plan.request_id,
+                )
+                continue
+            if plan.request_id in seen_request_ids:
+                raise RuntimeError(
+                    "received duplicate KV cache compression plans for request "
+                    f"{plan.request_id!r} in one model-runner output"
+                )
+            seen_request_ids.add(plan.request_id)
+            live_plans.append((request, plan))
+
+        # Validate the whole worker batch before releasing any block. This
+        # prevents a malformed later plan from leaving earlier requests partly
+        # committed.
+        for request, plan in live_plans:
+            self.kv_cache_manager.validate_compression_plan(request, plan)
+
+        for request, plan in live_plans:
+            released_ids = self.kv_cache_manager.apply_compression_plan(
+                request, plan
+            )
+            pending.add(plan.request_id)
+            logger.info(
+                "Committed KV cache compression plan: provider=%s request_id=%s "
+                "semantic_tokens=%d physical_tokens=%d released_blocks=%s",
+                plan.provider,
+                plan.request_id,
+                plan.semantic_num_tokens,
+                plan.physical_num_tokens,
+                released_ids,
+            )
+
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
         return status in (
@@ -2159,6 +2247,10 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if self._pending_kv_cache_compression_block_table_updates is not None:
+            self._pending_kv_cache_compression_block_table_updates.discard(
+                request.request_id
+            )
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.

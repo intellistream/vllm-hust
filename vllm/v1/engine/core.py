@@ -77,6 +77,10 @@ from vllm.v1.engine.utils import (
     get_physical_gpu_ids_for_local_dp_rank,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.kv_cache_compression import (
+    KVCacheCompressionCompatibility,
+    ensure_kv_cache_compression_compatible,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -251,6 +255,11 @@ class EngineCore:
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
+        # Compression compatibility is an enabled-only worker RPC. It runs
+        # after model/backend discovery but before memory profiling and formal
+        # KV tensor allocation.
+        self._validate_kv_cache_compression(vllm_config)
+
         # Some layers (e.g. Prefix LM attention) run non-causally and tag their
         # KV cache spec with ``non_causal=True``. The specs are collected here in
         # the engine-core process (the same process that builds the scheduler),
@@ -351,6 +360,32 @@ class EngineCore:
                 elapsed,
             )
         return scheduler_kv_cache_config
+
+    def _validate_kv_cache_compression(self, vllm_config: VllmConfig) -> None:
+        config = vllm_config.kv_cache_compression_config
+        if config is None:
+            return
+
+        reports: list[KVCacheCompressionCompatibility] = self.collective_rpc(
+            "validate_kv_cache_compression"
+        )
+        ensure_kv_cache_compression_compatible(config, reports)
+        for rank, report in enumerate(reports):
+            logger.info(
+                "KV cache compression compatibility passed: provider=%s "
+                "schema_version=%d worker_rank=%d platform=%s backend=%s "
+                "model=%s dtype=%s layout=%s block_size=%s factory=%s",
+                report.provider,
+                report.schema_version,
+                rank,
+                report.platform,
+                report.backend,
+                report.model_architecture,
+                report.dtype,
+                report.cache_layout,
+                report.block_size,
+                report.provider_factory,
+            )
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
