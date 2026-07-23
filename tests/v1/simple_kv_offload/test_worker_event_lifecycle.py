@@ -11,7 +11,7 @@ class _QueuedBackend:
     """Record submissions without consuming their wait events."""
 
     def __init__(self) -> None:
-        self.wait_events = []
+        self.wait_events: list[object] = []
 
     def launch_copy(
         self,
