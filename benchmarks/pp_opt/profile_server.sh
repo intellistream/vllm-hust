@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
+export WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
 
 source "${SCRIPT_DIR}/load_config.sh"
 load_pp_opt_config "${MODEL_KEY:?MODEL_KEY must be set}"
