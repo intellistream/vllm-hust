@@ -3,5 +3,9 @@
 self-hosted-runner:
   labels:
     - vllm-runners
+    - ascend
+    - 910b
+    - docker
+    - npu-2
     # Not yet in actionlint's known-label set.
     - macos-26
