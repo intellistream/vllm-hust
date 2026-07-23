@@ -6,12 +6,13 @@ from __future__ import annotations
 import atexit
 import json
 import os
-import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
+
+import regex as re
 
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode
