@@ -398,7 +398,7 @@ def test_update_states_new_request(model_runner, dist_init):
     req_id = "req_0"
 
     # new req
-    runner_extensions = {
+    runner_extensions: dict[str, object] = {
         "segment_reuse": {"kind": "vllm-runner-stitch-plan", "version": 1}
     }
     scheduler_output = _schedule_new_request(
