@@ -17,6 +17,7 @@ BENCHMARK_PUBLICATION_SYNC_SCRIPT=${BENCHMARK_PUBLICATION_SYNC_SCRIPT:-$VLLM_HUS
 SERVER_LOG=${SERVER_LOG:-$RESULT_ROOT/server.log}
 RUNNER_PREFLIGHT_FAILURE_FILE=${RUNNER_PREFLIGHT_FAILURE_FILE:-$RESULT_ROOT/runner_preflight_failure.txt}
 DIAGNOSTICS_DIR=${DIAGNOSTICS_DIR:-$RESULT_ROOT/diagnostics}
+DIAGNOSTIC_ENV_HELPER=${DIAGNOSTIC_ENV_HELPER:-$VLLM_HUST_REPO/.github/workflows/scripts/collect_ascend_diagnostic_env.py}
 NODE_ENV_FAILURE_FILE=${NODE_ENV_FAILURE_FILE:-$RESULT_ROOT/node_env_failure.txt}
 BENCH_SCENARIO=${BENCH_SCENARIO:-random-online}
 BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-}
@@ -24,7 +25,7 @@ BENCH_CONSTRAINTS_FILE=${BENCH_CONSTRAINTS_FILE:-}
 SAME_SPEC_BENCHMARK_ENABLED=${SAME_SPEC_BENCHMARK_ENABLED:-1}
 SAME_SPEC_SPEC_FILE=${SAME_SPEC_SPEC_FILE:-}
 SAME_SPEC_CONSTRAINTS_FILE=${SAME_SPEC_CONSTRAINTS_FILE:-$VLLM_HUST_BENCHMARK_REPO/docs/official-baselines/official-ascend-constraints.stub.json}
-SAME_SPEC_READY_TIMEOUT_SECONDS=${SAME_SPEC_READY_TIMEOUT_SECONDS:-600}
+SAME_SPEC_READY_TIMEOUT_SECONDS=${SAME_SPEC_READY_TIMEOUT_SECONDS:-1200}
 SAME_SPEC_PR_PREVIEW_COMPAT=${SAME_SPEC_PR_PREVIEW_COMPAT:-1}
 ALLOW_RANDOM_HF_PUBLISH=${ALLOW_RANDOM_HF_PUBLISH:-0}
 
@@ -79,17 +80,41 @@ marker_pgid_file=""
 selected_device=""
 NPU_SMI_BIN=${NPU_SMI_BIN:-$(command -v npu-smi || true)}
 
+if [[ "${RUNNER_NAME:-}" =~ npu([0-9]+)$ ]]; then
+  runner_physical_device="${BASH_REMATCH[1]}"
+  shopt -s nullglob
+  runner_devnodes=(/dev/davinci[0-9]*)
+  shopt -u nullglob
+
+  if [[ "${#runner_devnodes[@]}" -eq 1 ]] \
+    && [[ "$(basename "${runner_devnodes[0]}")" == "davinci${runner_physical_device}" ]]; then
+    export ASCEND_VISIBLE_DEVICES=0
+    export ASCEND_RT_VISIBLE_DEVICES=0
+    echo "Pinned isolated runner ${RUNNER_NAME} to logical Ascend device 0 (${runner_devnodes[0]})."
+  elif [[ -z "${ASCEND_RT_VISIBLE_DEVICES:-}" && -z "${ASCEND_VISIBLE_DEVICES:-}" ]]; then
+    export ASCEND_RT_VISIBLE_DEVICES="$runner_physical_device"
+    echo "Pinned Ascend device from runner name ${RUNNER_NAME}: ${ASCEND_RT_VISIBLE_DEVICES}"
+  fi
+fi
+
 USER_PROVIDED_ASCEND_VISIBLE_DEVICES=0
 if [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" || -n "${ASCEND_VISIBLE_DEVICES:-}" ]]; then
   USER_PROVIDED_ASCEND_VISIBLE_DEVICES=1
 fi
 
 NODE_ENV_RETRY_EXIT_CODE=86
+NPU_MEMORY_EXIT_CODE=${NPU_MEMORY_EXIT_CODE:-87}
+NPU_MEMORY_PREFLIGHT_SCRIPT=${NPU_MEMORY_PREFLIGHT_SCRIPT:-$VLLM_HUST_REPO/.github/workflows/scripts/check_ascend_npu_memory.py}
 INVALID_BENCHMARK_RESULT_EXIT_CODE=${INVALID_BENCHMARK_RESULT_EXIT_CODE:-77}
 
 is_node_env_failure_text() {
   local text=${1:-}
   printf '%s\n' "$text" | grep -Eq "DrvMngGetConsoleLogLevel failed|dcmi model initialized failed|ret is -8020|drvRet=87|drvRetCode=87|ErrCode=507899|error code is 507899|rtGetDeviceCount|Can't get ascend_hal device count|driver error:internal error|Resource_Busy\(EL0005\)|The resources are busy"
+}
+
+is_npu_memory_pressure_text() {
+  local text=${1:-}
+  printf '%s\n' "$text" | grep -Eqi 'Free memory on device .* less than desired GPU memory utilization|NPU out of memory|torch_npu.*OutOfMemoryError|ACL_ERROR_RT_MEMORY_ALLOCATION'
 }
 
 runtime_ready_log_indicates_sudo_auth_failure() {
@@ -342,6 +367,7 @@ SUDO_PRESERVE_ENV_VARS=(
   HCCL_EXEC_TIMEOUT
   HF_ENDPOINT
   HF_HOME
+  HF_HUB_DISABLE_XET
   HF_TOKEN
   HOME
   HOST
@@ -405,6 +431,7 @@ export_sudo_preserved_env_vars() {
 
   for var_name in "${SUDO_PRESERVE_ENV_VARS[@]}"; do
     if [[ -n "${!var_name+x}" ]]; then
+      # shellcheck disable=SC2163  # Export the variable named by var_name.
       export "$var_name"
     fi
   done
@@ -586,12 +613,10 @@ collect_ascend_diagnostics() {
     echo "phase=$phase"
     echo "run_id=$RUN_ID"
     echo "python_bin=$PYTHON_BIN"
-    echo "ascend_home_path=${ASCEND_HOME_PATH:-<unset>}"
-    echo "ascend_rt_visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-<unset>}"
-    echo "ld_library_path=${LD_LIBRARY_PATH:-<unset>}"
   } >"$phase_dir/context.txt"
 
-  env | sort >"$phase_dir/env.txt" 2>/dev/null || true
+  "$PYTHON_BIN" "$DIAGNOSTIC_ENV_HELPER" \
+    --output "$phase_dir/environment.json" 2>/dev/null || true
 
   if command -v npu-smi >/dev/null 2>&1; then
     npu-smi info >"$phase_dir/npu-smi-info.txt" 2>&1 || true
@@ -775,6 +800,18 @@ print(probe.get("selected_device") or "npu:0")
 PY
   )" || return 1
 
+  local required_memory_utilization=${VLLM_ASCEND_REQUIRED_MEMORY_UTILIZATION:-}
+  if [[ -z "$required_memory_utilization" ]]; then
+    case "$SAME_SPEC_BENCHMARK_ENABLED" in
+      1) required_memory_utilization=${SAME_SPEC_GPU_MEMORY_UTILIZATION:-0.92} ;;
+      *) required_memory_utilization=0.92 ;;
+    esac
+  fi
+  "$PYTHON_BIN" "$NPU_MEMORY_PREFLIGHT_SCRIPT" \
+    --device "$selected_device" \
+    --utilization "$required_memory_utilization" \
+    --insufficient-exit-code "$NPU_MEMORY_EXIT_CODE" || return "$?"
+
   echo "selected_device=${selected_device}"
 }
 
@@ -783,6 +820,7 @@ ensure_runner_npu_ready() {
   local delay_seconds=${RUNNER_NPU_PREFLIGHT_DELAY_SECONDS:-10}
   local attempt=1
   local preflight_output=""
+  local preflight_status=0
 
   while [[ "$attempt" -le "$max_attempts" ]]; do
     if preflight_output=$(run_runner_npu_preflight_once 2>&1); then
@@ -794,11 +832,18 @@ ensure_runner_npu_ready() {
       fi
       rm -f "$RUNNER_PREFLIGHT_FAILURE_FILE"
       return 0
+    else
+      preflight_status=$?
     fi
 
     printf '%s\n' "$preflight_output" > "$RUNNER_PREFLIGHT_FAILURE_FILE"
     echo "Runner NPU preflight failed ($attempt/$max_attempts)" >&2
     cat "$RUNNER_PREFLIGHT_FAILURE_FILE" >&2
+
+    if [[ "$preflight_status" -eq "$NPU_MEMORY_EXIT_CODE" ]]; then
+      echo "Ascend NPU memory is insufficient; failing without retry." >&2
+      return "$NPU_MEMORY_EXIT_CODE"
+    fi
 
     if [[ "$attempt" -lt "$max_attempts" ]]; then
       sleep "$delay_seconds"
@@ -899,6 +944,7 @@ prepare_hf_publish_cache_for_runner() {
 
 sync_benchmark_publication_to_github() {
   local publisher_script=${BENCHMARK_PUBLICATION_SYNC_SCRIPT:-$VLLM_HUST_REPO/.github/workflows/scripts/sync_benchmark_snapshots_to_github.sh}
+  local snapshot_commit_message="chore(data): sync benchmark publication $RUN_ID"
 
   if [[ "$PUBLISH_TO_BENCHMARK_REPO" != "1" ]]; then
     return 0
@@ -909,28 +955,30 @@ sync_benchmark_publication_to_github() {
     return 2
   fi
 
-  BENCHMARK_REPO_DIR="$VLLM_HUST_BENCHMARK_REPO" \
-  WEBSITE_REPO_DIR="$VLLM_HUST_WEBSITE_REPO" \
-  CURRENT_SUBMISSION_DIR="$SUBMISSION_DIR" \
-  VLLM_HUST_REPO_DIR="$VLLM_HUST_REPO" \
-  LOCAL_SNAPSHOT_OUTPUT_DIR="$AGGREGATE_OUTPUT_DIR" \
-  PYTHON_BIN="$PYTHON_BIN" \
-  BENCHMARK_REPO_SLUG="${BENCHMARK_REPO_SLUG:-vLLM-HUST/vllm-hust-benchmark}" \
-  BENCHMARK_REPO_GH_TOKEN="${BENCHMARK_REPO_GH_TOKEN:-}" \
-  BENCHMARK_REPO_SSH_KEY="${BENCHMARK_REPO_SSH_KEY:-}" \
-  SNAPSHOT_COMMIT_MESSAGE="chore(data): sync benchmark publication $RUN_ID" \
-  RUN_ID="$RUN_ID" \
-  "$publisher_script"
+  env \
+    BENCHMARK_REPO_DIR="$VLLM_HUST_BENCHMARK_REPO" \
+    WEBSITE_REPO_DIR="$VLLM_HUST_WEBSITE_REPO" \
+    CURRENT_SUBMISSION_DIR="$SUBMISSION_DIR" \
+    VLLM_HUST_REPO_DIR="$VLLM_HUST_REPO" \
+    LOCAL_SNAPSHOT_OUTPUT_DIR="$AGGREGATE_OUTPUT_DIR" \
+    PYTHON_BIN="$PYTHON_BIN" \
+    BENCHMARK_REPO_SLUG="${BENCHMARK_REPO_SLUG:-vLLM-HUST/vllm-hust-benchmark}" \
+    BENCHMARK_REPO_GH_TOKEN="${BENCHMARK_REPO_GH_TOKEN:-}" \
+    BENCHMARK_REPO_SSH_KEY="${BENCHMARK_REPO_SSH_KEY:-}" \
+    SNAPSHOT_COMMIT_MESSAGE="$snapshot_commit_message" \
+    RUN_ID="$RUN_ID" \
+    "$publisher_script"
 }
 
 run_same_spec_current_benchmark() {
   local same_spec_runner=$VLLM_HUST_BENCHMARK_REPO/scripts/run-current-ascend-same-spec.sh
   local same_spec_raw_result=$RESULT_ROOT/raw_benchmark_result.json
   local same_spec_submission_dir=$RESULT_ROOT/submission
-  local same_spec_ready_timeout_seconds=${SAME_SPEC_READY_TIMEOUT_SECONDS:-600}
+  local same_spec_ready_timeout_seconds=${SAME_SPEC_READY_TIMEOUT_SECONDS:-1200}
   local effective_same_spec_file=$SAME_SPEC_SPEC_FILE
   local same_spec_server_log=$RESULT_ROOT/server.stdout.log
   local same_spec_status=0
+  local same_spec_result_root=$RESULT_ROOT
   local current_vllm_hust_commit
   local current_vllm_hust_ref
   local current_plugin_commit
@@ -1046,8 +1094,8 @@ PY
         CURRENT_PLUGIN_GIT_COMMIT="$current_plugin_commit" \
         CURRENT_SUBMITTER="${GITHUB_ACTOR:-ci}" \
         CURRENT_DATA_SOURCE="vllm-hust-ci-same-spec" \
-        RESULT_DIR="$RESULT_ROOT" \
-        RESULT_ROOT="$RESULT_ROOT" \
+        RESULT_DIR="$same_spec_result_root" \
+        RESULT_ROOT="$same_spec_result_root" \
         RUN_ID="$RUN_ID" \
         CURRENT_SERVER_PORT="$PORT" \
         CURRENT_CLIENT_PORT="$PORT" \
@@ -1100,6 +1148,10 @@ PY
   if [[ "$same_spec_status" -ne 0 ]]; then
     print_same_spec_server_log_tail
     collect_ascend_diagnostics "same-spec-current-failure"
+    if [[ -f "$same_spec_server_log" ]] && is_npu_memory_pressure_text "$(cat "$same_spec_server_log" 2>/dev/null || true)"; then
+      echo "Detected deterministic Ascend NPU memory pressure in same-spec server log." >&2
+      return "$NPU_MEMORY_EXIT_CODE"
+    fi
     if [[ -f "$same_spec_server_log" ]] && is_node_env_failure_text "$(cat "$same_spec_server_log" 2>/dev/null || true)"; then
       mark_node_env_failure "same-spec benchmark failed due to Ascend node-level runtime errors"
       return "$NODE_ENV_RETRY_EXIT_CODE"
@@ -1224,8 +1276,6 @@ if [[ "$ASCEND_BENCHMARK_USE_SUDO" == "1" ]]; then
 fi
 
 if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then
-  EFFECTIVE_DATASET_NAME="$BENCH_SCENARIO"
-  EFFECTIVE_DATASET_PATH=""
   EFFECTIVE_INPUT_LEN=${BENCH_INPUT_LEN:-}
   EFFECTIVE_OUTPUT_LEN=${BENCH_OUTPUT_LEN:-}
   EFFECTIVE_CONSTRAINTS_FILE=$SAME_SPEC_CONSTRAINTS_FILE
@@ -1233,8 +1283,6 @@ if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then
 else
   case "$BENCH_SCENARIO" in
     random-online)
-      EFFECTIVE_DATASET_NAME="random"
-      EFFECTIVE_DATASET_PATH=""
       EFFECTIVE_INPUT_LEN=${BENCH_INPUT_LEN:-$BENCH_RANDOM_INPUT_LEN}
       EFFECTIVE_OUTPUT_LEN=${BENCH_OUTPUT_LEN:-$BENCH_RANDOM_OUTPUT_LEN}
       EFFECTIVE_CONSTRAINTS_FILE=${BENCH_CONSTRAINTS_FILE:-$VLLM_HUST_REPO/.github/workflows/data/random-online-ci-constraints.json}
@@ -1259,8 +1307,6 @@ else
         echo "BENCH_CONSTRAINTS_FILE is required for sharegpt-online" >&2
         exit 2
       fi
-      EFFECTIVE_DATASET_NAME="sharegpt"
-      EFFECTIVE_DATASET_PATH="$BENCH_DATASET_PATH"
       EFFECTIVE_INPUT_LEN=${BENCH_INPUT_LEN:-1024}
       EFFECTIVE_OUTPUT_LEN=${BENCH_OUTPUT_LEN:-256}
       EFFECTIVE_CONSTRAINTS_FILE="$BENCH_CONSTRAINTS_FILE"
@@ -1337,6 +1383,10 @@ else
       echo "vLLM server exited before becoming ready"
       cat "$SERVER_LOG"
       collect_ascend_diagnostics "server-exit-before-ready"
+      if is_npu_memory_pressure_text "$(cat "$SERVER_LOG" 2>/dev/null || true)"; then
+        echo "Detected deterministic Ascend NPU memory pressure in server log." >&2
+        exit "$NPU_MEMORY_EXIT_CODE"
+      fi
       if is_node_env_failure_text "$(cat "$SERVER_LOG" 2>/dev/null || true)"; then
         mark_node_env_failure "vllm server exited with Ascend node-level runtime error before ready"
         exit "$NODE_ENV_RETRY_EXIT_CODE"
@@ -1348,6 +1398,10 @@ else
       echo "Timed out waiting for vLLM server to become ready"
       cat "$SERVER_LOG"
       collect_ascend_diagnostics "server-ready-timeout"
+      if is_npu_memory_pressure_text "$(cat "$SERVER_LOG" 2>/dev/null || true)"; then
+        echo "Detected deterministic Ascend NPU memory pressure in server log." >&2
+        exit "$NPU_MEMORY_EXIT_CODE"
+      fi
       if is_node_env_failure_text "$(cat "$SERVER_LOG" 2>/dev/null || true)"; then
         mark_node_env_failure "vllm server readiness timeout with Ascend node-level runtime errors"
         exit "$NODE_ENV_RETRY_EXIT_CODE"
