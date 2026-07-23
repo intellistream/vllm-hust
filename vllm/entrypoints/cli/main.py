@@ -22,7 +22,7 @@ def main():
     import vllm.entrypoints.cli.benchmark.main
     import vllm.entrypoints.cli.collect_env
     import vllm.entrypoints.cli.launch
-    import vllm.entrypoints.cli.openai
+    import vllm.entrypoints.cli.openai_cmd
     import vllm.entrypoints.cli.run_batch
     import vllm.entrypoints.cli.serve
     from vllm.entrypoints.serve.utils.api_utils import (
@@ -32,7 +32,7 @@ def main():
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     CMD_MODULES = [
-        vllm.entrypoints.cli.openai,
+        vllm.entrypoints.cli.openai_cmd,
         vllm.entrypoints.cli.serve,
         vllm.entrypoints.cli.launch,
         vllm.entrypoints.cli.benchmark.main,
