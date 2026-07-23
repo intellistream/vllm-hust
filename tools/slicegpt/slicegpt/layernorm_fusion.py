@@ -2,7 +2,8 @@
 # Licensed under the MIT license.
 
 import logging
-from typing import Callable, Iterable, Optional, TypeVar
+from collections.abc import Callable, Iterable
+from typing import TypeVar
 
 import torch
 from torch.nn import Linear, Module, Parameter
@@ -38,7 +39,7 @@ def replace_modules(
     root: Module,
     type_to_replace: type[AnyModule],
     new_module_factory: Callable[
-        [AnyModule, Optional[int]],
+        [AnyModule, int | None],
         Module,
     ],
     replace_layers: bool,
@@ -99,15 +100,22 @@ def fuse_modules(model_adapter: ModelAdapter) -> None:
                 layer_adapter.get_attention_inputs() + layer_adapter.get_mlp_inputs(),
             )
         else:
-            fuse_ln_linear(layer_adapter.get_first_layernorm(), layer_adapter.get_attention_inputs())
-            fuse_ln_linear(layer_adapter.get_second_layernorm(), layer_adapter.get_mlp_inputs())
+            fuse_ln_linear(
+                layer_adapter.get_first_layernorm(),
+                layer_adapter.get_attention_inputs(),
+            )
+            fuse_ln_linear(
+                layer_adapter.get_second_layernorm(), layer_adapter.get_mlp_inputs()
+            )
 
         if model_adapter.should_bake_mean_into_linear:
             # Then we bake the mean substitution into the previous linear layers
             bake_mean_into_linear(layer_adapter.get_attention_output())
             bake_mean_into_linear(layer_adapter.get_mlp_output())
 
-    fuse_ln_linear(model_adapter.get_pre_head_layernorm(), [model_adapter.get_lm_head()])
+    fuse_ln_linear(
+        model_adapter.get_pre_head_layernorm(), [model_adapter.get_lm_head()]
+    )
 
     def build_rmsn_from_layernorm(layernorm: Module) -> RMSN:
         eps = getattr(layernorm, "variance_epsilon", getattr(layernorm, "eps", 1e-5))
@@ -149,8 +157,12 @@ def fuse_ln_linear(layernorm: Module, linear_layers: Iterable[Linear]) -> None:
         W_ = linear.weight.data.double()
         linear.weight.data = (W_ * layernorm.weight.double()).to(linear_dtype)
 
-        if hasattr(layernorm, 'bias'):
+        if hasattr(layernorm, "bias"):
             if linear.bias is None:
-                linear.bias = Parameter(torch.zeros(linear.out_features, dtype=torch.float64))
-            linear.bias.data = linear.bias.data.double() + torch.matmul(W_, layernorm.bias.double())
+                linear.bias = Parameter(
+                    torch.zeros(linear.out_features, dtype=torch.float64)
+                )
+            linear.bias.data = linear.bias.data.double() + torch.matmul(
+                W_, layernorm.bias.double()
+            )
             linear.bias.data = linear.bias.data.to(linear_dtype)

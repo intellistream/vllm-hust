@@ -12,12 +12,17 @@ import torch
 
 
 def create_file_handler(log_dir: str) -> logging.FileHandler:
-    path = pathlib.Path.cwd() / log_dir / f'{datetime.datetime.now():log_%Y-%m-%d-%H-%M-%S}.log'
+    path = (
+        pathlib.Path.cwd()
+        / log_dir
+        / f"{datetime.datetime.now():log_%Y-%m-%d-%H-%M-%S}.log"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(path, encoding='utf-8')
+    file_handler = logging.FileHandler(path, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     formatter = logging.Formatter(
-        '%(asctime)s.%(msecs)04d\t%(levelname)s\t%(name)s\t%(message)s', datefmt='%Y-%m-%dT%H:%M:%S'
+        "%(asctime)s.%(msecs)04d\t%(levelname)s\t%(name)s\t%(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
     )
     file_handler.setFormatter(formatter)
     return file_handler
@@ -26,7 +31,7 @@ def create_file_handler(log_dir: str) -> logging.FileHandler:
 def configure_logging(
     log_to_console: bool = True,
     log_to_file: bool = True,
-    log_dir: str = 'log',
+    log_dir: str = "log",
     level: int = logging.INFO,
 ) -> None:
     handlers: list[logging.Handler] = []
@@ -34,7 +39,7 @@ def configure_logging(
     if log_to_console:
         handler = logging.StreamHandler()
         handler.setLevel(level)
-        formatter = logging.Formatter('%(message)s')
+        formatter = logging.Formatter("%(message)s")
         handler.setFormatter(formatter)
         handlers.append(handler)
 
@@ -49,14 +54,17 @@ def configure_logging(
 
 def cleanup_memory() -> None:
     """Run GC and clear GPU memory."""
-    caller_name = ''
+    caller_name = ""
     try:
-        caller_name = f' (from {inspect.stack()[1].function})'
+        caller_name = f" (from {inspect.stack()[1].function})"
     except (ValueError, KeyError):
         pass
 
     def total_reserved_mem() -> int:
-        return sum(torch.cuda.memory_reserved(device=i) for i in range(torch.cuda.device_count()))
+        return sum(
+            torch.cuda.memory_reserved(device=i)
+            for i in range(torch.cuda.device_count())
+        )
 
     memory_before = total_reserved_mem()
 
@@ -67,15 +75,17 @@ def cleanup_memory() -> None:
         torch.cuda.empty_cache()
         memory_after = total_reserved_mem()
         logging.debug(
-            f"GPU memory{caller_name}: {memory_before / (1024 ** 3):.2f} -> {memory_after / (1024 ** 3):.2f} GB"
-            f" ({(memory_after - memory_before) / (1024 ** 3):.2f} GB)"
+            f"GPU memory{caller_name}: {memory_before / (1024**3):.2f} -> {memory_after / (1024**3):.2f} GB"
+            f" ({(memory_after - memory_before) / (1024**3):.2f} GB)"
         )
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
-def map_tensors(obj: T, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> T:
+def map_tensors(
+    obj: T, device: torch.device | str | None = None, dtype: torch.dtype | None = None
+) -> T:
     """Recursively map tensors to device and dtype."""
     if isinstance(obj, torch.Tensor):
         if device is not None:

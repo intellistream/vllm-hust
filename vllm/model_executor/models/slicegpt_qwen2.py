@@ -10,6 +10,7 @@ from transformers import Qwen2Config
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention, EncoderOnlyAttention
 from vllm.model_executor.layers.linear import (
@@ -26,10 +27,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
-from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.v1.attention.backend import AttentionType
 
-from .interfaces import SupportsPP
 from .utils import extract_layer_index, make_layers, maybe_prefix
 
 
@@ -194,11 +193,15 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         )
         orig_hidden = config.num_attention_heads * sc["attn_head_dim"]
         self.input_layernorm = SliceGPTRMSN(orig_hidden, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = SliceGPTRMSN(orig_hidden, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = SliceGPTRMSN(
+            orig_hidden, eps=config.rms_norm_eps
+        )
         self.attn_shortcut_Q = nn.Parameter(torch.empty(attn_in, attn_out))
         self.mlp_shortcut_Q = nn.Parameter(torch.empty(mlp_in, mlp_out))
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
@@ -229,7 +232,9 @@ class SliceGPTQwen2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, sc["embedding_dim"])
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: SliceGPTQwen2DecoderLayer(vllm_config=vllm_config, prefix=prefix),
+            lambda prefix: SliceGPTQwen2DecoderLayer(
+                vllm_config=vllm_config, prefix=prefix
+            ),
             prefix=f"{prefix}.layers",
         )
         orig_hidden = config.num_attention_heads * sc["attn_head_dim"]
@@ -255,7 +260,7 @@ class SliceGPTQwen2Model(nn.Module):
         return hidden_states
 
 
-class SliceGPTQwen2ForCausalLM(nn.Module, SupportsPP):
+class SliceGPTQwen2ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -263,6 +268,11 @@ class SliceGPTQwen2ForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "SliceGPTQwen2ForCausalLM does not support pipeline parallelism. "
+                "Use pipeline_parallel_size=1."
+            )
         config: Qwen2Config = vllm_config.model_config.hf_config.get_text_config()
         sc = config.slicing_config
         self.config = config
@@ -276,7 +286,6 @@ class SliceGPTQwen2ForCausalLM(nn.Module, SupportsPP):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = lambda *a, **k: IntermediateTensors({})
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -288,6 +297,11 @@ class SliceGPTQwen2ForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if intermediate_tensors is not None:
+            raise ValueError(
+                "SliceGPTQwen2ForCausalLM does not support pipeline "
+                "intermediate_tensors. Use pipeline_parallel_size=1."
+            )
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

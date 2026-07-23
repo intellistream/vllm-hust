@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import Callable, final
+from collections.abc import Callable
+from typing import final
 
 from slicegpt.model_adapter import SlicingConfig
 
@@ -40,7 +41,9 @@ class SlicingScheduler(ABC):
         """Return whether working with a parallel blocks models."""
         return self.slicing_conf.parallel_blocks
 
-    def setup(self, *, hidden_size: int, layers_num: int, parallel_blocks: bool) -> None:
+    def setup(
+        self, *, hidden_size: int, layers_num: int, parallel_blocks: bool
+    ) -> None:
         """Set up the slicing scheduler with the given model parameters."""
         self.slicing_conf.hidden_size = hidden_size
         self.slicing_conf.layers_num = layers_num
@@ -75,7 +78,11 @@ class SlicingScheduler(ABC):
             return self.get_mlp_output_dimension(idx)
 
         use_head_dim = match_head_dim and idx == self.layers_num - 1
-        val = self._get_attention_output_dimension(idx) if not use_head_dim else self.get_head_dimension()
+        val = (
+            self._get_attention_output_dimension(idx)
+            if not use_head_dim
+            else self.get_head_dimension()
+        )
         self.slicing_conf.attention_output_dimensions[idx] = val
         return val
 
@@ -101,7 +108,11 @@ class SlicingScheduler(ABC):
     def get_mlp_output_dimension(self, idx: int) -> int:
         """Return the mlp output dimension for the specified layer index."""
         use_head_dim = idx == self.layers_num - 1
-        val = self._get_mlp_output_dimension(idx) if not use_head_dim else self.get_head_dimension()
+        val = (
+            self._get_mlp_output_dimension(idx)
+            if not use_head_dim
+            else self.get_head_dimension()
+        )
         self.slicing_conf.mlp_output_dimensions[idx] = val
         return val
 
@@ -112,7 +123,11 @@ class SlicingScheduler(ABC):
     @final
     def get_head_dimension(self) -> int:
         """Return the LM head dimension."""
-        val = self._get_head_dimension() if self.slicing_conf.do_slice_head else self.hidden_size
+        val = (
+            self._get_head_dimension()
+            if self.slicing_conf.do_slice_head
+            else self.hidden_size
+        )
         self.slicing_conf.head_dimension = val
         return val
 
@@ -186,7 +201,9 @@ class ForwardSlicingScheduler(SlicingScheduler, ABC):
     def _get_attention_input_dimension(self, idx: int) -> int:
         # return the input embedding dimension when at the first attn layer inputs
         if idx == 0:
-            return self._get_input_embedding_dimensions()[0]  # all dimensions are the same there
+            return self._get_input_embedding_dimensions()[
+                0
+            ]  # all dimensions are the same there
 
         return self._get_mlp_output_dimension(idx - 1)
 
@@ -210,7 +227,9 @@ class FunctionSlicingScheduler(ForwardSlicingScheduler):
     ):
         super().__init__(do_slice_head=do_slice_head)
         self.mlp_sparsity: Callable[[float], float] = mlp_sparsity_func
-        self.attn_sparsity: Callable[[float], float] = attn_sparsity_func  # unused for parallel blocks case
+        self.attn_sparsity: Callable[[float], float] = (
+            attn_sparsity_func  # unused for parallel blocks case
+        )
         self.round_interval: int = round_interval
 
     def _get_layer_dimension(self, idx: int, is_attn_layer: bool = False) -> int:
@@ -229,7 +248,9 @@ class FunctionSlicingScheduler(ForwardSlicingScheduler):
         return self._get_layer_dimension(idx, is_attn_layer=True)
 
     def _get_mlp_output_dimension(self, idx: int) -> int:
-        return self._get_layer_dimension(idx + 1)  # head dimension matching ensures location will not exceed 1
+        return self._get_layer_dimension(
+            idx + 1
+        )  # head dimension matching ensures location will not exceed 1
 
     def _get_head_dimension(self) -> int:
         return self._get_layer_dimension(self.layers_num - 1)
@@ -242,7 +263,7 @@ class FunctionSlicingScheduler(ForwardSlicingScheduler):
         attn_end: float | None = None,
         round_interval: int = 1,
         do_slice_head: bool = False,
-    ) -> 'FunctionSlicingScheduler':
+    ) -> "FunctionSlicingScheduler":
         """Create a linear slicing scheduler, mainly as an example for testing."""
 
         def linear(start: float, end: float) -> Callable[[float], float]:

@@ -31,9 +31,12 @@ def get_dataset(name: str) -> datasets.DatasetDict:
                 "train": "en/c4-train.00000-of-01024.json.gz",
                 "validation": "en/c4-validation.00000-of-00008.json.gz",
             },
-            "cols_to_remove": ['url', 'timestamp'],
+            "cols_to_remove": ["url", "timestamp"],
         },
-        "alpaca": {"path": "tatsu-lab/alpaca", "cols_to_remove": ['input', 'output', 'instruction']},
+        "alpaca": {
+            "path": "tatsu-lab/alpaca",
+            "cols_to_remove": ["input", "output", "instruction"],
+        },
     }
 
     if name not in ds_properties:
@@ -41,7 +44,9 @@ def get_dataset(name: str) -> datasets.DatasetDict:
 
     properties = ds_properties[name]
     ds = datasets.load_dataset(
-        properties["path"], name=properties.get("config_name"), data_files=properties.get("data_files")
+        properties["path"],
+        name=properties.get("config_name"),
+        data_files=properties.get("data_files"),
     )
 
     if "cols_to_remove" in properties:
@@ -60,7 +65,10 @@ def get_dataset(name: str) -> datasets.DatasetDict:
 
 
 def prepare_test_dataloader(
-    dataset: datasets.Dataset, tokenizer: PreTrainedTokenizerBase, seqlen: int = 2048, batch_size: int = 1
+    dataset: datasets.Dataset,
+    tokenizer: PreTrainedTokenizerBase,
+    seqlen: int = 2048,
+    batch_size: int = 1,
 ) -> DataLoader[dict[str, torch.Tensor]]:
     """
     Get a DataLoader from a test dataset. This dataloader should be used when comparing WikiText2 perplexities with other papers, e.g. SparseGPT (arxiv.org/abs/2301.00774).
@@ -75,13 +83,13 @@ def prepare_test_dataloader(
         A DataLoader.
     """
 
-    logging.info(f"Preparing test dataloader")
+    logging.info("Preparing test dataloader")
 
     class TestDataset(Dataset):
         def __init__(self, ds, tokenizer, seqlen=2048):
             """Tokenize the entire dataset and reshape it into sequences of length seqlen."""
 
-            tokenized_ds = tokenizer("\n\n".join(ds['text']), return_tensors='pt')
+            tokenized_ds = tokenizer("\n\n".join(ds["text"]), return_tensors="pt")
             nsamples = tokenized_ds.input_ids.numel() // seqlen
 
             input_ids = tokenized_ds.input_ids[0, : nsamples * seqlen]
@@ -93,14 +101,17 @@ def prepare_test_dataloader(
             self.attn_mask = attn_mask
 
         def __getitem__(self, idx):
-            return {"input_ids": self.input_ids[idx], "attention_mask": self.attn_mask[idx]}
+            return {
+                "input_ids": self.input_ids[idx],
+                "attention_mask": self.attn_mask[idx],
+            }
 
         def __len__(self):
             return len(self.input_ids)
 
     test_ds = TestDataset(dataset, tokenizer, seqlen)
     loader = DataLoader(test_ds, batch_size=batch_size)
-    logging.info(f"Preparing test dataloader done")
+    logging.info("Preparing test dataloader done")
     return loader
 
 
@@ -128,7 +139,7 @@ def prepare_dataloader(
     Returns:
         A DataLoader.
     """
-    logging.info(f"Preparing dataloader")
+    logging.info("Preparing dataloader")
 
     if not varied_seqlen and not nsamples:
         logging.warning(
@@ -183,5 +194,5 @@ def prepare_dataloader(
     sampler = SubsetRandomSampler(torch.randperm(len(ds))[:nsamples])
 
     loader = DataLoader(ds, batch_size=batch_size, sampler=sampler)
-    logging.info(f"Preparing dataloader done")
+    logging.info("Preparing dataloader done")
     return loader

@@ -47,7 +47,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsPP
 from .llama import LlamaAttention
 from .utils import extract_layer_index, make_layers, maybe_prefix
 
@@ -119,16 +118,20 @@ class SliceGPTDecoderLayer(nn.Module):
         mlp_in = sc["mlp_input_dims"][idx]
         mlp_out = sc["mlp_output_dims"][idx]
         # We reuse vLLM's LlamaAttention, whose o_proj output is forced to equal its
-        # hidden_size input. SliceGPT (sequential) keeps attn_in == attn_out, so this holds.
+        # hidden_size input. SliceGPT (sequential) keeps attn_in == attn_out,
+        # so this holds.
         assert attn_in == attn_out, (
             f"layer {idx}: attn_in({attn_in}) != attn_out({attn_out}); "
-            "LlamaAttention reuse requires equal attention in/out dims")
+            "LlamaAttention reuse requires equal attention in/out dims"
+        )
 
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=attn_in,
             num_heads=config.num_attention_heads,
-            num_kv_heads=getattr(config, "num_key_value_heads", config.num_attention_heads),
+            num_kv_heads=getattr(
+                config, "num_key_value_heads", config.num_attention_heads
+            ),
             max_position_embeddings=getattr(config, "max_position_embeddings", 4096),
             quant_config=None,
             bias=False,
@@ -144,13 +147,17 @@ class SliceGPTDecoderLayer(nn.Module):
         # SliceGPT normalizes by the ORIGINAL hidden size, not the sliced width.
         orig_hidden = config.num_attention_heads * sc["attn_head_dim"]
         self.input_layernorm = SliceGPTRMSN(orig_hidden, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = SliceGPTRMSN(orig_hidden, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = SliceGPTRMSN(
+            orig_hidden, eps=config.rms_norm_eps
+        )
 
         # Dense residual rotations, used as `residual @ Q`.
         self.attn_shortcut_Q = nn.Parameter(torch.empty(attn_in, attn_out))
         self.mlp_shortcut_Q = nn.Parameter(torch.empty(mlp_in, mlp_out))
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
         # Attention block (un-fused residual: rotate residual, then add).
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -211,7 +218,7 @@ class SliceGPTLlamaModel(nn.Module):
         return hidden_states
 
 
-class SliceGPTLlamaForCausalLM(nn.Module, SupportsPP):
+class SliceGPTLlamaForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -219,6 +226,11 @@ class SliceGPTLlamaForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "SliceGPTLlamaForCausalLM does not support pipeline parallelism. "
+                "Use pipeline_parallel_size=1."
+            )
         config: LlamaConfig = vllm_config.model_config.hf_config
         self.config = config
         sc = config.slicing_config
@@ -232,9 +244,6 @@ class SliceGPTLlamaForCausalLM(nn.Module, SupportsPP):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = (
-            lambda *a, **k: IntermediateTensors({})
-        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -246,6 +255,11 @@ class SliceGPTLlamaForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if intermediate_tensors is not None:
+            raise ValueError(
+                "SliceGPTLlamaForCausalLM does not support pipeline "
+                "intermediate_tensors. Use pipeline_parallel_size=1."
+            )
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

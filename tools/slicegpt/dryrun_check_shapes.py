@@ -7,6 +7,7 @@ slicing_config exactly like tools/convert_slicegpt_to_vllm.py, and asserts every
 tensor's shape against those dims -- printing each check. Writes NOTHING to disk
 and does NOT import safetensors / touch the GPU.
 """
+
 import argparse
 import json
 import pathlib
@@ -28,7 +29,9 @@ def normalize_slicing_conf(raw: dict, num_layers: int) -> dict:
         "embedding_dim": embedding_dim,
         "final_norm_dim": int(raw["head_dimension"]),
         "attention_input_dims": as_list(raw["attention_input_dimensions"], num_layers),
-        "attention_output_dims": as_list(raw["attention_output_dimensions"], num_layers),
+        "attention_output_dims": as_list(
+            raw["attention_output_dimensions"], num_layers
+        ),
         "mlp_input_dims": as_list(raw["mlp_input_dimensions"], num_layers),
         "mlp_output_dims": as_list(raw["mlp_output_dimensions"], num_layers),
     }
@@ -64,27 +67,35 @@ def main():
     qkv_out = num_heads * attn_head_dim
     kv_out = num_kv_heads * attn_head_dim
 
-    print(f"[conf] embedding_dim={sc['embedding_dim']} final_norm_dim={sc['final_norm_dim']} "
-          f"attn_head_dim={attn_head_dim} qkv_out={qkv_out} kv_out={kv_out}")
-    print(f"[conf] attn_in[0]={sc['attention_input_dims'][0]} attn_in[-1]={sc['attention_input_dims'][-1]} "
-          f"mlp_in[-1]={sc['mlp_input_dims'][-1]} mlp_out[-1]={sc['mlp_output_dims'][-1]}")
+    print(
+        f"[conf] embedding_dim={sc['embedding_dim']} final_norm_dim={sc['final_norm_dim']} "
+        f"attn_head_dim={attn_head_dim} qkv_out={qkv_out} kv_out={kv_out}"
+    )
+    print(
+        f"[conf] attn_in[0]={sc['attention_input_dims'][0]} attn_in[-1]={sc['attention_input_dims'][-1]} "
+        f"mlp_in[-1]={sc['mlp_input_dims'][-1]} mlp_out[-1]={sc['mlp_output_dims'][-1]}"
+    )
 
     # residual-stream continuity: mlp_out[i] must feed attn_in[i+1]; last feeds final norm/head
     print("[continuity] checking residual-stream dim continuity across layers ...")
     for i in range(num_layers - 1):
         assert sc["mlp_output_dims"][i] == sc["attention_input_dims"][i + 1], (
             f"layer {i} mlp_out({sc['mlp_output_dims'][i]}) != "
-            f"layer {i+1} attn_in({sc['attention_input_dims'][i+1]})")
+            f"layer {i + 1} attn_in({sc['attention_input_dims'][i + 1]})"
+        )
     assert sc["embedding_dim"] == sc["attention_input_dims"][0], (
-        f"embedding_dim({sc['embedding_dim']}) != attn_in[0]({sc['attention_input_dims'][0]})")
+        f"embedding_dim({sc['embedding_dim']}) != attn_in[0]({sc['attention_input_dims'][0]})"
+    )
     assert sc["mlp_output_dims"][-1] == sc["final_norm_dim"], (
-        f"mlp_out[-1]({sc['mlp_output_dims'][-1]}) != final_norm_dim({sc['final_norm_dim']})")
+        f"mlp_out[-1]({sc['mlp_output_dims'][-1]}) != final_norm_dim({sc['final_norm_dim']})"
+    )
     print("[continuity] OK")
 
     # model code also asserts attn_in == attn_out (LlamaAttention reuse)
     for i in range(num_layers):
         assert sc["attention_input_dims"][i] == sc["attention_output_dims"][i], (
-            f"layer {i}: attn_in != attn_out (model.py reuse of LlamaAttention forbids this)")
+            f"layer {i}: attn_in != attn_out (model.py reuse of LlamaAttention forbids this)"
+        )
     print("[attn-square] attn_in==attn_out for all layers: OK")
 
     errors = []
@@ -123,24 +134,43 @@ def main():
     expected_names = {"model.embed_tokens.weight", "lm_head.weight"}
     for i in range(num_layers):
         pre = f"model.layers.{i}"
-        for suf in ["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
-                    "self_attn.o_proj.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight",
-                    "mlp.down_proj.weight", "attn_shortcut_Q", "mlp_shortcut_Q"]:
+        for suf in [
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+            "attn_shortcut_Q",
+            "mlp_shortcut_Q",
+        ]:
             expected_names.add(f"{pre}.{suf}")
 
     def droppable(n):
-        return ("rotary_emb" in n or n.endswith(".inv_freq")
-                or n.endswith("input_layernorm.weight")
-                or n.endswith("post_attention_layernorm.weight")
-                or n == "model.norm.weight")
+        return (
+            "rotary_emb" in n
+            or n.endswith(".inv_freq")
+            or n.endswith("input_layernorm.weight")
+            or n.endswith("post_attention_layernorm.weight")
+            or n == "model.norm.weight"
+        )
 
-    leftovers = [n for n in state if n not in expected_names and not droppable(n) and torch.is_tensor(state[n])]
+    leftovers = [
+        n
+        for n in state
+        if n not in expected_names and not droppable(n) and torch.is_tensor(state[n])
+    ]
     dropped = [n for n in state if droppable(n)]
 
     print(f"[shapes] checked {checked} tensors, {len(errors)} error(s)")
-    print(f"[drop] {len(dropped)} norm/rotary tensors will be dropped (sample): {dropped[:4]}")
+    print(
+        f"[drop] {len(dropped)} norm/rotary tensors will be dropped (sample): {dropped[:4]}"
+    )
     if leftovers:
-        print(f"[WARN] {len(leftovers)} UNEXPECTED leftover tensor(s) not handled by converter:")
+        print(
+            f"[WARN] {len(leftovers)} UNEXPECTED leftover tensor(s) not handled by converter:"
+        )
         for n in leftovers[:20]:
             print(f"        {n}  {tuple(state[n].shape)}")
     else:

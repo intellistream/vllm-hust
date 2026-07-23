@@ -23,7 +23,11 @@ from slicegpt.model_adapter import LayerAdapter, ModelAdapter
 
 
 def _supports_qwen2_model(model_name: str) -> bool:
-    return "Qwen2" in model_name or "Qwen2.5" in model_name or "qwen2" in model_name.lower()
+    return (
+        "Qwen2" in model_name
+        or "Qwen2.5" in model_name
+        or "qwen2" in model_name.lower()
+    )
 
 
 class CompressedQwen2DecoderLayer(Qwen2DecoderLayer):
@@ -103,7 +107,11 @@ class Qwen2LayerAdapter(LayerAdapter):
         return self.layer.post_attention_layernorm
 
     def get_attention_inputs(self) -> list[Linear]:
-        return [self.layer.self_attn.q_proj, self.layer.self_attn.k_proj, self.layer.self_attn.v_proj]
+        return [
+            self.layer.self_attn.q_proj,
+            self.layer.self_attn.k_proj,
+            self.layer.self_attn.v_proj,
+        ]
 
     def get_attention_output(self) -> Linear:
         return self.layer.self_attn.o_proj
@@ -175,8 +183,12 @@ class Qwen2ModelAdapter(ModelAdapter):
     def compute_output_logits(self, input_ids: Tensor) -> FloatTensor:
         return self.model(input_ids=input_ids).logits
 
-    def convert_layer_to_compressed(self, layer: Module, layer_idx: int | None) -> Module:
-        compressed_layer = self.compressed_layer_type(self.config, layer_idx).to(self.config.torch_dtype)
+    def convert_layer_to_compressed(
+        self, layer: Module, layer_idx: int | None
+    ) -> Module:
+        compressed_layer = self.compressed_layer_type(self.config, layer_idx).to(
+            self.config.torch_dtype
+        )
         compressed_layer.load_state_dict(layer.state_dict(), strict=True)
         return compressed_layer
 
@@ -218,7 +230,10 @@ class Qwen2ModelAdapter(ModelAdapter):
             return None
 
         model = Qwen2ForCausalLM.from_pretrained(
-            model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
+            model_path,
+            torch_dtype=dtype,
+            token=token,
+            local_files_only=local_files_only,
         )
         model.config.torch_dtype = dtype
         return Qwen2ModelAdapter(model)
@@ -241,7 +256,10 @@ class Qwen2ModelAdapter(ModelAdapter):
                 pass
 
         config = Qwen2Config.from_pretrained(
-            model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
+            model_path,
+            torch_dtype=dtype,
+            token=token,
+            local_files_only=local_files_only,
         )
         model = UninitializedQwen2ForCausalLM(config)
         model = model.to(dtype=dtype)

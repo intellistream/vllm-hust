@@ -30,13 +30,12 @@ def do_not_initialize(func):
         torch.nn.init.uniform_ = skip
         torch.nn.init.normal_ = skip
 
-        result = func(*args, **kwargs)
-
-        torch.nn.init.kaiming_uniform_ = kaiming_fn
-        torch.nn.init.uniform_ = uniform_fn
-        torch.nn.init.normal_ = normal_fn
-
-        return result
+        try:
+            return func(*args, **kwargs)
+        finally:
+            torch.nn.init.kaiming_uniform_ = kaiming_fn
+            torch.nn.init.uniform_ = uniform_fn
+            torch.nn.init.normal_ = normal_fn
 
     return wrapper
 
@@ -82,10 +81,10 @@ def get_model_and_tokenizer(
         model_path = model_name
 
     logging.info(
-        f"Loading %s config %s from %s",
+        "Loading %s config %s from %s",
         model_name,
         "and model weights" if not uninitialized else "",
-        model_path if local_model else 'Hugging Face',
+        model_path if local_model else "Hugging Face",
     )
 
     model_adapter = ModelAdapter.from_model(
@@ -102,7 +101,9 @@ def get_model_and_tokenizer(
     model.eval()  # This switches off dropout.
     model_adapter.use_cache = False
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, token=token, local_files_only=local_model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, use_fast=True, token=token, local_files_only=local_model
+    )
 
     model_adapter.post_init(tokenizer)
     logging.info("Loading model done")
@@ -155,7 +156,9 @@ def load_sliced_model(
     config_path = pathlib.Path(sliced_model_path) / my_sliced_model_config
 
     if config_path.exists():
-        model_adapter.slicing_conf = SlicingConfig.from_json_string(config_path.read_text())
+        model_adapter.slicing_conf = SlicingConfig.from_json_string(
+            config_path.read_text()
+        )
 
     if model_adapter.slicing_conf is None:
         # assume the model was sliced with the const sparsity specified in the arguments to this method
@@ -174,7 +177,10 @@ def load_sliced_model(
 
     logging.info(f"Loading sliced model weights from {sliced_model_path}")
     model_adapter.model.load_state_dict(
-        torch.load(str(pathlib.Path(sliced_model_path) / my_sliced_model_name), map_location="cpu")
+        torch.load(
+            str(pathlib.Path(sliced_model_path) / my_sliced_model_name),
+            map_location="cpu",
+        )
     )
     model_adapter.model.eval()
 

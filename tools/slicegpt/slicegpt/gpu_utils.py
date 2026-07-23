@@ -17,7 +17,9 @@ from .model_adapter import ModelAdapter
 
 @torch.no_grad()
 def evaluate_ppl(
-    model: torch.nn.Module, pad_token_id: int | None, testloader: DataLoader[dict[str, torch.Tensor]]
+    model: torch.nn.Module,
+    pad_token_id: int | None,
+    testloader: DataLoader[dict[str, torch.Tensor]],
 ) -> float:
     """
     Evaluate the model's perplexity on the test set using batch processing.
@@ -61,7 +63,9 @@ def evaluate_ppl(
     elapsed = time.time() - start_time
     logging.info(
         "Time spent on evaluation: %s",
-        time.strftime("%H:%M:%S.{}".format(str(elapsed % 1)[2:])[:13], time.gmtime(elapsed)),
+        time.strftime(
+            "%H:%M:%S.{}".format(str(elapsed % 1)[2:])[:13], time.gmtime(elapsed)
+        ),
     )
 
     return ppl.item()
@@ -76,7 +80,9 @@ def distribute_model(model_adapter: ModelAdapter) -> None:
     )
 
     device_map = infer_auto_device_map(
-        model, max_memory=max_memory, no_split_module_classes=model_adapter.no_split_module_classes
+        model,
+        max_memory=max_memory,
+        no_split_module_classes=model_adapter.no_split_module_classes,
     )
 
     dispatch_model(
@@ -127,17 +133,28 @@ def benchmark(model_adapter: ModelAdapter, input_batch: torch.Tensor) -> dict:
 
             sync_gpus()
             start_time = time.time()
-            output = model_adapter.model(input_ids_i, past_key_values=cache["past"], attention_mask=attention_mask_i)
+            output = model_adapter.model(
+                input_ids_i,
+                past_key_values=cache["past"],
+                attention_mask=attention_mask_i,
+            )
             sync_gpus()
             time_measurements.append(time.time() - start_time)
 
             cache["past"] = list(output.past_key_values)
             del output
 
-            input_ids_i, attention_mask_i = input_ids_i.to("cpu"), attention_mask_i.to("cpu")
+            input_ids_i, attention_mask_i = (
+                input_ids_i.to("cpu"),
+                attention_mask_i.to("cpu"),
+            )
 
         median_time = np.median(time_measurements)
         throughput = batch_size / median_time
 
-        results = {"median_time": median_time, "latency": 1 / throughput, "throughput": throughput}
+        results = {
+            "median_time": median_time,
+            "latency": 1 / throughput,
+            "throughput": throughput,
+        }
         return results

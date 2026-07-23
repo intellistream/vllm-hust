@@ -104,7 +104,9 @@ class LayerAdapter(ABC):
         hidden_states argument. This method returns a new tuple of arguments with the hidden_states argument updated.
         """
         return (
-            args[: self.hidden_states_args_position] + (hidden_states,) + args[self.hidden_states_args_position + 1 :]
+            args[: self.hidden_states_args_position]
+            + (hidden_states,)
+            + args[self.hidden_states_args_position + 1 :]
         )
 
 
@@ -229,7 +231,9 @@ class ModelAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def convert_layer_to_compressed(self, layer: Module, layer_idx: int | None) -> Module:
+    def convert_layer_to_compressed(
+        self, layer: Module, layer_idx: int | None
+    ) -> Module:
         """
         Replace the given layer with a compressed version of the layer.
         """
@@ -286,15 +290,17 @@ class ModelAdapter(ABC):
         return [self.original_layer_type.__name__, self.compressed_layer_type.__name__]
 
     @final
-    def convert_layer_to_compressed_and_register_buffers(self, layer: Module, layer_idx: int | None) -> Module:
+    def convert_layer_to_compressed_and_register_buffers(
+        self, layer: Module, layer_idx: int | None
+    ) -> Module:
         """
         Replace the given layer with a compressed version of the layer. Also register the shortcut_Q matrices
         to be used in Compressed transformer layer's forward() method to be updated during slicing.
         """
         compressed_layer = self.convert_layer_to_compressed(layer, layer_idx)
         if not self.parallel_blocks:
-            compressed_layer.register_parameter('mlp_shortcut_Q', None)
-        compressed_layer.register_parameter('attn_shortcut_Q', None)
+            compressed_layer.register_parameter("mlp_shortcut_Q", None)
+        compressed_layer.register_parameter("attn_shortcut_Q", None)
         return compressed_layer
 
     def post_init(self, tokenizer: PreTrainedTokenizerBase) -> None:
@@ -310,7 +316,7 @@ class ModelAdapter(ABC):
         model_name: str,
         model_path: str,
         *,
-        model_type: str = 'pretrained',
+        model_type: str = "pretrained",
         dtype: torch.dtype = torch.float16,
         local_files_only: bool = False,
         token: str | bool | None = None,
@@ -358,7 +364,9 @@ class ModelAdapter(ABC):
         if adapter is not None:
             return adapter
 
-        raise NotImplementedError(f"{model_path} is neither a Hugging Face model nor a supported local model.")
+        raise NotImplementedError(
+            f"{model_path} is neither a Hugging Face model nor a supported local model."
+        )
 
     @classmethod
     def _from_model(
@@ -366,13 +374,13 @@ class ModelAdapter(ABC):
         model_name: str,
         model_path: str,
         *,
-        model_type: str = 'pretrained',
+        model_type: str = "pretrained",
         dtype: torch.dtype = torch.float16,
         local_files_only: bool = False,
         token: str | bool | None = None,
     ) -> ModelAdapter | None:
         match model_type:
-            case 'pretrained':
+            case "pretrained":
                 return cls._from_pretrained(
                     model_name,
                     model_path=model_path,
@@ -381,7 +389,7 @@ class ModelAdapter(ABC):
                     token=token,
                 )
 
-            case 'uninitialized':
+            case "uninitialized":
                 return cls._from_uninitialized(
                     model_name,
                     model_path=model_path,
@@ -449,10 +457,12 @@ class SlicingConfig:
 
     head_dimension: int | None = None
 
-    const_dimension: int | None = None  # to be able to load models without config, sliced with const sparsity
+    const_dimension: int | None = (
+        None  # to be able to load models without config, sliced with const sparsity
+    )
 
     @staticmethod
-    def from_dict(d: dict) -> 'SlicingConfig':
+    def from_dict(d: dict) -> SlicingConfig:
         """Return a SliceConfig object constructed from the provided dictionary."""
 
         def convert_dict_keys_to_int(d: Any) -> Any:
@@ -470,7 +480,7 @@ class SlicingConfig:
         return SlicingConfig(**convert_dict_keys_to_int(d))
 
     @staticmethod
-    def from_json_string(json_str: str) -> 'SlicingConfig':
+    def from_json_string(json_str: str) -> SlicingConfig:
         """Return a SliceConfig object constructed from the provided JSON string."""
         return SlicingConfig.from_dict(json.loads(json_str))
 
@@ -485,6 +495,6 @@ class SlicingConfig:
         """Return a JSON representation of this object."""
         return json.dumps(self.to_dict())
 
-    def clone(self) -> 'SlicingConfig':
+    def clone(self) -> SlicingConfig:
         """Return a clone of this object."""
         return copy.deepcopy(self)

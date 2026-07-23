@@ -10,7 +10,12 @@ import torch
 from torch import FloatTensor, LongTensor, Tensor, matmul
 from torch.nn import Linear, Module
 from transformers import PretrainedConfig, PreTrainedTokenizerBase
-from transformers.models.llama.modeling_llama import LlamaConfig, LlamaDecoderLayer, LlamaForCausalLM, LlamaRMSNorm
+from transformers.models.llama.modeling_llama import (
+    LlamaConfig,
+    LlamaDecoderLayer,
+    LlamaForCausalLM,
+    LlamaRMSNorm,
+)
 
 from slicegpt.model_adapter import LayerAdapter, ModelAdapter
 
@@ -112,7 +117,11 @@ class LlamaLayerAdapter(LayerAdapter):
         return self.layer.post_attention_layernorm
 
     def get_attention_inputs(self) -> list[Linear]:
-        return [self.layer.self_attn.q_proj, self.layer.self_attn.k_proj, self.layer.self_attn.v_proj]
+        return [
+            self.layer.self_attn.q_proj,
+            self.layer.self_attn.k_proj,
+            self.layer.self_attn.v_proj,
+        ]
 
     def get_attention_output(self) -> Linear:
         return self.layer.self_attn.o_proj
@@ -184,8 +193,12 @@ class LlamaModelAdapter(ModelAdapter):
     def compute_output_logits(self, input_ids: Tensor) -> FloatTensor:
         return self.model(input_ids=input_ids).logits
 
-    def convert_layer_to_compressed(self, layer: Module, layer_idx: int | None) -> Module:
-        compressed_layer = self.compressed_layer_type(self.config, layer_idx).to(self.config.torch_dtype)
+    def convert_layer_to_compressed(
+        self, layer: Module, layer_idx: int | None
+    ) -> Module:
+        compressed_layer = self.compressed_layer_type(self.config, layer_idx).to(
+            self.config.torch_dtype
+        )
         compressed_layer.load_state_dict(layer.state_dict(), strict=True)
         return compressed_layer
 
@@ -224,11 +237,17 @@ class LlamaModelAdapter(ModelAdapter):
         local_files_only: bool = False,
         token: str | bool | None = None,
     ) -> ModelAdapter | None:
-        if not (model_name.startswith("meta-llama/Llama-2") or model_name.startswith("meta-llama/Meta-Llama-3")):
+        if not (
+            model_name.startswith("meta-llama/Llama-2")
+            or model_name.startswith("meta-llama/Meta-Llama-3")
+        ):
             return None
 
         model = LlamaForCausalLM.from_pretrained(
-            model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
+            model_path,
+            torch_dtype=dtype,
+            token=token,
+            local_files_only=local_files_only,
         )
         model.config.torch_dtype = dtype
 
@@ -244,7 +263,10 @@ class LlamaModelAdapter(ModelAdapter):
         local_files_only: bool = False,
         token: str | bool | None = None,
     ) -> ModelAdapter | None:
-        if not (model_name.startswith("meta-llama/Llama-2") or model_name.startswith("meta-llama/Meta-Llama-3")):
+        if not (
+            model_name.startswith("meta-llama/Llama-2")
+            or model_name.startswith("meta-llama/Meta-Llama-3")
+        ):
             return None
 
         class UninitializedLlamaForCausalLM(LlamaForCausalLM):
@@ -253,7 +275,10 @@ class LlamaModelAdapter(ModelAdapter):
                 pass
 
         config = LlamaConfig.from_pretrained(
-            model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
+            model_path,
+            torch_dtype=dtype,
+            token=token,
+            local_files_only=local_files_only,
         )
         model = UninitializedLlamaForCausalLM(config)
         model = model.to(dtype=dtype)

@@ -13,7 +13,9 @@ from .config import config
 from .model_adapter import LayerAdapter, ModelAdapter
 
 
-def get_layer0_inputs(model_adapter: ModelAdapter, batch: Tensor) -> tuple[Tensor, tuple, dict[str, Any]]:
+def get_layer0_inputs(
+    model_adapter: ModelAdapter, batch: Tensor
+) -> tuple[Tensor, tuple, dict[str, Any]]:
     """
     Returns the inputs to the first layer of the model (after embeddings).
 
@@ -58,15 +60,15 @@ def get_layer0_inputs(model_adapter: ModelAdapter, batch: Tensor) -> tuple[Tenso
     kwargs = layer0_catcher.saved_kwargs
 
     # put the caught stuff on cpu
-    args = utils.map_tensors(args, device='cpu')
-    kwargs = utils.map_tensors(kwargs, device='cpu')
+    args = utils.map_tensors(args, device="cpu")
+    kwargs = utils.map_tensors(kwargs, device="cpu")
 
     # put the layer back to normal
     model_adapter.set_raw_layer_at(0, layer0_adapter.layer)
 
     # Move embeddings back to cpu, and clear GPU cache.
     for W in model_adapter.get_embeddings():
-        W.weight = torch.nn.Parameter(W.weight.to('cpu'))
+        W.weight = torch.nn.Parameter(W.weight.to("cpu"))
 
     # Run GC and cleanup GPU memory
     utils.cleanup_memory()
@@ -75,7 +77,9 @@ def get_layer0_inputs(model_adapter: ModelAdapter, batch: Tensor) -> tuple[Tenso
 
 
 def get_signals(
-    layer_adapter: LayerAdapter, layer_args: list[tuple], layer_kwargs: list[dict[str, Any]]
+    layer_adapter: LayerAdapter,
+    layer_args: list[tuple],
+    layer_kwargs: list[dict[str, Any]],
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     Take the input signals ("activations") for a layer, run the layer forward.
@@ -93,7 +97,9 @@ def get_signals(
     second_layernorm = layer_adapter.get_second_layernorm()
     assert isinstance(second_layernorm, RMSN)
     hook = second_layernorm.register_forward_hook(hook_fn)
-    for i, (layer_args_batch, layer_kwargs_batch) in enumerate(zip(layer_args, layer_kwargs)):
+    for i, (layer_args_batch, layer_kwargs_batch) in enumerate(
+        zip(layer_args, layer_kwargs)
+    ):
         layer_args_batch, layer_kwargs_batch = utils.map_tensors(
             [layer_args_batch, layer_kwargs_batch], device=config.device
         )
@@ -104,7 +110,9 @@ def get_signals(
         outputs.append(out)
 
         if mlp_ln_inputs[i].ndim == 2:
-            batch_size, seqlen, _ = out.shape  # both batch_size and seqlen are can vary from batch to batch
+            batch_size, seqlen, _ = (
+                out.shape
+            )  # both batch_size and seqlen are can vary from batch to batch
             mlp_ln_inputs[i] = mlp_ln_inputs[i].reshape(batch_size, seqlen, -1)
 
     hook.remove()
