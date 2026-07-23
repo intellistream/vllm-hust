@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Download and convert the Mooncake conversation trace for the PP benchmark."""
 
 from __future__ import annotations

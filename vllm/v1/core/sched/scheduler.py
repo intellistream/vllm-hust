@@ -839,13 +839,18 @@ class Scheduler(SchedulerInterface):
     def _get_pp_opt_active_microbatch_ids(
         self, in_flight_ids: set[int] | None = None
     ) -> list[int]:
-        active_ids = set(self._get_pp_opt_base_active_microbatch_ids())
-        if in_flight_ids is None:
-            in_flight_ids = getattr(self, "_pp_opt_last_in_flight_ids", set())
-        first_scheduled_req_ids = getattr(self, "pp_opt_first_scheduled_req_ids", set())
+        active_ids: set[int] = set(self._get_pp_opt_base_active_microbatch_ids())
+        resolved_in_flight_ids: set[int] = (
+            getattr(self, "_pp_opt_last_in_flight_ids", set())
+            if in_flight_ids is None
+            else in_flight_ids
+        )
+        first_scheduled_req_ids: set[str] = getattr(
+            self, "pp_opt_first_scheduled_req_ids", set()
+        )
         active_ids.update(
             microbatch_id
-            for microbatch_id in in_flight_ids
+            for microbatch_id in resolved_in_flight_ids
             if microbatch_id in self.pp_opt_microbatches
         )
         active_ids.update(
@@ -944,10 +949,13 @@ class Scheduler(SchedulerInterface):
             request = self.waiting.pop_request()
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED)
-            request.num_external_computed_tokens = num_external_computed_tokens
             request.num_computed_tokens = num_external_computed_tokens
-            if getattr(request, "num_cached_tokens", -1) < 0:
-                request.num_cached_tokens = num_external_computed_tokens
+            if request.prefill_stats is not None:
+                request.prefill_stats.set(
+                    num_prompt_tokens=request.num_prompt_tokens,
+                    num_local_cached_tokens=0,
+                    num_external_cached_tokens=num_external_computed_tokens,
+                )
             self._add_request_to_pp_opt_microbatch(request, microbatch)
             logger.debug(
                 "PP optimization admitted request %s to microbatch %d: "
@@ -1269,8 +1277,8 @@ class Scheduler(SchedulerInterface):
                 new_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                 new_reqs.append(request)
             else:
-                new_blocks = self.kv_cache_manager.allocate_slots(request, 1)
-                if new_blocks is None:
+                allocated_blocks = self.kv_cache_manager.allocate_slots(request, 1)
+                if allocated_blocks is None:
                     logger.debug(
                         "PP optimization KV allocation failed: microbatch_id=%d "
                         "request_id=%s",
@@ -1278,6 +1286,7 @@ class Scheduler(SchedulerInterface):
                         req_id,
                     )
                     continue
+                new_blocks = allocated_blocks
                 cached_reqs.append(request)
 
             scheduled_reqs.append(request)

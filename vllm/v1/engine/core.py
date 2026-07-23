@@ -156,7 +156,7 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
-        self.scheduler.available_kv_cache_memory_bytes = (
+        self.scheduler.available_kv_cache_memory_bytes = (  # type: ignore[attr-defined]
             self.available_gpu_memory_for_kv_cache
             if self.available_gpu_memory_for_kv_cache >= 0
             else None
@@ -657,9 +657,10 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        pp_scheduler = cast(Any, self.scheduler)
 
-        if self.scheduler.has_requests_pp_opt():
-            new_microbatch_id = self.scheduler.select_microbatch_pp_opt(
+        if pp_scheduler.has_requests_pp_opt():
+            new_microbatch_id = pp_scheduler.select_microbatch_pp_opt(
                 self.in_flight_microbatch_ids
             )
             if new_microbatch_id is not None:
@@ -667,7 +668,7 @@ class EngineCore:
                     "Schedule PP optimization microbatch %s", new_microbatch_id
                 )
                 self.in_flight_microbatch_ids.add(new_microbatch_id)
-                scheduler_output = self.scheduler.schedule_pp_opt(new_microbatch_id)
+                scheduler_output = pp_scheduler.schedule_pp_opt(new_microbatch_id)
                 scheduler_output.microbatch_id = new_microbatch_id
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -717,7 +718,7 @@ class EngineCore:
                 raise RuntimeError("unexpected error")
 
         self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output_pp_opt(
+        engine_core_outputs = pp_scheduler.update_from_output_pp_opt(
             scheduler_output, model_output
         )
 

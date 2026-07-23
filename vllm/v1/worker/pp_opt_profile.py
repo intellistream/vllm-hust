@@ -237,7 +237,10 @@ def _rank_output_path(record: ProfileRecord) -> Path:
     if cached is not None:
         return cached
 
-    base = Path(envs_vllm.VLLM_PROFILE_PP_OPT_OUTPUT_PATH)
+    configured_path = envs_vllm.VLLM_PROFILE_PP_OPT_OUTPUT_PATH
+    if not configured_path:
+        raise RuntimeError("VLLM_PROFILE_PP_OPT_OUTPUT_PATH is not configured")
+    base = Path(configured_path)
     suffix = base.suffix or ".csv"
     stem = base.stem if base.suffix else base.name
     output_path = base.with_name(
@@ -253,7 +256,10 @@ def _sample_tokens_output_path(pp_rank: int, tp_rank: int) -> Path:
     if cached is not None:
         return cached
 
-    base = Path(envs_vllm.VLLM_PROFILE_PP_OPT_OUTPUT_PATH)
+    configured_path = envs_vllm.VLLM_PROFILE_PP_OPT_OUTPUT_PATH
+    if not configured_path:
+        raise RuntimeError("VLLM_PROFILE_PP_OPT_OUTPUT_PATH is not configured")
+    base = Path(configured_path)
     suffix = base.suffix or ".csv"
     stem = base.stem if base.suffix else base.name
     output_path = base.with_name(

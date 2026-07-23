@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fail unless each PP-opt regression-gate result matches or beats baseline."""
 
 from __future__ import annotations

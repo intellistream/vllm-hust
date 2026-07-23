@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compare PP-stage compactness from Ascend PyTorch Profiler traces."""
 
 from __future__ import annotations

@@ -832,10 +832,17 @@ def test_engine_core_pp_opt_path_calls_scheduler_pp_opt_methods():
 
     calls: list[str] = []
     scheduler = Mock()
-    scheduler.has_requests_pp_opt.side_effect = lambda: calls.append("has") or True
-    scheduler.select_microbatch_pp_opt.side_effect = (
-        lambda in_flight_ids: calls.append(f"select:{sorted(in_flight_ids)}") or 2
-    )
+
+    def has_requests_pp_opt() -> bool:
+        calls.append("has")
+        return True
+
+    def select_microbatch_pp_opt(in_flight_ids: set[int]) -> int:
+        calls.append(f"select:{sorted(in_flight_ids)}")
+        return 2
+
+    scheduler.has_requests_pp_opt.side_effect = has_requests_pp_opt
+    scheduler.select_microbatch_pp_opt.side_effect = select_microbatch_pp_opt
 
     def schedule_pp_opt(microbatch_id: int):
         calls.append(f"schedule:{microbatch_id}")

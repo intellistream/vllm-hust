@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Plot baseline and PP-opt generation throughput for the benchmark matrix."""
 
 from __future__ import annotations
