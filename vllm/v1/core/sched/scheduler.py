@@ -18,7 +18,11 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
-from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
+from vllm.distributed.kv_events import (
+    EventPublisherFactory,
+    KVEventBatch,
+    PrefixCacheEventUploaderFactory,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -54,6 +58,10 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.victim_selector import (
+    get_victim_selector,
+    infer_kv_utilization_from_scheduler,
+)
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -157,9 +165,9 @@ class Scheduler(SchedulerInterface):
             else self.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
-        self.enable_kv_cache_events = (
-            self.kv_events_config is not None
-            and self.kv_events_config.enable_kv_cache_events
+        self.enable_kv_cache_events = self.kv_events_config is not None and (
+            self.kv_events_config.enable_kv_cache_events
+            or self.kv_events_config.prefix_cache_upload_endpoint is not None
         )
         self.available_kv_cache_memory_bytes: int | None = None
         # Diffusion models may not sample any tokens for a denoising step.
@@ -228,6 +236,9 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # Victim selector (pluggable via vllm.victim_selector entry point).
+        self.victim_selector = get_victim_selector(self.vllm_config)
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -315,6 +326,20 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+        )
+        prefix_cache_snapshot = (
+            self.kv_cache_manager.get_prefix_cache_snapshot(
+                node_id="",
+                data_parallel_rank=self.parallel_config.data_parallel_index,
+            )
+            if self.kv_events_config is not None
+            and self.kv_events_config.prefix_cache_upload_endpoint is not None
+            else None
+        )
+        self.prefix_cache_event_uploader = PrefixCacheEventUploaderFactory.create(
+            self.kv_events_config,
+            self.parallel_config.data_parallel_index,
+            initial_snapshot=prefix_cache_snapshot,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1487,33 +1512,32 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
+                    # Preempt a victim via pluggable selector.
+                    preempted_req = self.victim_selector.pick_victim(
+                        self.running,
+                        self.policy,
+                        kv_utilization=infer_kv_utilization_from_scheduler(self),
+                        now_s=scheduled_timestamp,
+                    )
+                    self.running.remove(preempted_req)
+                    if preempted_req in scheduled_running_reqs:
+                        preempted_req_id = preempted_req.request_id
+                        scheduled_running_reqs.remove(preempted_req)
+                        token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                        req_to_new_blocks.pop(preempted_req_id)
+                        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
                         )
-                        self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
+                        if preempted_encoder_inputs:
+                            # Restore encoder compute budget if the preempted
+                            # request had encoder inputs scheduled in this step.
+                            num_embeds_to_restore = sum(
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
                             )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
-                    else:
-                        preempted_req = self.running.pop()
+                            encoder_compute_budget += num_embeds_to_restore
+                        req_index -= 1
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
@@ -1867,7 +1891,22 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    break
+                    if self.running:
+                        # Running requests will free blocks when they
+                        # complete; stop here to preserve queue-order
+                        # admission.
+                        break
+                    # Nothing is running, so no future event frees blocks and
+                    # stopping at this request would freeze this state
+                    # permanently. Requests behind this one may hold blocks
+                    # while parked (async KV loads in WAITING_FOR_REMOTE_KVS)
+                    # and are only promoted when this traversal reaches them.
+                    # Keep scanning so they can be promoted, scheduled, and
+                    # eventually free the blocks this request needs.
+                    # See https://github.com/vllm-project/vllm/issues/45388
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -2071,6 +2110,10 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        if preempted_reqs:
+            self.victim_selector.emit_observability_log(logger, self.__class__.__name__)
+
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2764,6 +2807,7 @@ class Scheduler(SchedulerInterface):
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+            self.prefix_cache_event_uploader.publish(batch)
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
@@ -3292,6 +3336,8 @@ class Scheduler(SchedulerInterface):
         logger.debug_once("[shutdown] Scheduler: start")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
+        if self.prefix_cache_event_uploader:
+            self.prefix_cache_event_uploader.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
 
