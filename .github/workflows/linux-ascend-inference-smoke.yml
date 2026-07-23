@@ -1,11 +1,10 @@
 name: Linux Ascend Inference Smoke Test
 
 on:
-  # pull_request:
-  #   types: [labeled]
-  # workflow_dispatch:
-  push:
-    branches: [dev]
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
