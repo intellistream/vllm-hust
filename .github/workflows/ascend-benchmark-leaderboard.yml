@@ -549,6 +549,31 @@ jobs:
             done
 
             echo "Failed to clone $repo_url after ${attempts} attempts" >&2
+
+            # The self-hosted runner's Git smart-HTTP mirror can lag behind
+            # GitHub's pull-request refs. The benchmark still needs the exact
+            # event source tree, so fall back to GitHub's SHA-addressed archive.
+            # Keep an origin remote: later steps may fetch main for Stage 2.
+            local repo_slug=${repo_url#https://github.com/}
+            repo_slug=${repo_slug%.git}
+            rm -rf "$temp_dir"
+            mkdir -p "$temp_dir"
+            if curl --fail --location --retry 3 --retry-all-errors \
+              "https://codeload.github.com/${repo_slug}/tar.gz/${target_sha}" \
+              | tar -xz --strip-components=1 -C "$temp_dir"; then
+              test -f "$temp_dir/pyproject.toml"
+              git -C "$temp_dir" init -q
+              git -C "$temp_dir" remote add origin "$repo_url"
+              git -C "$temp_dir" add -A
+              git -C "$temp_dir" -c user.name=ci -c user.email=ci@localhost \
+                commit -qm "CI source snapshot ${target_sha}"
+              rm -rf "$target_dir"
+              mv "$temp_dir" "$target_dir"
+              echo "Checked out SHA-addressed codeload snapshot: $target_sha"
+              return 0
+            fi
+
+            echo "Codeload fallback failed for $target_sha" >&2
             return 1
           }
 
@@ -590,7 +615,17 @@ jobs:
           }
 
           fetch_with_retry --deepen=500 origin main || fetch_with_retry --unshallow origin main || true
-          fetch_with_retry --no-tags origin "$PR_HEAD_SHA" "$PR_BASE_SHA"
+          if ! fetch_with_retry --no-tags origin "$PR_HEAD_SHA" "$PR_BASE_SHA"; then
+            # The source archive fallback above intentionally has no upstream
+            # ancestry. Use the exact PR base SHA for Stage 1 instead of
+            # pretending that the synthetic snapshot has a Git fork point.
+            # Stage 2 will either fetch main successfully or record a rebase
+            # conflict, both of which preserve a fail-closed performance gate.
+            echo "PR refs unavailable from the runner mirror; using PR base SHA as the conservative fork point." >&2
+            echo "FORK_POINT=$PR_BASE_SHA" >> "$GITHUB_ENV"
+            echo "Fork point fallback: $PR_BASE_SHA"
+            exit 0
+          fi
           git checkout --force "$PR_HEAD_SHA"
           fork_point="$(git merge-base "$PR_HEAD_SHA" "$PR_BASE_SHA")"
           echo "FORK_POINT=$fork_point" >> "$GITHUB_ENV"
