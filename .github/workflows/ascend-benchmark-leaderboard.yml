@@ -526,6 +526,7 @@ jobs:
             mkdir -p "$parent_dir"
             rm -rf "$temp_dir"
             while [[ "$try" -le "$attempts" ]]; do
+              mkdir -p "$temp_dir"
               if git -C "$temp_dir" -c init.defaultBranch=main init \
                 && git -C "$temp_dir" remote add origin "$repo_url" \
                 && timeout --foreground "${timeout_seconds}s" git -C "$temp_dir" \
