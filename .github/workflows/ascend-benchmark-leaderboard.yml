@@ -713,6 +713,15 @@ jobs:
 
       - name: Checkout website repo
         run: |
+          # The website repository is only consumed by the optional benchmark
+          # publication script. PR/report runs never publish, so do not make
+          # their NPU validation depend on a separate GitHub HTTPS checkout.
+          if [[ "$PUBLISH_TO_BENCHMARK_REPO" != "1" ]]; then
+            mkdir -p "$GITHUB_WORKSPACE/vllm-hust-website"
+            echo "Skipping website checkout because benchmark publication is disabled."
+            exit 0
+          fi
+
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
