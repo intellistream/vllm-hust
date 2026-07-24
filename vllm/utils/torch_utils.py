@@ -48,7 +48,9 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_4bit_nc": torch.uint8,
     "turboquant_k3v4_nc": torch.uint8,
     "turboquant_3bit_nc": torch.uint8,
+    "int4": torch.uint8,
     "nvfp4": torch.uint8,
+    "fp4_e2m1": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -76,7 +78,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
         kv_cache_dtype.startswith("fp8")
         or kv_cache_dtype.endswith("per_token_head")
-        or kv_cache_dtype == "nvfp4"
+        or kv_cache_dtype in ("nvfp4", "int4", "fp4_e2m1")
     )
 
 
@@ -409,6 +411,23 @@ def set_random_seed(seed: int | None) -> None:
         from vllm.platforms import current_platform
 
         current_platform.manual_seed_all(seed)
+
+
+def int4_kv_cache_full_dim(head_size: int) -> int:
+    """Packed last dim for INT4 KV cache: 2×int4 per byte."""
+    return head_size // 2
+
+
+def fp4_e2m1_kv_cache_full_dim(head_size: int) -> int:
+    """Packed last dim for FP4 E2M1 KV cache: fp4 data + fp8 block scales.
+
+    Uses block microscaling with block size 16: 16 fp4 elements (8 bytes)
+    + 1 fp8 scale (1 byte) per block.
+    """
+    num_blocks = (head_size + 15) // 16
+    data_bytes = num_blocks * 8  # 16 fp4 elements packed into 8 bytes
+    scale_bytes = num_blocks * 1  # 1 fp8 scale per block
+    return data_bytes + scale_bytes
 
 
 def nvfp4_kv_cache_full_dim(head_size: int) -> int:

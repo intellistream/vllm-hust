@@ -43,6 +43,8 @@ class KVQuantMode(IntEnum):
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
     NVFP4 = 5  # packed fp4 data + fp8 block scales
+    INT4 = 6  # 4-bit integer quantization, per-token-head dynamic scale
+    FP4_E2M1 = 7  # FP4 E2M1 microscaling format
 
     @property
     def is_per_token_head(self) -> bool:
@@ -67,8 +69,12 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
+    if kv_cache_dtype == "int4":
+        return KVQuantMode.INT4
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
+    if kv_cache_dtype == "fp4_e2m1":
+        return KVQuantMode.FP4_E2M1
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
