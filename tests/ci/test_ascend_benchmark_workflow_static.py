@@ -10,10 +10,18 @@ WORKFLOW_PATH = (
     Path(__file__).resolve().parents[2]
     / ".github/workflows/ascend-benchmark-leaderboard.yml"
 )
+RUNNER_SCRIPT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / ".github/workflows/scripts/run_ascend_benchmark_scenario_list.sh"
+)
 
 
 def workflow_text() -> str:
     return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+
+def runner_script_text() -> str:
+    return RUNNER_SCRIPT_PATH.read_text(encoding="utf-8")
 
 
 def workflow_yaml() -> dict:
@@ -108,16 +116,37 @@ def test_benchmark_repo_default_ref_is_main():
     ) in text
 
 
-def test_pr_checkout_urls_use_https_without_publish_ssh_key():
+def test_pr_and_manual_checkout_urls_use_https_without_publish_ssh_key():
     text = workflow_text()
 
     assert "format('https://github.com/{0}.git', github.repository)" in text
     assert "format('git@github.com:{0}.git', github.repository)" in text
-    assert (
-        "github.event_name == 'pull_request' || github.event_name == 'issue_comment'"
-    ) in text
+    read_only_events = (
+        "github.event_name == 'pull_request' || github.event_name == "
+        "'issue_comment' || github.event_name == 'workflow_dispatch'"
+    )
+    assert text.count(read_only_events) >= 5
     assert "https://github.com/vLLM-HUST/vllm-hust-benchmark.git" in text
     assert "https://github.com/vLLM-HUST/vllm-ascend-hust.git" in text
+
+
+def test_benchmark_checkout_retries_have_hard_network_timeouts():
+    text = workflow_text()
+    checkout_block = text[
+        text.index("      - name: Checkout target repo with retry") : text.index(
+            "      - name: Prepare Hugging Face cache directories"
+        )
+    ]
+
+    assert "GIT_CHECKOUT_RETRY_ATTEMPTS:-3" in checkout_block
+    assert "GIT_CHECKOUT_TIMEOUT_SECONDS:-90" in checkout_block
+    assert checkout_block.count('timeout --foreground "${timeout_seconds}s"') >= 6
+
+
+def test_benchmark_disables_hugging_face_xet_downloads():
+    text = workflow_text()
+
+    assert 'HF_HUB_DISABLE_XET: "1"' in text
 
 
 def test_benchmark_install_removes_conflicting_vllm_provider():
@@ -171,8 +200,8 @@ def test_main_benchmark_defaults_match_ascend_main_config():
     assert "PERFGATE_SPEC_FILE: ${{ vars.VLLM_HUST_PERFGATE_SPEC_FILE || '' }}" in text
     assert "VLLM_HUST_PERFGATE_HARDWARE_CHIP_MODEL" in text
     assert (
-        "HARDWARE_CHIP_MODEL: ${{ vars.VLLM_HUST_PERFGATE_HARDWARE_CHIP_MODEL || '910B2' }}"
-        in text
+        "HARDWARE_CHIP_MODEL: ${{ "
+        "vars.VLLM_HUST_PERFGATE_HARDWARE_CHIP_MODEL || '910B2' }}" in text
     )
     assert "Resolve perfgate spec for Ascend runner" in text
     assert "Resolve main same-spec file" in text
@@ -201,6 +230,19 @@ def test_schedule_runs_registered_multi_scenario_benchmark_publish():
         "visionarena-online",
     ):
         assert scenario in text
+
+
+def test_multi_scenario_runner_prints_failure_diagnostics():
+    text = runner_script_text()
+
+    assert "scenario.log" in text
+    assert ') 2>&1 | tee "$scenario_log"' in text
+    assert "scenario_exit_code=${PIPESTATUS[0]}" in text
+    assert "print_multi_scenario_summary" in text
+    assert "Failed Ascend benchmark scenario diagnostics" in text
+    assert 'print_file_tail "scenario output"' in text
+    assert 'print_file_tail "vLLM server log"' in text
+    assert 'print_file_tail "runner preflight failure"' in text
 
 
 def test_benchmark_script_does_not_force_max_model_len():
@@ -233,15 +275,18 @@ def test_benchmark_runner_supports_registry_same_spec_scenarios():
 
     assert 'if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then' in script
     same_spec_block = script[
-        script.index('if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then') :
-        script.index('else', script.index('if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'))
+        script.index(
+            'if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'
+        ) : script.index(
+            "else", script.index('if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then')
+        )
     ]
     assert "EFFECTIVE_CONSTRAINTS_FILE=$SAME_SPEC_CONSTRAINTS_FILE" in same_spec_block
     assert "bench_args=()" in same_spec_block
-    assert 'Unsupported BENCH_SCENARIO without same-spec mode' in script
+    assert "Unsupported BENCH_SCENARIO without same-spec mode" in script
     assert (
-        'if [[ "$BENCH_SCENARIO" == "random-online" && "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then'
-        not in script
+        'if [[ "$BENCH_SCENARIO" == "random-online" && '
+        '"$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then' not in script
     )
 
 
@@ -419,6 +464,24 @@ def test_workflow_dispatch_metadata_lengths_are_parsed_from_single_input():
     assert "inputs.output_length" not in text
 
 
+def test_pr_and_comment_runs_target_dedicated_npu_two():
+    text = workflow_text()
+
+    assert (
+        "(github.event_name == 'pull_request' || "
+        "github.event_name == 'issue_comment') && 'npu-2'"
+    ) in text
+
+
+def test_workflow_dispatch_targets_manual_runner_pool():
+    text = workflow_text()
+
+    assert (
+        "github.event_name == 'workflow_dispatch' && "
+        "(vars.VLLM_HUST_MANUAL_RUNNER_LABEL || 'npu-1')"
+    ) in text
+
+
 def test_l3_benchmark_publish_preflight_runs_before_benchmark():
     text = workflow_text()
 
@@ -449,8 +512,10 @@ def test_target_checkout_uses_resilient_git_http_retry_settings():
         )
     ]
 
-    assert "GIT_CHECKOUT_RETRY_ATTEMPTS:-6" in checkout_step
+    assert "GIT_CHECKOUT_RETRY_ATTEMPTS:-3" in checkout_step
     assert "GIT_CHECKOUT_RETRY_DELAY_SECONDS:-30" in checkout_step
+    assert "GIT_CHECKOUT_TIMEOUT_SECONDS:-90" in checkout_step
+    assert 'timeout --foreground "${timeout_seconds}s"' in checkout_step
     assert "-c http.version=HTTP/1.1" in checkout_step
     assert "-c http.lowSpeedLimit=1024" in checkout_step
     assert "-c http.lowSpeedTime=30" in checkout_step
@@ -458,6 +523,10 @@ def test_target_checkout_uses_resilient_git_http_retry_settings():
 
 def test_ascend_torch_stack_is_installed_before_preinstall_preflight():
     text = workflow_text()
+    ensure_script = (
+        Path(__file__).resolve().parents[2]
+        / ".github/workflows/scripts/ensure_ascend_torch_stack.sh"
+    ).read_text(encoding="utf-8")
 
     install_step = text.index("      - name: Install Ascend torch stack for preflight")
     preinstall_preflight_step = text.index(
@@ -465,8 +534,15 @@ def test_ascend_torch_stack_is_installed_before_preinstall_preflight():
     )
 
     assert install_step < preinstall_preflight_step
-    assert '"torch==2.9.0" "torch-npu==2.9.0"' in text
-    assert "import torch, torch_npu" in text
+    assert "bash .github/workflows/scripts/ensure_ascend_torch_stack.sh" in text
+    assert 'ASCEND_TORCH_VERSION="${ASCEND_TORCH_VERSION:-2.10.0}"' in ensure_script
+    assert (
+        'ASCEND_TORCH_NPU_VERSION="${ASCEND_TORCH_NPU_VERSION:-2.10.0}"'
+        in ensure_script
+    )
+    assert "import torch" in ensure_script
+    assert "import torch_npu" in ensure_script
+    assert "torch_npu probe failed" in text
 
 
 def test_l2_targeted_scenario_registry_is_covered_by_parser_tests():
