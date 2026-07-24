@@ -122,6 +122,31 @@ jobs:
             done
 
             echo "Failed to clone $repo_url after ${attempts} attempts" >&2
+
+            # Some self-hosted runners use a delayed Git smart-HTTP mirror:
+            # the event SHA exists on GitHub but its ref is temporarily absent
+            # from the runner's advertised refs.  Smoke only needs the exact
+            # source tree, not Git history, so use GitHub's SHA-addressed
+            # codeload archive as a fail-closed fallback.
+            local repo_slug=${repo_url#https://github.com/}
+            repo_slug=${repo_slug%.git}
+            rm -rf "$temp_dir"
+            mkdir -p "$temp_dir"
+            if curl --fail --location --retry 3 --retry-all-errors \
+              "https://codeload.github.com/${repo_slug}/tar.gz/${target_sha}" \
+              | tar -xz --strip-components=1 -C "$temp_dir"; then
+              test -f "$temp_dir/pyproject.toml"
+              git -C "$temp_dir" init -q
+              git -C "$temp_dir" add -A
+              git -C "$temp_dir" -c user.name=ci -c user.email=ci@localhost \
+                commit -qm "CI source snapshot ${target_sha}"
+              rm -rf "$target_dir"
+              mv "$temp_dir" "$target_dir"
+              echo "Checked out SHA-addressed codeload snapshot: $target_sha"
+              return 0
+            fi
+
+            echo "Codeload fallback failed for $target_sha" >&2
             return 1
           }
 
