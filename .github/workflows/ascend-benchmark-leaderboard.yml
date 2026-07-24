@@ -713,15 +713,6 @@ jobs:
 
       - name: Checkout website repo
         run: |
-          # The website repository is only consumed by the optional benchmark
-          # publication script. PR/report runs never publish, so do not make
-          # their NPU validation depend on a separate GitHub HTTPS checkout.
-          if [[ "$PUBLISH_TO_BENCHMARK_REPO" != "1" ]]; then
-            mkdir -p "$GITHUB_WORKSPACE/vllm-hust-website"
-            echo "Skipping website checkout because benchmark publication is disabled."
-            exit 0
-          fi
-
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
@@ -744,6 +735,24 @@ jobs:
             done
 
             echo "Failed to clone $repo_url after ${attempts} attempts" >&2
+
+            # The PR benchmark still uses the website's aggregation script to
+            # build local leaderboard data, but it does not need website Git
+            # history.  Use codeload when this runner cannot reach GitHub's
+            # smart-HTTP endpoint.
+            local repo_slug=${repo_url#https://github.com/}
+            repo_slug=${repo_slug%.git}
+            rm -rf "$target_dir"
+            mkdir -p "$target_dir"
+            if curl --fail --location --retry 3 --retry-all-errors \
+              "https://codeload.github.com/${repo_slug}/tar.gz/main" \
+              | tar -xz --strip-components=1 -C "$target_dir"; then
+              test -f "$target_dir/scripts/aggregate_results.py"
+              echo "Checked out website source through codeload fallback."
+              return 0
+            fi
+
+            echo "Website codeload fallback failed for ${repo_slug}" >&2
             return 1
           }
 
