@@ -12,7 +12,7 @@ SliceGPT implementation from Microsoft:
 The upstream project is distributed under the MIT License.  Its copyright and
 license are preserved below and in vendored source-file headers.
 
-```
+```text
 MIT License
 
 Copyright (c) Microsoft Corporation.

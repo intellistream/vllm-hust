@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 import logging
@@ -99,8 +101,8 @@ def distribute_model(model_adapter: ModelAdapter) -> None:
 
 def sync_gpus() -> None:
     """Sync all GPUs to make sure all operations are finished, needed for correct benchmarking of latency/throughput."""
-    for i in range(torch.cuda.device_count()):
-        torch.cuda.synchronize(device=i)
+    for i in range(torch.accelerator.device_count()):
+        torch.accelerator.synchronize(device=i)
 
 
 def benchmark(model_adapter: ModelAdapter, input_batch: torch.Tensor) -> dict:

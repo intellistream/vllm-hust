@@ -314,7 +314,10 @@ jobs:
       PUBLISH_TO_BENCHMARK_REPO: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.VLLM_HUST_PUBLISH_BENCHMARK_ON_MAIN == '1') || (github.event_name == 'schedule' && vars.VLLM_HUST_SCHEDULE_PUBLISH_BENCHMARK != '0') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_benchmark_repo)) && '1' || '0' }}
       PUBLISH_TO_HF: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_to_hf && secrets.HF_TOKEN != '') && '1' || '0' }}
       TARGET_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && format('https://github.com/{0}.git', github.repository) || format('git@github.com:{0}.git', github.repository) }}
-      TARGET_REPO_SHA: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_head_sha || github.sha }}
+      # A pull_request run's github.sha is a synthetic merge object. It may be
+      # regenerated before this self-hosted runner fetches it, whereas the PR
+      # head SHA is immutable and can always be fetched from origin.
+      TARGET_REPO_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_head_sha || github.sha }}
       BENCHMARK_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && 'https://github.com/vLLM-HUST/vllm-hust-benchmark.git' || 'git@github.com:vLLM-HUST/vllm-hust-benchmark.git' }}
       BENCHMARK_REPO_SLUG: vLLM-HUST/vllm-hust-benchmark
       BENCHMARK_REPO_GH_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN || '' }}

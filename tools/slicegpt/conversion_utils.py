@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 """Strict validation helpers shared by SliceGPT checkpoint converters."""
@@ -98,9 +100,7 @@ def normalize_slicing_conf(raw: Mapping[str, object], num_layers: int) -> dict:
     return normalized
 
 
-def validate_state_keys(
-    state: Mapping[str, object], expected: set[str]
-) -> None:
+def validate_state_keys(state: Mapping[str, object], expected: set[str]) -> None:
     """Reject missing, unsupported, and non-tensor checkpoint entries."""
 
     missing = expected.difference(state)
@@ -143,9 +143,7 @@ def validate_shape(name: str, tensor: torch.Tensor, expected: tuple[int, ...]) -
         raise ValueError(f"{name}: shape {actual} != expected {expected}")
 
 
-def infer_attention_head_dim(
-    q_proj: torch.Tensor, num_attention_heads: int
-) -> int:
+def infer_attention_head_dim(q_proj: torch.Tensor, num_attention_heads: int) -> int:
     """Infer and validate the unmodified attention head dimension."""
     if num_attention_heads <= 0:
         raise ValueError(

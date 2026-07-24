@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
@@ -179,7 +181,10 @@ def process_slicing_args(args):
 def slicing_main(args: argparse.Namespace) -> None:
     logging.info("Running SliceGPT experiment.")
     logging.info(f"PyTorch device: {config.device}")
-    logging.info(f"Number of available cuda devices: {torch.cuda.device_count()}")
+    logging.info(
+        "Number of available accelerator devices: %s",
+        torch.accelerator.device_count(),
+    )
 
     try:
         wandb.init(

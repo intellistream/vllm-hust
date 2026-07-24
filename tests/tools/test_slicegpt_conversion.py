@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Focused contract tests for SliceGPT checkpoint conversion."""
 
 import json
@@ -66,10 +67,13 @@ def _state(*, attention_bias: bool) -> dict[str, torch.Tensor]:
     return state
 
 
-@pytest.mark.parametrize("converter,attention_bias,architecture", [
-    ("convert_slicegpt_to_vllm.py", False, "SliceGPTLlamaForCausalLM"),
-    ("convert_slicegpt_to_vllm_qwen2.py", True, "SliceGPTQwen2ForCausalLM"),
-])
+@pytest.mark.parametrize(
+    "converter,attention_bias,architecture",
+    [
+        ("convert_slicegpt_to_vllm.py", False, "SliceGPTLlamaForCausalLM"),
+        ("convert_slicegpt_to_vllm_qwen2.py", True, "SliceGPTQwen2ForCausalLM"),
+    ],
+)
 def test_converter_writes_only_validated_tensors(
     tmp_path: Path,
     converter: str,

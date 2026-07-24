@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
@@ -62,8 +64,8 @@ def cleanup_memory() -> None:
 
     def total_reserved_mem() -> int:
         return sum(
-            torch.cuda.memory_reserved(device=i)
-            for i in range(torch.cuda.device_count())
+            torch.accelerator.memory_reserved(device=i)
+            for i in range(torch.accelerator.device_count())
         )
 
     memory_before = total_reserved_mem()
@@ -71,8 +73,8 @@ def cleanup_memory() -> None:
     # gc.collect and empty cache are necessary to clean up GPU memory if the model was distributed
     gc.collect()
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if torch.accelerator.is_available():
+        torch.accelerator.empty_cache()
         memory_after = total_reserved_mem()
         logging.debug(
             f"GPU memory{caller_name}: {memory_before / (1024**3):.2f} -> {memory_after / (1024**3):.2f} GB"
