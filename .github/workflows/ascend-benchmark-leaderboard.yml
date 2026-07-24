@@ -314,9 +314,9 @@ jobs:
       PUBLISH_TO_BENCHMARK_REPO: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.VLLM_HUST_PUBLISH_BENCHMARK_ON_MAIN == '1') || (github.event_name == 'schedule' && vars.VLLM_HUST_SCHEDULE_PUBLISH_BENCHMARK != '0') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_benchmark_repo)) && '1' || '0' }}
       PUBLISH_TO_HF: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_to_hf && secrets.HF_TOKEN != '') && '1' || '0' }}
       TARGET_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && format('https://github.com/{0}.git', github.repository) || format('git@github.com:{0}.git', github.repository) }}
-      # A pull_request run's github.sha is a synthetic merge object. It may be
-      # regenerated before this self-hosted runner fetches it, whereas the PR
-      # head SHA is immutable and can always be fetched from origin.
+      # Fetch a stable named ref before checking out the head SHA. GitHub does
+      # not guarantee upload-pack access for an otherwise unreachable SHA.
+      TARGET_REPO_REF: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
       TARGET_REPO_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_head_sha || github.sha }}
       BENCHMARK_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && 'https://github.com/vLLM-HUST/vllm-hust-benchmark.git' || 'git@github.com:vLLM-HUST/vllm-hust-benchmark.git' }}
       BENCHMARK_REPO_SLUG: vLLM-HUST/vllm-hust-benchmark
@@ -512,6 +512,7 @@ jobs:
             local repo_url=$1
             local target_dir=$2
             local target_sha=$3
+            local target_ref=$4
             local attempts=${GIT_CHECKOUT_RETRY_ATTEMPTS:-3}
             local delay_seconds=${GIT_CHECKOUT_RETRY_DELAY_SECONDS:-30}
             local timeout_seconds=${GIT_CHECKOUT_TIMEOUT_SECONDS:-90}
@@ -525,18 +526,13 @@ jobs:
             mkdir -p "$parent_dir"
             rm -rf "$temp_dir"
             while [[ "$try" -le "$attempts" ]]; do
-              if timeout --foreground "${timeout_seconds}s" git \
-                -c http.version=HTTP/1.1 \
-                -c http.lowSpeedLimit=1024 \
-                -c http.lowSpeedTime=30 \
-                clone --depth 1 "$repo_url" "$temp_dir"; then
-                if ! git -C "$temp_dir" rev-parse --verify --quiet "$target_sha^{commit}" >/dev/null; then
-                  timeout --foreground "${timeout_seconds}s" git -C "$temp_dir" \
-                    -c http.version=HTTP/1.1 \
-                    -c http.lowSpeedLimit=1024 \
-                    -c http.lowSpeedTime=30 \
-                    fetch --depth 1 origin "$target_sha"
-                fi
+              if git -C "$temp_dir" -c init.defaultBranch=main init \
+                && git -C "$temp_dir" remote add origin "$repo_url" \
+                && timeout --foreground "${timeout_seconds}s" git -C "$temp_dir" \
+                  -c http.version=HTTP/1.1 \
+                  -c http.lowSpeedLimit=1024 \
+                  -c http.lowSpeedTime=30 \
+                  fetch --no-tags --depth 1 origin "$target_ref"; then
                 git -C "$temp_dir" checkout --force "$target_sha"
                 rm -rf "$target_dir"
                 mv "$temp_dir" "$target_dir"
@@ -555,7 +551,7 @@ jobs:
             return 1
           }
 
-          clone_with_retry "$TARGET_REPO_URL" "$GITHUB_WORKSPACE" "$TARGET_REPO_SHA"
+          clone_with_retry "$TARGET_REPO_URL" "$GITHUB_WORKSPACE" "$TARGET_REPO_SHA" "$TARGET_REPO_REF"
 
       - name: L3 benchmark publication preflight
         shell: bash

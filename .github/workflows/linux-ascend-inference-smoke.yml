@@ -44,10 +44,10 @@ jobs:
       ASCEND_E2E_ROOT_HELPER: ${{ vars.VLLM_HUST_ASCEND_E2E_ROOT_HELPER || '' }}
       SOC_VERSION: ascend910b3
       TARGET_REPO_URL: https://github.com/${{ github.repository }}.git
-      # Fetch the immutable PR head. The synthetic refs/pull/*/merge commit can
-      # be regenerated while a self-hosted runner is queued, so it is not a
-      # safe object to fetch and check out by SHA.
-      TARGET_REPO_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.sha }}
+      # Fetch GitHub's stable PR-head ref. Neither the synthetic merge ref nor
+      # a bare branch name is safe here: the former can be regenerated while a
+      # runner is queued and the latter is ambiguous for slash-containing refs.
+      TARGET_REPO_REF: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
       TARGET_REPO_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
       VLLM_ASCEND_HUST_REPO_URL: https://github.com/vLLM-HUST/vllm-ascend-hust.git
