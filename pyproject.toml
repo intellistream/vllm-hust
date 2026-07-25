@@ -56,6 +56,13 @@ include = ["vllm*"]
 
 [tool.ruff.lint.per-file-ignores]
 "vllm/third_party/**" = ["ALL"]
+# SliceGPT's construction implementation is an MIT-licensed upstream vendor;
+# its provenance and local changes are documented in tools/slicegpt/THIRD_PARTY_NOTICES.md.
+"tools/slicegpt/slicegpt/**" = ["ALL"]
+# The command front-end is kept source-compatible with the upstream CLI.  Its
+# long argparse help strings are intentionally not wrapped at runtime.
+"tools/slicegpt/run_slicegpt.py" = ["E501", "G004"]
+"tools/slicegpt/dryrun_check_shapes.py" = ["E501"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
 
