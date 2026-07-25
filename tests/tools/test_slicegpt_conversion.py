@@ -12,6 +12,8 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
+from vllm import ModelRegistry
+
 _TOOLS_DIR = Path(__file__).parents[2] / "tools" / "slicegpt"
 sys.path.insert(0, str(_TOOLS_DIR))
 
@@ -155,3 +157,29 @@ def test_slicegpt_models_fail_fast_for_pipeline_parallelism(model_cls) -> None:
 
     with pytest.raises(ValueError, match="does not support pipeline parallelism"):
         model_cls(vllm_config=vllm_config)
+
+
+@pytest.mark.parametrize(
+    ("architecture", "expected_cls"),
+    [
+        ("SliceGPTLlamaForCausalLM", SliceGPTLlamaForCausalLM),
+        ("SliceGPTQwen2ForCausalLM", SliceGPTQwen2ForCausalLM),
+    ],
+)
+def test_slicegpt_architectures_resolve_from_model_registry(
+    architecture: str,
+    expected_cls: type,
+) -> None:
+    model_config = MagicMock(
+        model_impl="vllm",
+        convert_type="none",
+        runner_type="generate",
+    )
+
+    model_cls, resolved_architecture = ModelRegistry.resolve_model_cls(
+        architecture,
+        model_config,
+    )
+
+    assert resolved_architecture == architecture
+    assert model_cls is expected_cls
