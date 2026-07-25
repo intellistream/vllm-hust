@@ -8,8 +8,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
 
-import numpy as np
-
 from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -2486,20 +2484,6 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
-    @staticmethod
-    def _get_generated_token_ids(
-        sampled_token_ids: list[list[int]] | np.ndarray,
-        req_index: int,
-        num_sampled_tokens: list[int] | np.ndarray | None,
-    ) -> list[int]:
-        if isinstance(sampled_token_ids, np.ndarray):
-            if num_sampled_tokens is None:
-                return sampled_token_ids[req_index].tolist()
-            num_tokens = int(num_sampled_tokens[req_index])
-            return sampled_token_ids[req_index, :num_tokens].tolist()
-
-        return sampled_token_ids[req_index] if sampled_token_ids else []
-
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -2513,9 +2497,7 @@ class Scheduler(SchedulerInterface):
             submit_block_scores(knorm_scores)
 
         sampled_token_ids = model_runner_output.sampled_token_ids
-        num_sampled_tokens = model_runner_output.num_sampled_tokens
         logprobs = model_runner_output.logprobs
-
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
@@ -2589,10 +2571,8 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
-            generated_token_ids = self._get_generated_token_ids(
-                sampled_token_ids,
-                req_index,
-                num_sampled_tokens,
+            generated_token_ids = (
+                sampled_token_ids[req_index] if sampled_token_ids else []
             )
 
             scheduled_spec_token_ids = (

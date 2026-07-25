@@ -836,8 +836,15 @@ def test_fcfs_finished_remote_load_not_stranded_by_capacity_head():
         block_size=16,
         max_model_len=160,
     )
-    scheduler = create_scheduler(vllm_config, num_blocks=10)
+    num_blocks = 10
+    num_usable_blocks = num_blocks - 1  # The block pool reserves one null block.
+    scheduler = create_scheduler(vllm_config, num_blocks=num_blocks)
     block_size = vllm_config.cache_config.block_size
+    block_pool = scheduler.kv_cache_manager.block_pool
+    req_to_blocks = scheduler.kv_cache_manager.coordinator.single_type_managers[
+        0
+    ].req_to_blocks
+    assert block_pool.get_num_free_blocks() == num_usable_blocks
 
     remote = create_request(
         request_id=2,
@@ -858,7 +865,8 @@ def test_fcfs_finished_remote_load_not_stranded_by_capacity_head():
     capacity_head = create_request(
         request_id=1,
         block_size=block_size,
-        num_tokens=block_size * 10,
+        # This request fits exactly when the remote load releases its blocks.
+        num_tokens=block_size * num_usable_blocks,
     )
     scheduler.add_request(capacity_head)
     scheduler.waiting.remove_request(capacity_head)
@@ -869,3 +877,18 @@ def test_fcfs_finished_remote_load_not_stranded_by_capacity_head():
     assert output.total_num_scheduled_tokens > 0
     assert remote.status == RequestStatus.RUNNING
     assert remote.request_id not in scheduler.finished_recving_kv_req_ids
+
+    # Completing the promoted request must release every scheduler-side owner
+    # before the original FCFS head is retried.
+    scheduler.update_from_output(
+        output, create_model_runner_output([remote], use_eos=True)
+    )
+    assert remote.request_id not in scheduler.requests
+    assert remote not in scheduler._inflight_prefills
+    assert remote.request_id not in scheduler.finished_recving_kv_req_ids
+    assert remote.request_id not in req_to_blocks
+    assert block_pool.get_num_free_blocks() == num_usable_blocks
+
+    head_output = scheduler.schedule()
+    assert capacity_head.status == RequestStatus.RUNNING
+    assert head_output.num_scheduled_tokens[capacity_head.request_id] > 0

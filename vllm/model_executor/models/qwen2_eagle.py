@@ -5,16 +5,19 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
-from transformers import LlamaConfig
+from transformers import Qwen2Config
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaForCausalLM
+from vllm.model_executor.models.qwen2 import (
+    Qwen2DecoderLayer as BaseQwen2DecoderLayer,
+)
+from vllm.model_executor.models.qwen2 import (
+    Qwen2ForCausalLM,
+)
 
 from .utils import (
     AutoWeightsLoader,
@@ -24,35 +27,33 @@ from .utils import (
     process_eagle_weight,
 )
 
-logger = init_logger(__name__)
 
-
-class LlamaDecoderLayer(LlamaDecoderLayer):
+class Qwen2EagleDecoderLayer(BaseQwen2DecoderLayer):
     def __init__(
         self,
         vllm_config: VllmConfig,
         disable_input_layernorm: bool,
         prefix: str = "",
-        config: LlamaConfig | None = None,
+        config: Qwen2Config | None = None,
     ) -> None:
-        super().__init__(vllm_config, prefix=prefix, config=config)
+        assert config is not None
+        super().__init__(
+            config=config,
+            cache_config=vllm_config.cache_config,
+            quant_config=get_draft_quant_config(vllm_config),
+            prefix=prefix,
+        )
 
-        # Skip the input_layernorm
-        # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
+        # Skip the input_layernorm for EAGLE first layer.
         if disable_input_layernorm:
             del self.input_layernorm
             self.input_layernorm = nn.Identity()
 
-    def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
-        """Use drafter's quantization config instead of verifier's."""
-        return get_draft_quant_config(vllm_config)
-
 
 @support_torch_compile
-class LlamaModel(nn.Module):
+class Qwen2Model(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
             ".q_proj": (".qkv_proj", "q"),
             ".k_proj": (".qkv_proj", "k"),
             ".v_proj": (".qkv_proj", "v"),
@@ -83,7 +84,7 @@ class LlamaModel(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(
+                Qwen2EagleDecoderLayer(
                     vllm_config,
                     i == 0,
                     prefix=maybe_prefix(prefix, f"layers.{i + start_layer_id}"),
@@ -95,7 +96,7 @@ class LlamaModel(nn.Module):
         self.fc = ReplicatedLinear(
             input_size=self.config.hidden_size * 2,
             output_size=self.config.hidden_size,
-            bias=False,
+            bias=True,
             params_dtype=vllm_config.model_config.dtype,
             quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "fc"),
@@ -128,7 +129,7 @@ class LlamaModel(nn.Module):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
-class EagleLlamaForCausalLM(LlamaForCausalLM):
+class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -141,7 +142,7 @@ class EagleLlamaForCausalLM(LlamaForCausalLM):
             vllm_config.parallel_config
         )
         self.config.target_layer_count = target_layer_num
-        self.model = LlamaModel(
+        self.model = Qwen2Model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,

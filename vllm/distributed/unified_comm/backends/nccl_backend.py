@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -34,6 +36,24 @@ from vllm.distributed.unified_comm.backend import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_DEFAULT_MULTI_NIC_ENABLE = True
+_DEFAULT_MULTI_NIC_COUNT = 8
+_DEFAULT_MULTI_NIC_QPS_PER_CONNECTION = 4
+_DEFAULT_MULTI_NIC_FORCE = False
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var with common truthy/falsey spellings."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _split_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 # ============================================================
@@ -133,13 +153,139 @@ class NCCLBackend(CommBackend):
     def is_available(self) -> bool:
         """检查当前环境是否有 CUDA + NCCL"""
         try:
-            return torch.cuda.is_available() and dist.is_nccl_available()
+            return torch.accelerator.is_available() and dist.is_nccl_available()
         except Exception:
             return False
 
     # ----------------------------------------------------------
     # 生命周期管理
     # ----------------------------------------------------------
+
+    def _discover_rdma_hcas(
+        self, ib_root: Path = Path("/sys/class/infiniband")
+    ) -> list[str]:
+        """Discover device names accepted by ``NCCL_IB_HCA``."""
+        if not ib_root.is_dir():
+            return []
+        with contextlib.suppress(OSError):
+            names = [entry.name for entry in ib_root.iterdir() if entry.is_dir()]
+            return sorted(names, key=lambda name: ("bond" not in name, name))
+        return []
+
+    def _maybe_enable_multi_nic_aggregation(
+        self,
+        config: CommConfig,
+    ) -> None:
+        """
+        在 NCCLBackend 内部启用多网卡带宽聚合。
+
+        开关：
+          - UNIFIED_COMM_NCCL_MULTI_NIC_ENABLE (默认 1)
+          - UNIFIED_COMM_NCCL_MULTI_NIC_COUNT (默认 8)
+          - UNIFIED_COMM_NCCL_MULTI_NIC_DEVICES (显式设备列表，逗号分隔)
+          - UNIFIED_COMM_NCCL_MULTI_NIC_FORCE (默认 0；为 1 时覆盖已存在 NCCL_IB_HCA)
+        """
+        # 允许通过 config.extra 覆盖环境变量，便于上层策略化控制
+        enabled = config.extra.get(
+            "multi_nic_enable",
+            _env_enabled(
+                "UNIFIED_COMM_NCCL_MULTI_NIC_ENABLE",
+                default=_DEFAULT_MULTI_NIC_ENABLE,
+            ),
+        )
+        if not enabled:
+            return
+
+        force_override = config.extra.get(
+            "multi_nic_force",
+            _env_enabled(
+                "UNIFIED_COMM_NCCL_MULTI_NIC_FORCE",
+                default=_DEFAULT_MULTI_NIC_FORCE,
+            ),
+        )
+
+        if os.environ.get("NCCL_IB_HCA") and not force_override:
+            logger.info(
+                "Skip multi-NIC auto-config because NCCL_IB_HCA is already set "
+                "(set UNIFIED_COMM_NCCL_MULTI_NIC_FORCE=1 to override)."
+            )
+            return
+
+        explicit = config.extra.get("multi_nic_devices")
+        if explicit is None:
+            explicit = os.environ.get("UNIFIED_COMM_NCCL_MULTI_NIC_DEVICES")
+
+        if isinstance(explicit, str) and explicit.strip():
+            explicit_str = explicit.strip()
+            if explicit_str.lower() in (
+                "auto",
+                "auto-detect",
+                "autodetect",
+                "default",
+            ):
+                candidates = self._discover_rdma_hcas()
+            else:
+                candidates = _split_csv(explicit_str)
+        elif isinstance(explicit, list | tuple):
+            candidates = [str(x).strip() for x in explicit if str(x).strip()]
+        else:
+            candidates = self._discover_rdma_hcas()
+
+        if not candidates:
+            logger.warning(
+                "Multi-NIC aggregation requested but no RDMA HCA found; "
+                "keep NCCL default device selection."
+            )
+            return
+
+        max_count_raw = config.extra.get(
+            "multi_nic_count",
+            os.environ.get(
+                "UNIFIED_COMM_NCCL_MULTI_NIC_COUNT",
+                str(_DEFAULT_MULTI_NIC_COUNT),
+            ),
+        )
+        try:
+            max_count = max(1, int(max_count_raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid multi-NIC count %r; using default %d.",
+                max_count_raw,
+                _DEFAULT_MULTI_NIC_COUNT,
+            )
+            max_count = _DEFAULT_MULTI_NIC_COUNT
+        candidates = candidates[:max_count]
+
+        hca_csv = ",".join(candidates)
+        os.environ["NCCL_IB_HCA"] = hca_csv
+        # 跨 NIC 连接默认打开，有助于聚合多网卡带宽
+        os.environ.setdefault("NCCL_CROSS_NIC", "1")
+
+        qps_raw = config.extra.get(
+            "multi_nic_qps_per_connection",
+            os.environ.get(
+                "UNIFIED_COMM_NCCL_MULTI_NIC_QPS_PER_CONNECTION",
+                str(_DEFAULT_MULTI_NIC_QPS_PER_CONNECTION),
+            ),
+        )
+        try:
+            qps = max(1, int(qps_raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid multi-NIC QPs per connection %r; using default %d.",
+                qps_raw,
+                _DEFAULT_MULTI_NIC_QPS_PER_CONNECTION,
+            )
+            qps = _DEFAULT_MULTI_NIC_QPS_PER_CONNECTION
+        os.environ["NCCL_IB_QPS_PER_CONNECTION"] = str(qps)
+
+        logger.info(
+            "NCCL multi-NIC aggregation enabled: NCCL_IB_HCA=%s, "
+            "NCCL_CROSS_NIC=%s, NCCL_IB_QPS_PER_CONNECTION=%s",
+            hca_csv,
+            os.environ.get("NCCL_CROSS_NIC", ""),
+            os.environ.get("NCCL_IB_QPS_PER_CONNECTION", ""),
+        )
 
     def init_comm_group(
         self, group_info: CommGroupInfo, config: CommConfig
@@ -151,6 +297,9 @@ class NCCLBackend(CommBackend):
         A) 复用已有 ProcessGroup（通过 config.extra 传入）
         B) 新建 ProcessGroup（默认行为）
         """
+        # 在构建 PG 前尽早注入 NCCL 多网卡配置，确保生效。
+        self._maybe_enable_multi_nic_aggregation(config)
+
         existing_device_group = config.extra.get("existing_device_group", None)
         existing_cpu_group = config.extra.get("existing_cpu_group", None)
 
@@ -259,14 +408,14 @@ class NCCLBackend(CommBackend):
             unique_id.internal[i] = byte_val
 
         # 初始化 NCCL Communicator
-        with torch.cuda.device(device):
+        with torch.accelerator.device_index(device.index):
             nccl_comm = nccl_lib.ncclCommInitRank(
                 group_info.world_size, unique_id, group_info.rank_in_group
             )
 
         # Warmup
-        with torch.cuda.device(device):
-            stream = torch.cuda.current_stream(device)
+        with torch.accelerator.device_index(device.index):
+            stream = torch.accelerator.current_stream(device)
             warmup_data = torch.zeros(1, device=device)
             nccl_lib.ncclAllReduce(
                 buffer_type(warmup_data.data_ptr()),
@@ -290,7 +439,9 @@ class NCCLBackend(CommBackend):
         """销毁通信组，释放所有资源"""
         if comm_handle.nccl_comm is not None and comm_handle.nccl_lib is not None:
             try:
-                with torch.cuda.device(comm_handle.device):
+                device = comm_handle.device
+                assert device is not None
+                with torch.accelerator.device_index(device.index):
                     comm_handle.nccl_lib.ncclCommDestroy(comm_handle.nccl_comm)
             except Exception as e:
                 logger.warning("Failed to destroy NCCL comm: %s", e)
@@ -341,7 +492,7 @@ class NCCLBackend(CommBackend):
         out_tensor = torch.empty_like(input_tensor)
 
         if stream is None:
-            stream = torch.cuda.current_stream(comm_handle.device)
+            stream = torch.accelerator.current_stream(comm_handle.device)
 
         comm_handle.nccl_lib.ncclAllReduce(
             buffer_type(input_tensor.data_ptr()),
@@ -405,7 +556,7 @@ class NCCLBackend(CommBackend):
         )
 
         if stream is None:
-            stream = torch.cuda.current_stream(comm_handle.device)
+            stream = torch.accelerator.current_stream(comm_handle.device)
 
         comm_handle.nccl_lib.ncclAllGather(
             buffer_type(input_tensor.data_ptr()),
@@ -478,7 +629,7 @@ class NCCLBackend(CommBackend):
         )
 
         if stream is None:
-            stream = torch.cuda.current_stream(comm_handle.device)
+            stream = torch.accelerator.current_stream(comm_handle.device)
 
         comm_handle.nccl_lib.ncclReduceScatter(
             buffer_type(input_tensor.data_ptr()),
@@ -529,7 +680,7 @@ class NCCLBackend(CommBackend):
         assert tensor.device == comm_handle.device
 
         if stream is None:
-            stream = torch.cuda.current_stream(comm_handle.device)
+            stream = torch.accelerator.current_stream(comm_handle.device)
 
         rank_in_group = comm_handle.group_info.rank_in_group
         if rank_in_group == src:
@@ -638,7 +789,7 @@ class NCCLBackend(CommBackend):
             gather_dim += input_tensor.dim()
 
         if stream is None:
-            stream = torch.cuda.current_stream(comm_handle.device)
+            stream = torch.accelerator.current_stream(comm_handle.device)
 
         # 切分 input
         if scatter_sizes is not None:
@@ -732,7 +883,7 @@ class NCCLBackend(CommBackend):
         assert tensor.device == comm_handle.device
 
         if stream is None:
-            stream = torch.cuda.current_stream(comm_handle.device)
+            stream = torch.accelerator.current_stream(comm_handle.device)
 
         dtype = tensor.dtype
         if "float8" in str(dtype):
@@ -783,7 +934,7 @@ class NCCLBackend(CommBackend):
         assert tensor.device == comm_handle.device
 
         if stream is None:
-            stream = torch.cuda.current_stream(comm_handle.device)
+            stream = torch.accelerator.current_stream(comm_handle.device)
 
         dtype = tensor.dtype
         if "float8" in str(dtype):
@@ -813,7 +964,7 @@ class NCCLBackend(CommBackend):
         if stream is not None:
             stream.synchronize()
         else:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
     # ----------------------------------------------------------
     # 高级功能：NCCL Group API (仅 Mode B)
@@ -865,7 +1016,7 @@ class NCCLBackend(CommBackend):
         )
 
         if stream is None:
-            stream = torch.cuda.current_stream(comm_handle.device)
+            stream = torch.accelerator.current_stream(comm_handle.device)
 
         cuda_stream = cudaStream_t(stream.cuda_stream)
 

@@ -1457,6 +1457,14 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         speculative_model="yuhuili/EAGLE-LLaMA3-Instruct-8B",
         tokenizer="meta-llama/Meta-Llama-3-8B-Instruct",
     ),
+    "Qwen2ForCausalLMEagle": _HfExamplesInfo(
+        "Qwen/Qwen2.5-7B-Instruct",
+        is_available_online=False,
+    ),
+    "EagleQwen2ForCausalLMEagle": _HfExamplesInfo(
+        "Qwen/Qwen2.5-7B-Instruct",
+        is_available_online=False,
+    ),
     "Eagle3DeepseekV2ForCausalLM": _HfExamplesInfo(
         "moonshotai/Kimi-K2.5",
         trust_remote_code=True,

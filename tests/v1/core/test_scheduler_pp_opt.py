@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import logging
 import queue
 from collections import deque
 from concurrent.futures import Future
@@ -547,7 +546,7 @@ def test_pp_opt_dynamic_microbatch_count_preserves_in_flight_tail(
     }
 
 
-def test_pp_opt_monitor_logs_microbatch_imbalance(monkeypatch, caplog):
+def test_pp_opt_monitor_logs_microbatch_imbalance(monkeypatch):
     monkeypatch.setenv("VLLM_PP_OPT_BATCH_QUEUE_SIZE", "4")
     monkeypatch.setenv("VLLM_PP_OPT_MONITOR_INTERVAL", "1")
     scheduler = _create_pp_opt_scheduler(
@@ -557,13 +556,17 @@ def test_pp_opt_monitor_logs_microbatch_imbalance(monkeypatch, caplog):
     for request in create_requests(4, num_tokens=4):
         scheduler.add_request(request)
 
-    with caplog.at_level(logging.INFO, logger="vllm.v1.core.sched.scheduler"):
-        assert scheduler.select_microbatch_pp_opt(set()) == 0
+    log_info = Mock()
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.logger.info",
+        log_info,
+    )
+    assert scheduler.select_microbatch_pp_opt(set()) == 0
 
     assert any(
-        "PP optimization monitor:" in record.message
-        and "request_count_imbalance" in record.message
-        for record in caplog.records
+        "PP optimization monitor:" in call.args[0]
+        and "request_count_imbalance" in call.args[0]
+        for call in log_info.call_args_list
     )
 
 
