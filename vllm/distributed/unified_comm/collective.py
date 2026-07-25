@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -530,8 +532,6 @@ class CollectiveGroup:
 
     def _detect_topology(self) -> TopologyInfo:
         """自动探测硬件拓扑信息。"""
-        import os
-
         device_type = self._group_info.device.type
         gpus_per_node = 8  # 保守默认值
 
@@ -572,11 +572,8 @@ class CollectiveGroup:
         # 带宽估计
         intra_bw = 600.0 if has_nvswitch else 300.0
 
-        if has_rdma:
-            # 估算聚合能力：单 NIC 100Gbps，按 NIC 数线性叠加并限制上限。
-            inter_bw = min(800.0, 100.0 * nic_count)
-        else:
-            inter_bw = 25.0
+        # 估算聚合能力：单 NIC 100Gbps，按 NIC 数线性叠加并限制上限。
+        inter_bw = min(800.0, 100.0 * nic_count) if has_rdma else 25.0
 
         return TopologyInfo(
             num_nodes=num_nodes,
@@ -605,20 +602,25 @@ class CollectiveGroup:
         return result
 
     @staticmethod
-    def _detect_inter_node_nics() -> list[str]:
+    def _detect_inter_node_nics(
+        ib_root: Path = Path("/sys/class/infiniband"),
+    ) -> list[str]:
         """探测可用于跨节点通信的 NIC 列表。"""
-        import os
-
         nccl_hcas = os.environ.get("NCCL_IB_HCA", "").strip()
         if nccl_hcas:
-            return [x.strip() for x in nccl_hcas.split(",") if x.strip()]
+            entries = [entry.strip() for entry in nccl_hcas.split(",")]
+            if not any(entry.startswith("^") for entry in entries):
+                names = {
+                    entry.removeprefix("=").split(":", 1)[0]
+                    for entry in entries
+                    if entry
+                }
+                if names:
+                    return sorted(names)
 
-        ib_path = "/sys/class/infiniband"
-        if os.path.exists(ib_path):
-            with contextlib.suppress(Exception):
-                devs = sorted(os.listdir(ib_path))
-                if devs:
-                    return devs
+        if ib_root.is_dir():
+            with contextlib.suppress(OSError):
+                return sorted(entry.name for entry in ib_root.iterdir())
 
         # 最后兜底：默认单网卡
         return []

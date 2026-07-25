@@ -112,7 +112,6 @@ Optional knobs:
 | `UNIFIED_COMM_NCCL_MULTI_NIC_DEVICES` | `auto-detect` | comma-separated NIC list (e.g. `mlx5_bond_1,mlx5_bond_2,...`), overrides auto-detection |
 | `UNIFIED_COMM_NCCL_MULTI_NIC_COUNT` | `8` | max number of detected NICs to include when `UNIFIED_COMM_NCCL_MULTI_NIC_DEVICES` is unset |
 | `UNIFIED_COMM_NCCL_MULTI_NIC_QPS_PER_CONNECTION` | `4` | forwarded to `NCCL_IB_QPS_PER_CONNECTION` |
-| `UNIFIED_COMM_NCCL_MULTI_NIC_VERIFY_PEERS` | `1` | do peer-side NIC connectivity filtering using cross-rank GID checks before setting `NCCL_IB_HCA` |
 | `UNIFIED_COMM_NCCL_MULTI_NIC_FORCE` | `0` | force override of an existing `NCCL_IB_HCA` |
 
 When enabled successfully, the worker logs three confirmation lines
