@@ -439,7 +439,9 @@ class NCCLBackend(CommBackend):
         """销毁通信组，释放所有资源"""
         if comm_handle.nccl_comm is not None and comm_handle.nccl_lib is not None:
             try:
-                with torch.accelerator.device_index(comm_handle.device.index):
+                device = comm_handle.device
+                assert device is not None
+                with torch.accelerator.device_index(device.index):
                     comm_handle.nccl_lib.ncclCommDestroy(comm_handle.nccl_comm)
             except Exception as e:
                 logger.warning("Failed to destroy NCCL comm: %s", e)
