@@ -190,8 +190,16 @@ class KnormFullAttentionManager(FullAttentionManager):
         prioritize_uncached_for_reuse: bool = False,
     ) -> None:
         """Free blocks and clean up score records."""
-        super().free(
-            request_id,
-            prioritize_uncached_for_reuse=prioritize_uncached_for_reuse,
-        )
+        if prioritize_uncached_for_reuse:
+            blocks = list(self.pop_blocks_for_free(request_id))
+            cached = [block for block in reversed(blocks)
+                      if block.block_hash is not None]
+            uncached = [block for block in reversed(blocks)
+                        if block.block_hash is None]
+            if cached:
+                self.block_pool.free_blocks(cached)
+            if uncached:
+                self.block_pool.free_blocks(uncached, prepend=True)
+        else:
+            super().free(request_id)
         self._block_scores.pop(request_id, None)
