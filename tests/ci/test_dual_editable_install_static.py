@@ -6,13 +6,11 @@ These tests ensure that PR #137's CI artefacts retain the critical
 verification steps and do not regress over time.
 
 How to run manually:
-    $ export VLLM_ASCEND_HUST_REPO=~/hust/vllm-ascend-hust
-    $ export VLLM_ASCEND_HUST_REF=HEAD
-
-    $ export VLLM_HUST_REPO=~/hust/vllm-hust
-    $ export VLLM_HUST_REF=HEAD
-
-    $ bash scripts/ci/validate_dual_editable_install.sh
+    export VLLM_ASCEND_HUST_REPO=~/vllm/vllm-ascend-hust
+    export VLLM_ASCEND_HUST_REF=HEAD
+    export VLLM_HUST_REPO=~/vllm/vllm-hust
+    export VLLM_HUST_REF=HEAD
+    bash scripts/ci/validate_dual_editable_install.sh
 """
 
 from __future__ import annotations

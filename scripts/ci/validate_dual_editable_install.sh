@@ -60,6 +60,14 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 python --version
+# On some systems (e.g. Kylin) python3 -m venv does not bundle pip.
+if ! python -m pip --version &>/dev/null; then
+  echo "pip not found in venv – bootstrapping with ensurepip …"
+  if ! python -m ensurepip --upgrade 2>/dev/null; then
+    echo "ensurepip failed – falling back to get-pip.py …"
+    python -c "$(curl -fsSL https://bootstrap.pypa.io/get-pip.py)"
+  fi
+fi
 python -m pip install --upgrade pip setuptools wheel
 echo "::endgroup::"
 
