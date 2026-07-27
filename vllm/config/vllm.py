@@ -1760,14 +1760,16 @@ class VllmConfig:
                         i for i in [1, 2, 4] if i <= max_cudagraph_capture_size
                     ]
                 if max_cudagraph_capture_size >= 8:
-                    # Step size 8 for small batch sizes, up to 256(not included)
+                    # Step size 32 for small batch sizes, up to 256(not included)
+                    # T20: reduced from 8→32 to lower SQ/CQ stream consumption on Ascend
                     cudagraph_capture_sizes += list(
-                        range(8, min(max_cudagraph_capture_size + 1, 256), 8)
+                        range(8, min(max_cudagraph_capture_size + 1, 256), 32)
                     )
                 if max_cudagraph_capture_size >= 256:
-                    # Step size 16 for larger batch sizes
+                    # Step size 64 for larger batch sizes
+                    # T20: reduced from 16→64 to lower SQ/CQ stream consumption on Ascend
                     cudagraph_capture_sizes += list(
-                        range(256, max_cudagraph_capture_size + 1, 16)
+                        range(256, max_cudagraph_capture_size + 1, 64)
                     )
                 # ensure max_num_tokens is captured if within max capture size
                 if (
