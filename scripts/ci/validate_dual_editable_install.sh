@@ -84,6 +84,16 @@ python -m pip install --upgrade \
 echo "::endgroup::"
 
 # --------------------------------------------------------------------------- #
+# Step 2b – Install torch (CPU) as build-time prerequisite
+# --------------------------------------------------------------------------- #
+echo "::group::Step 2b – Install torch (CPU) for metadata generation"
+# setup.py unconditionally imports torch at the top level, so it must be
+# present even for --no-deps editable installs.  Use the CPU-only wheel to
+# keep the CI environment lightweight.
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+echo "::endgroup::"
+
+# --------------------------------------------------------------------------- #
 # Step 3 – Install vllm-ascend-hust (plugin first)
 # --------------------------------------------------------------------------- #
 echo "::group::Step 3 – Install vllm-ascend-hust (editable, --no-deps)"
