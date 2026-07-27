@@ -79,6 +79,9 @@ echo "::endgroup::"
 # Step 3 – Install vllm-ascend-hust (plugin first)
 # --------------------------------------------------------------------------- #
 echo "::group::Step 3 – Install vllm-ascend-hust (editable, --no-deps)"
+# SOC_VERSION is required by vllm-ascend-hust's setup.py for chip detection.
+# On CPU-only hosts (no npu-smi), set a default so metadata generation succeeds.
+SOC_VERSION="${SOC_VERSION:-ascend910b1}"
 COMPILE_CUSTOM_KERNELS=0 pip install -e "$VLLM_ASCEND_HUST_REPO" --no-build-isolation --no-deps
 echo "::endgroup::"
 

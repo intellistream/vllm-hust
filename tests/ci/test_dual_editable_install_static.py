@@ -5,7 +5,7 @@
 These tests ensure that PR #137's CI artefacts retain the critical
 verification steps and do not regress over time.
 
-How to run mannually:
+How to run manually:
     $ export VLLM_ASCEND_HUST_REPO=~/hust/vllm-ascend-hust
     $ export VLLM_ASCEND_HUST_REF=HEAD
 
@@ -74,6 +74,12 @@ def test_script_installs_both_packages_editable():
     assert "pip install -e" in text
     assert "VLLM_ASCEND_HUST_REPO" in text
     assert "VLLM_TARGET_DEVICE=empty" in text
+
+
+def test_script_sets_soc_version_for_ascend_build():
+    text = SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "SOC_VERSION" in text
+    assert "ascend910b1" in text
 
 
 def test_script_runs_import_smoke_tests():
