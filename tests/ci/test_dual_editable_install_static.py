@@ -4,6 +4,15 @@
 
 These tests ensure that PR #137's CI artefacts retain the critical
 verification steps and do not regress over time.
+
+How to run mannually:
+    $ export VLLM_ASCEND_HUST_REPO=~/hust/vllm-ascend-hust
+    $ export VLLM_ASCEND_HUST_REF=HEAD
+
+    $ export VLLM_HUST_REPO=~/hust/vllm-hust
+    $ export VLLM_HUST_REF=HEAD
+
+    $ bash scripts/ci/validate_dual_editable_install.sh
 """
 
 from __future__ import annotations
@@ -21,6 +30,18 @@ def test_workflow_exists():
 
 def test_validation_script_exists():
     assert SCRIPT_PATH.exists(), f"Missing script: {SCRIPT_PATH}"
+
+
+def test_script_rejects_url_for_ascend_repo():
+    text = SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "http*" in text
+    assert "must be a local path, not a URL" in text
+
+
+def test_script_validates_directories_exist():
+    text = SCRIPT_PATH.read_text(encoding="utf-8")
+    assert '[[ ! -d "$VLLM_ASCEND_HUST_REPO" ]]' in text
+    assert '[[ ! -d "$VLLM_HUST_REPO" ]]' in text
 
 
 def test_workflow_has_manual_trigger_with_ref_inputs():

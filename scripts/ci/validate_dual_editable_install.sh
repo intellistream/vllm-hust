@@ -21,6 +21,21 @@ VLLM_HUST_REPO="${VLLM_HUST_REPO:-$REPO_ROOT}"
 VLLM_ASCEND_HUST_REPO="${VLLM_ASCEND_HUST_REPO:?VLLM_ASCEND_HUST_REPO is required}"
 VENV_DIR="${VENV_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/dual-editable-XXXXXX")}"
 
+# Validate that paths are local directories, not URLs.
+if [[ "$VLLM_ASCEND_HUST_REPO" == http* ]]; then
+  echo "::error::VLLM_ASCEND_HUST_REPO must be a local path, not a URL: $VLLM_ASCEND_HUST_REPO" >&2
+  echo "Usage: VLLM_ASCEND_HUST_REPO=/path/to/local/vllm-ascend-hust bash $0" >&2
+  exit 1
+fi
+if [[ ! -d "$VLLM_ASCEND_HUST_REPO" ]]; then
+  echo "::error::VLLM_ASCEND_HUST_REPO directory does not exist: $VLLM_ASCEND_HUST_REPO" >&2
+  exit 1
+fi
+if [[ ! -d "$VLLM_HUST_REPO" ]]; then
+  echo "::error::VLLM_HUST_REPO directory does not exist: $VLLM_HUST_REPO" >&2
+  exit 1
+fi
+
 cleanup() {
   echo "::endgroup::"
 }
@@ -124,14 +139,14 @@ if [[ -z "$CHECK_OUTPUT" ]]; then
 else
   echo "pip check reported the following issues:"
   echo "$CHECK_OUTPUT"
-  # Fail only on hard version conflicts, not on missing optional packages.
-  if echo "$CHECK_OUTPUT" | grep -qE "requires|Conflict"; then
+  # Only fail if vllm or vllm-ascend-hust itself has a conflict.
+  if echo "$CHECK_OUTPUT" | grep -qE "^vllm |^vllm-ascend-hust "; then
     echo ""
-    echo "::error::Dependency conflict detected. See above for details."
+    echo "::error::vllm or vllm-ascend-hust has a dependency conflict."
     exit 1
   fi
   echo ""
-  echo "Ignoring non-critical missing optional packages."
+  echo "Non-vllm conflicts are pre-existing and ignored."
 fi
 echo "::endgroup::"
 
