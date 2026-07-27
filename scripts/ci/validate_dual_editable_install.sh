@@ -60,14 +60,14 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 python --version
-pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade pip setuptools wheel
 echo "::endgroup::"
 
 # --------------------------------------------------------------------------- #
 # Step 2 – Upgrade build tooling
 # --------------------------------------------------------------------------- #
 echo "::group::Step 2 – Upgrade build tooling"
-pip install --upgrade \
+python -m pip install --upgrade \
   "setuptools>=77.0.3,<81.0.0" \
   "setuptools-scm>=8.0" \
   "setuptools-rust>=1.9.0" \
@@ -83,14 +83,14 @@ echo "::group::Step 3 – Install vllm-ascend-hust (editable, --no-deps)"
 # On CPU-only hosts (no npu-smi), set a default so metadata generation succeeds.
 SOC_VERSION="${SOC_VERSION:-ascend910b1}"
 export SOC_VERSION
-COMPILE_CUSTOM_KERNELS=0 pip install -e "$VLLM_ASCEND_HUST_REPO" --no-build-isolation --no-deps
+COMPILE_CUSTOM_KERNELS=0 python -m pip install -e "$VLLM_ASCEND_HUST_REPO" --no-build-isolation --no-deps
 echo "::endgroup::"
 
 # --------------------------------------------------------------------------- #
 # Step 4 – Install vllm-hust (core)
 # --------------------------------------------------------------------------- #
 echo "::group::Step 4 – Install vllm-hust (editable, --no-deps)"
-VLLM_TARGET_DEVICE=empty pip install -e "$VLLM_HUST_REPO" --no-build-isolation --no-deps
+VLLM_TARGET_DEVICE=empty python -m pip install -e "$VLLM_HUST_REPO" --no-build-isolation --no-deps
 echo "::endgroup::"
 
 # --------------------------------------------------------------------------- #
@@ -137,7 +137,7 @@ echo "::endgroup::"
 # Step 7 – pip check (warn but do not fail on known optional gaps)
 # --------------------------------------------------------------------------- #
 echo "::group::Step 7 – pip check"
-CHECK_OUTPUT=$(pip check 2>&1) || true
+CHECK_OUTPUT=$(python -m pip check 2>&1) || true
 if [[ -z "$CHECK_OUTPUT" ]]; then
   echo "pip check passed – no dependency conflicts detected."
 else
