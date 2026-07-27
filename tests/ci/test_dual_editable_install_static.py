@@ -71,7 +71,7 @@ def test_workflow_does_not_require_ascend_hardware():
 
 def test_script_installs_both_packages_editable():
     text = SCRIPT_PATH.read_text(encoding="utf-8")
-    assert "pip install -e" in text
+    assert "pip3 install -e" in text
     assert "VLLM_ASCEND_HUST_REPO" in text
     assert "VLLM_TARGET_DEVICE=empty" in text
 
@@ -90,7 +90,7 @@ def test_script_runs_import_smoke_tests():
 
 def test_script_runs_dependency_check():
     text = SCRIPT_PATH.read_text(encoding="utf-8")
-    assert "pip check" in text
+    assert "pip3 check" in text
 
 
 def test_script_prints_dependency_versions():
