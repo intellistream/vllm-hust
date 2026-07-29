@@ -1115,8 +1115,10 @@ class AsyncMPClient(MPClient):
             EngineCoreRequestType.UTILITY.value,
             *self.encoder.encode((self.client_index, call_id, method, args)),
         )
-        await self._send_input_message(message, engine, args)
+        # Same ordering fix as add_request_async — output reader task must
+        # be running before any message is sent to EngineCore.
         self._ensure_output_queue_task()
+        await self._send_input_message(message, engine, args)
         return await future
 
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
@@ -1124,8 +1126,12 @@ class AsyncMPClient(MPClient):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index
-        await self._send_input(EngineCoreRequestType.ADD, request)
+        # Ensure the output reader task is running BEFORE sending the
+        # request to EngineCore. Otherwise the EngineCore's response
+        # could arrive on the output socket before the reader task is
+        # scheduled, resulting in a lost response and 502 Bad Gateway.
         self._ensure_output_queue_task()
+        await self._send_input(EngineCoreRequestType.ADD, request)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
@@ -1362,6 +1368,9 @@ class DPAsyncMPClient(AsyncMPClient):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         self._ensure_stats_update_task()
+        # Output reader task must be running before any message is sent
+        # to EngineCore (see AsyncMPClient.add_request_async).
+        self._ensure_output_queue_task()
 
         request.current_wave = self.current_wave
         request.client_index = self.client_index
@@ -1374,8 +1383,6 @@ class DPAsyncMPClient(AsyncMPClient):
             await self.first_req_send_socket.send(req_msg)
 
         await to_await
-
-        self._ensure_output_queue_task()
 
     def get_core_engine_for_request(self, request: EngineCoreRequest):
         return self.core_engine
