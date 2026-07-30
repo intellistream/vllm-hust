@@ -222,6 +222,40 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    @staticmethod
+    def _get_materialization_control(request: Request) -> dict | None:
+        runtime_control = request.kv_materialization_runtime_control
+        if isinstance(runtime_control, dict):
+            return runtime_control
+        kv_transfer_params = request.kv_transfer_params or {}
+        runtime_control = kv_transfer_params.get("kv_materialization_runtime_control")
+        return runtime_control if isinstance(runtime_control, dict) else None
+
+    def _get_lookup_block_hashes(self, request: Request) -> list:
+        runtime_control = self._get_materialization_control(request)
+        if runtime_control is None:
+            return request.block_hashes
+        decision = runtime_control.get(
+            "effective_decision", runtime_control.get("observed_decision")
+        )
+        target_reuse_tokens = runtime_control.get("target_reuse_tokens")
+        if decision != "partial_reuse" or not isinstance(target_reuse_tokens, int):
+            return request.block_hashes
+        max_full_blocks = max(target_reuse_tokens, 0) // self.hash_block_size
+        return request.block_hashes[:max_full_blocks]
+
+    def _get_cacheable_num_tokens(self, request: Request, num_tokens: int) -> int:
+        runtime_control = self._get_materialization_control(request)
+        if runtime_control is None:
+            return max(num_tokens, 0)
+        decision = runtime_control.get(
+            "effective_decision", runtime_control.get("observed_decision")
+        )
+        target_reuse_tokens = runtime_control.get("target_reuse_tokens")
+        if decision != "partial_reuse" or not isinstance(target_reuse_tokens, int):
+            return max(num_tokens, 0)
+        return min(max(num_tokens, 0), max(target_reuse_tokens, 0))
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -248,9 +282,10 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        lookup_block_hashes = self._get_lookup_block_hashes(request)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+                lookup_block_hashes, max_cache_hit_length
             )
         )
 
@@ -703,7 +738,8 @@ class KVCacheManager:
         """
         if self.enable_caching:
             num_cached_blocks = self.coordinator.cache_blocks(
-                request, num_computed_tokens
+                request,
+                self._get_cacheable_num_tokens(request, num_computed_tokens),
             )
             if _prefix_cache_trace_enabled():
                 logger.info(
