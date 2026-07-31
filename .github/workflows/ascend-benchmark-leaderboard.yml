@@ -328,6 +328,7 @@ jobs:
       ISSUE_COMMENT_PR_NUMBER: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_number || '' }}
       HUST_ASCEND_MANAGER_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && 'https://github.com/vLLM-HUST/ascend-runtime-manager.git' || 'git@github.com:vLLM-HUST/ascend-runtime-manager.git' }}
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
+      VLLM_PLUGINS: ascend
       # Disable precompiled CUDA wheel fetch from wheels.vllm.ai.
       # The Ascend benchmark uses the vllm-ascend-hust plugin, not CUDA
       # precompiled wheels, so this avoids transient SSL failures.
@@ -1092,6 +1093,7 @@ jobs:
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
         run: |
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
+          "${PYTHON_BIN}" .github/workflows/scripts/report_vllm_plugin_inventory.py
           "${PYTHON_BIN}" --version
           "${PYTHON_BIN}" - <<'PY'
           import importlib.metadata as metadata

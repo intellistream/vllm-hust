@@ -53,6 +53,7 @@ jobs:
       VLLM_ASCEND_HUST_REPO_URL: https://github.com/vLLM-HUST/vllm-ascend-hust.git
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
       HUST_ASCEND_MANAGER_REPO_URL: https://github.com/vLLM-HUST/ascend-runtime-manager.git
+      VLLM_PLUGINS: ascend
       VLLM_USE_PRECOMPILED: "0"
 
     steps:
@@ -297,6 +298,7 @@ jobs:
           TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
         run: |
           source "$VLLM_ASCEND_HUST_REPO/scripts/use_single_ascend_env.sh"
+          "$PYTHON_BIN" .github/workflows/scripts/report_vllm_plugin_inventory.py
           which python
           "$PYTHON_BIN" --version
           "$PYTHON_BIN" - <<'PY'
