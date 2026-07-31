@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import json
+import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -26,6 +29,27 @@ logger = init_logger(__name__)
 
 def _prefix_cache_trace_enabled() -> bool:
     return envs.VLLM_DEBUG_PREFIX_CACHE_TRACE
+
+
+def _write_materialization_runtime_event(payload: dict[str, object]) -> None:
+    """Append one scheduler-owned event without making telemetry fatal.
+
+    The lookup values are emitted where the cache manager has the actual cache
+    hit result.  They must not be synthesized by the policy/plugin layer.
+    """
+    path = os.getenv("VLLM_KV_MATERIALIZATION_RUNTIME_EVENT_LOG_PATH")
+    if not path:
+        return
+    record = {"schema_version": 1, "timestamp_s": time.time(), **payload}
+    encoded = (json.dumps(record, sort_keys=True) + "\n").encode()
+    try:
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+    except OSError:
+        logger.exception("Unable to write KV materialization runtime event")
 
 
 def _count_block_groups(block_groups: Sequence[Sequence[KVCacheBlock]]) -> int:
@@ -273,6 +297,28 @@ class KVCacheManager:
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         if not self.enable_caching or request.skip_reading_prefix_cache:
+            runtime_control = self._get_materialization_control(request) or {}
+            _write_materialization_runtime_event(
+                {
+                    "event": "lookup",
+                    "request_id": request.request_id,
+                    "engine_prompt_tokens": request.num_tokens,
+                    "engine_reused_tokens": 0,
+                    "engine_recomputed_tokens": request.num_tokens,
+                    "matched_blocks": 0,
+                    "hash_block_size": getattr(self, "hash_block_size", None),
+                    "max_cache_hit_length": max(request.num_tokens - 1, 0),
+                    "applied_decision": runtime_control.get(
+                        "effective_decision",
+                        runtime_control.get("observed_decision"),
+                    ),
+                    "observed_decision": runtime_control.get("observed_decision"),
+                    "fallback_reason": runtime_control.get("fallback_reason"),
+                    "target_reuse_tokens": runtime_control.get("target_reuse_tokens"),
+                    "realized_decision": "recompute",
+                    "skip_read": request.skip_reading_prefix_cache,
+                }
+            )
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -287,6 +333,35 @@ class KVCacheManager:
             self.coordinator.find_longest_cache_hit(
                 lookup_block_hashes, max_cache_hit_length
             )
+        )
+
+        runtime_control = self._get_materialization_control(request) or {}
+        recomputed_tokens = request.num_tokens - num_new_computed_tokens
+        if num_new_computed_tokens <= 0:
+            realized_decision = "recompute"
+        elif recomputed_tokens <= 0:
+            realized_decision = "full_reuse"
+        else:
+            realized_decision = "partial_reuse"
+        _write_materialization_runtime_event(
+            {
+                "event": "lookup",
+                "request_id": request.request_id,
+                "engine_prompt_tokens": request.num_tokens,
+                "engine_reused_tokens": num_new_computed_tokens,
+                "engine_recomputed_tokens": recomputed_tokens,
+                "matched_blocks": _count_block_groups(computed_blocks),
+                "hash_block_size": self.hash_block_size,
+                "max_cache_hit_length": max_cache_hit_length,
+                "applied_decision": runtime_control.get(
+                    "effective_decision", runtime_control.get("observed_decision")
+                ),
+                "observed_decision": runtime_control.get("observed_decision"),
+                "fallback_reason": runtime_control.get("fallback_reason"),
+                "target_reuse_tokens": runtime_control.get("target_reuse_tokens"),
+                "realized_decision": realized_decision,
+                "skip_read": request.skip_reading_prefix_cache,
+            }
         )
 
         if _prefix_cache_trace_enabled():
@@ -737,9 +812,28 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
+            cacheable_num_tokens = self._get_cacheable_num_tokens(
+                request, num_computed_tokens
+            )
             num_cached_blocks = self.coordinator.cache_blocks(
                 request,
-                self._get_cacheable_num_tokens(request, num_computed_tokens),
+                cacheable_num_tokens,
+            )
+            runtime_control = self._get_materialization_control(request) or {}
+            _write_materialization_runtime_event(
+                {
+                    "event": "commit",
+                    "request_id": request.request_id,
+                    "engine_num_computed_tokens": num_computed_tokens,
+                    "cacheable_boundary_tokens": cacheable_num_tokens,
+                    "cached_blocks": num_cached_blocks,
+                    "hash_block_size": getattr(self, "hash_block_size", None),
+                    "applied_decision": runtime_control.get(
+                        "effective_decision",
+                        runtime_control.get("observed_decision"),
+                    ),
+                    "target_reuse_tokens": runtime_control.get("target_reuse_tokens"),
+                }
             )
             if _prefix_cache_trace_enabled():
                 logger.info(
