@@ -49,9 +49,7 @@ def test_no_plugin_uses_default_selector():
 
 def test_disabled_plugin_discovery_uses_default_selector():
     with patch("importlib.metadata.entry_points") as discover:
-        selector = get_victim_selector(
-            _config(victim_selector_plugin_disabled=True)
-        )
+        selector = get_victim_selector(_config(victim_selector_plugin_disabled=True))
 
     assert isinstance(selector, NoOpVictimSelector)
     discover.assert_not_called()
