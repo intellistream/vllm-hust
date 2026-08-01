@@ -15,6 +15,8 @@ pytestmark = pytest.mark.cpu_test
 
 
 class _ValidSelector:
+    vllm_victim_selector_api_version = 1
+
     @classmethod
     def from_vllm_config(cls, vllm_config):
         return cls()
@@ -55,12 +57,12 @@ def test_disabled_plugin_discovery_uses_default_selector():
     discover.assert_not_called()
 
 
-def test_single_plugin_is_auto_selected():
-    ep = _entry_point("bidkv")
-    with patch("importlib.metadata.entry_points", return_value=[ep]):
+def test_installed_plugin_is_ignored_without_explicit_selection():
+    with patch("importlib.metadata.entry_points") as discover:
         selector = get_victim_selector(_config())
 
-    assert isinstance(selector, _ValidSelector)
+    assert isinstance(selector, NoOpVictimSelector)
+    discover.assert_not_called()
 
 
 def test_requested_plugin_is_selected_deterministically():
@@ -74,13 +76,12 @@ def test_requested_plugin_is_selected_deterministically():
     other.load.assert_not_called()
 
 
-def test_multiple_plugins_require_explicit_selection():
-    eps = [_entry_point("bidkv"), _entry_point("other")]
-    with (
-        patch("importlib.metadata.entry_points", return_value=eps),
-        pytest.raises(RuntimeError, match="Multiple victim selector plugins"),
-    ):
-        get_victim_selector(_config())
+def test_multiple_plugins_do_not_affect_default_selection():
+    with patch("importlib.metadata.entry_points") as discover:
+        selector = get_victim_selector(_config())
+
+    assert isinstance(selector, NoOpVictimSelector)
+    discover.assert_not_called()
 
 
 def test_missing_requested_plugin_fails_closed():
@@ -101,15 +102,6 @@ def test_duplicate_requested_plugin_fails_closed():
         pytest.raises(RuntimeError, match="Multiple victim selector entry points"),
     ):
         get_victim_selector(_config(victim_selector_plugin="bidkv"))
-
-
-def test_broken_auto_selected_plugin_falls_back():
-    ep = _entry_point("bidkv")
-    ep.load.side_effect = ImportError("broken plugin")
-    with patch("importlib.metadata.entry_points", return_value=[ep]):
-        selector = get_victim_selector(_config())
-
-    assert isinstance(selector, NoOpVictimSelector)
 
 
 def test_broken_requested_plugin_fails_closed():
@@ -133,9 +125,19 @@ def test_requested_plugin_discovery_failure_fails_closed():
         get_victim_selector(_config(victim_selector_plugin="bidkv"))
 
 
-def test_invalid_implicit_plugin_falls_back():
-    ep = _entry_point("invalid", object)
-    with patch("importlib.metadata.entry_points", return_value=[ep]):
-        selector = get_victim_selector(_config())
+def test_requested_plugin_with_wrong_api_version_fails_closed():
+    class OldSelector(_ValidSelector):
+        vllm_victim_selector_api_version = 0
 
-    assert isinstance(selector, NoOpVictimSelector)
+    ep = _entry_point("old", OldSelector)
+    with (
+        patch("importlib.metadata.entry_points", return_value=[ep]),
+        pytest.raises(RuntimeError, match="expected 1"),
+    ):
+        get_victim_selector(_config(victim_selector_plugin="old"))
+
+
+@pytest.mark.parametrize("requested", ["", "   ", 1])
+def test_requested_plugin_name_must_be_a_non_empty_string(requested):
+    with pytest.raises(ValueError, match="non-empty string"):
+        get_victim_selector(_config(victim_selector_plugin=requested))

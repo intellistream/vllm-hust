@@ -29,6 +29,7 @@ logger = init_logger(__name__)
 
 VICTIM_SELECTOR_PLUGINS_GROUP = "vllm.victim_selector"
 VICTIM_SELECTOR_PLUGIN_CONFIG_KEY = "victim_selector_plugin"
+VICTIM_SELECTOR_API_VERSION = 1
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -118,75 +119,63 @@ class NoOpVictimSelector:
 def get_victim_selector(vllm_config) -> VictimSelector:
     """Discover and instantiate a victim selector.
 
-    Tries to load a plugin registered under the
-    ``vllm.victim_selector`` entry-point group. A requested plugin fails
-    closed, while a single implicitly discovered broken plugin is logged
-    before falling back to ``NoOpVictimSelector``.
+    Loads a plugin from the ``vllm.victim_selector`` entry-point group only
+    when the user explicitly requests it. Ambient site-packages must not
+    change the default scheduler behavior.
     """
     additional_config = getattr(vllm_config, "additional_config", None) or {}
     if additional_config.get("victim_selector_plugin_disabled"):
         return NoOpVictimSelector()
 
     requested_plugin = additional_config.get(VICTIM_SELECTOR_PLUGIN_CONFIG_KEY)
+    if requested_plugin is None:
+        return NoOpVictimSelector()
+    if not isinstance(requested_plugin, str) or not requested_plugin.strip():
+        raise ValueError(
+            f"additional_config.{VICTIM_SELECTOR_PLUGIN_CONFIG_KEY} must be "
+            "a non-empty string"
+        )
 
     try:
         from importlib.metadata import EntryPoints, entry_points
 
         eps: EntryPoints = entry_points(group=VICTIM_SELECTOR_PLUGINS_GROUP)
     except Exception as exc:
-        if requested_plugin:
-            raise RuntimeError(
-                "Failed to discover requested victim selector plugin "
-                f"{requested_plugin!r}"
-            ) from exc
-        logger.exception(
-            "Failed to discover victim selector plugins; using the default selector"
-        )
-        return NoOpVictimSelector()
-
-    if requested_plugin:
-        candidates = [ep for ep in eps if ep.name == requested_plugin]
-        if not candidates:
-            available = ", ".join(sorted(ep.name for ep in eps)) or "none"
-            raise ValueError(
-                f"Requested victim selector plugin {requested_plugin!r} is not "
-                f"installed; available plugins: {available}"
-            )
-        if len(candidates) > 1:
-            raise RuntimeError(
-                f"Multiple victim selector entry points are registered as "
-                f"{requested_plugin!r}; uninstall duplicate distributions"
-            )
-        selected = candidates[0]
-    elif len(eps) == 0:
-        return NoOpVictimSelector()
-    elif len(eps) == 1:
-        selected = eps[0]
-    else:
-        available = ", ".join(sorted(ep.name for ep in eps))
         raise RuntimeError(
-            "Multiple victim selector plugins are installed "
-            f"({available}). Select one with "
-            f"additional_config.{VICTIM_SELECTOR_PLUGIN_CONFIG_KEY}."
+            f"Failed to discover requested victim selector plugin {requested_plugin!r}"
+        ) from exc
+
+    candidates = [ep for ep in eps if ep.name == requested_plugin]
+    if not candidates:
+        available = ", ".join(sorted(ep.name for ep in eps))
+        raise ValueError(
+            f"Requested victim selector plugin {requested_plugin!r} is not "
+            f"installed; available plugins: {available or 'none'}"
         )
+    if len(candidates) > 1:
+        raise RuntimeError(
+            f"Multiple victim selector entry points are registered as "
+            f"{requested_plugin!r}; uninstall duplicate distributions"
+        )
+    selected = candidates[0]
 
     try:
         selector_cls = selected.load()
+        api_version = getattr(selector_cls, "vllm_victim_selector_api_version", None)
+        if api_version != VICTIM_SELECTOR_API_VERSION:
+            raise TypeError(
+                "plugin declares victim-selector API version "
+                f"{api_version!r}; expected {VICTIM_SELECTOR_API_VERSION}"
+            )
         if not hasattr(selector_cls, "from_vllm_config"):
             raise TypeError("plugin does not define from_vllm_config()")
         selector = selector_cls.from_vllm_config(vllm_config)
         if not isinstance(selector, VictimSelector):
             raise TypeError("plugin does not implement the VictimSelector protocol")
     except Exception as exc:
-        if requested_plugin:
-            raise RuntimeError(
-                f"Failed to load requested victim selector plugin {selected.name!r}"
-            ) from exc
-        logger.exception(
-            "Failed to load victim selector plugin %r; using the default selector",
-            selected.name,
-        )
-        return NoOpVictimSelector()
+        raise RuntimeError(
+            f"Failed to load requested victim selector plugin {selected.name!r}: {exc}"
+        ) from exc
 
     logger.info("Loaded victim selector plugin %r", selected.name)
     return selector
