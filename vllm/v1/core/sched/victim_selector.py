@@ -188,8 +188,7 @@ def get_victim_selector(vllm_config) -> VictimSelector:
     except (OSError, TypeError):
         source_path = selected.value
     logger.info(
-        "Loaded victim selector plugin %r distribution=%s==%s source=%s "
-        "api_version=%s",
+        "Loaded victim selector plugin %r distribution=%s==%s source=%s api_version=%s",
         selected.name,
         distribution_name,
         distribution_version,
