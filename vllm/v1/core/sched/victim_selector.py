@@ -18,6 +18,7 @@ When more than one selector is installed, choose one explicitly with
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
@@ -177,7 +178,24 @@ def get_victim_selector(vllm_config) -> VictimSelector:
             f"Failed to load requested victim selector plugin {selected.name!r}: {exc}"
         ) from exc
 
-    logger.info("Loaded victim selector plugin %r", selected.name)
+    distribution = selected.dist
+    distribution_name = getattr(distribution, "name", None) or "unknown"
+    distribution_version = getattr(distribution, "version", None) or "unknown"
+    try:
+        source_path = inspect.getsourcefile(selector_cls) or inspect.getfile(
+            selector_cls
+        )
+    except (OSError, TypeError):
+        source_path = selected.value
+    logger.info(
+        "Loaded victim selector plugin %r distribution=%s==%s source=%s "
+        "api_version=%s",
+        selected.name,
+        distribution_name,
+        distribution_version,
+        source_path,
+        api_version,
+    )
     return selector
 
 
