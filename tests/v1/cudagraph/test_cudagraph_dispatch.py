@@ -77,6 +77,38 @@ def _create_vllm_config(
 
 
 class TestCudagraphDispatcher:
+    def test_dispatch_trace_carries_tensor_free_runtime_state(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 8],
+        )
+        dispatcher = CudagraphDispatcher(_create_vllm_config(comp_config))
+        dispatcher.initialize_cudagraph_keys(comp_config.cudagraph_mode)
+        trace_context = {
+            "schema_version": 1,
+            "phase": "decode",
+            "kv_cache_dtype": "auto",
+            "runner_version": "v1",
+        }
+
+        with patch(
+            "vllm.v1.cudagraph_dispatcher.emit_compilation_trace"
+        ) as emit_trace:
+            dispatcher.dispatch(
+                num_tokens=8,
+                uniform_decode=True,
+                trace_context=trace_context,
+            )
+
+        event = emit_trace.call_args.args[0]
+        fields = emit_trace.call_args.kwargs
+        assert event == "cudagraph_dispatch"
+        assert fields["graph_state"] == {
+            **trace_context,
+            "selected_graph_mode": str(CUDAGraphMode.FULL),
+        }
+
     @pytest.mark.parametrize(
         "cudagraph_mode_str,compilation_mode,lora_config",
         [

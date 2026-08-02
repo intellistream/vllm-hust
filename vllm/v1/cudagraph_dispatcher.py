@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
@@ -265,7 +266,10 @@ class CudagraphDispatcher:
         mode: CUDAGraphMode,
         descriptor: BatchDescriptor,
         fallback_reason: str | None = None,
+        trace_context: Mapping[str, object] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+        graph_state = dict(trace_context or ())
+        graph_state["selected_graph_mode"] = str(mode)
         emit_compilation_trace(
             "cudagraph_dispatch",
             requested_num_tokens=requested_num_tokens,
@@ -276,6 +280,7 @@ class CudagraphDispatcher:
             selected_key=self._descriptor_fields(descriptor),
             hit=mode != CUDAGraphMode.NONE,
             fallback_reason=fallback_reason,
+            graph_state=graph_state,
             configured_key_cardinality=sum(
                 len(keys) for keys in self.cudagraph_keys.values()
             ),
@@ -290,6 +295,7 @@ class CudagraphDispatcher:
         num_active_loras: int = 0,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
+        trace_context: Mapping[str, object] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -309,6 +315,8 @@ class CudagraphDispatcher:
                 valid_modes to compute allowed modes. (e.g., {FULL} for
                 features like cascade attention not supported by full
                 cudagraphs). None means no modes are excluded.
+            trace_context: Tensor-free runtime state to attach to the opt-in
+                compilation trace.
         """
         allowed_modes = valid_modes or CUDAGraphMode.valid_runtime_modes()
 
@@ -346,6 +354,7 @@ class CudagraphDispatcher:
                 mode=CUDAGraphMode.NONE,
                 descriptor=BatchDescriptor(num_tokens),
                 fallback_reason=reason,
+                trace_context=trace_context,
             )
 
         effective_num_active_loras = num_active_loras
@@ -383,6 +392,7 @@ class CudagraphDispatcher:
                     requested_num_active_loras=num_active_loras,
                     mode=CUDAGraphMode.FULL,
                     descriptor=batch_desc_to_check,
+                    trace_context=trace_context,
                 )
 
         if CUDAGraphMode.PIECEWISE in allowed_modes:
@@ -397,6 +407,7 @@ class CudagraphDispatcher:
                     requested_num_active_loras=num_active_loras,
                     mode=CUDAGraphMode.PIECEWISE,
                     descriptor=batch_desc_to_check,
+                    trace_context=trace_context,
                 )
 
         assert CUDAGraphMode.NONE in allowed_modes, (
@@ -411,6 +422,7 @@ class CudagraphDispatcher:
             mode=CUDAGraphMode.NONE,
             descriptor=BatchDescriptor(num_tokens),
             fallback_reason="no_matching_graph_key",
+            trace_context=trace_context,
         )
 
     def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:

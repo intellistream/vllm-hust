@@ -3,7 +3,11 @@
 
 import json
 
-from vllm.compilation.trace import TRACE_PATH_ENV, emit_compilation_trace
+from vllm.compilation.trace import (
+    TRACE_PATH_ENV,
+    compilation_trace_enabled,
+    emit_compilation_trace,
+)
 
 
 def test_emit_compilation_trace_is_opt_in(monkeypatch, tmp_path):
@@ -13,11 +17,13 @@ def test_emit_compilation_trace_is_opt_in(monkeypatch, tmp_path):
     emit_compilation_trace("disabled", value=1)
 
     assert not trace_path.exists()
+    assert not compilation_trace_enabled()
 
 
 def test_emit_compilation_trace_writes_structured_event(monkeypatch, tmp_path):
     trace_path = tmp_path / "compile.jsonl"
     monkeypatch.setenv(TRACE_PATH_ENV, str(trace_path))
+    assert compilation_trace_enabled()
 
     emit_compilation_trace("cache_lookup", key={"shape": 8}, hit=False)
 

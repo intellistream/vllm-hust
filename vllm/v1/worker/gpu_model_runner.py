@@ -28,6 +28,7 @@ from vllm.compilation.breakable_cudagraph import (
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+from vllm.compilation.trace import compilation_trace_enabled
 from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
@@ -3900,6 +3901,36 @@ class GPUModelRunner(
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
 
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
+            trace_context = None
+            if compilation_trace_enabled():
+                attention_backends = "+".join(
+                    sorted(
+                        {
+                            group.backend.get_name()
+                            for groups in self.attn_groups
+                            for group in groups
+                        }
+                    )
+                )
+                trace_context = {
+                    "schema_version": 1,
+                    "batch_size": num_reqs,
+                    "num_tokens": num_tokens,
+                    "phase": "decode" if uniform_decode else "mixed-or-prefill",
+                    "kv_cache_dtype": self.cache_config.cache_dtype,
+                    "runner_version": "v1",
+                    "attention_backend": attention_backends or "uninitialized",
+                    "configured_graph_mode": str(
+                        self.compilation_config.cudagraph_mode
+                    ),
+                    "prefix_cache_enabled": (
+                        self.cache_config.enable_prefix_caching
+                    ),
+                    "kv_offload_configured": (
+                        self.cache_config.kv_offloading_size is not None
+                    ),
+                    "speculative_configured": self.speculative_config is not None,
+                }
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
@@ -3907,6 +3938,7 @@ class GPUModelRunner(
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                trace_context=trace_context,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(

@@ -16,6 +16,11 @@ from typing import Any
 TRACE_PATH_ENV = "VLLM_COMPILATION_TRACE_PATH"
 
 
+def compilation_trace_enabled() -> bool:
+    """Return whether the opt-in compilation trace has a destination."""
+    return bool(os.getenv(TRACE_PATH_ENV, "").strip())
+
+
 def emit_compilation_trace(event: str, **fields: Any) -> None:
     """Append one best-effort JSON event without affecting serving behavior."""
     path = os.getenv(TRACE_PATH_ENV, "").strip()
