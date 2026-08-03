@@ -4,6 +4,7 @@
 Define KV connector functionality mixin for model runners.
 """
 
+import time
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -32,6 +33,18 @@ logger = init_logger(__name__)
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
 class KVConnectorModelRunnerMixin:
+    @staticmethod
+    def observe_kv_recovery_first_compute(
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Observe the exact scheduled roster immediately before model forward."""
+        if not has_kv_transfer_group():
+            return
+        get_kv_transfer_group().observe_kv_recovery_first_compute(
+            frozenset(scheduler_output.num_scheduled_tokens),
+            time.monotonic_ns(),
+        )
+
     @staticmethod
     def kv_connector_no_forward(
         scheduler_output: "SchedulerOutput", vllm_config: VllmConfig

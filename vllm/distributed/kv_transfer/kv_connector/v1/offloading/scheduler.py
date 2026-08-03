@@ -50,6 +50,7 @@ from vllm.v1.kv_recovery_profile import (
     MAX_LOGICAL_BLOCKS_PER_SET,
     KVRecoveryBlockCoordinate,
     KVRecoveryComputeContext,
+    KVRecoveryComputeKind,
     KVRecoveryH2DReceipt,
     KVRecoveryOperation,
     KVRecoveryRequeueReason,
@@ -1227,6 +1228,7 @@ class OffloadingConnectorScheduler:
                         )
 
         admitted_recovery_epochs: dict[ReqId, int] = {}
+        admitted_compute_kinds: dict[ReqId, KVRecoveryComputeKind] = {}
         if observer is not None:
             resumed_req_ids = set(
                 scheduler_output.scheduled_cached_reqs.resumed_req_ids
@@ -1248,6 +1250,12 @@ class OffloadingConnectorScheduler:
                     and recovery_epoch == req_status.req.num_preemptions
                 ):
                     admitted_recovery_epochs[req_id] = recovery_epoch
+                    admitted_compute_kinds[req_id] = (
+                        "prefill"
+                        if req_status.req.num_computed_tokens
+                        < req_status.req.num_prompt_tokens
+                        else "decode"
+                    )
                     with suppress(Exception):
                         observer.request_admission_started(
                             req_id,
@@ -1262,7 +1270,11 @@ class OffloadingConnectorScheduler:
         if observer is not None:
             for req_id, recovery_epoch in admitted_recovery_epochs.items():
                 with suppress(Exception):
-                    context = observer.request_admitted(req_id, recovery_epoch)
+                    context = observer.request_admitted(
+                        req_id,
+                        recovery_epoch,
+                        admitted_compute_kinds[req_id],
+                    )
                     if (
                         isinstance(context, KVRecoveryComputeContext)
                         and context.identity.runtime_request_id == req_id

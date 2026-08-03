@@ -428,6 +428,8 @@ class KVRecoveryComputeContext:
     block_set_id: str
     bytes_moved: int
     admission_profile_record_id: str
+    compute_kind: KVRecoveryComputeKind
+    base_phase_start_event_id: str
 
     def __post_init__(self) -> None:
         if self.binding != KV_RECOVERY_PROFILE_BINDING:
@@ -445,6 +447,14 @@ class KVRecoveryComputeContext:
         ):
             raise ValueError(
                 "admission_profile_record_id must use process_uuid:k:record_seq"
+            )
+        if self.compute_kind not in {"prefill", "decode"}:
+            raise ValueError("compute context kind must be prefill or decode")
+        if not _matches_scoped_uint64(
+            self.base_phase_start_event_id, _BASE_EVENT_ID_RE
+        ):
+            raise ValueError(
+                "base_phase_start_event_id must use process_uuid:e:record_seq"
             )
 
 
@@ -520,6 +530,7 @@ class KVRecoverySchedulerObserver(Protocol):
         self,
         runtime_request_id: str,
         recovery_epoch: int,
+        compute_kind: KVRecoveryComputeKind,
     ) -> KVRecoveryComputeContext | None: ...
 
     def request_terminal(self, runtime_request_id: str) -> None: ...
@@ -580,8 +591,6 @@ class KVRecoveryWorkerObserver(Protocol):
         self,
         context: KVRecoveryComputeContext,
         timestamp_ns: int,
-        compute_kind: KVRecoveryComputeKind,
-        base_event_id: str,
     ) -> None: ...
 
     def first_compute_not_observed(
@@ -644,8 +653,6 @@ class KVRecoveryWorkerEvidenceSink(Protocol):
         self,
         context: KVRecoveryComputeContext,
         timestamp_ns: int,
-        compute_kind: KVRecoveryComputeKind,
-        base_event_id: str,
     ) -> None: ...
 
     def close(
@@ -1132,8 +1139,6 @@ class BoundedKVRecoveryWorkerObserver:
         self,
         context: KVRecoveryComputeContext,
         timestamp_ns: int,
-        compute_kind: KVRecoveryComputeKind,
-        base_event_id: str,
     ) -> None:
         with self._lifecycle_lock:
             with self._state_lock:
@@ -1144,18 +1149,11 @@ class BoundedKVRecoveryWorkerObserver:
                     and context.binding == KV_RECOVERY_PROFILE_BINDING
                     and context.identity.run_id == self._run_id
                     and _is_uint64(timestamp_ns)
-                    and compute_kind in {"prefill", "decode"}
-                    and _matches_scoped_uint64(base_event_id, _BASE_EVENT_ID_RE)
                 )
                 if not valid:
                     self._evidence_disabled = True
             if valid:
-                self._sink.first_compute(
-                    context,
-                    timestamp_ns,
-                    compute_kind,
-                    base_event_id,
-                )
+                self._sink.first_compute(context, timestamp_ns)
             else:
                 self._sink.evidence_failure(
                     reason="invalid_first_compute_observation",
