@@ -4,7 +4,6 @@
 import pytest
 
 import vllm.entrypoints.serve.utils.api_utils as api_utils
-
 from vllm.entrypoints.openai.engine.protocol import StreamOptions
 from vllm.entrypoints.serve.utils.api_utils import (
     get_max_tokens,
