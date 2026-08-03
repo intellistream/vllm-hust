@@ -3,6 +3,7 @@
 """Static AST checks for issue #163: verify that gpu_model_runner guards
 all Knorm code paths with _knorm_active / _knorm_wrapper_installed so no
 half-enabled state can occur."""
+
 from __future__ import annotations
 
 import ast
@@ -36,15 +37,16 @@ def test_knorm_active_flag_defined_in_init():
     register_all_kvcache_specs."""
     tree = _tree()
     cls = next(
-        n for n in ast.walk(tree)
+        n
+        for n in ast.walk(tree)
         if isinstance(n, ast.ClassDef) and n.name == "GPUModelRunner"
     )
     init = next(
-        n for n in cls.body
-        if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
     )
     active_assigns = [
-        n for n in ast.walk(init)
+        n
+        for n in ast.walk(init)
         if isinstance(n, (ast.Assign, ast.AnnAssign))
         and _attr_name(n) == "_knorm_active"
     ]

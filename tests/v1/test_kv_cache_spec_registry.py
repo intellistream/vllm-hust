@@ -223,7 +223,9 @@ class TestKVCacheSpecRegistry:
         vice versa). See issue #163."""
         monkeypatch.setenv("VLLM_KNORM_ENABLED", "0")
         import importlib
+
         import vllm.envs as envs_mod
+
         importlib.reload(envs_mod)
 
         _REGISTRY_KVCACHESPEC_LIST.clear()
@@ -235,9 +237,7 @@ class TestKVCacheSpecRegistry:
         spec = make_spec(FullAttentionSpec)
         assert KVCacheSpecRegistry.get_manager_class(spec) is FullAttentionManager
 
-    def test_knorm_is_not_registered_when_compression_ratio_is_one(
-        self, monkeypatch
-    ):
+    def test_knorm_is_not_registered_when_compression_ratio_is_one(self, monkeypatch):
         """Knorm manager must NOT register when compression_ratio=1.0 (no
         compression) even if VLLM_KNORM_ENABLED=1 and prefix caching is off.
         compression_ratio=1.0 means no blocks would be evicted, so installing
@@ -247,7 +247,9 @@ class TestKVCacheSpecRegistry:
         monkeypatch.setenv("VLLM_KNORM_ENABLED", "1")
         monkeypatch.setenv("VLLM_KNORM_COMPRESSION_RATIO", "1.0")
         import importlib
+
         import vllm.envs as envs_mod
+
         importlib.reload(envs_mod)
 
         _REGISTRY_KVCACHESPEC_LIST.clear()
@@ -265,19 +267,20 @@ class TestKVCacheSpecRegistry:
         register_all_kvcache_specs agree on manager type for every
         combination. See issue #163 review feedback."""
         import importlib
+
         import vllm.envs as envs_mod
         from vllm.knorm.config import should_activate
 
         cases = [
             # (knorm_enabled, compression_ratio, prefix_caching, expected_knorm)
-            ("1", "0.5", False, True),   # fully active
-            ("1", "0.5", True,  False),   # prefix caching blocks
-            ("1", "1.0", False, False),   # ratio=1.0 blocks
-            ("1", "1.0", True,  False),   # both block
-            ("0", "0.5", False, False),   # disabled
-            ("0", "0.5", True,  False),   # disabled + prefix
-            ("0", "1.0", False, False),   # all off
-            ("0", "1.0", True,  False),   # all off + prefix
+            ("1", "0.5", False, True),  # fully active
+            ("1", "0.5", True, False),  # prefix caching blocks
+            ("1", "1.0", False, False),  # ratio=1.0 blocks
+            ("1", "1.0", True, False),  # both block
+            ("0", "0.5", False, False),  # disabled
+            ("0", "0.5", True, False),  # disabled + prefix
+            ("0", "1.0", False, False),  # all off
+            ("0", "1.0", True, False),  # all off + prefix
         ]
 
         for enabled, ratio, prefix_caching, expected_knorm in cases:
@@ -303,6 +306,7 @@ class TestKVCacheSpecRegistry:
             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
             if expected_knorm:
                 from vllm.knorm.manager import KnormFullAttentionManager
+
                 assert manager_cls is KnormFullAttentionManager, (
                     f"Expected KnormFullAttentionManager for "
                     f"ENABLED={enabled}, RATIO={ratio}, prefix={prefix_caching}"
