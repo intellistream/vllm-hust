@@ -6,7 +6,9 @@ from collections.abc import Iterable
 
 import pytest
 
+import vllm.distributed.kv_transfer.kv_connector.v1.offloading.common as common_module
 import vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker as worker_module
+import vllm.v1.kv_recovery_profile as recovery_profile
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     TransferJob,
@@ -84,7 +86,7 @@ class RecordingObserver:
         self.attempts: dict[int, KVRecoveryTransferAttempt] = {}
         self.transfer_seq = 0
         self.wait_completed_calls: list[KVRecoveryWaitAttempt] = []
-        self.receipt_truncations: list[KVRecoveryH2DReceipt] = []
+        self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
         self.closed = False
 
     def _raise_if_requested(self, stage: str):
@@ -168,8 +170,8 @@ class RecordingObserver:
         self.events.append(("observer_wait_completed", attempt.transfer_ids))
         self.wait_completed_calls.append(attempt)
 
-    def h2d_receipt_truncated(self, receipt):
-        self.receipt_truncations.append(receipt)
+    def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+        self.receipt_capacity_losses.append((receipt, loss_reason))
 
     def close(self):
         self._raise_if_requested("close")
@@ -181,10 +183,12 @@ class RecordingEvidenceSink:
         self.submissions: list[tuple[KVRecoveryTransferAttempt, int]] = []
         self.not_submitted: list[KVRecoveryTransferAttempt] = []
         self.completions: list[int] = []
-        self.capacity_losses: list[tuple[KVRecoveryTransferAttempt, int, str]] = []
+        self.capacity_losses: list[
+            tuple[KVRecoveryTransferAttempt, str, int | None, str]
+        ] = []
         self.failures: list[tuple[str, tuple[int, ...]]] = []
         self.waits: list[KVRecoveryWaitAttempt] = []
-        self.truncated: list[KVRecoveryH2DReceipt] = []
+        self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
         self.close_calls: list[tuple[tuple[KVRecoveryTransferAttempt, ...], bool]] = []
 
     def transfer_submitted(self, attempt, timestamp_ns):
@@ -226,8 +230,14 @@ class RecordingEvidenceSink:
             bytes_moved=bytes_moved,
         )
 
-    def pending_h2d_capacity_exhausted(self, attempt, timestamp_ns, loss_reason):
-        self.capacity_losses.append((attempt, timestamp_ns, loss_reason))
+    def transfer_capacity_exhausted(
+        self,
+        attempt,
+        capacity,
+        timestamp_ns,
+        loss_reason,
+    ):
+        self.capacity_losses.append((attempt, capacity, timestamp_ns, loss_reason))
 
     def evidence_failure(
         self,
@@ -241,8 +251,8 @@ class RecordingEvidenceSink:
     def wait_completed(self, attempt):
         self.waits.append(attempt)
 
-    def h2d_receipt_truncated(self, receipt):
-        self.truncated.append(receipt)
+    def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+        self.receipt_capacity_losses.append((receipt, loss_reason))
 
     def close(self, open_attempts, evidence_disabled):
         self.close_calls.append((open_attempts, evidence_disabled))
@@ -366,7 +376,7 @@ def test_disabled_worker_path_preserves_load_semantics():
     assert worker_meta.completed_jobs == {7: 1}
     assert worker_meta.transfer_stats.load.bytes == 128
     assert worker_meta.kv_recovery_h2d_receipts == ()
-    assert not worker_meta.kv_recovery_h2d_receipts_truncated
+    assert not worker_meta.kv_recovery_h2d_receipt_capacity_exhausted
 
 
 def test_disabled_worker_path_does_not_read_profile_clock(
@@ -732,6 +742,66 @@ def test_successful_wait_is_recorded_only_after_backend_returns():
     assert observer.wait_completed_calls[0].transfer_ids == (f"{'a' * 32}:t:0",)
 
 
+def test_prepared_transfer_capacity_is_distinct_and_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        recovery_profile,
+        "MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS",
+        1,
+    )
+    sink = RecordingEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver("a" * 32, "0" * 32, "c" * 32, sink)
+    context = make_context("d2h_preserve")
+
+    first = observer.begin_transfer(1, context)
+    second = observer.begin_transfer(2, context)
+
+    assert first is not None
+    assert second is None
+    assert observer.prepared_transfer_count == 1
+    assert observer.transfer_seq == 2
+    assert len(sink.capacity_losses) == 1
+    attempt, capacity, timestamp_ns, loss_reason = sink.capacity_losses[0]
+    assert attempt.connector_job_id == 2
+    assert capacity == "prepared_transfer"
+    assert timestamp_ns is None
+    assert loss_reason == "serialization_failure"
+    assert sink.failures == []
+    assert observer.evidence_disabled
+
+
+def test_pending_d2h_capacity_is_distinct_and_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        recovery_profile,
+        "MAX_PENDING_D2H_CONTEXTS_PER_PROCESS",
+        1,
+    )
+    sink = RecordingEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver("a" * 32, "0" * 32, "c" * 32, sink)
+    context = make_context("d2h_preserve")
+    first = observer.begin_transfer(1, context)
+    assert first is not None
+    observer.transfer_submitted(first, 10)
+    second = observer.begin_transfer(2, context)
+    assert second is not None
+
+    observer.transfer_submitted(second, 11)
+
+    assert observer.pending_d2h_count == 1
+    assert len(sink.submissions) == 1
+    assert len(sink.capacity_losses) == 1
+    attempt, capacity, timestamp_ns, loss_reason = sink.capacity_losses[0]
+    assert attempt == second
+    assert capacity == "pending_d2h"
+    assert timestamp_ns == 11
+    assert loss_reason == "serialization_failure"
+    assert sink.failures == []
+    assert observer.evidence_disabled
+
+
 def test_4097th_h2d_keeps_serving_and_records_one_capacity_loss():
     sink = RecordingEvidenceSink()
     observer = BoundedKVRecoveryWorkerObserver("a" * 32, "0" * 32, "c" * 32, sink)
@@ -750,8 +820,9 @@ def test_4097th_h2d_keeps_serving_and_records_one_capacity_loss():
     assert observer.pending_h2d_count == MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
     assert len(sink.submissions) == MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
     assert len(sink.capacity_losses) == 1
-    dropped_attempt, _, loss_reason = sink.capacity_losses[0]
+    dropped_attempt, capacity, _, loss_reason = sink.capacity_losses[0]
     assert dropped_attempt.connector_job_id == total_jobs - 1
+    assert capacity == "pending_h2d"
     assert loss_reason == "serialization_failure"
     assert sink.failures == []
     assert observer.evidence_disabled
@@ -773,3 +844,41 @@ def test_4097th_h2d_keeps_serving_and_records_one_capacity_loss():
     open_attempts, evidence_disabled = sink.close_calls[0]
     assert len(open_attempts) == MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
     assert evidence_disabled
+
+
+def test_late_h2d_receipt_capacity_preserves_prefix_and_fails_evidence_closed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(common_module, "MAX_H2D_RECEIPTS_PER_WORKER_STEP", 1)
+    sink = RecordingEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver("a" * 32, "0" * 32, "c" * 32, sink)
+    worker, backend, _ = make_worker(observer)
+    context = make_context("h2d_restore")
+    job = make_load_job()
+    worker.start_kv_transfers(
+        metadata(
+            load_jobs=((1, job), (2, job)),
+            kv_recovery_contexts=((1, context), (2, context)),
+        )
+    )
+    backend.finished.extend(
+        (
+            TransferResult(1, True, 128, 0.25),
+            TransferResult(2, True, 128, 0.25),
+        )
+    )
+
+    worker.get_finished(set())
+    worker_meta = worker.build_connector_worker_meta()
+
+    assert worker_meta is not None
+    assert worker_meta.completed_jobs == {1: 1, 2: 1}
+    assert len(worker_meta.kv_recovery_h2d_receipts) == 1
+    assert worker_meta.kv_recovery_h2d_receipts[0].connector_job_id == 1
+    assert worker_meta.kv_recovery_h2d_receipt_capacity_exhausted
+    assert sink.completions == [1, 2]
+    assert len(sink.receipt_capacity_losses) == 1
+    late_receipt, loss_reason = sink.receipt_capacity_losses[0]
+    assert late_receipt.connector_job_id == 2
+    assert loss_reason == "serialization_failure"
+    assert observer.evidence_disabled

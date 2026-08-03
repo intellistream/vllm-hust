@@ -16,6 +16,10 @@ import pytest
 import vllm.v1.kv_recovery_profile as recovery_profile
 from vllm.v1.kv_recovery_profile import (
     KV_RECOVERY_PROFILE_BINDING,
+    MAX_H2D_RECEIPTS_PER_WORKER_STEP,
+    MAX_PENDING_D2H_CONTEXTS_PER_PROCESS,
+    MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
+    MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS,
     BoundedKVRecoveryWorkerObserver,
     KVRecoveryBlockCoordinate,
     KVRecoveryH2DReceipt,
@@ -138,7 +142,13 @@ class NoopEvidenceSink:
     def transfer_completed(self, **kwargs):
         return None
 
-    def pending_h2d_capacity_exhausted(self, attempt, timestamp_ns, loss_reason):
+    def transfer_capacity_exhausted(
+        self,
+        attempt,
+        capacity,
+        timestamp_ns,
+        loss_reason,
+    ):
         return None
 
     def evidence_failure(
@@ -153,7 +163,7 @@ class NoopEvidenceSink:
     def wait_completed(self, attempt):
         return None
 
-    def h2d_receipt_truncated(self, receipt):
+    def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         return None
 
     def close(self, open_attempts, evidence_disabled):
@@ -165,16 +175,50 @@ def test_binding_locks_authorized_candidate_digests():
     assert binding.profile_sha256 == (
         "b363532884d1cae8049ab080d2b85a629f3b33a75f6621788d1e4c8f30737666"
     )
-    assert binding.communication_mapping_candidate_sha256 == (
-        "dca914f989f3a98d43fb9fa2538f7c43a375e8f22f5deb7e09343aee5ee7bc19"
+    assert binding.profile_owner_approval_record_sha256 == (
+        "2831ce52802e7cbe4ec092431c71c18de05491da7ac8d48512014b1d43b3cb0c"
     )
-    assert binding.base_mode_overlay_candidate_sha256 == (
-        "6e035c29664038cdc93b545538cee6fc31abfb79e455d994851f8c9dbfd1c734"
+    assert binding.observer_policy_sha256 == (
+        "fbee3bc4f74b8c5c20e929c4e37596b06b31c1b9cd02517d8461961a8aedf420"
     )
-    assert binding.communication_mapping_status == (
-        "candidate_issue2_authority_pending"
+    assert binding.observer_policy_approval_candidate_sha256 == (
+        "27cb52269fff8f10e376f3128384c4aac37f149ad685b89501f98ba50bc0cf29"
     )
-    assert binding.base_mode_overlay_status == ("candidate_owner_ratification_pending")
+    assert binding.observer_policy_profile_p0_owner_approval_sha256 == (
+        "322df19ade75797fc4c3f43fe96e689404ef60a270c92081afea03683e734c91"
+    )
+    assert binding.communication_mapping_sha256 == (
+        "095944bbbb1a3ad3518aebfdd61c820ade3affdebd6024b47389cdaec24a3fa3"
+    )
+    assert binding.communication_mapping_approval_candidate_sha256 == (
+        "a686243ffd9c650790e6421e5f976a2a5c010a5d2480e7a30ad8722a9218f3f7"
+    )
+    assert binding.communication_mapping_authority_approval_sha256 == (
+        "42b761177c4bea13833be19ddc143f89c32eee02fbbb98afc2c03249c2783fe5"
+    )
+    assert binding.base_mode_overlay_sha256 == (
+        "d80771b793a9513cdbd4fc2001e21771c56a59d49340ee88d4381027d70b1d5a"
+    )
+    assert binding.base_mode_overlay_approval_candidate_sha256 == (
+        "de889357af659d8e9c1f7daf0aa32656761e80dcf0fea29ef60809912f513694"
+    )
+    assert binding.base_mode_overlay_owner_approval_sha256 == (
+        "50d7deb8f98fcdca36303297a4ce6f7958ae619574d2e1994872936b6fc583a3"
+    )
+    assert binding.g0_remediation_cpu_result_sha256 == (
+        "4b378d10cef6be10fa3fb5a840402da77b1da755781118127a5d30b1cc4b7eb2"
+    )
+    assert binding.g1_cpu_source_reauthorization_sha256 == (
+        "448ff68cd139077a2f767fd16359bb5dd8f4cf61cfe258fd48f53a26569718f5"
+    )
+    assert binding.communication_mapping_status == "approved_mapping_only"
+    assert binding.base_mode_overlay_status == "approved_overlay_only"
+    assert binding.observer_policy_status == (
+        "profile_P0_items_1_5_approved_runtime_items_6_8_pending"
+    )
+    assert binding.complete_configuration_status == "pending"
+    assert binding.runtime_conformance_status == "pending"
+    assert binding.joint_admission_status == "pending"
     assert binding.communication_mode == "none"
     assert not binding.runtime_activation_authorized
     assert not recovery_profile.KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED
@@ -182,6 +226,44 @@ def test_binding_locks_authorized_candidate_digests():
     assert binding.device_plugin_audit_commit == (
         "cafad89a5e103f31ea517c1edb56130578c3cd56"
     )
+    assert {
+        MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS,
+        MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
+        MAX_PENDING_D2H_CONTEXTS_PER_PROCESS,
+        MAX_H2D_RECEIPTS_PER_WORKER_STEP,
+    } == {4096}
+
+
+def test_mapping_and_overlay_approval_cannot_open_activation_gate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    binding = replace(
+        KV_RECOVERY_PROFILE_BINDING,
+        communication_mode=KV_RECOVERY_PROFILE_BINDING.communication_mapping_id,
+        runtime_activation_authorized=True,
+    )
+    monkeypatch.setattr(
+        recovery_profile,
+        "KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED",
+        True,
+    )
+    monkeypatch.setattr(recovery_profile, "KV_RECOVERY_PROFILE_BINDING", binding)
+
+    assert not recovery_profile._activation_gate_open()
+
+    fully_admitted = replace(
+        binding,
+        observer_policy_status="fully_ratified",
+        complete_configuration_status="approved",
+        runtime_conformance_status="conformant",
+        joint_admission_status="approved",
+    )
+    monkeypatch.setattr(
+        recovery_profile,
+        "KV_RECOVERY_PROFILE_BINDING",
+        fully_admitted,
+    )
+    assert recovery_profile._activation_gate_open()
 
 
 def test_recovery_abi_round_trips_through_pickle():

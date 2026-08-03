@@ -262,7 +262,10 @@ class OffloadingConnectorWorker:
         if self._connector_worker_meta.add_kv_recovery_h2d_receipt(receipt):
             return
         try:
-            observer.h2d_receipt_truncated(receipt)
+            observer.h2d_receipt_capacity_exhausted(
+                receipt,
+                "serialization_failure",
+            )
         except Exception:
             return
 
