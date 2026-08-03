@@ -941,6 +941,12 @@ jobs:
           test "$(git -C "$GITHUB_WORKSPACE/vllm-hust-benchmark" rev-parse HEAD)" = "$PERFGATE_BENCHMARK_RUNNER_SHA"
           test "$(git -C "$GITHUB_WORKSPACE/vllm-ascend-hust" rev-parse HEAD)" = "$PERFGATE_VLLM_ASCEND_HUST_SHA"
           test "$(git -C "$GITHUB_WORKSPACE/ascend-runtime-manager" rev-parse HEAD)" = "$PERFGATE_RUNTIME_MANAGER_SHA"
+          if ! PYTHONPATH="$GITHUB_WORKSPACE/vllm-hust-benchmark/src${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -m vllm_hust_benchmark.perfgate_baselines publish --help | \
+            grep -Fq -- '--runtime-manager-sha'; then
+            echo "Pinned benchmark runner does not support --runtime-manager-sha; update VLLM_HUST_PERFGATE_BENCHMARK_RUNNER_SHA to a compatible immutable SHA." >&2
+            exit 2
+          fi
 
       - name: Prepare Hugging Face cache directories
         run: |

@@ -108,6 +108,7 @@ ARTIFACT_SHA=$(read_json '.metadata.git_commit' "$BASELINE_FILE")
 VLLM_HUST_SHA=$(read_json '.vllm_hust_sha' "$PROVENANCE_FILE")
 VLLM_ASCEND_HUST_SHA=$(read_json '.vllm_ascend_hust_sha' "$PROVENANCE_FILE")
 BENCHMARK_RUNNER_SHA=$(read_json '.benchmark_runner_sha' "$PROVENANCE_FILE")
+RUNTIME_MANAGER_SHA=$(read_json '.runtime_manager_sha' "$PROVENANCE_FILE")
 HARDWARE_CHIP_MODEL=$(read_json '.hardware_chip_model' "$PROVENANCE_FILE")
 CANN_VERSION=$(read_json '.cann_version' "$PROVENANCE_FILE")
 TORCH_VERSION=$(read_json '.torch_version' "$PROVENANCE_FILE")
@@ -170,6 +171,7 @@ PYTHONPATH="$BENCHMARK_REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
   --vllm-hust-sha "$VLLM_HUST_SHA" \
   --vllm-ascend-hust-sha "$VLLM_ASCEND_HUST_SHA" \
   --benchmark-runner-sha "$BENCHMARK_RUNNER_SHA" \
+  --runtime-manager-sha "$RUNTIME_MANAGER_SHA" \
   --hardware-chip-model "$HARDWARE_CHIP_MODEL" \
   --cann-version "$CANN_VERSION" \
   --torch-version "$TORCH_VERSION" \

@@ -714,6 +714,9 @@ def test_runner_script_copies_measurement_json_fail_closed():
     assert "perfgate-provenance.json" in text
     assert '"schema_version": "perfgate-runtime-provenance/v1"' in text
     assert 'PERFGATE_CANN_VERSION="${HUST_ASCEND_RUNTIME_VERSION:-}"' in text
+    assert 'git -C "${HUST_ASCEND_MANAGER_REPO:-}" rev-parse HEAD' in text
+    assert 'PERFGATE_RUNTIME_MANAGER_SHA="$runtime_manager_commit"' in text
+    assert '"runtime_manager_sha": one_line' in text
 
 
 def test_store_baseline_script_uses_central_exact_protocol_and_askpass():
@@ -724,6 +727,7 @@ def test_store_baseline_script_uses_central_exact_protocol_and_askpass():
     assert '--target-repository "$TARGET_REPOSITORY"' in text
     assert '--spec-hash "$SPEC_HASH"' in text
     assert '--benchmark-runner-sha "$BENCHMARK_RUNNER_SHA"' in text
+    assert '--runtime-manager-sha "$RUNTIME_MANAGER_SHA"' in text
     assert "perfgate-measurement/v2" in text
     assert "warmup+primary-median-run" in text
     assert 'secondary_sort_key == "run_index"' in text
@@ -737,6 +741,19 @@ def test_store_baseline_script_uses_central_exact_protocol_and_askpass():
     assert 'sha256sum "$raw_result"' in text
     assert "baselines/$GITHUB_SHA" not in text
     assert "latest-main-pointer.json" not in text
+
+
+def test_trusted_main_benchmark_runner_supports_runtime_manager_provenance() -> None:
+    workflow = workflow_text()
+    check_start = workflow.index("- name: Verify trusted main dependency SHAs")
+    check_end = workflow.index(
+        "- name: Prepare Hugging Face cache directories", check_start
+    )
+    dependency_check = workflow[check_start:check_end]
+
+    assert "perfgate_baselines publish --help" in dependency_check
+    assert "--runtime-manager-sha" in dependency_check
+    assert "Pinned benchmark runner does not support" in dependency_check
 
 
 def test_perfgate_producer_and_store_survive_formal_benchmark_failure():
