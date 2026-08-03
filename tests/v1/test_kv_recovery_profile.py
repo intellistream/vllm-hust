@@ -765,6 +765,28 @@ def test_foreign_run_transfer_cannot_enter_wait_membership():
     assert sink.failures == ["foreign_run_transfer", "invalid_wait_membership"]
 
 
+@pytest.mark.parametrize("operation", ["h2d_restore", "d2h_preserve"])
+def test_connector_flush_invalidates_pending_context_exactly_once(operation):
+    sink = NoopEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver(
+        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
+    )
+    attempt = observer.begin_transfer(7, make_context(operation=operation))
+    assert attempt is not None
+    observer.transfer_submitted(attempt, 10)
+
+    observer.invalidate_transfers(frozenset({7, 8}))
+    observer.invalidate_transfers(frozenset({7}))
+
+    assert observer.prepared_transfer_count == 0
+    assert observer.pending_h2d_count == 0
+    assert observer.pending_d2h_count == 0
+    assert observer.evidence_disabled
+    assert sink.failures == ["connector_flush_invalidation"]
+    assert observer.transfer_completed(7, 20, True, 128, 5) is None
+    assert sink.failures == ["connector_flush_invalidation"]
+
+
 @pytest.mark.parametrize(
     ("connector_job_id", "timestamp_ns", "success", "bytes_moved", "duration_ns"),
     [
