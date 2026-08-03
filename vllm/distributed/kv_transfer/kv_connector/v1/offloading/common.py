@@ -9,6 +9,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.v1.kv_offload.base import LoadStoreSpec
 from vllm.v1.kv_recovery_profile import (
     MAX_H2D_RECEIPTS_PER_WORKER_STEP,
+    KVRecoveryComputeContext,
     KVRecoveryH2DReceipt,
     KVRecoveryTransferContext,
 )
@@ -76,6 +77,7 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
     kv_recovery_contexts: dict[int, KVRecoveryTransferContext] | None = None
+    kv_recovery_compute_contexts: dict[str, KVRecoveryComputeContext] | None = None
 
 
 @dataclass

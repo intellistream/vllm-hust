@@ -529,6 +529,10 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def observe_kv_recovery_requeue(self, request: "Request", reason: str) -> None:
+        """Optional default-off observation of a post-wakeup scheduler defer."""
+        return
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
         Update KVConnector state from worker-side connectors output.

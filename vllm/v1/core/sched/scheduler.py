@@ -719,6 +719,10 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    if self.connector is not None:
+                        self.connector.observe_kv_recovery_requeue(
+                            request, "lora_capacity"
+                        )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -846,6 +850,10 @@ class Scheduler(SchedulerInterface):
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    if self.connector is not None:
+                        self.connector.observe_kv_recovery_requeue(
+                            request, "prefill_throttled"
+                        )
                     break
                 else:
                     # Number of tokens to be scheduled.
@@ -867,6 +875,10 @@ class Scheduler(SchedulerInterface):
                             or num_computed_tokens + num_new_tokens > self.max_model_len
                         ):
                             # Prefer to not schedule than schedule un-padded here.
+                            if self.connector is not None:
+                                self.connector.observe_kv_recovery_requeue(
+                                    request, "token_budget"
+                                )
                             break
                         pad_spec_decode = True
 
@@ -882,6 +894,10 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        if self.connector is not None:
+                            self.connector.observe_kv_recovery_requeue(
+                                request, "token_budget"
+                            )
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -903,6 +919,10 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            if self.connector is not None:
+                                self.connector.observe_kv_recovery_requeue(
+                                    request, "encoder_budget"
+                                )
                             break
 
                 # Skip block alignment when setting up async receive (no local work).
@@ -963,6 +983,11 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+
+                    if self.connector is not None:
+                        self.connector.observe_kv_recovery_requeue(
+                            request, "block_capacity"
+                        )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager

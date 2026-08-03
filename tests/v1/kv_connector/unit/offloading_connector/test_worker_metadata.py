@@ -29,6 +29,7 @@ def make_receipt(job_id: int = 42) -> KVRecoveryH2DReceipt:
         recovery_epoch=1,
         episode_id=f"{lifecycle_id}:k:1",
         base_preempted_event_id=f"{'b' * 32}:e:0",
+        preempt_profile_record_id=f"{'b' * 32}:k:0",
     )
     return KVRecoveryH2DReceipt(
         binding=KV_RECOVERY_PROFILE_BINDING,

@@ -14,6 +14,15 @@ from typing import Literal, Protocol
 
 KVRecoveryOperation = Literal["d2h_preserve", "h2d_restore"]
 KVRecoveryCapacity = Literal["prepared_transfer", "pending_h2d", "pending_d2h"]
+KVRecoveryRequeueReason = Literal[
+    "lora_capacity",
+    "prefill_throttled",
+    "token_budget",
+    "encoder_budget",
+    "block_capacity",
+    "unclassified",
+]
+KVRecoveryComputeKind = Literal["prefill", "decode"]
 
 MAX_LOGICAL_BLOCKS_PER_SET = 4096
 MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS = 4096
@@ -230,6 +239,7 @@ class KVRecoveryIdentity:
     recovery_epoch: int | None
     episode_id: str | None
     base_preempted_event_id: str | None
+    preempt_profile_record_id: str | None
 
     def __post_init__(self) -> None:
         if not _is_lower_hex32(self.run_id):
@@ -244,7 +254,11 @@ class KVRecoveryIdentity:
             MAX_RUNTIME_REQUEST_ID_BYTES,
         )
         if self.recovery_epoch is None:
-            if self.episode_id is not None or self.base_preempted_event_id is not None:
+            if (
+                self.episode_id is not None
+                or self.base_preempted_event_id is not None
+                or self.preempt_profile_record_id is not None
+            ):
                 raise ValueError("non-recovery identity cannot carry episode fields")
             return
         if not _is_positive_uint64(self.recovery_epoch):
@@ -257,6 +271,12 @@ class KVRecoveryIdentity:
         if not _matches_scoped_uint64(self.base_preempted_event_id, _BASE_EVENT_ID_RE):
             raise ValueError(
                 "base_preempted_event_id must use process_uuid:e:record_seq"
+            )
+        if self.preempt_profile_record_id is None or not _matches_scoped_uint64(
+            self.preempt_profile_record_id, _PROFILE_RECORD_ID_RE
+        ):
+            raise ValueError(
+                "preempt_profile_record_id must use process_uuid:k:record_seq"
             )
 
 
@@ -399,6 +419,36 @@ class KVRecoveryH2DReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class KVRecoveryComputeContext:
+    """Scheduler-to-worker sidecar for the first recovered compute."""
+
+    binding: KVRecoveryProfileBinding
+    identity: KVRecoveryIdentity
+    transfer_id: str
+    block_set_id: str
+    bytes_moved: int
+    admission_profile_record_id: str
+
+    def __post_init__(self) -> None:
+        if self.binding != KV_RECOVERY_PROFILE_BINDING:
+            raise ValueError("compute context is bound to an unknown candidate")
+        if self.identity.recovery_epoch is None:
+            raise ValueError("compute context requires a recovery episode")
+        if not _matches_transfer_id(self.transfer_id):
+            raise ValueError("compute context transfer_id is invalid")
+        if not _is_lower_hex64(self.block_set_id):
+            raise ValueError("compute context block_set_id must be lowercase SHA-256")
+        if not _is_positive_uint64(self.bytes_moved):
+            raise ValueError("compute context bytes_moved must be positive")
+        if not _matches_scoped_uint64(
+            self.admission_profile_record_id, _PROFILE_RECORD_ID_RE
+        ):
+            raise ValueError(
+                "admission_profile_record_id must use process_uuid:k:record_seq"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class KVRecoveryWaitMembership:
     """Resolved process-scoped membership frozen before a worker wait."""
 
@@ -438,7 +488,7 @@ class KVRecoverySchedulerObserver(Protocol):
         self,
         runtime_request_id: str,
         recovery_epoch: int,
-    ) -> None: ...
+    ) -> str | None: ...
 
     def prepare_transfer_context(
         self,
@@ -459,11 +509,18 @@ class KVRecoverySchedulerObserver(Protocol):
         recovery_epoch: int,
     ) -> None: ...
 
+    def request_requeued(
+        self,
+        runtime_request_id: str,
+        recovery_epoch: int,
+        reason: KVRecoveryRequeueReason,
+    ) -> None: ...
+
     def request_admitted(
         self,
         runtime_request_id: str,
         recovery_epoch: int,
-    ) -> None: ...
+    ) -> KVRecoveryComputeContext | None: ...
 
     def request_terminal(self, runtime_request_id: str) -> None: ...
 
@@ -519,6 +576,19 @@ class KVRecoveryWorkerObserver(Protocol):
         loss_reason: Literal["serialization_failure"],
     ) -> None: ...
 
+    def first_compute(
+        self,
+        context: KVRecoveryComputeContext,
+        timestamp_ns: int,
+        compute_kind: KVRecoveryComputeKind,
+        base_event_id: str,
+    ) -> None: ...
+
+    def first_compute_not_observed(
+        self,
+        context: KVRecoveryComputeContext,
+    ) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -568,6 +638,14 @@ class KVRecoveryWorkerEvidenceSink(Protocol):
         self,
         receipt: KVRecoveryH2DReceipt,
         loss_reason: Literal["serialization_failure"],
+    ) -> None: ...
+
+    def first_compute(
+        self,
+        context: KVRecoveryComputeContext,
+        timestamp_ns: int,
+        compute_kind: KVRecoveryComputeKind,
+        base_event_id: str,
     ) -> None: ...
 
     def close(
@@ -1049,6 +1127,66 @@ class BoundedKVRecoveryWorkerObserver:
                     return
                 self._evidence_disabled = True
             self._sink.h2d_receipt_capacity_exhausted(receipt, loss_reason)
+
+    def first_compute(
+        self,
+        context: KVRecoveryComputeContext,
+        timestamp_ns: int,
+        compute_kind: KVRecoveryComputeKind,
+        base_event_id: str,
+    ) -> None:
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._closed or self._evidence_disabled:
+                    return
+                valid = (
+                    isinstance(context, KVRecoveryComputeContext)
+                    and context.binding == KV_RECOVERY_PROFILE_BINDING
+                    and context.identity.run_id == self._run_id
+                    and _is_uint64(timestamp_ns)
+                    and compute_kind in {"prefill", "decode"}
+                    and _matches_scoped_uint64(base_event_id, _BASE_EVENT_ID_RE)
+                )
+                if not valid:
+                    self._evidence_disabled = True
+            if valid:
+                self._sink.first_compute(
+                    context,
+                    timestamp_ns,
+                    compute_kind,
+                    base_event_id,
+                )
+            else:
+                self._sink.evidence_failure(
+                    reason="invalid_first_compute_observation",
+                    connector_job_ids=(),
+                    transfer_ids=(
+                        (context.transfer_id,)
+                        if isinstance(context, KVRecoveryComputeContext)
+                        else ()
+                    ),
+                    timestamp_ns=timestamp_ns if _is_uint64(timestamp_ns) else None,
+                )
+
+    def first_compute_not_observed(
+        self,
+        context: KVRecoveryComputeContext,
+    ) -> None:
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._closed:
+                    return
+                self._evidence_disabled = True
+            self._sink.evidence_failure(
+                reason="missing_first_compute_observation",
+                connector_job_ids=(),
+                transfer_ids=(
+                    (context.transfer_id,)
+                    if isinstance(context, KVRecoveryComputeContext)
+                    else ()
+                ),
+                timestamp_ns=None,
+            )
 
     def close(self) -> None:
         with self._lifecycle_lock:

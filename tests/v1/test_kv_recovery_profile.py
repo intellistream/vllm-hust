@@ -22,6 +22,7 @@ from vllm.v1.kv_recovery_profile import (
     MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS,
     BoundedKVRecoveryWorkerObserver,
     KVRecoveryBlockCoordinate,
+    KVRecoveryComputeContext,
     KVRecoveryH2DReceipt,
     KVRecoveryIdentity,
     KVRecoveryLogicalBlock,
@@ -59,6 +60,7 @@ def make_identity(*, recovery: bool = True) -> KVRecoveryIdentity:
         recovery_epoch=1 if recovery else None,
         episode_id=f"{lifecycle_id}:k:1" if recovery else None,
         base_preempted_event_id=f"{'b' * 32}:e:0" if recovery else None,
+        preempt_profile_record_id=f"{'b' * 32}:k:0" if recovery else None,
     )
 
 
@@ -132,6 +134,7 @@ class NoopEvidenceSink:
     def __init__(self):
         self.failures: list[str] = []
         self.close_calls = 0
+        self.first_compute_observations: list[tuple[object, int, str, str]] = []
 
     def transfer_submitted(self, attempt, timestamp_ns):
         return None
@@ -165,6 +168,11 @@ class NoopEvidenceSink:
 
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         return None
+
+    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
+        self.first_compute_observations.append(
+            (context, timestamp_ns, compute_kind, base_event_id)
+        )
 
     def close(self, open_attempts, evidence_disabled):
         self.close_calls += 1
@@ -273,9 +281,60 @@ def test_recovery_abi_round_trips_through_pickle():
         transfer_id=f"{'a' * 32}:t:0",
         context=context,
     )
+    compute_context = KVRecoveryComputeContext(
+        binding=context.binding,
+        identity=context.identity,
+        transfer_id=attempt.transfer_id,
+        block_set_id=context.block_set_id,
+        bytes_moved=128,
+        admission_profile_record_id=f"{'b' * 32}:k:1",
+    )
 
     assert pickle.loads(pickle.dumps(context)) == context
     assert pickle.loads(pickle.dumps(attempt)) == attempt
+    assert pickle.loads(pickle.dumps(compute_context)) == compute_context
+
+
+def test_first_compute_requires_exact_context_and_base_event():
+    context = make_context()
+    compute_context = KVRecoveryComputeContext(
+        binding=context.binding,
+        identity=context.identity,
+        transfer_id=f"{PROCESS_UUID}:t:0",
+        block_set_id=context.block_set_id,
+        bytes_moved=128,
+        admission_profile_record_id=f"{'b' * 32}:k:1",
+    )
+    sink = NoopEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver(
+        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
+    )
+
+    observer.first_compute(
+        compute_context,
+        20,
+        "prefill",
+        f"{'d' * 32}:e:0",
+    )
+    assert sink.first_compute_observations == [
+        (compute_context, 20, "prefill", f"{'d' * 32}:e:0")
+    ]
+
+    invalid_sink = NoopEvidenceSink()
+    invalid_observer = BoundedKVRecoveryWorkerObserver(
+        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, invalid_sink
+    )
+    invalid_observer.first_compute(compute_context, 20, "prefill", "not-an-event")
+    assert invalid_observer.evidence_disabled
+    assert invalid_sink.failures == ["invalid_first_compute_observation"]
+
+    missing_sink = NoopEvidenceSink()
+    missing_observer = BoundedKVRecoveryWorkerObserver(
+        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, missing_sink
+    )
+    missing_observer.first_compute_not_observed(compute_context)
+    assert missing_observer.evidence_disabled
+    assert missing_sink.failures == ["missing_first_compute_observation"]
 
 
 def test_context_rejects_coordinate_or_digest_drift():

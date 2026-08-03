@@ -49,8 +49,10 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_recovery_profile import (
     MAX_LOGICAL_BLOCKS_PER_SET,
     KVRecoveryBlockCoordinate,
+    KVRecoveryComputeContext,
     KVRecoveryH2DReceipt,
     KVRecoveryOperation,
+    KVRecoveryRequeueReason,
     KVRecoverySchedulerObserver,
     KVRecoveryTransferContext,
 )
@@ -433,6 +435,23 @@ class OffloadingConnectorScheduler:
             return context
         except Exception:
             return None
+
+    def observe_kv_recovery_requeue(
+        self, req_id: str, reason: KVRecoveryRequeueReason
+    ) -> None:
+        """Report one exact post-wakeup defer without changing scheduling."""
+        observer = self._kv_recovery_observer
+        recovery_epoch = self._kv_recovery_receipt_ready.get(req_id)
+        req_status = self._req_status.get(req_id)
+        if (
+            observer is None
+            or recovery_epoch is None
+            or req_status is None
+            or recovery_epoch != req_status.req.num_preemptions
+        ):
+            return
+        with suppress(Exception):
+            observer.request_requeued(req_id, recovery_epoch, reason)
 
     @staticmethod
     def _append_kv_recovery_coordinate(
@@ -1237,10 +1256,20 @@ class OffloadingConnectorScheduler:
 
         self._update_req_states(scheduler_output)
 
+        compute_contexts: dict[ReqId, KVRecoveryComputeContext] | None = (
+            {} if observer is not None else None
+        )
         if observer is not None:
             for req_id, recovery_epoch in admitted_recovery_epochs.items():
                 with suppress(Exception):
-                    observer.request_admitted(req_id, recovery_epoch)
+                    context = observer.request_admitted(req_id, recovery_epoch)
+                    if (
+                        isinstance(context, KVRecoveryComputeContext)
+                        and context.identity.runtime_request_id == req_id
+                        and context.identity.recovery_epoch == recovery_epoch
+                    ):
+                        assert compute_contexts is not None
+                        compute_contexts[req_id] = context
 
         self.manager.update_device_pressure(
             scheduler_output.kv_cache_usage,
@@ -1281,6 +1310,7 @@ class OffloadingConnectorScheduler:
             store_jobs=store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
             kv_recovery_contexts=self._current_batch_kv_recovery_contexts,
+            kv_recovery_compute_contexts=compute_contexts,
         )
         self._current_batch_load_jobs = {}
         self._current_batch_kv_recovery_contexts = (
