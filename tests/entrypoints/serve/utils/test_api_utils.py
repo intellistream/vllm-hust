@@ -3,12 +3,32 @@
 
 import pytest
 
+import vllm.entrypoints.serve.utils.api_utils as api_utils
+
 from vllm.entrypoints.openai.engine.protocol import StreamOptions
 from vllm.entrypoints.serve.utils.api_utils import (
     get_max_tokens,
+    jsonify_non_default_args,
+    log_non_default_args,
     sanitize_message,
     should_include_usage,
 )
+
+
+def test_non_default_args_redact_api_keys(monkeypatch, caplog):
+    secret = "sk-secret-that-must-not-appear"
+    monkeypatch.setattr(
+        api_utils,
+        "get_non_default_args",
+        lambda _args: {"api_key": [secret], "port": 8000},
+    )
+
+    serialized = jsonify_non_default_args(object())
+    log_non_default_args(object())
+
+    assert serialized == {"api_key": "<redacted>", "port": 8000}
+    assert secret not in caplog.text
+    assert "<redacted>" in caplog.text
 
 
 def test_sanitize_message():
