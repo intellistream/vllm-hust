@@ -44,7 +44,7 @@ class RecordingSchedulerObserver:
         self.receipt_batches: list[tuple[tuple[KVRecoveryH2DReceipt, ...], bool]] = []
         self.preemptions: list[tuple[str, int]] = []
         self.admission_starts: list[tuple[str, int]] = []
-        self.admissions: list[tuple[str, int]] = []
+        self.admissions: list[tuple[str, int, str]] = []
         self.requeues: list[tuple[str, int, str]] = []
         self.terminals: list[str] = []
         self.runtime_events: list[tuple[str, str, int | None]] = []
@@ -123,8 +123,8 @@ class RecordingSchedulerObserver:
             ("admission_started", runtime_request_id, recovery_epoch)
         )
 
-    def request_admitted(self, runtime_request_id, recovery_epoch):
-        self.admissions.append((runtime_request_id, recovery_epoch))
+    def request_admitted(self, runtime_request_id, recovery_epoch, compute_kind):
+        self.admissions.append((runtime_request_id, recovery_epoch, compute_kind))
         self.runtime_events.append(("admitted", runtime_request_id, recovery_epoch))
         receipt = next(
             receipt
@@ -139,6 +139,8 @@ class RecordingSchedulerObserver:
             block_set_id=receipt.block_set_id,
             bytes_moved=receipt.bytes_moved,
             admission_profile_record_id=f"{'b' * 32}:k:1",
+            compute_kind=compute_kind,
+            base_phase_start_event_id=f"{'d' * 32}:e:0",
         )
 
     def request_requeued(self, runtime_request_id, recovery_epoch, reason):
@@ -162,9 +164,7 @@ class RecordingWorkerObserver:
         self.contexts: list[KVRecoveryTransferContext] = []
         self.transfer_seq = 0
         self.waits: list[KVRecoveryWaitAttempt] = []
-        self.first_compute_observations: list[
-            tuple[KVRecoveryComputeContext, int, str, str]
-        ] = []
+        self.first_compute_observations: list[tuple[KVRecoveryComputeContext, int]] = []
         self.missing_first_compute: list[KVRecoveryComputeContext] = []
 
     def begin_transfer(self, connector_job_id, context):
@@ -229,10 +229,8 @@ class RecordingWorkerObserver:
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         raise AssertionError("receipt capacity unexpectedly exhausted")
 
-    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
-        self.first_compute_observations.append(
-            (context, timestamp_ns, compute_kind, base_event_id)
-        )
+    def first_compute(self, context, timestamp_ns):
+        self.first_compute_observations.append((context, timestamp_ns))
 
     def first_compute_not_observed(self, context):
         self.missing_first_compute.append(context)
@@ -389,7 +387,7 @@ def test_pressure_preemption_preserves_identity_through_real_connector_path(
     runtime_request_id = h2d_contexts[0].identity.runtime_request_id
     assert factory.scheduler.preemptions == [(runtime_request_id, 1)]
     assert factory.scheduler.admission_starts == [(runtime_request_id, 1)]
-    assert factory.scheduler.admissions == [(runtime_request_id, 1)]
+    assert factory.scheduler.admissions == [(runtime_request_id, 1, "decode")]
     connector_worker = runner.worker_connector.connector_worker
     assert connector_worker is not None
     compute_contexts = connector_worker._kv_recovery_compute_contexts

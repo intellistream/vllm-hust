@@ -134,7 +134,7 @@ class NoopEvidenceSink:
     def __init__(self):
         self.failures: list[str] = []
         self.close_calls = 0
-        self.first_compute_observations: list[tuple[object, int, str, str]] = []
+        self.first_compute_observations: list[tuple[object, int]] = []
 
     def transfer_submitted(self, attempt, timestamp_ns):
         return None
@@ -169,10 +169,8 @@ class NoopEvidenceSink:
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         return None
 
-    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
-        self.first_compute_observations.append(
-            (context, timestamp_ns, compute_kind, base_event_id)
-        )
+    def first_compute(self, context, timestamp_ns):
+        self.first_compute_observations.append((context, timestamp_ns))
 
     def close(self, open_attempts, evidence_disabled):
         self.close_calls += 1
@@ -288,6 +286,8 @@ def test_recovery_abi_round_trips_through_pickle():
         block_set_id=context.block_set_id,
         bytes_moved=128,
         admission_profile_record_id=f"{'b' * 32}:k:1",
+        compute_kind="prefill",
+        base_phase_start_event_id=f"{'d' * 32}:e:0",
     )
 
     assert pickle.loads(pickle.dumps(context)) == context
@@ -304,27 +304,28 @@ def test_first_compute_requires_exact_context_and_base_event():
         block_set_id=context.block_set_id,
         bytes_moved=128,
         admission_profile_record_id=f"{'b' * 32}:k:1",
+        compute_kind="prefill",
+        base_phase_start_event_id=f"{'d' * 32}:e:0",
     )
     sink = NoopEvidenceSink()
     observer = BoundedKVRecoveryWorkerObserver(
         PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
     )
 
-    observer.first_compute(
-        compute_context,
-        20,
-        "prefill",
-        f"{'d' * 32}:e:0",
-    )
-    assert sink.first_compute_observations == [
-        (compute_context, 20, "prefill", f"{'d' * 32}:e:0")
-    ]
+    observer.first_compute(compute_context, 20)
+    assert sink.first_compute_observations == [(compute_context, 20)]
 
     invalid_sink = NoopEvidenceSink()
     invalid_observer = BoundedKVRecoveryWorkerObserver(
         PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, invalid_sink
     )
-    invalid_observer.first_compute(compute_context, 20, "prefill", "not-an-event")
+    invalid_observer.first_compute(
+        replace(
+            compute_context,
+            identity=replace(compute_context.identity, run_id="9" * 32),
+        ),
+        20,
+    )
     assert invalid_observer.evidence_disabled
     assert invalid_sink.failures == ["invalid_first_compute_observation"]
 

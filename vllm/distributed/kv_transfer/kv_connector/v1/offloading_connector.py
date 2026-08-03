@@ -40,7 +40,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_recovery_profile import (
-    KVRecoveryComputeKind,
     KVRecoveryRequeueReason,
     create_kv_recovery_scheduler_observer,
     create_kv_recovery_worker_observer,
@@ -115,19 +114,13 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
     def observe_kv_recovery_first_compute(
         self,
-        runtime_request_id: str,
-        recovery_epoch: int,
+        scheduled_request_ids: frozenset[str],
         timestamp_ns: int,
-        compute_kind: KVRecoveryComputeKind,
-        base_event_id: str,
     ) -> None:
         if self.connector_worker is not None:
             self.connector_worker.observe_kv_recovery_first_compute(
-                runtime_request_id,
-                recovery_epoch,
+                scheduled_request_ids,
                 timestamp_ns,
-                compute_kind,
-                base_event_id,
             )
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):

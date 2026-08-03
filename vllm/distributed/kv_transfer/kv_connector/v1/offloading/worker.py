@@ -33,7 +33,6 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_recovery_profile import (
     MAX_TRANSFER_IDS_PER_WAIT_SET,
     KVRecoveryComputeContext,
-    KVRecoveryComputeKind,
     KVRecoveryH2DReceipt,
     KVRecoveryTransferAttempt,
     KVRecoveryTransferContext,
@@ -571,28 +570,26 @@ class OffloadingConnectorWorker:
 
     def observe_kv_recovery_first_compute(
         self,
-        runtime_request_id: str,
-        recovery_epoch: int,
+        scheduled_request_ids: frozenset[str],
         timestamp_ns: int,
-        compute_kind: KVRecoveryComputeKind,
-        base_event_id: str,
     ) -> None:
-        """Consume one exact admitted-roster sidecar at worker forward entry."""
+        """Consume the exact admitted sidecars at the worker forward entry."""
         observer = self._kv_recovery_observer
         contexts = self._kv_recovery_compute_contexts
         if observer is None or contexts is None:
             return
-        context = contexts.get(runtime_request_id)
-        if context is None or context.identity.recovery_epoch != recovery_epoch:
-            return
-        contexts.pop(runtime_request_id, None)
-        with suppress(Exception):
-            observer.first_compute(
-                context,
-                timestamp_ns,
-                compute_kind,
-                base_event_id,
-            )
+        pending = tuple(contexts.items())
+        contexts.clear()
+        for runtime_request_id, context in pending:
+            if (
+                runtime_request_id not in scheduled_request_ids
+                or context.identity.runtime_request_id != runtime_request_id
+            ):
+                with suppress(Exception):
+                    observer.first_compute_not_observed(context)
+                continue
+            with suppress(Exception):
+                observer.first_compute(context, timestamp_ns)
 
     def _fail_unobserved_first_compute(self) -> None:
         observer = self._kv_recovery_observer

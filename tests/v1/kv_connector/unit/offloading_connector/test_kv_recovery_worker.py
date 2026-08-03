@@ -88,7 +88,7 @@ class RecordingObserver:
         self.transfer_seq = 0
         self.wait_completed_calls: list[KVRecoveryWaitAttempt] = []
         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
-        self.first_compute_observations: list[tuple[object, int, str, str]] = []
+        self.first_compute_observations: list[tuple[object, int]] = []
         self.missing_first_compute: list[object] = []
         self.closed = False
 
@@ -176,10 +176,8 @@ class RecordingObserver:
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         self.receipt_capacity_losses.append((receipt, loss_reason))
 
-    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
-        self.first_compute_observations.append(
-            (context, timestamp_ns, compute_kind, base_event_id)
-        )
+    def first_compute(self, context, timestamp_ns):
+        self.first_compute_observations.append((context, timestamp_ns))
 
     def first_compute_not_observed(self, context):
         self.missing_first_compute.append(context)
@@ -266,10 +264,8 @@ class RecordingEvidenceSink:
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         self.receipt_capacity_losses.append((receipt, loss_reason))
 
-    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
-        self.first_compute_observations.append(
-            (context, timestamp_ns, compute_kind, base_event_id)
-        )
+    def first_compute(self, context, timestamp_ns):
+        self.first_compute_observations.append((context, timestamp_ns))
 
     def close(self, open_attempts, evidence_disabled):
         self.close_calls.append((open_attempts, evidence_disabled))
@@ -318,6 +314,8 @@ def make_compute_context() -> KVRecoveryComputeContext:
         block_set_id=transfer_context.block_set_id,
         bytes_moved=128,
         admission_profile_record_id=f"{'b' * 32}:k:1",
+        compute_kind="prefill",
+        base_phase_start_event_id=f"{'d' * 32}:e:0",
     )
 
 
@@ -402,20 +400,25 @@ def test_worker_first_compute_consumes_exact_admitted_roster_once():
         )
     )
 
-    worker.observe_kv_recovery_first_compute(
-        "request-0", 2, 199, "prefill", f"{'d' * 32}:e:0"
-    )
-    assert observer.first_compute_observations == []
-    worker.observe_kv_recovery_first_compute(
-        "request-0", 1, 200, "prefill", f"{'d' * 32}:e:0"
-    )
-    worker.observe_kv_recovery_first_compute(
-        "request-0", 1, 201, "prefill", f"{'d' * 32}:e:0"
+    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}), 200)
+    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}), 201)
+
+    assert observer.first_compute_observations == [(context, 200)]
+
+
+def test_worker_first_compute_fails_closed_for_roster_mismatch():
+    events: list[tuple] = []
+    observer = RecordingObserver(events)
+    worker, _backend, _events = make_worker(observer)
+    context = make_compute_context()
+    worker.start_kv_transfers(
+        metadata(kv_recovery_compute_contexts=(("request-0", context),))
     )
 
-    assert observer.first_compute_observations == [
-        (context, 200, "prefill", f"{'d' * 32}:e:0")
-    ]
+    worker.observe_kv_recovery_first_compute(frozenset({"request-1"}), 200)
+
+    assert observer.first_compute_observations == []
+    assert observer.missing_first_compute == [context]
 
 
 def test_worker_marks_unconsumed_compute_sidecar_failed_on_next_step():

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,6 +31,11 @@ class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
 
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
+        pass
+
+    def observe_kv_recovery_first_compute(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
         pass
 
     def post_forward(
@@ -73,6 +79,16 @@ class ActiveKVConnector(KVConnector):
         else:
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(get_forward_context())
+
+    def observe_kv_recovery_first_compute(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        if self._disabled:
+            return
+        self.kv_connector.observe_kv_recovery_first_compute(
+            frozenset(scheduler_output.num_scheduled_tokens),
+            time.monotonic_ns(),
+        )
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
