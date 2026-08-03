@@ -40,6 +40,8 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_recovery_profile import (
+    KVRecoveryComputeKind,
+    KVRecoveryRequeueReason,
     create_kv_recovery_scheduler_observer,
     create_kv_recovery_worker_observer,
     kv_recovery_runtime_scope_authorized,
@@ -102,6 +104,31 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         assert self.connector_worker is not None
         self.connector_worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
+
+    def observe_kv_recovery_requeue(
+        self, request: Request, reason: KVRecoveryRequeueReason
+    ) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.observe_kv_recovery_requeue(
+                request.request_id, reason
+            )
+
+    def observe_kv_recovery_first_compute(
+        self,
+        runtime_request_id: str,
+        recovery_epoch: int,
+        timestamp_ns: int,
+        compute_kind: KVRecoveryComputeKind,
+        base_event_id: str,
+    ) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.observe_kv_recovery_first_compute(
+                runtime_request_id,
+                recovery_epoch,
+                timestamp_ns,
+                compute_kind,
+                base_event_id,
+            )
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         assert self.connector_worker is not None

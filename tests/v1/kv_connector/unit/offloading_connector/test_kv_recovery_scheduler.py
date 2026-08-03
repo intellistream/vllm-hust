@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.v1.kv_recovery_profile import (
     KV_RECOVERY_PROFILE_BINDING,
+    KVRecoveryComputeContext,
     KVRecoveryH2DReceipt,
     KVRecoveryIdentity,
     KVRecoveryLogicalBlock,
@@ -43,6 +45,7 @@ class RecordingSchedulerObserver:
         self.preemptions: list[tuple[str, int]] = []
         self.admission_starts: list[tuple[str, int]] = []
         self.admissions: list[tuple[str, int]] = []
+        self.requeues: list[tuple[str, int, str]] = []
         self.terminals: list[str] = []
         self.runtime_events: list[tuple[str, str, int | None]] = []
         self.receipt_ready_request_ids: set[str] = set()
@@ -52,6 +55,7 @@ class RecordingSchedulerObserver:
     def request_preempted(self, runtime_request_id, recovery_epoch):
         self.preemptions.append((runtime_request_id, recovery_epoch))
         self.runtime_events.append(("preempted", runtime_request_id, recovery_epoch))
+        return f"{'b' * 32}:k:0"
 
     def prepare_transfer_context(self, runtime_request_id, operation, coordinates):
         self.runtime_events.append((operation, runtime_request_id, None))
@@ -66,6 +70,7 @@ class RecordingSchedulerObserver:
             recovery_epoch=1 if is_recovery else None,
             episode_id=f"{lifecycle_id}:k:1" if is_recovery else None,
             base_preempted_event_id=(f"{'b' * 32}:e:0" if is_recovery else None),
+            preempt_profile_record_id=(f"{'b' * 32}:k:0" if is_recovery else None),
         )
         logical_blocks = tuple(
             KVRecoveryLogicalBlock(
@@ -121,6 +126,24 @@ class RecordingSchedulerObserver:
     def request_admitted(self, runtime_request_id, recovery_epoch):
         self.admissions.append((runtime_request_id, recovery_epoch))
         self.runtime_events.append(("admitted", runtime_request_id, recovery_epoch))
+        receipt = next(
+            receipt
+            for batch, _truncated in reversed(self.receipt_batches)
+            for receipt in batch
+            if receipt.identity.runtime_request_id == runtime_request_id
+        )
+        return KVRecoveryComputeContext(
+            binding=receipt.binding,
+            identity=receipt.identity,
+            transfer_id=receipt.transfer_id,
+            block_set_id=receipt.block_set_id,
+            bytes_moved=receipt.bytes_moved,
+            admission_profile_record_id=f"{'b' * 32}:k:1",
+        )
+
+    def request_requeued(self, runtime_request_id, recovery_epoch, reason):
+        self.requeues.append((runtime_request_id, recovery_epoch, reason))
+        self.runtime_events.append(("requeued", runtime_request_id, recovery_epoch))
 
     def request_terminal(self, runtime_request_id):
         self.terminals.append(runtime_request_id)
@@ -139,6 +162,10 @@ class RecordingWorkerObserver:
         self.contexts: list[KVRecoveryTransferContext] = []
         self.transfer_seq = 0
         self.waits: list[KVRecoveryWaitAttempt] = []
+        self.first_compute_observations: list[
+            tuple[KVRecoveryComputeContext, int, str, str]
+        ] = []
+        self.missing_first_compute: list[KVRecoveryComputeContext] = []
 
     def begin_transfer(self, connector_job_id, context):
         attempt = KVRecoveryTransferAttempt(
@@ -201,6 +228,14 @@ class RecordingWorkerObserver:
 
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         raise AssertionError("receipt capacity unexpectedly exhausted")
+
+    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
+        self.first_compute_observations.append(
+            (context, timestamp_ns, compute_kind, base_event_id)
+        )
+
+    def first_compute_not_observed(self, context):
+        self.missing_first_compute.append(context)
 
     def close(self):
         return None
@@ -355,6 +390,15 @@ def test_pressure_preemption_preserves_identity_through_real_connector_path(
     assert factory.scheduler.preemptions == [(runtime_request_id, 1)]
     assert factory.scheduler.admission_starts == [(runtime_request_id, 1)]
     assert factory.scheduler.admissions == [(runtime_request_id, 1)]
+    connector_worker = runner.worker_connector.connector_worker
+    assert connector_worker is not None
+    compute_contexts = connector_worker._kv_recovery_compute_contexts
+    assert compute_contexts is not None
+    assert compute_contexts == {}
+    assert [
+        context.identity.runtime_request_id
+        for context in factory.worker.missing_first_compute
+    ] == [runtime_request_id]
     event_names = [
         event_name
         for event_name, request_id, _ in factory.scheduler.runtime_events
@@ -391,6 +435,24 @@ def test_scheduler_observer_failure_is_fail_open(
 
     assert factory.worker.contexts == []
     assert factory.scheduler.terminals == ["0"]
+
+
+def test_post_wakeup_requeue_requires_matching_ready_epoch():
+    observer = RecordingSchedulerObserver()
+    scheduler = object.__new__(scheduler_module.OffloadingConnectorScheduler)
+    scheduler._kv_recovery_observer = observer
+    scheduler._kv_recovery_receipt_ready = {"request-0": 1}
+    scheduler._req_status = {
+        "request-0": SimpleNamespace(
+            req=SimpleNamespace(num_preemptions=1),
+        )
+    }
+
+    scheduler.observe_kv_recovery_requeue("request-0", "block_capacity")
+    scheduler._req_status["request-0"].req.num_preemptions = 2
+    scheduler.observe_kv_recovery_requeue("request-0", "token_budget")
+
+    assert observer.requeues == [("request-0", 1, "block_capacity")]
 
 
 def test_malformed_scheduler_observer_return_is_fail_open(

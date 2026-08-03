@@ -26,6 +26,7 @@ from vllm.v1.kv_recovery_profile import (
     MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
     MAX_TRANSFER_IDS_PER_WAIT_SET,
     BoundedKVRecoveryWorkerObserver,
+    KVRecoveryComputeContext,
     KVRecoveryH2DReceipt,
     KVRecoveryIdentity,
     KVRecoveryLogicalBlock,
@@ -87,6 +88,8 @@ class RecordingObserver:
         self.transfer_seq = 0
         self.wait_completed_calls: list[KVRecoveryWaitAttempt] = []
         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
+        self.first_compute_observations: list[tuple[object, int, str, str]] = []
+        self.missing_first_compute: list[object] = []
         self.closed = False
 
     def _raise_if_requested(self, stage: str):
@@ -173,6 +176,14 @@ class RecordingObserver:
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         self.receipt_capacity_losses.append((receipt, loss_reason))
 
+    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
+        self.first_compute_observations.append(
+            (context, timestamp_ns, compute_kind, base_event_id)
+        )
+
+    def first_compute_not_observed(self, context):
+        self.missing_first_compute.append(context)
+
     def close(self):
         self._raise_if_requested("close")
         self.closed = True
@@ -190,6 +201,7 @@ class RecordingEvidenceSink:
         self.waits: list[KVRecoveryWaitAttempt] = []
         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
         self.close_calls: list[tuple[tuple[KVRecoveryTransferAttempt, ...], bool]] = []
+        self.first_compute_observations: list[tuple[object, int, str, str]] = []
 
     def transfer_submitted(self, attempt, timestamp_ns):
         self.submissions.append((attempt, timestamp_ns))
@@ -254,6 +266,11 @@ class RecordingEvidenceSink:
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         self.receipt_capacity_losses.append((receipt, loss_reason))
 
+    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
+        self.first_compute_observations.append(
+            (context, timestamp_ns, compute_kind, base_event_id)
+        )
+
     def close(self, open_attempts, evidence_disabled):
         self.close_calls.append((open_attempts, evidence_disabled))
 
@@ -270,6 +287,7 @@ def make_context(operation: str) -> KVRecoveryTransferContext:
         recovery_epoch=1 if is_recovery else None,
         episode_id=f"{lifecycle_id}:k:1" if is_recovery else None,
         base_preempted_event_id=f"{'b' * 32}:e:0" if is_recovery else None,
+        preempt_profile_record_id=f"{'b' * 32}:k:0" if is_recovery else None,
     )
     logical_blocks = (KVRecoveryLogicalBlock(0, 0, "b" * 32),)
     return KVRecoveryTransferContext(
@@ -288,6 +306,18 @@ def make_load_job() -> TransferJob:
         req_id="request-0",
         src_spec=CPULoadStoreSpec(),
         dst_spec=GPULoadStoreSpec([3], group_sizes=[1], block_indices=[0]),
+    )
+
+
+def make_compute_context() -> KVRecoveryComputeContext:
+    transfer_context = make_context("h2d_restore")
+    return KVRecoveryComputeContext(
+        binding=transfer_context.binding,
+        identity=transfer_context.identity,
+        transfer_id=f"{'a' * 32}:t:0",
+        block_set_id=transfer_context.block_set_id,
+        bytes_moved=128,
+        admission_profile_record_id=f"{'b' * 32}:k:1",
     )
 
 
@@ -316,13 +346,16 @@ def metadata(
     store_jobs: Iterable[tuple[int, TransferJob]] = (),
     jobs_to_flush: set[int] | None = None,
     kv_recovery_contexts: Iterable[tuple[int, KVRecoveryTransferContext]] = (),
+    kv_recovery_compute_contexts: Iterable[tuple[str, KVRecoveryComputeContext]] = (),
 ) -> OffloadingConnectorMetadata:
     contexts = dict(kv_recovery_contexts)
+    compute_contexts = dict(kv_recovery_compute_contexts)
     return OffloadingConnectorMetadata(
         load_jobs=dict(load_jobs),
         store_jobs=dict(store_jobs),
         jobs_to_flush=jobs_to_flush,
         kv_recovery_contexts=contexts or None,
+        kv_recovery_compute_contexts=compute_contexts or None,
     )
 
 
@@ -341,17 +374,62 @@ def test_transfer_job_remains_backward_compatible():
 def test_connector_metadata_sidecar_round_trips_and_defaults_off():
     job = make_load_job()
     context = make_context("h2d_restore")
+    compute_context = make_compute_context()
     disabled = metadata(load_jobs=((7, job),))
     active = metadata(
         load_jobs=((7, job),),
         kv_recovery_contexts=((7, context),),
+        kv_recovery_compute_contexts=(("request-0", compute_context),),
     )
 
     disabled_copy = pickle.loads(pickle.dumps(disabled))
     active_copy = pickle.loads(pickle.dumps(active))
 
     assert disabled_copy.kv_recovery_contexts is None
+    assert disabled_copy.kv_recovery_compute_contexts is None
     assert active_copy.kv_recovery_contexts == {7: context}
+    assert active_copy.kv_recovery_compute_contexts == {"request-0": compute_context}
+
+
+def test_worker_first_compute_consumes_exact_admitted_roster_once():
+    events: list[tuple] = []
+    observer = RecordingObserver(events)
+    worker, _backend, _events = make_worker(observer)
+    context = make_compute_context()
+    worker.start_kv_transfers(
+        metadata(
+            kv_recovery_compute_contexts=(("request-0", context),),
+        )
+    )
+
+    worker.observe_kv_recovery_first_compute(
+        "request-0", 2, 199, "prefill", f"{'d' * 32}:e:0"
+    )
+    assert observer.first_compute_observations == []
+    worker.observe_kv_recovery_first_compute(
+        "request-0", 1, 200, "prefill", f"{'d' * 32}:e:0"
+    )
+    worker.observe_kv_recovery_first_compute(
+        "request-0", 1, 201, "prefill", f"{'d' * 32}:e:0"
+    )
+
+    assert observer.first_compute_observations == [
+        (context, 200, "prefill", f"{'d' * 32}:e:0")
+    ]
+
+
+def test_worker_marks_unconsumed_compute_sidecar_failed_on_next_step():
+    events: list[tuple] = []
+    observer = RecordingObserver(events)
+    worker, _backend, _events = make_worker(observer)
+    context = make_compute_context()
+    worker.start_kv_transfers(
+        metadata(kv_recovery_compute_contexts=(("request-0", context),))
+    )
+
+    worker.start_kv_transfers(metadata())
+
+    assert observer.missing_first_compute == [context]
 
 
 def test_disabled_worker_path_preserves_load_semantics():

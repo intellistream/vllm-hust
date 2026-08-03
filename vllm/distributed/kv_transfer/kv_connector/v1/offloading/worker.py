@@ -32,6 +32,8 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_recovery_profile import (
     MAX_TRANSFER_IDS_PER_WAIT_SET,
+    KVRecoveryComputeContext,
+    KVRecoveryComputeKind,
     KVRecoveryH2DReceipt,
     KVRecoveryTransferAttempt,
     KVRecoveryTransferContext,
@@ -90,6 +92,9 @@ class OffloadingConnectorWorker:
         ) = {} if kv_recovery_observer is not None else None
         self._kv_recovery_profiled_attempts: (
             dict[int, KVRecoveryTransferAttempt] | None
+        ) = {} if kv_recovery_observer is not None else None
+        self._kv_recovery_compute_contexts: (
+            dict[ReqId, KVRecoveryComputeContext] | None
         ) = {} if kv_recovery_observer is not None else None
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
@@ -533,6 +538,12 @@ class OffloadingConnectorWorker:
         assert self.worker is not None
         self._submit_pending_stores()
 
+        if self._kv_recovery_compute_contexts is not None:
+            self._fail_unobserved_first_compute()
+            self._kv_recovery_compute_contexts = dict(
+                metadata.kv_recovery_compute_contexts or {}
+            )
+
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
             context = None
@@ -557,6 +568,42 @@ class OffloadingConnectorWorker:
                 ):
                     assert self._kv_recovery_profiled_attempts is not None
                     self._kv_recovery_profiled_attempts[job_id] = attempt
+
+    def observe_kv_recovery_first_compute(
+        self,
+        runtime_request_id: str,
+        recovery_epoch: int,
+        timestamp_ns: int,
+        compute_kind: KVRecoveryComputeKind,
+        base_event_id: str,
+    ) -> None:
+        """Consume one exact admitted-roster sidecar at worker forward entry."""
+        observer = self._kv_recovery_observer
+        contexts = self._kv_recovery_compute_contexts
+        if observer is None or contexts is None:
+            return
+        context = contexts.get(runtime_request_id)
+        if context is None or context.identity.recovery_epoch != recovery_epoch:
+            return
+        contexts.pop(runtime_request_id, None)
+        with suppress(Exception):
+            observer.first_compute(
+                context,
+                timestamp_ns,
+                compute_kind,
+                base_event_id,
+            )
+
+    def _fail_unobserved_first_compute(self) -> None:
+        observer = self._kv_recovery_observer
+        contexts = self._kv_recovery_compute_contexts
+        if observer is None or not contexts:
+            return
+        pending = tuple(contexts.values())
+        contexts.clear()
+        for context in pending:
+            with suppress(Exception):
+                observer.first_compute_not_observed(context)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -646,6 +693,8 @@ class OffloadingConnectorWorker:
             self._kv_recovery_store_contexts.clear()
         if self._kv_recovery_profiled_attempts is not None:
             self._kv_recovery_profiled_attempts.clear()
+        if self._kv_recovery_compute_contexts is not None:
+            self._fail_unobserved_first_compute()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         try:
             if self.worker is not None:
