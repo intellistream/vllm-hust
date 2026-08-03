@@ -214,6 +214,27 @@ class TestKVCacheSpecRegistry:
         spec = make_spec(FullAttentionSpec)
         assert KVCacheSpecRegistry.get_manager_class(spec) is KnormFullAttentionManager
 
+    def test_knorm_is_not_registered_when_disabled_even_without_prefix_caching(
+        self, monkeypatch
+    ):
+        """Knorm manager must NOT register when VLLM_KNORM_ENABLED=0 even if
+        prefix caching is off. This prevents the half-enabled state where the
+        runner-side wrapper installs but the manager is not registered (or
+        vice versa). See issue #163."""
+        monkeypatch.setenv("VLLM_KNORM_ENABLED", "0")
+        import importlib
+        import vllm.envs as envs_mod
+        importlib.reload(envs_mod)
+
+        _REGISTRY_KVCACHESPEC_LIST.clear()
+        config = make_vllm_config()
+        config.cache_config.enable_prefix_caching = False
+
+        register_all_kvcache_specs(config)
+
+        spec = make_spec(FullAttentionSpec)
+        assert KVCacheSpecRegistry.get_manager_class(spec) is FullAttentionManager
+
     @pytest.mark.parametrize("spec_cls", list(spec_manager_map))
     def test_custom_spec_register(self, spec_cls):
         """A decorated custom spec resolves to the declared manager."""
