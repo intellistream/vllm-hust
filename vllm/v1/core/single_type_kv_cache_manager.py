@@ -1509,7 +1509,7 @@ def register_all_kvcache_specs(vllm_config):
     """Built-in spec registration"""
     from vllm import envs
 
-    full_attention_manager = FullAttentionManager
+    full_attention_manager: type[FullAttentionManager] = FullAttentionManager
     prefix_caching_enabled = (
         vllm_config is not None
         and vllm_config.cache_config is not None
@@ -1522,7 +1522,7 @@ def register_all_kvcache_specs(vllm_config):
     try:
         from vllm.knorm.config import should_activate as _knorm_should_activate
     except ImportError:
-        _knorm_should_activate = lambda _: False  # noqa: E731
+        _knorm_should_activate = lambda _: False  # type: ignore[assignment]  # noqa: E731
 
     knorm_compatible = (
         vllm_config is not None

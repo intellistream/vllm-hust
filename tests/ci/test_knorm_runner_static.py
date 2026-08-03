@@ -52,6 +52,9 @@ def test_knorm_active_flag_defined_in_init():
         "_knorm_active must be assigned exactly once in __init__"
     )
 
+    assert active_assigns[0].value is not None, (
+        "_knorm_active assignment must have a value"
+    )
     src = ast.unparse(active_assigns[0].value)
     # Must call should_activate (single source of truth), not inline
     # envs checks that could drift from register_all_kvcache_specs.

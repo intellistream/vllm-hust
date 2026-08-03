@@ -926,7 +926,7 @@ class GPUModelRunner(
                 should_activate as _knorm_should_activate,
             )
         except ImportError:
-            _knorm_should_activate = lambda _: False  # noqa: E731
+            _knorm_should_activate = lambda _: False  # type: ignore[assignment]  # noqa: E731
         self._knorm_active: bool = bool(
             _knorm_should_activate(self.cache_config.enable_prefix_caching)
         )
