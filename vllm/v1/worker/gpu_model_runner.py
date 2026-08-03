@@ -917,14 +917,18 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self._knorm_scores: dict | None = None
         self._knorm_wrapper_installed: bool = False
-        # Knorm is active only when explicitly enabled AND prefix caching
-        # is disabled. This must match register_all_kvcache_specs in
-        # single_type_kv_cache_manager.py to avoid a half-enabled state
-        # where the wrapper is installed but the manager is not registered
-        # (or vice versa). See issue #163.
+        # Knorm is active only when should_activate() returns True — the
+        # same single source of truth used by register_all_kvcache_specs.
+        # This avoids the half-enabled state where the wrapper is installed
+        # but the manager is not registered (or vice versa). See issue #163.
+        try:
+            from vllm.knorm.config import (
+                should_activate as _knorm_should_activate,
+            )
+        except ImportError:
+            _knorm_should_activate = lambda _: False  # noqa: E731
         self._knorm_active: bool = bool(
-            envs.VLLM_KNORM_ENABLED
-            and not self.cache_config.enable_prefix_caching
+            _knorm_should_activate(self.cache_config.enable_prefix_caching)
         )
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None

@@ -31,8 +31,9 @@ def _attr_name(node) -> str:
 
 
 def test_knorm_active_flag_defined_in_init():
-    """_knorm_active must be computed from VLLM_KNORM_ENABLED AND
-    not enable_prefix_caching, matching register_all_kvcache_specs."""
+    """_knorm_active must be computed via should_activate() from
+    vllm.knorm.config, the single source of truth shared with
+    register_all_kvcache_specs."""
     tree = _tree()
     cls = next(
         n for n in ast.walk(tree)
@@ -52,11 +53,10 @@ def test_knorm_active_flag_defined_in_init():
     )
 
     src = ast.unparse(active_assigns[0].value)
-    assert "VLLM_KNORM_ENABLED" in src, (
-        "_knorm_active must check VLLM_KNORM_ENABLED"
-    )
-    assert "enable_prefix_caching" in src, (
-        "_knorm_active must check enable_prefix_caching"
+    # Must call should_activate (single source of truth), not inline
+    # envs checks that could drift from register_all_kvcache_specs.
+    assert "should_activate" in src, (
+        "_knorm_active must use should_activate() from vllm.knorm.config"
     )
 
 

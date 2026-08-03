@@ -41,3 +41,24 @@ class KnormConfig:
     def is_active(self) -> bool:
         """Return True if compression should be applied."""
         return self.enabled and self.compression_ratio < 1.0
+
+
+def should_activate(enable_prefix_caching: bool) -> bool:
+    """Single source of truth for Knorm activation.
+
+    Used by both ``register_all_kvcache_specs`` (manager registration) and
+    ``GPUModelRunner.__init__`` (wrapper installation and score collection)
+    to ensure they share identical activation logic, avoiding the
+    half-enabled state from issue #163.
+
+    Knorm is active when ALL of:
+      - ``VLLM_KNORM_ENABLED`` is True
+      - ``compression_ratio < 1.0`` (actual compression would occur; matches
+        ``KnormConfig.is_active``)
+      - prefix caching is disabled (mutually exclusive with Knorm)
+    """
+    return (
+        envs.VLLM_KNORM_ENABLED
+        and envs.VLLM_KNORM_COMPRESSION_RATIO < 1.0
+        and not enable_prefix_caching
+    )
