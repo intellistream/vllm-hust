@@ -39,6 +39,11 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+from vllm.v1.kv_recovery_profile import (
+    create_kv_recovery_scheduler_observer,
+    create_kv_recovery_worker_observer,
+    kv_recovery_runtime_scope_authorized,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -57,13 +62,30 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
 
         spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
+        kv_recovery_scope_authorized = kv_recovery_runtime_scope_authorized(
+            spec, vllm_config
+        )
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = OffloadingConnectorScheduler(spec)
+            self.connector_scheduler = OffloadingConnectorScheduler(
+                spec,
+                kv_recovery_observer=(
+                    create_kv_recovery_scheduler_observer()
+                    if kv_recovery_scope_authorized
+                    else None
+                ),
+            )
         elif role == KVConnectorRole.WORKER:
-            self.connector_worker = OffloadingConnectorWorker(spec)
+            self.connector_worker = OffloadingConnectorWorker(
+                spec,
+                kv_recovery_observer=(
+                    create_kv_recovery_worker_observer()
+                    if kv_recovery_scope_authorized
+                    else None
+                ),
+            )
 
     def shutdown(self) -> None:
         if self.connector_worker is not None:
