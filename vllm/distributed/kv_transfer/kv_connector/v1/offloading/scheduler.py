@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, NamedTuple
@@ -44,6 +45,14 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     ScheduleEndContext,
     make_offload_key,
+)
+from vllm.v1.kv_recovery_profile import (
+    MAX_LOGICAL_BLOCKS_PER_SET,
+    KVRecoveryBlockCoordinate,
+    KVRecoveryH2DReceipt,
+    KVRecoveryOperation,
+    KVRecoverySchedulerObserver,
+    KVRecoveryTransferContext,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -339,9 +348,11 @@ class OffloadingConnectorScheduler:
     def __init__(
         self,
         spec: OffloadingSpec,
+        kv_recovery_observer: KVRecoverySchedulerObserver | None = None,
     ):
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
+        self._kv_recovery_observer = kv_recovery_observer
         self._connector_stats: OffloadingConnectorStats | None = None
         self._reclaimable_block_ids: set[int] = set()
 
@@ -368,6 +379,9 @@ class OffloadingConnectorScheduler:
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
+        self._current_batch_kv_recovery_contexts: (
+            dict[int, KVRecoveryTransferContext] | None
+        ) = {} if kv_recovery_observer is not None else None
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
         self._current_batch_allocated_block_ids: set[int] = set()
@@ -392,6 +406,47 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
+    def _prepare_kv_recovery_context(
+        self,
+        req_id: str,
+        operation: KVRecoveryOperation,
+        coordinates: list[KVRecoveryBlockCoordinate] | None,
+    ) -> KVRecoveryTransferContext | None:
+        observer = self._kv_recovery_observer
+        if observer is None or not coordinates:
+            return None
+        canonical_coordinates = tuple(sorted(coordinates))
+        try:
+            context = observer.prepare_transfer_context(
+                req_id, operation, canonical_coordinates
+            )
+            if not isinstance(context, KVRecoveryTransferContext):
+                return None
+            if (
+                context.operation != operation
+                or context.identity.runtime_request_id != req_id
+                or context.coordinates != canonical_coordinates
+            ):
+                return None
+            return context
+        except Exception:
+            return None
+
+    @staticmethod
+    def _append_kv_recovery_coordinate(
+        coordinates: list[KVRecoveryBlockCoordinate] | None,
+        group_index: int,
+        logical_ordinal: int,
+    ) -> None:
+        if coordinates is None or len(coordinates) > MAX_LOGICAL_BLOCKS_PER_SET:
+            return
+        coordinates.append(
+            KVRecoveryBlockCoordinate(
+                group_index=group_index,
+                logical_ordinal=logical_ordinal,
+            )
+        )
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -726,6 +781,9 @@ class OffloadingConnectorScheduler:
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
+        kv_recovery_coordinates: list[KVRecoveryBlockCoordinate] | None = (
+            [] if self._kv_recovery_observer is not None else None
+        )
         for group_config, group_state, group_blocks in zip(
             self.config.kv_group_configs,
             req_status.group_states,
@@ -768,6 +826,20 @@ class OffloadingConnectorScheduler:
                     num_locally_computed_gpu_blocks // self.config.block_size_factor
                 )
                 keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
+                if kv_recovery_coordinates is not None:
+                    remaining_capacity = (
+                        MAX_LOGICAL_BLOCKS_PER_SET + 1 - len(kv_recovery_coordinates)
+                    )
+                    capture_stop = min(
+                        num_blocks,
+                        start_block_idx + max(0, remaining_capacity),
+                    )
+                    for logical_ordinal in range(start_block_idx, capture_stop):
+                        self._append_kv_recovery_coordinate(
+                            kv_recovery_coordinates,
+                            group_config.group_idx,
+                            logical_ordinal,
+                        )
 
             dst_block_ids.extend(
                 block.block_id
@@ -790,6 +862,14 @@ class OffloadingConnectorScheduler:
         )
 
         load_job_id = self._generate_job_id()
+        kv_recovery_context = self._prepare_kv_recovery_context(
+            request.request_id,
+            "h2d_restore",
+            kv_recovery_coordinates,
+        )
+        if kv_recovery_context is not None:
+            assert self._current_batch_kv_recovery_contexts is not None
+            self._current_batch_kv_recovery_contexts[load_job_id] = kv_recovery_context
         self._current_batch_load_jobs[load_job_id] = TransferJob(
             req_id=request.request_id,
             src_spec=src_spec,
@@ -1003,6 +1083,9 @@ class OffloadingConnectorScheduler:
             src_block_ids: list[int] = []
             sliding_window_block_ids: list[int] = []
             non_sliding_window_block_ids: list[int] = []
+            kv_recovery_coordinates: list[KVRecoveryBlockCoordinate] | None = (
+                [] if self._kv_recovery_observer is not None else None
+            )
             for group_idx, (group_config, group_state) in enumerate(
                 zip(self.config.kv_group_configs, req_status.group_states)
             ):
@@ -1021,6 +1104,15 @@ class OffloadingConnectorScheduler:
                         continue
 
                     offloaded_block_idx = start_block_idx + idx
+                    if (
+                        kv_recovery_coordinates is not None
+                        and len(kv_recovery_coordinates) <= MAX_LOGICAL_BLOCKS_PER_SET
+                    ):
+                        self._append_kv_recovery_coordinate(
+                            kv_recovery_coordinates,
+                            group_config.group_idx,
+                            offloaded_block_idx,
+                        )
 
                     self._events_tracker.record_store(
                         req, group_config, offloaded_block_idx, offload_key
@@ -1075,8 +1167,18 @@ class OffloadingConnectorScheduler:
                 ),
             )
 
+            kv_recovery_context = self._prepare_kv_recovery_context(
+                req_id,
+                "d2h_preserve",
+                kv_recovery_coordinates,
+            )
+            if kv_recovery_context is not None:
+                assert self._current_batch_kv_recovery_contexts is not None
+                self._current_batch_kv_recovery_contexts[job_id] = kv_recovery_context
             store_jobs[job_id] = TransferJob(
-                req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
+                req_id=req_id,
+                src_spec=src_spec,
+                dst_spec=dst_spec,
             )
 
             logger.debug(
@@ -1126,12 +1228,17 @@ class OffloadingConnectorScheduler:
                 for jid in self._block_id_to_pending_jobs[bid]
             )
 
+        store_jobs = self._build_store_jobs(scheduler_output)
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=self._build_store_jobs(scheduler_output),
+            store_jobs=store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            kv_recovery_contexts=self._current_batch_kv_recovery_contexts,
         )
         self._current_batch_load_jobs = {}
+        self._current_batch_kv_recovery_contexts = (
+            {} if self._kv_recovery_observer is not None else None
+        )
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
         return meta
@@ -1189,6 +1296,19 @@ class OffloadingConnectorScheduler:
             else:
                 self._connector_stats.aggregate(transfer_stats)
 
+        observer = self._kv_recovery_observer
+        eligible_h2d_receipt_job_ids = (
+            {
+                job_id
+                for job_id in meta.completed_jobs
+                if job_id >= self._stale_job_threshold
+                and (job_status := self._jobs.get(job_id)) is not None
+                and not job_status.is_store
+            }
+            if observer is not None
+            else None
+        )
+
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
             if job_id < self._stale_job_threshold:
@@ -1233,6 +1353,33 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
                 del self._req_status[job_status.req_id]
+
+        if observer is not None and (
+            meta.kv_recovery_h2d_receipts or meta.kv_recovery_h2d_receipts_truncated
+        ):
+            assert eligible_h2d_receipt_job_ids is not None
+            fresh_receipts: list[KVRecoveryH2DReceipt] = []
+            receipts_incomplete = meta.kv_recovery_h2d_receipts_truncated
+            for receipt in meta.kv_recovery_h2d_receipts:
+                try:
+                    if not isinstance(receipt, KVRecoveryH2DReceipt):
+                        receipts_incomplete = True
+                    elif receipt.connector_job_id < self._stale_job_threshold:
+                        continue
+                    elif receipt.connector_job_id in eligible_h2d_receipt_job_ids:
+                        fresh_receipts.append(receipt)
+                    else:
+                        receipts_incomplete = True
+                except Exception:
+                    receipts_incomplete = True
+            try:
+                if fresh_receipts or receipts_incomplete:
+                    observer.consume_h2d_receipts(
+                        tuple(fresh_receipts),
+                        receipts_incomplete,
+                    )
+            except Exception:
+                pass
 
     def take_reclaimable_block_ids(self) -> set[int]:
         block_ids = self._reclaimable_block_ids
@@ -1314,6 +1461,7 @@ class OffloadingConnectorScheduler:
 
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
+        assert not self._current_batch_kv_recovery_contexts
         assert not self._current_batch_jobs_to_flush
         assert not self._current_batch_allocated_block_ids
 
@@ -1337,6 +1485,11 @@ class OffloadingConnectorScheduler:
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
 
+        observer = self._kv_recovery_observer
+        if observer is not None:
+            with suppress(Exception):
+                observer.reset(self._stale_job_threshold)
+
         # The manager pool is empty; pending event payloads and announced
         # reference counts are stale.
         self._events_tracker.reset()
@@ -1347,4 +1500,10 @@ class OffloadingConnectorScheduler:
             self._blocks_being_loaded.clear()
 
     def shutdown(self) -> None:
-        self.manager.shutdown()
+        try:
+            self.manager.shutdown()
+        finally:
+            observer = self._kv_recovery_observer
+            if observer is not None:
+                with suppress(Exception):
+                    observer.close()
