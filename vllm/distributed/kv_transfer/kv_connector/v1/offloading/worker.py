@@ -510,6 +510,12 @@ class OffloadingConnectorWorker:
         self._submit_pending_stores()
 
         if kv_connector_metadata.jobs_to_flush:
+            observer = self._kv_recovery_observer
+            if observer is not None:
+                with suppress(Exception):
+                    observer.invalidate_transfers(
+                        frozenset(kv_connector_metadata.jobs_to_flush)
+                    )
             wait_membership = self._prepare_kv_recovery_wait(
                 kv_connector_metadata.jobs_to_flush
             )

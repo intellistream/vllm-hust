@@ -506,6 +506,11 @@ class KVRecoveryWorkerObserver(Protocol):
         connector_job_ids: frozenset[int],
     ) -> KVRecoveryWaitMembership | None: ...
 
+    def invalidate_transfers(
+        self,
+        connector_job_ids: frozenset[int],
+    ) -> None: ...
+
     def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None: ...
 
     def h2d_receipt_capacity_exhausted(
@@ -986,6 +991,45 @@ class BoundedKVRecoveryWorkerObserver:
                     )
                 )
             )
+
+    def invalidate_transfers(self, connector_job_ids: frozenset[int]) -> None:
+        """Consume formal contexts named by an EngineCore flush handoff."""
+        if not connector_job_ids:
+            return
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._closed:
+                    return
+                invalidated: list[KVRecoveryTransferAttempt] = []
+                for connector_job_id in sorted(connector_job_ids):
+                    prepared = self._prepared_by_job_id.pop(connector_job_id, None)
+                    if prepared is not None:
+                        invalidated.append(prepared)
+                    transfer_id = self._h2d_transfer_id_by_connector_job_id.pop(
+                        connector_job_id, None
+                    )
+                    if transfer_id is not None:
+                        pending_h2d = self._pending_h2d_by_transfer_id.pop(
+                            transfer_id, None
+                        )
+                        if pending_h2d is not None:
+                            invalidated.append(pending_h2d.attempt)
+                    pending_d2h = self._pending_d2h_by_job_id.pop(
+                        connector_job_id, None
+                    )
+                    if pending_d2h is not None:
+                        invalidated.append(pending_d2h.attempt)
+                if invalidated:
+                    self._evidence_disabled = True
+            if invalidated:
+                self._sink.evidence_failure(
+                    reason="connector_flush_invalidation",
+                    connector_job_ids=tuple(
+                        attempt.connector_job_id for attempt in invalidated
+                    ),
+                    transfer_ids=tuple(attempt.transfer_id for attempt in invalidated),
+                    timestamp_ns=None,
+                )
 
     def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None:
         with self._lifecycle_lock:
