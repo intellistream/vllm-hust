@@ -917,6 +917,15 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self._knorm_scores: dict | None = None
         self._knorm_wrapper_installed: bool = False
+        # Knorm is active only when explicitly enabled AND prefix caching
+        # is disabled. This must match register_all_kvcache_specs in
+        # single_type_kv_cache_manager.py to avoid a half-enabled state
+        # where the wrapper is installed but the manager is not registered
+        # (or vice versa). See issue #163.
+        self._knorm_active: bool = bool(
+            envs.VLLM_KNORM_ENABLED
+            and not self.cache_config.enable_prefix_caching
+        )
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
@@ -4099,8 +4108,11 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
-        # Knorm: install Ascend attention wrapper on first forward.
-        if not getattr(self, "_knorm_wrapper_installed", False):
+        # Knorm: install Ascend attention wrapper on first forward, but
+        # only when knorm is active (enabled AND prefix caching disabled).
+        # When prefix caching is on, the wrapper would add per-forward
+        # overhead with no consumer (KnormFullAttentionManager not registered).
+        if self._knorm_active and not self._knorm_wrapper_installed:
             from vllm.knorm.attention_backend import install_ascend_wrapper
 
             install_ascend_wrapper()
@@ -4463,8 +4475,9 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        # Knorm: collect key L2 norms from attention backend after forward.
-        if get_pp_group().is_last_rank:
+        # Knorm: collect key L2 norms from attention backend after forward,
+        # but only when the wrapper was actually installed.
+        if self._knorm_wrapper_installed and get_pp_group().is_last_rank:
             from vllm.knorm.hooks import collect_knorm_scores
 
             collect_knorm_scores(self, self.input_batch)
@@ -4690,9 +4703,10 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
-            from vllm.knorm.hooks import attach_knorm_scores
+            if self._knorm_wrapper_installed:
+                from vllm.knorm.hooks import attach_knorm_scores
 
-            attach_knorm_scores(self, output)
+                attach_knorm_scores(self, output)
             if self.routed_experts_initialized:
                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
                 # synchronized by ``_to_list``'s event.synchronize(), so
@@ -4752,9 +4766,12 @@ class GPUModelRunner(
 
         # Knorm: attach scores directly (not via attach_knorm_scores,
         # which calls get_output() — a destructive one-shot method).
-        knorm_scores = getattr(self, "_knorm_scores", None)
-        if knorm_scores:
-            async_output.knorm_block_scores = knorm_scores  # type: ignore[attr-defined]
+        # Guarded by _knorm_wrapper_installed so the getattr is skipped
+        # entirely when knorm is inactive.
+        if self._knorm_wrapper_installed:
+            knorm_scores = getattr(self, "_knorm_scores", None)
+            if knorm_scores:
+                async_output.knorm_block_scores = knorm_scores  # type: ignore[attr-defined]
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(

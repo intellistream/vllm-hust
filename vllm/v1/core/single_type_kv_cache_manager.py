@@ -1507,15 +1507,24 @@ def get_manager_for_kv_cache_spec(
 
 def register_all_kvcache_specs(vllm_config):
     """Built-in spec registration"""
+    from vllm import envs
+
     full_attention_manager = FullAttentionManager
     prefix_caching_enabled = (
         vllm_config is not None
         and vllm_config.cache_config is not None
         and vllm_config.cache_config.enable_prefix_caching
     )
+    # KnormFullAttentionManager is registered only when Knorm is explicitly
+    # enabled (VLLM_KNORM_ENABLED) AND prefix caching is disabled. This
+    # keeps the registration condition consistent with the runner-side
+    # _knorm_active guard in gpu_model_runner.py, avoiding the
+    # "half-enabled" state where the wrapper is installed but the
+    # manager is not registered (or vice versa). See issue #163.
     knorm_compatible = (
         vllm_config is not None
         and vllm_config.cache_config is not None
+        and envs.VLLM_KNORM_ENABLED
         and not vllm_config.cache_config.enable_prefix_caching
     )
     if knorm_compatible:
@@ -1525,14 +1534,11 @@ def register_all_kvcache_specs(vllm_config):
             full_attention_manager = KnormFullAttentionManager
         except ImportError:
             pass  # knorm module not installed - use default FullAttentionManager
-    elif prefix_caching_enabled:
-        from vllm import envs
-
-        if envs.VLLM_KNORM_ENABLED:
-            logger.warning_once(
-                "Knorm KV compression is disabled because prefix caching is enabled. "
-                "Set --no-enable-prefix-caching to use Knorm."
-            )
+    elif prefix_caching_enabled and envs.VLLM_KNORM_ENABLED:
+        logger.warning_once(
+            "Knorm KV compression is disabled because prefix caching is enabled. "
+            "Set --no-enable-prefix-caching to use Knorm."
+        )
 
     KVCacheSpecRegistry.register(
         FullAttentionSpec,
