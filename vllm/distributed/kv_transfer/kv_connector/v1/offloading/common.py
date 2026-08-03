@@ -91,7 +91,7 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     completed_jobs: dict[int, int] = field(default_factory=dict)
     transfer_stats: TransferStats = field(default_factory=TransferStats)
     kv_recovery_h2d_receipts: tuple[KVRecoveryH2DReceipt, ...] = ()
-    kv_recovery_h2d_receipts_truncated: bool = False
+    kv_recovery_h2d_receipt_capacity_exhausted: bool = False
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
@@ -100,7 +100,7 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     def add_kv_recovery_h2d_receipt(self, receipt: KVRecoveryH2DReceipt) -> bool:
         """Append a bounded evidence receipt without affecting completion."""
         if len(self.kv_recovery_h2d_receipts) >= (MAX_H2D_RECEIPTS_PER_WORKER_STEP):
-            self.kv_recovery_h2d_receipts_truncated = True
+            self.kv_recovery_h2d_receipt_capacity_exhausted = True
             return False
         self.kv_recovery_h2d_receipts = (
             *self.kv_recovery_h2d_receipts,
@@ -120,8 +120,8 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         if (
             not self.kv_recovery_h2d_receipts
             and not other.kv_recovery_h2d_receipts
-            and not self.kv_recovery_h2d_receipts_truncated
-            and not other.kv_recovery_h2d_receipts_truncated
+            and not self.kv_recovery_h2d_receipt_capacity_exhausted
+            and not other.kv_recovery_h2d_receipt_capacity_exhausted
         ):
             return OffloadingWorkerMetadata(
                 completed_jobs=merged,
@@ -132,9 +132,9 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         remaining_capacity = MAX_H2D_RECEIPTS_PER_WORKER_STEP - len(left_receipts)
         right_receipts = other.kv_recovery_h2d_receipts[:remaining_capacity]
         combined_receipts = left_receipts + right_receipts
-        receipts_truncated = (
-            self.kv_recovery_h2d_receipts_truncated
-            or other.kv_recovery_h2d_receipts_truncated
+        receipt_capacity_exhausted = (
+            self.kv_recovery_h2d_receipt_capacity_exhausted
+            or other.kv_recovery_h2d_receipt_capacity_exhausted
             or len(self.kv_recovery_h2d_receipts) > len(left_receipts)
             or len(other.kv_recovery_h2d_receipts) > len(right_receipts)
         )
@@ -143,5 +143,5 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
             completed_jobs=merged,
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
             kv_recovery_h2d_receipts=combined_receipts,
-            kv_recovery_h2d_receipts_truncated=receipts_truncated,
+            kv_recovery_h2d_receipt_capacity_exhausted=receipt_capacity_exhausted,
         )

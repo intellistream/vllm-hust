@@ -95,7 +95,7 @@ def test_add_h2d_receipt_does_not_change_completion_counts():
     assert meta.add_kv_recovery_h2d_receipt(receipt)
     assert meta.completed_jobs == {42: 1}
     assert meta.kv_recovery_h2d_receipts == (receipt,)
-    assert not meta.kv_recovery_h2d_receipts_truncated
+    assert not meta.kv_recovery_h2d_receipt_capacity_exhausted
 
 
 def test_aggregate_preserves_duplicate_receipts_for_exact_one_validation():
@@ -113,7 +113,7 @@ def test_aggregate_preserves_duplicate_receipts_for_exact_one_validation():
 
     assert result.completed_jobs == {42: 2}
     assert result.kv_recovery_h2d_receipts == (receipt, receipt)
-    assert not result.kv_recovery_h2d_receipts_truncated
+    assert not result.kv_recovery_h2d_receipt_capacity_exhausted
     assert meta1.completed_jobs == {42: 1}
     assert meta2.completed_jobs == {42: 1}
 
@@ -133,4 +133,4 @@ def test_aggregate_bounds_receipts_without_affecting_serving_metadata():
 
     assert result.completed_jobs == {42: 2}
     assert len(result.kv_recovery_h2d_receipts) == (MAX_H2D_RECEIPTS_PER_WORKER_STEP)
-    assert result.kv_recovery_h2d_receipts_truncated
+    assert result.kv_recovery_h2d_receipt_capacity_exhausted

@@ -382,6 +382,7 @@ class OffloadingConnectorScheduler:
         self._current_batch_kv_recovery_contexts: (
             dict[int, KVRecoveryTransferContext] | None
         ) = {} if kv_recovery_observer is not None else None
+        self._kv_recovery_receipt_ready: dict[ReqId, int] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
         self._current_batch_allocated_block_ids: set[int] = set()
@@ -1194,7 +1195,53 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        observer = self._kv_recovery_observer
+        if observer is not None:
+            for req_id in sorted(scheduler_output.preempted_req_ids or ()):
+                self._kv_recovery_receipt_ready.pop(req_id, None)
+                req_status = self._req_status.get(req_id)
+                if req_status is not None:
+                    with suppress(Exception):
+                        observer.request_preempted(
+                            req_id,
+                            req_status.req.num_preemptions,
+                        )
+
+        admitted_recovery_epochs: dict[ReqId, int] = {}
+        if observer is not None:
+            resumed_req_ids = set(
+                scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            )
+            resumed_req_ids.update(
+                req.req_id
+                for req in scheduler_output.scheduled_new_reqs
+                if (
+                    (req_status := self._req_status.get(req.req_id)) is not None
+                    and req_status.req.num_preemptions > 0
+                )
+            )
+            for req_id in sorted(resumed_req_ids):
+                req_status = self._req_status.get(req_id)
+                recovery_epoch = self._kv_recovery_receipt_ready.pop(req_id, None)
+                if (
+                    req_status is not None
+                    and recovery_epoch is not None
+                    and recovery_epoch == req_status.req.num_preemptions
+                ):
+                    admitted_recovery_epochs[req_id] = recovery_epoch
+                    with suppress(Exception):
+                        observer.request_admission_started(
+                            req_id,
+                            recovery_epoch,
+                        )
+
         self._update_req_states(scheduler_output)
+
+        if observer is not None:
+            for req_id, recovery_epoch in admitted_recovery_epochs.items():
+                with suppress(Exception):
+                    observer.request_admitted(req_id, recovery_epoch)
+
         self.manager.update_device_pressure(
             scheduler_output.kv_cache_usage,
             preempted=bool(scheduler_output.preempted_req_ids),
@@ -1355,11 +1402,12 @@ class OffloadingConnectorScheduler:
                 del self._req_status[job_status.req_id]
 
         if observer is not None and (
-            meta.kv_recovery_h2d_receipts or meta.kv_recovery_h2d_receipts_truncated
+            meta.kv_recovery_h2d_receipts
+            or meta.kv_recovery_h2d_receipt_capacity_exhausted
         ):
             assert eligible_h2d_receipt_job_ids is not None
             fresh_receipts: list[KVRecoveryH2DReceipt] = []
-            receipts_incomplete = meta.kv_recovery_h2d_receipts_truncated
+            receipts_incomplete = meta.kv_recovery_h2d_receipt_capacity_exhausted
             for receipt in meta.kv_recovery_h2d_receipts:
                 try:
                     if not isinstance(receipt, KVRecoveryH2DReceipt):
@@ -1378,6 +1426,10 @@ class OffloadingConnectorScheduler:
                         tuple(fresh_receipts),
                         receipts_incomplete,
                     )
+                    for receipt in fresh_receipts:
+                        self._kv_recovery_receipt_ready[
+                            receipt.identity.runtime_request_id
+                        ] = receipt.identity.recovery_epoch
             except Exception:
                 pass
 
@@ -1413,6 +1465,12 @@ class OffloadingConnectorScheduler:
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
+        observer = self._kv_recovery_observer
+        if observer is not None:
+            self._kv_recovery_receipt_ready.pop(request.request_id, None)
+            with suppress(Exception):
+                observer.request_terminal(request.request_id)
+
         # TODO(orozery): possibly kickoff offload for last block
         # which may have been deferred due to async scheduling
         req_status = self._req_status.get(request.request_id)
@@ -1484,6 +1542,7 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        self._kv_recovery_receipt_ready.clear()
 
         observer = self._kv_recovery_observer
         if observer is not None:

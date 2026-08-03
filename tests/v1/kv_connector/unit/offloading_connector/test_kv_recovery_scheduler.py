@@ -40,10 +40,21 @@ class RecordingSchedulerObserver:
         self.logical_ids: dict[tuple[str, int, int], str] = {}
         self.contexts: list[KVRecoveryTransferContext] = []
         self.receipt_batches: list[tuple[tuple[KVRecoveryH2DReceipt, ...], bool]] = []
+        self.preemptions: list[tuple[str, int]] = []
+        self.admission_starts: list[tuple[str, int]] = []
+        self.admissions: list[tuple[str, int]] = []
+        self.terminals: list[str] = []
+        self.runtime_events: list[tuple[str, str, int | None]] = []
+        self.receipt_ready_request_ids: set[str] = set()
         self.reset_thresholds: list[int] = []
         self.closed = False
 
+    def request_preempted(self, runtime_request_id, recovery_epoch):
+        self.preemptions.append((runtime_request_id, recovery_epoch))
+        self.runtime_events.append(("preempted", runtime_request_id, recovery_epoch))
+
     def prepare_transfer_context(self, runtime_request_id, operation, coordinates):
+        self.runtime_events.append((operation, runtime_request_id, None))
         trace_id = hashlib.sha256(runtime_request_id.encode()).hexdigest()[:32]
         lifecycle_id = f"{trace_id}:e:0"
         is_recovery = operation == "h2d_restore"
@@ -89,8 +100,31 @@ class RecordingSchedulerObserver:
         self.contexts.append(context)
         return context
 
-    def consume_h2d_receipts(self, receipts, receipts_truncated):
-        self.receipt_batches.append((receipts, receipts_truncated))
+    def consume_h2d_receipts(self, receipts, receipt_capacity_exhausted):
+        self.receipt_batches.append((receipts, receipt_capacity_exhausted))
+        self.runtime_events.extend(
+            ("receipt", receipt.identity.runtime_request_id, None)
+            for receipt in receipts
+        )
+        self.receipt_ready_request_ids.update(
+            receipt.identity.runtime_request_id for receipt in receipts
+        )
+
+    def request_admission_started(self, runtime_request_id, recovery_epoch):
+        if runtime_request_id not in self.receipt_ready_request_ids:
+            return
+        self.admission_starts.append((runtime_request_id, recovery_epoch))
+        self.runtime_events.append(
+            ("admission_started", runtime_request_id, recovery_epoch)
+        )
+
+    def request_admitted(self, runtime_request_id, recovery_epoch):
+        self.admissions.append((runtime_request_id, recovery_epoch))
+        self.runtime_events.append(("admitted", runtime_request_id, recovery_epoch))
+
+    def request_terminal(self, runtime_request_id):
+        self.terminals.append(runtime_request_id)
+        self.runtime_events.append(("terminal", runtime_request_id, None))
 
     def reset(self, stale_job_threshold):
         self.reset_thresholds.append(stale_job_threshold)
@@ -165,8 +199,8 @@ class RecordingWorkerObserver:
     def wait_completed(self, attempt):
         self.waits.append(attempt)
 
-    def h2d_receipt_truncated(self, receipt):
-        raise AssertionError("receipt transport unexpectedly truncated")
+    def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+        raise AssertionError("receipt capacity unexpectedly exhausted")
 
     def close(self):
         return None
@@ -317,6 +351,19 @@ def test_pressure_preemption_preserves_identity_through_real_connector_path(
     assert len(receipts) == 1
     assert receipts[0].identity == h2d_contexts[0].identity
     assert receipts[0].block_set_id == h2d_contexts[0].block_set_id
+    runtime_request_id = h2d_contexts[0].identity.runtime_request_id
+    assert factory.scheduler.preemptions == [(runtime_request_id, 1)]
+    assert factory.scheduler.admission_starts == [(runtime_request_id, 1)]
+    assert factory.scheduler.admissions == [(runtime_request_id, 1)]
+    event_names = [
+        event_name
+        for event_name, request_id, _ in factory.scheduler.runtime_events
+        if request_id == runtime_request_id
+    ]
+    assert event_names.index("preempted") < event_names.index("h2d_restore")
+    assert event_names.index("h2d_restore") < event_names.index("receipt")
+    assert event_names.index("receipt") < event_names.index("admission_started")
+    assert event_names.index("admission_started") < event_names.index("admitted")
 
 
 def test_scheduler_observer_failure_is_fail_open(
@@ -343,6 +390,7 @@ def test_scheduler_observer_failure_is_fail_open(
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
 
     assert factory.worker.contexts == []
+    assert factory.scheduler.terminals == ["0"]
 
 
 def test_malformed_scheduler_observer_return_is_fail_open(
