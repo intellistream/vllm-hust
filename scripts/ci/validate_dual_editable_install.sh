@@ -178,20 +178,27 @@ echo "::endgroup::"
 # runtime dependencies is jointly satisfiable. Full dependency resolution is
 # validated separately in the vllm-ascend-hust CI.
 echo "::group::Step 7 – Metadata/build smoke check"
+# Both editable installs used --no-deps, so pip check will report many
+# "requires X, which is not installed" entries. These are EXPECTED in a
+# --no-deps environment and do not indicate a metadata conflict. We only
+# fail on real version conflicts (e.g. "requires X>=1.0, but you have X 0.9").
 CHECK_OUTPUT=$(python -m pip check 2>&1) || true
 if [[ -z "$CHECK_OUTPUT" ]]; then
-  echo "pip check passed – installed metadata is self-consistent."
+  echo "pip check passed – no issues detected."
 else
-  echo "pip check reported the following issues:"
-  echo "$CHECK_OUTPUT"
-  # Only fail if vllm or vllm-ascend-hust itself has a metadata conflict.
-  if echo "$CHECK_OUTPUT" | grep -qE "^vllm |^vllm-ascend-hust "; then
+  # Filter out "requires X, which is not installed" (expected with --no-deps)
+  REAL_CONFLICTS=$(echo "$CHECK_OUTPUT" | grep -v "which is not installed" || true)
+  if [[ -z "$REAL_CONFLICTS" ]]; then
+    echo "pip check reports only missing-dependency entries (expected with --no-deps)."
+    echo "These are not metadata conflicts – the packages metadata is self-consistent."
+    echo "Full dependency resolution is validated separately in vllm-ascend-hust CI."
+  else
+    echo "pip check found real version conflicts:"
+    echo "$REAL_CONFLICTS"
     echo ""
-    echo "::error::vllm or vllm-ascend-hust has a metadata conflict."
+    echo "::error::Real dependency version conflicts detected."
     exit 1
   fi
-  echo ""
-  echo "Non-vllm metadata issues are pre-existing and ignored."
 fi
 echo "::endgroup::"
 
