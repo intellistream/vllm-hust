@@ -32,7 +32,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -41,7 +40,8 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -127,17 +127,14 @@ class BailingAttention(nn.Module):
             prefix=f"{prefix}.dense",
         )
 
-        self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-
-        self.rotary_dim = getattr(config, "rotary_dim", self.head_dim)
+        rotary_dim = getattr(config, "rotary_dim", self.head_dim)
+        config.rope_parameters["partial_rotary_factor"] = rotary_dim / self.head_dim
 
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.rotary_dim,
             max_position=config.max_position_embeddings,
             rope_parameters=config.rope_parameters,
             is_neox_style=True,
-            partial_rotary_factor=self.partial_rotary_factor,
         )
 
         self.attn = Attention(
@@ -288,13 +285,12 @@ class BailingMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        self.experts = SharedFusedMoE(
+        self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=self.num_experts,
             top_k=self.top_k,
             hidden_size=self.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=self.norm_expert_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -303,6 +299,8 @@ class BailingMoE(nn.Module):
             num_expert_group=self.n_group,
             topk_group=self.topk_group,
             use_grouped_topk=self.use_grouped_topk,
+            router_logits_dtype=self.router_dtype,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -316,21 +314,6 @@ class BailingMoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-
-        if self.shared_experts is not None:
-            shared_output, final_hidden_states = final_hidden_states
-        else:
-            shared_output = None
-
-        final_hidden_states *= self.routed_scaling_factor
-
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
-
-        if self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
-                final_hidden_states
-            )
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
@@ -443,7 +426,7 @@ class BailingMoeModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         position_ids: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
@@ -478,7 +461,8 @@ class BailingMoeModel(nn.Module):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return SharedFusedMoE.make_expert_params_mapping(
+        return FusedMoE.make_expert_params_mapping(
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -613,7 +597,7 @@ class BailingMoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

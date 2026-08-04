@@ -7,8 +7,6 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from vllm.attention.backends.abstract import AttentionImpl
-from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.config import (
     CacheConfig,
     CompilationConfig,
@@ -20,11 +18,14 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.model import ModelDType
-from vllm.v1.attention.backends.utils import (
+from vllm.v1.attention.backend import (
+    AttentionImpl,
     AttentionMetadataBuilder,
+    AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, FullAttentionSpec
 
 
 @dataclass
@@ -106,8 +107,8 @@ def create_common_attn_metadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens,
-        seq_lens_cpu=seq_lens_cpu,
-        num_computed_tokens_cpu=num_computed_tokens_cpu,
+        _seq_lens_cpu=seq_lens_cpu,
+        _num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_reqs=batch_spec.batch_size,
         num_actual_tokens=num_tokens,
         max_query_len=max_query_len,
@@ -130,8 +131,36 @@ def try_get_attention_backend(
         raise AssertionError("unreachable") from None
 
 
-def create_standard_kv_cache_spec(vllm_config: VllmConfig) -> FullAttentionSpec:
-    """Create a FullAttentionSpec from ModelParams only."""
+def try_backend_includes_kv_cache_update(
+    backend: AttentionBackendEnum,
+) -> bool:
+    """Try to get the attention backend class, skipping test if not found."""
+    try:
+        backend_class = backend.get_class()
+        return backend_class.forward_includes_kv_cache_update
+    except ImportError as e:
+        pytest.skip(f"{backend.name} not available: {e}")
+        raise AssertionError("unreachable") from None
+
+
+def create_standard_kv_cache_spec(
+    vllm_config: VllmConfig,
+    attn_type: AttentionType = AttentionType.DECODER,
+) -> FullAttentionSpec | EncoderOnlyAttentionSpec:
+    """Create an AttentionSpec from VllmConfig.
+
+    Returns an EncoderOnlyAttentionSpec for encoder-only attention (no KV
+    cache), and a FullAttentionSpec otherwise.
+    """
+    if attn_type == AttentionType.ENCODER_ONLY:
+        return EncoderOnlyAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=vllm_config.model_config.get_num_kv_heads(
+                vllm_config.parallel_config
+            ),
+            head_size=vllm_config.model_config.get_head_size(),
+            dtype=vllm_config.model_config.dtype,
+        )
     return FullAttentionSpec(
         block_size=vllm_config.cache_config.block_size,
         num_kv_heads=vllm_config.model_config.get_num_kv_heads(
@@ -170,7 +199,6 @@ def create_vllm_config(
     cache_config = CacheConfig(
         block_size=block_size,
         cache_dtype="auto",
-        swap_space=0,
     )
     # Set cache blocks for testing
     #   (these may be set during initialization normally)
@@ -185,6 +213,8 @@ def create_vllm_config(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         enable_chunked_prefill=enable_chunked_prefill,
+        max_model_len=model_config.max_model_len,
+        is_encoder_decoder=model_config.is_encoder_decoder,
     )
 
     device_config = DeviceConfig()
@@ -247,8 +277,8 @@ def create_dummy_kv_cache(
 @dataclass
 class BackendConfig:
     name: str
-    env_vars: dict
-    comp_config: dict  # compilation config
+    attention_config: dict
+    comp_config: dict
     specific_gpu_arch: tuple | None = None
 
 
@@ -257,10 +287,10 @@ full_cg_backend_configs = {
     # FA3 on Hopper
     "FA3": BackendConfig(
         name="FA3",
-        env_vars={
-            "VLLM_ATTENTION_BACKEND": "FLASH_ATTN",
-            "VLLM_FLASH_ATTN_VERSION": "3",
-            "VLLM_FLASH_ATTN_MAX_NUM_SPLITS_FOR_CUDA_GRAPH": "16",
+        attention_config={
+            "backend": "FLASH_ATTN",
+            "flash_attn_version": 3,
+            "flash_attn_max_num_splits_for_cuda_graph": 16,
         },
         comp_config={
             "cudagraph_mode": "FULL",
@@ -270,9 +300,7 @@ full_cg_backend_configs = {
     # FlashMLA on Hopper
     "FlashMLA": BackendConfig(
         name="FlashMLA",
-        env_vars={
-            "VLLM_ATTENTION_BACKEND": "FLASHMLA",
-        },
+        attention_config={"backend": "FLASHMLA"},
         comp_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE",
         },
@@ -281,9 +309,7 @@ full_cg_backend_configs = {
     # Cutlass MLA on Blackwell
     "CutlassMLA": BackendConfig(
         name="CutlassMLA",
-        env_vars={
-            "VLLM_ATTENTION_BACKEND": "CUTLASS_MLA",
-        },
+        attention_config={"backend": "CUTLASS_MLA"},
         comp_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE",
         },
@@ -292,9 +318,7 @@ full_cg_backend_configs = {
     # FlashInfer MLA on Blackwell
     "FlashInferMLA": BackendConfig(
         name="FlashInferMLA",
-        env_vars={
-            "VLLM_ATTENTION_BACKEND": "FLASHINFER_MLA",
-        },
+        attention_config={"backend": "FLASHINFER_MLA"},
         comp_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE",
         },
@@ -303,9 +327,9 @@ full_cg_backend_configs = {
     # FlashAttention MLA on Hopper
     "FlashAttentionMLA": BackendConfig(
         name="FlashAttentionMLA",
-        env_vars={
-            "VLLM_ATTENTION_BACKEND": "FLASH_ATTN_MLA",
-            "VLLM_FLASH_ATTN_MAX_NUM_SPLITS_FOR_CUDA_GRAPH": "16",
+        attention_config={
+            "backend": "FLASH_ATTN_MLA",
+            "flash_attn_max_num_splits_for_cuda_graph": 16,
         },
         comp_config={
             "cudagraph_mode": "FULL_DECODE_ONLY",
@@ -315,10 +339,10 @@ full_cg_backend_configs = {
     # FA2
     "FA2": BackendConfig(
         name="FA2",
-        env_vars={
-            "VLLM_ATTENTION_BACKEND": "FLASH_ATTN",
-            "VLLM_FLASH_ATTN_VERSION": "2",
-            "VLLM_FLASH_ATTN_MAX_NUM_SPLITS_FOR_CUDA_GRAPH": "16",
+        attention_config={
+            "backend": "FLASH_ATTN",
+            "flash_attn_version": 2,
+            "flash_attn_max_num_splits_for_cuda_graph": 16,
         },
         comp_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE",
@@ -327,7 +351,7 @@ full_cg_backend_configs = {
     # Triton Attention
     "TritonAttn": BackendConfig(
         name="TritonAttn",
-        env_vars={"VLLM_ATTENTION_BACKEND": "TRITON_ATTN"},
+        attention_config={"backend": "TRITON_ATTN"},
         comp_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE",
         },
@@ -335,14 +359,17 @@ full_cg_backend_configs = {
     # FlashInfer
     "FlashInfer": BackendConfig(
         name="FlashInfer",
-        env_vars={"VLLM_ATTENTION_BACKEND": "FLASHINFER"},
+        attention_config={"backend": "FLASHINFER"},
         comp_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE",
         },
     ),
     "RocmAttn": BackendConfig(
         name="RocmAttn",
-        env_vars={"VLLM_V1_USE_PREFILL_DECODE_ATTENTION": "1"},
+        attention_config={
+            "backend": "ROCM_ATTN",
+            "use_prefill_decode_attention": True,
+        },
         comp_config={
             "cudagraph_mode": "FULL",
         },

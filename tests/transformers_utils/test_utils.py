@@ -5,13 +5,16 @@ from unittest.mock import patch
 
 import pytest
 
-from vllm.transformers_utils.utils import (
-    is_cloud_storage,
-    is_gcs,
+from vllm.transformers_utils.gguf_utils import (
     is_gguf,
     is_remote_gguf,
-    is_s3,
     split_remote_gguf,
+)
+from vllm.transformers_utils.utils import (
+    is_azure,
+    is_cloud_storage,
+    is_gcs,
+    is_s3,
 )
 
 
@@ -29,9 +32,17 @@ def test_is_s3():
     assert not is_s3("nfs://nfs-fqdn.local")
 
 
+def test_is_azure():
+    assert is_azure("az://model-container/path")
+    assert not is_azure("s3://model-path/path-to-model")
+    assert not is_azure("/unix/local/path")
+    assert not is_azure("nfs://nfs-fqdn.local")
+
+
 def test_is_cloud_storage():
     assert is_cloud_storage("gs://model-path")
     assert is_cloud_storage("s3://model-path/path-to-model")
+    assert is_cloud_storage("az://model-container/path")
     assert not is_cloud_storage("/unix/local/path")
     assert not is_cloud_storage("nfs://nfs-fqdn.local")
 
@@ -41,7 +52,7 @@ class TestIsRemoteGGUF:
 
     def test_is_remote_gguf_with_colon_and_slash(self):
         """Test is_remote_gguf with repo_id:quant_type format."""
-        # Valid quant types
+        # Valid quant types (exact GGML types)
         assert is_remote_gguf("unsloth/Qwen3-0.6B-GGUF:IQ1_S")
         assert is_remote_gguf("user/repo:Q2_K")
         assert is_remote_gguf("repo/model:Q4_K")
@@ -51,6 +62,43 @@ class TestIsRemoteGGUF:
         assert not is_remote_gguf("repo/model:quant")
         assert not is_remote_gguf("repo/model:INVALID")
         assert not is_remote_gguf("repo/model:invalid_type")
+
+    def test_is_remote_gguf_extended_quant_types(self):
+        """Test is_remote_gguf with extended quant type naming conventions."""
+        # Extended quant types with _M, _S, _L suffixes
+        assert is_remote_gguf("repo/model:Q4_K_M")
+        assert is_remote_gguf("repo/model:Q4_K_S")
+        assert is_remote_gguf("repo/model:Q3_K_L")
+        assert is_remote_gguf("repo/model:Q5_K_M")
+        assert is_remote_gguf("repo/model:Q3_K_S")
+
+        # Extended quant types with _XL, _XS, _XXS suffixes
+        assert is_remote_gguf("repo/model:Q5_K_XL")
+        assert is_remote_gguf("repo/model:IQ4_XS")
+        assert is_remote_gguf("repo/model:IQ3_XXS")
+
+        # Invalid extended types (base type doesn't exist)
+        assert not is_remote_gguf("repo/model:INVALID_M")
+        assert not is_remote_gguf("repo/model:Q9_K_M")
+
+    def test_is_remote_gguf_nonstandard_quant_type(self):
+        """Test is_remote_gguf with non-standard quant types containing
+        a known GGML type."""
+        # Non-standard quant types with known GGML type after prefix
+        assert is_remote_gguf("unsloth/Qwen3.5-35B-A3B-GGUF:UD-Q4_K_XL")
+        assert is_remote_gguf("user/Model:UD-Q4_K_M")
+        assert is_remote_gguf("user/SomeModel:Custom-Q8_0")
+
+        # Exact GGML type after prefix (no suffix stripping needed)
+        assert is_remote_gguf("user/Model-GGUF:UD-IQ4_NL")
+        assert is_remote_gguf("user/Model-GGUF:UD-Q8_0")
+
+        # Completely unknown quant types should still fail
+        assert not is_remote_gguf("repo/model:TOTALLY-RANDOM")
+        assert not is_remote_gguf("user/Model:UD-INVALID")
+
+        # No dash separator → not recognized as prefixed
+        assert not is_remote_gguf("repo/model:UDIQ4NL")
 
     def test_is_remote_gguf_without_colon(self):
         """Test is_remote_gguf without colon."""
@@ -104,6 +152,24 @@ class TestSplitRemoteGGUF:
         assert repo_id == "repo/model"
         assert quant_type == "Q2_K"
 
+    def test_split_remote_gguf_extended_quant_types(self):
+        """Test split_remote_gguf with extended quant type naming conventions."""
+        repo_id, quant_type = split_remote_gguf("unsloth/Qwen3-0.6B-GGUF:Q4_K_M")
+        assert repo_id == "unsloth/Qwen3-0.6B-GGUF"
+        assert quant_type == "Q4_K_M"
+
+        repo_id, quant_type = split_remote_gguf("repo/model:Q3_K_S")
+        assert repo_id == "repo/model"
+        assert quant_type == "Q3_K_S"
+
+    def test_split_remote_gguf_nonstandard_quant_type(self):
+        """Test split_remote_gguf with non-standard quant types in GGUF repos."""
+        repo_id, quant_type = split_remote_gguf(
+            "unsloth/Qwen3.5-35B-A3B-GGUF:UD-Q4_K_XL"
+        )
+        assert repo_id == "unsloth/Qwen3.5-35B-A3B-GGUF"
+        assert quant_type == "UD-Q4_K_XL"
+
     def test_split_remote_gguf_with_path_object(self):
         """Test split_remote_gguf with Path object."""
         repo_id, quant_type = split_remote_gguf(Path("unsloth/Qwen3-0.6B-GGUF:IQ1_S"))
@@ -132,7 +198,7 @@ class TestSplitRemoteGGUF:
 class TestIsGGUF:
     """Test is_gguf utility function."""
 
-    @patch("vllm.transformers_utils.utils.check_gguf_file", return_value=True)
+    @patch("vllm.transformers_utils.gguf_utils.check_gguf_file", return_value=True)
     def test_is_gguf_with_local_file(self, mock_check_gguf):
         """Test is_gguf with local GGUF file."""
         assert is_gguf("/path/to/model.gguf")
@@ -145,11 +211,16 @@ class TestIsGGUF:
         assert is_gguf("repo/model:Q2_K")
         assert is_gguf("repo/model:Q4_K")
 
+        # Extended quant types with suffixes
+        assert is_gguf("repo/model:Q4_K_M")
+        assert is_gguf("repo/model:Q3_K_S")
+        assert is_gguf("repo/model:Q5_K_L")
+
         # Invalid quant_type should return False
         assert not is_gguf("repo/model:quant")
         assert not is_gguf("repo/model:INVALID")
 
-    @patch("vllm.transformers_utils.utils.check_gguf_file", return_value=False)
+    @patch("vllm.transformers_utils.gguf_utils.check_gguf_file", return_value=False)
     def test_is_gguf_false(self, mock_check_gguf):
         """Test is_gguf returns False for non-GGUF models."""
         assert not is_gguf("unsloth/Qwen3-0.6B")
