@@ -1419,6 +1419,12 @@ jobs:
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
           VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
           RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}
+          # PR candidates must use the same repeated-run policy as the
+          # central primary-median baseline so provenance is emitted and the
+          # comparison remains apples-to-apples.
+          PERFGATE_WARMUP_RUNS: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '1' || '0' }}
+          PERFGATE_MEASURED_RUNS: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '3' || '1' }}
+          PERFGATE_AGGREGATION: "primary-median-run"
         run: |
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
           max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}
@@ -1461,6 +1467,9 @@ jobs:
           VLLM_HUST_REPO: ${{ github.workspace }}
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
           VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
+          PERFGATE_WARMUP_RUNS: "1"
+          PERFGATE_MEASURED_RUNS: "3"
+          PERFGATE_AGGREGATION: "primary-median-run"
         run: |
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
           bash .github/workflows/scripts/perfgate_stage2_rebase_and_benchmark.sh

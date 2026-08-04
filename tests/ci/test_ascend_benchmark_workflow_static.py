@@ -665,7 +665,7 @@ def test_store_baseline_step_expects_measurement_policy():
     assert 'PERFGATE_EXPECTED_AGGREGATION: "primary-median-run"' in store_block
 
 
-def test_pr_stage1_and_stage2_keep_single_run_measurement_defaults():
+def test_pr_stage1_and_stage2_emit_provenance_with_repeated_measurements():
     text = workflow_text()
 
     formal_step = text.index("- name: Run benchmark CI and optional formal publish")
@@ -677,13 +677,15 @@ def test_pr_stage1_and_stage2_keep_single_run_measurement_defaults():
         "- name: Performance gate - two-stage comparison", stage2_step
     )
 
-    for block in (
-        text[formal_step:stage1_step],
-        text[stage2_step:final_compare_step],
-    ):
-        assert "PERFGATE_WARMUP_RUNS:" not in block
-        assert "PERFGATE_MEASURED_RUNS:" not in block
-        assert "PERFGATE_AGGREGATION:" not in block
+    pr_block = text[formal_step:stage1_step]
+    stage2_block = text[stage2_step:final_compare_step]
+
+    assert "PERFGATE_WARMUP_RUNS:" in pr_block
+    assert "PERFGATE_MEASURED_RUNS:" in pr_block
+    assert 'PERFGATE_AGGREGATION: "primary-median-run"' in pr_block
+    assert 'PERFGATE_WARMUP_RUNS: "1"' in stage2_block
+    assert 'PERFGATE_MEASURED_RUNS: "3"' in stage2_block
+    assert 'PERFGATE_AGGREGATION: "primary-median-run"' in stage2_block
 
 
 def test_runner_script_forwards_perfgate_measurement_env():
