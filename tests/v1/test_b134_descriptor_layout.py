@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -51,4 +52,7 @@ def test_capture_writes_only_region_relative_offsets(monkeypatch, tmp_path) -> N
     assert payload["evidence_label"] == "existing-server-probe"
     assert payload["descriptors"][0]["src_offset"] == 8192
     assert "address" not in output.read_text(encoding="utf-8")
-    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    # os.open(mode=0o600) is a POSIX permission; Windows does not implement
+    # it, so the mode bit assertion is only meaningful on POSIX platforms.
+    if os.name != "nt":
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
