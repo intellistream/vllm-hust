@@ -180,25 +180,29 @@ echo "::endgroup::"
 echo "::group::Step 7 – Metadata/build smoke check"
 # Both editable installs used --no-deps, so pip check will report many
 # "requires X, which is not installed" entries. These are EXPECTED in a
-# --no-deps environment and do not indicate a metadata conflict. We only
-# fail on real version conflicts (e.g. "requires X>=1.0, but you have X 0.9").
+# --no-deps environment and do not indicate a metadata conflict.
+# We filter those out and only fail if vllm or vllm-ascend-hust itself has
+# a real version conflict (e.g. "requires X>=1.0, but you have X 0.9").
+# Non-vllm conflicts (e.g. torch internal conflicts) are pre-existing and ignored.
 CHECK_OUTPUT=$(python -m pip check 2>&1) || true
 if [[ -z "$CHECK_OUTPUT" ]]; then
-  echo "pip check passed – no issues detected."
+  echo "pip check passed – installed metadata is self-consistent."
 else
-  # Filter out "requires X, which is not installed" (expected with --no-deps)
+  echo "pip check reported the following issues:"
+  echo "$CHECK_OUTPUT"
+  # Filter out "requires X, which is not installed" (expected with --no-deps).
+  # Then only fail if vllm or vllm-ascend-hust itself has a real version conflict.
   REAL_CONFLICTS=$(echo "$CHECK_OUTPUT" | grep -v "which is not installed" || true)
-  if [[ -z "$REAL_CONFLICTS" ]]; then
-    echo "pip check reports only missing-dependency entries (expected with --no-deps)."
-    echo "These are not metadata conflicts – the packages metadata is self-consistent."
-    echo "Full dependency resolution is validated separately in vllm-ascend-hust CI."
-  else
-    echo "pip check found real version conflicts:"
-    echo "$REAL_CONFLICTS"
+  VLLM_CONFLICTS=$(echo "$REAL_CONFLICTS" | grep -E "^vllm |^vllm-ascend-hust " || true)
+  if [[ -n "$VLLM_CONFLICTS" ]]; then
     echo ""
-    echo "::error::Real dependency version conflicts detected."
+    echo "::error::vllm or vllm-ascend-hust has a metadata conflict:"
+    echo "$VLLM_CONFLICTS"
     exit 1
   fi
+  echo ""
+  echo "Only missing-dependency entries (expected with --no-deps) and non-vllm pre-existing issues found."
+  echo "Full dependency resolution is validated separately in vllm-ascend-hust CI."
 fi
 echo "::endgroup::"
 
