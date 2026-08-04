@@ -279,7 +279,7 @@ jobs:
       # Set this repository variable to a runner-local persistent directory to
       # reuse large model snapshots across benchmark runs.
       VLLM_HUST_HF_CACHE_ROOT: ${{ vars.VLLM_HUST_HF_CACHE_ROOT || '' }}
-      SAME_SPEC_READY_TIMEOUT_SECONDS: "1800"
+      SAME_SPEC_READY_TIMEOUT_SECONDS: "2400"
       HF_TOKEN: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_to_hf) && secrets.HF_TOKEN || '' }}
       HF_REPO_ID: intellistream/vllm-hust-benchmark-results
       MODEL_NAME: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && (github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.model_name || 'Qwen/Qwen2.5-3B-Instruct') || (github.event_name == 'workflow_dispatch' && inputs.model_name || 'Qwen/Qwen2.5-14B-Instruct') }}
