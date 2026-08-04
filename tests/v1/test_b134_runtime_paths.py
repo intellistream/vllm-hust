@@ -98,7 +98,18 @@ def kv_offload_env():
         }
     )
 
-    saved = {name: sys.modules.get(name) for name in stubs}
+    # Snapshot EVERY key we are about to touch — the stubs plus all modules
+    # dynamically loaded below — BEFORE overwriting anything.
+    dynamic_names = {
+        "vllm.v1.b134_events",
+        "vllm.v1.kv_offload.base",
+        "vllm.v1.kv_offload.cpu.common",
+        "vllm.v1.kv_offload.cpu.policies.base",
+        "vllm.v1.kv_offload.cpu.policies.lru",
+        "vllm.v1.kv_offload.cpu.policies.arc",
+        "vllm.v1.kv_offload.cpu.manager",
+    }
+    saved = {name: sys.modules.get(name) for name in set(stubs) | dynamic_names}
     sys.modules.update(stubs)
 
     try:

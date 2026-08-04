@@ -36,9 +36,10 @@ def _load_scheduler_module():
     stubs: dict[str, types.ModuleType] = {}
 
     def add(name: str, **attrs) -> types.ModuleType:
+        # Build the stub but do NOT write sys.modules yet: the snapshot of
+        # pre-existing state must be taken before ANY key is overwritten.
         mod = _make_module(name, **attrs)
         stubs[name] = mod
-        sys.modules[name] = mod
         return mod
 
     # Every symbol scheduler.py imports must exist on its stub module.
@@ -195,20 +196,25 @@ def _load_scheduler_module():
     )
     assert events_spec is not None and events_spec.loader is not None
     events_mod = importlib.util.module_from_spec(events_spec)
+
+    scheduler_path = REPO_ROOT / "vllm" / "v1" / "core" / "sched" / "scheduler.py"
+    scheduler_spec = importlib.util.spec_from_file_location(
+        "vllm.v1.core.sched.scheduler", scheduler_path
+    )
+    assert scheduler_spec is not None and scheduler_spec.loader is not None
+    scheduler_mod = importlib.util.module_from_spec(scheduler_spec)
+
+    # Snapshot EVERY key we are about to touch — stubs plus the two real
+    # modules loaded below — BEFORE overwriting anything. Restoring from
+    # this snapshot puts sys.modules back to its pre-test identity.
+    touched = set(stubs) | {"vllm.v1.b134_events", "vllm.v1.core.sched.scheduler"}
+    saved = {name: sys.modules.get(name) for name in touched}
+    sys.modules.update(stubs)
     sys.modules["vllm.v1.b134_events"] = events_mod
     events_spec.loader.exec_module(events_mod)
-
-    saved = {name: sys.modules.get(name) for name in stubs}
-    sys.modules.update(stubs)
+    sys.modules["vllm.v1.core.sched.scheduler"] = scheduler_mod
     try:
-        scheduler_path = REPO_ROOT / "vllm" / "v1" / "core" / "sched" / "scheduler.py"
-        spec = importlib.util.spec_from_file_location(
-            "vllm.v1.core.sched.scheduler", scheduler_path
-        )
-        assert spec is not None and spec.loader is not None
-        scheduler_mod = importlib.util.module_from_spec(spec)
-        sys.modules["vllm.v1.core.sched.scheduler"] = scheduler_mod
-        spec.loader.exec_module(scheduler_mod)
+        scheduler_spec.loader.exec_module(scheduler_mod)
     finally:
         for name, mod in saved.items():
             if mod is None:
@@ -319,6 +325,66 @@ def _make_scheduler(scheduler_mod, request):
     return sched
 
 
+def _scheduler_touched_keys() -> set[str]:
+    """Every sys.modules key the scheduler loader overwrites."""
+    stub_names = {
+        "torch",
+        "numpy",
+        "vllm",
+        "vllm.compilation",
+        "vllm.compilation.cuda_graph",
+        "vllm.config",
+        "vllm.distributed",
+        "vllm.distributed.ec_transfer",
+        "vllm.distributed.ec_transfer.ec_connector",
+        "vllm.distributed.ec_transfer.ec_connector.base",
+        "vllm.distributed.ec_transfer.ec_connector.factory",
+        "vllm.distributed.kv_events",
+        "vllm.distributed.kv_transfer",
+        "vllm.distributed.kv_transfer.kv_connector",
+        "vllm.distributed.kv_transfer.kv_connector.factory",
+        "vllm.distributed.kv_transfer.kv_connector.v1",
+        "vllm.distributed.kv_transfer.kv_connector.v1.base",
+        "vllm.distributed.kv_transfer.kv_connector.v1.metrics",
+        "vllm.logger",
+        "vllm.model_executor",
+        "vllm.model_executor.layers",
+        "vllm.model_executor.layers.fused_moe",
+        "vllm.model_executor.layers.fused_moe.routed_experts_capturer",
+        "vllm.multimodal",
+        "vllm.multimodal.encoder_budget",
+        "vllm.multimodal.utils",
+        "vllm.v1",
+        "vllm.v1.core",
+        "vllm.v1.core.sched",
+        "vllm.v1.core.sched.interface",
+        "vllm.v1.core.sched.output",
+        "vllm.v1.core.sched.policy",
+        "vllm.v1.core.sched.request_queue",
+        "vllm.v1.core.sched.utils",
+        "vllm.v1.core.sched.victim_selector",
+        "vllm.v1.core.encoder_cache_manager",
+        "vllm.v1.core.kv_cache_coordinator",
+        "vllm.v1.core.kv_cache_manager",
+        "vllm.v1.core.kv_cache_metrics",
+        "vllm.v1.core.kv_cache_utils",
+        "vllm.v1.engine",
+        "vllm.v1.kv_cache_interface",
+        "vllm.v1.metrics",
+        "vllm.v1.metrics.perf",
+        "vllm.v1.metrics.stats",
+        "vllm.v1.outputs",
+        "vllm.v1.request",
+        "vllm.v1.spec_decode",
+        "vllm.v1.spec_decode.dynamic",
+        "vllm.v1.spec_decode.dynamic.utils",
+        "vllm.v1.spec_decode.metrics",
+        "vllm.v1.structured_output",
+        "vllm.v1.utils",
+    }
+    return stub_names | {"vllm.v1.b134_events", "vllm.v1.core.sched.scheduler"}
+
+
 def test_restore_request_emits_wakeup_admission_scheduled(monkeypatch) -> None:
     """One PREEMPTED request going through schedule() must emit the exact
     chain wakeup -> admission -> scheduled."""
@@ -338,3 +404,24 @@ def test_restore_request_emits_wakeup_admission_scheduled(monkeypatch) -> None:
     assert emitted == ["wakeup", "admission", "scheduled"], (
         f"restore chain order wrong: {emitted}"
     )
+
+
+def test_scheduler_loader_restores_sys_modules_identity() -> None:
+    """Running the loader must leave sys.modules in its exact prior state.
+
+    Regression guard for test isolation: every module key the loader touches
+    (stubs + dynamically loaded real modules) must be restored to the same
+    object, or removed if it did not exist before.
+    """
+    touched = _scheduler_touched_keys()
+    before = {name: sys.modules.get(name) for name in touched}
+
+    _load_scheduler_module()
+
+    after = {name: sys.modules.get(name) for name in touched}
+    assert set(before) == set(after)
+    for name in touched:
+        assert after[name] is before[name], (
+            f"sys.modules[{name!r}] identity changed by loader: "
+            f"{before[name]!r} -> {after[name]!r}"
+        )
