@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import subprocess
+
 import pytest
 
 from vllm.entrypoints.openai.engine.protocol import StreamOptions
+from vllm.entrypoints.serve.utils import api_utils
 from vllm.entrypoints.serve.utils.api_utils import (
     get_max_tokens,
     sanitize_message,
@@ -35,6 +38,60 @@ def test_sanitize_message():
 )
 def test_should_include_usage_force_enables_continuous_usage(stream_options, expected):
     assert should_include_usage(stream_options, True) == expected
+
+
+def test_ascend_torch_preflight_timeout_defaults_to_60_seconds(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S", raising=False)
+
+    assert api_utils._ascend_torch_preflight_timeout_s() == 60
+
+
+@pytest.mark.parametrize("timeout_s", ["1", "60", "300"])
+def test_ascend_torch_preflight_timeout_accepts_bounded_values(
+    monkeypatch, timeout_s
+):
+    monkeypatch.setenv("VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S", timeout_s)
+
+    assert api_utils._ascend_torch_preflight_timeout_s() == int(timeout_s)
+
+
+@pytest.mark.parametrize("timeout_s", ["invalid", "0", "301"])
+def test_ascend_torch_preflight_timeout_rejects_invalid_values(
+    monkeypatch, timeout_s
+):
+    monkeypatch.setenv("VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S", timeout_s)
+
+    with pytest.raises(SystemExit, match="must be"):
+        api_utils._ascend_torch_preflight_timeout_s()
+
+
+def test_ascend_torch_preflight_uses_configured_timeout(monkeypatch):
+    observed = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = command
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setenv("VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S", "75")
+    monkeypatch.setattr(api_utils.subprocess, "run", fake_run)
+
+    api_utils._run_ascend_torch_preflight()
+
+    assert observed["timeout"] == 75
+    assert "torch.npu.is_available()" in observed["command"][2]
+    assert "torch.zeros(1, device=device)" in observed["command"][2]
+
+
+def test_ascend_torch_preflight_timeout_remains_fail_closed(monkeypatch):
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setenv("VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S", "75")
+    monkeypatch.setattr(api_utils.subprocess, "run", fake_run)
+
+    with pytest.raises(SystemExit, match="engine startup remains blocked"):
+        api_utils._run_ascend_torch_preflight()
 
 
 class TestGetMaxTokens:

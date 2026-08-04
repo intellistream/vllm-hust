@@ -30,7 +30,10 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
-_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S = 20
+_ASCEND_TORCH_PREFLIGHT_TIMEOUT_ENV = "VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S"
+_ASCEND_TORCH_PREFLIGHT_TIMEOUT_DEFAULT_S = 60
+_ASCEND_TORCH_PREFLIGHT_TIMEOUT_MIN_S = 1
+_ASCEND_TORCH_PREFLIGHT_TIMEOUT_MAX_S = 300
 _ASCEND_TORCH_PREFLIGHT_CMDS = {"serve", "launch"}
 _ASCEND_EXPLICIT_BACKENDS = {"ascend", "npu"}
 
@@ -249,6 +252,33 @@ def _format_ascend_torch_preflight_failure(
     )
 
 
+def _ascend_torch_preflight_timeout_s() -> int:
+    raw_timeout = os.environ.get(_ASCEND_TORCH_PREFLIGHT_TIMEOUT_ENV)
+    if raw_timeout is None:
+        return _ASCEND_TORCH_PREFLIGHT_TIMEOUT_DEFAULT_S
+
+    try:
+        timeout_s = int(raw_timeout)
+    except ValueError:
+        raise SystemExit(
+            f"{_ASCEND_TORCH_PREFLIGHT_TIMEOUT_ENV} must be an integer between "
+            f"{_ASCEND_TORCH_PREFLIGHT_TIMEOUT_MIN_S} and "
+            f"{_ASCEND_TORCH_PREFLIGHT_TIMEOUT_MAX_S} seconds"
+        ) from None
+
+    if not (
+        _ASCEND_TORCH_PREFLIGHT_TIMEOUT_MIN_S
+        <= timeout_s
+        <= _ASCEND_TORCH_PREFLIGHT_TIMEOUT_MAX_S
+    ):
+        raise SystemExit(
+            f"{_ASCEND_TORCH_PREFLIGHT_TIMEOUT_ENV} must be between "
+            f"{_ASCEND_TORCH_PREFLIGHT_TIMEOUT_MIN_S} and "
+            f"{_ASCEND_TORCH_PREFLIGHT_TIMEOUT_MAX_S} seconds"
+        )
+    return timeout_s
+
+
 def _run_ascend_torch_preflight() -> None:
     probe = (
         "import importlib.util, os, sys, traceback\n"
@@ -266,14 +296,22 @@ def _run_ascend_torch_preflight() -> None:
         "print('torch.zeros preflight ok')\n"
     )
 
-    result = subprocess.run(
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        timeout=_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S,
-        check=False,
-        env=os.environ.copy(),
-    )
+    timeout_s = _ascend_torch_preflight_timeout_s()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+            env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            "Ascend torch_npu preflight timed out after "
+            f"{timeout_s} seconds. The runtime did not prove NPU visibility "
+            "and tensor allocation, so engine startup remains blocked."
+        ) from None
     if result.returncode != 0:
         raise SystemExit(_format_ascend_torch_preflight_failure(result))
 
