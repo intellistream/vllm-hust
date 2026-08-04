@@ -168,3 +168,6 @@ def test_perfgate_baseline_fetch_bounds_git_network_waits():
     assert 'timeout --foreground "${GIT_NETWORK_TIMEOUT_SECONDS}s"' in text
     assert "run_git_network ls-remote" in text
     assert "run_git_network clone" in text
+    assert "CENTRAL_REPO_URL=${PERFGATE_CENTRAL_REPO_URL" in text
+    assert "baseline-metadata.json" in text
+    assert 'write_env PERFGATE_BASELINE_METADATA_FILE "$manifest"' in text

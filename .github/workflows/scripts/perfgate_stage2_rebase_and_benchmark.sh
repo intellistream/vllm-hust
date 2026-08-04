@@ -144,8 +144,28 @@ if [[ "$stage2_baseline_available" != "1" ]]; then
 fi
 
 stage2_baseline_file=$(read_env_value PERFGATE_BASELINE_FILE "$stage2_env_file")
+stage2_baseline_metadata_file=$(read_env_value PERFGATE_BASELINE_METADATA_FILE "$stage2_env_file")
 stage2_baseline_commit=$(read_env_value PERFGATE_BASELINE_COMMIT "$stage2_env_file")
 stage2_baseline_source=$(read_env_value PERFGATE_BASELINE_SOURCE "$stage2_env_file")
+stage2_candidate_provenance="$STAGE2_RESULT_ROOT/submissions/$STAGE2_RUN_ID/perfgate-provenance.json"
+stage2_target_sha=$(git rev-parse HEAD)
+set +e
+provenance_output=$("${PYTHON_BIN:-python}" \
+  .github/workflows/scripts/validate_perfgate_candidate_provenance.py \
+  --baseline-metadata "$stage2_baseline_metadata_file" \
+  --candidate-provenance "$stage2_candidate_provenance" \
+  --expected-target-sha "$stage2_target_sha" 2>&1)
+provenance_rc=$?
+set -e
+if [[ "$provenance_rc" -ne 0 ]]; then
+  reason="Stage 2 candidate provenance validation failed: $provenance_output"
+  write_env PERFGATE_STAGE2_PROVENANCE_VALID 0
+  write_env PERFGATE_STAGE2_NOT_RUN_REASON "$reason"
+  echo "$reason" >&2
+  exit 0
+fi
+echo "$provenance_output"
+write_env PERFGATE_STAGE2_PROVENANCE_VALID 1
 write_env PERFGATE_STAGE2_B1PRIME_FILE "$b1prime_file"
 write_env PERFGATE_STAGE2_M2_BASELINE_FILE "$stage2_baseline_file"
 write_env PERFGATE_STAGE2_M2_BASELINE_COMMIT "$stage2_baseline_commit"
