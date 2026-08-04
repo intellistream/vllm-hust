@@ -21,6 +21,10 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
+from vllm.v1.kv_offload.cpu.b134_descriptor_layout import (
+    CAPTURE_ENABLED,
+    capture_descriptor_layout,
+)
 from vllm.v1.kv_offload.cpu.gpu_worker import compute_sub_block_ptrs
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
@@ -249,6 +253,9 @@ class AscendSingleDirectionOffloadingHandler:
         dst_offset = 0
         op_idx = 0
         num_transfer_bytes = 0
+        layout_descriptors: list[dict[str, int | str]] | None = (
+            [] if CAPTURE_ENABLED else None
+        )
         for group_size, block_idx, group_data_refs in zip(
             group_sizes, block_indices, self.kv_cache_groups_data_refs
         ):
@@ -287,6 +294,21 @@ class AscendSingleDirectionOffloadingHandler:
                     skip_count=dst_skip,
                 )
                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
+                if layout_descriptors is not None:
+                    src_base = self.src_tensors[data_ref.tensor_idx].data_ptr()
+                    dst_base = self.dst_tensors[data_ref.tensor_idx].data_ptr()
+                    direction = "d2h" if self.npu_to_cpu else "h2d"
+                    for descriptor_idx in range(op_idx, end_idx):
+                        layout_descriptors.append(
+                            {
+                                "direction": direction,
+                                "dst_offset": int(all_dst[descriptor_idx]) - dst_base,
+                                "dst_region": f"dst_tensor_{data_ref.tensor_idx}",
+                                "size": int(all_sizes[descriptor_idx]),
+                                "src_offset": int(all_src[descriptor_idx]) - src_base,
+                                "src_region": f"src_tensor_{data_ref.tensor_idx}",
+                            }
+                        )
                 num_transfer_bytes += group_size * data_ref.page_size_bytes
                 op_idx = end_idx
 
@@ -296,6 +318,12 @@ class AscendSingleDirectionOffloadingHandler:
         assert src_offset == len(src_blocks)
         assert dst_offset == len(dst_blocks)
         assert op_idx == num_copy_ops
+        if layout_descriptors is not None:
+            capture_descriptor_layout(
+                job_id,
+                "d2h" if self.npu_to_cpu else "h2d",
+                layout_descriptors,
+            )
         descriptors_done_at = time.monotonic() if EVENTS_ENABLED else 0.0
 
         npu = _get_torch_npu()
