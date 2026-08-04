@@ -23,23 +23,44 @@ def test_run_ascend_benchmark_propagates_benchmark_repo_publish_env():
     assert 'BENCHMARK_REPO_SSH_KEY="${BENCHMARK_REPO_SSH_KEY:-}" \\' in text
 
 
-def test_perfgate_store_baseline_cleans_worktree_on_exit():
+def test_perfgate_store_baseline_cleans_scoped_writer_credentials_on_exit():
     text = script_text("perfgate_store_baseline.sh")
 
     assert "cleanup() {" in text
-    assert 'git worktree remove "$WORKTREE_DIR" --force' in text
-    assert 'rm -rf "$WORKTREE_DIR"' in text
+    assert "unset PERFGATE_BASELINE_WRITER_TOKEN WRITER_TOKEN" in text
+    assert 'rm -rf "$ASKPASS_DIR"' in text
     assert "trap cleanup EXIT" in text
 
 
 def test_benchmark_snapshot_sync_explains_missing_write_credentials():
     text = script_text("sync_benchmark_snapshots_to_github.sh")
+    runner_text = script_text("run_ascend_benchmark_ci.sh")
 
     assert "L3 benchmark repository publication is enabled" in text
     assert "no cross-repository write credential is available" in text
     assert "VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY" in text
     assert "VLLM_HUST_BENCHMARK_GH_TOKEN" in text
     assert "Benchmark repo publish target:" in text
+    staging_index = text.index("publication_staging_dir=$(mktemp -d")
+    public_validator_index = text.index("validate_public_leaderboard_snapshots.py")
+    trend_validator_index = text.index("validate-trend --input")
+    git_add_index = text.index('git -C "$BENCHMARK_REPO_DIR" add')
+    git_commit_index = text.index('git -C "$BENCHMARK_REPO_DIR" commit')
+    git_push_index = text.index('git -C "$BENCHMARK_REPO_DIR" push')
+    assert staging_index < public_validator_index < trend_validator_index
+    assert trend_validator_index < git_add_index
+    assert git_add_index < git_commit_index < git_push_index
+    assert "write_github_env GITHUB_SNAPSHOT_SYNC_STATUS rejected" in text
+    assert (
+        "required_submission_files=(leaderboard_manifest.json "
+        "run_leaderboard.json STATUS)" in text
+    )
+    assert "reset_publication_staging()" in text
+    assert "reset_publication_staging || return $?" in text
+    submit_index = runner_text.index('"$PYTHON_BIN" -m vllm_hust_benchmark.cli submit')
+    status_index = runner_text.index("printf 'OK\\n' > \"$SUBMISSION_DIR/STATUS\"")
+    sync_index = runner_text.index("sync_benchmark_publication_to_github", status_index)
+    assert submit_index < status_index < sync_index
 
 
 def test_same_spec_benchmark_failure_prints_server_log_tail():
