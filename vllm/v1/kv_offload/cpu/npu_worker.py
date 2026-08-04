@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import time
+from vllm.v1.b134_events import emit  # B134
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -40,6 +42,7 @@ class NPUTransfer:
     dma_dst: torch.Tensor | None = None
     dma_sizes: torch.Tensor | None = None
     staging_buffer: torch.Tensor | None = None
+    submitted_at: float = 0.0  # B134 wall-clock submit timestamp
 
 
 def _get_torch_npu() -> Any:
@@ -206,6 +209,7 @@ class AscendSingleDirectionOffloadingHandler:
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
+        _t0 = time.monotonic()  # B134
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
 
         src_blocks = src_spec.block_ids
@@ -292,6 +296,7 @@ class AscendSingleDirectionOffloadingHandler:
         assert src_offset == len(src_blocks)
         assert dst_offset == len(dst_blocks)
         assert op_idx == num_copy_ops
+        _t_desc = time.monotonic()  # B134 (descriptors/packing/index-remap done)
 
         npu = _get_torch_npu()
         start_event = self._new_event()
@@ -305,6 +310,7 @@ class AscendSingleDirectionOffloadingHandler:
             self._stream.wait_stream(npu.current_stream())
         if self._transfers:
             self._stream.wait_event(self._transfers[-1].end_event)
+        _t_sync = time.monotonic()  # B134 (stream sync done)
 
         if num_copy_ops and not self.npu_to_cpu:
             max_page_bytes = int(all_sizes.max())
@@ -331,19 +337,23 @@ class AscendSingleDirectionOffloadingHandler:
             start_event.record(self._stream)
             if num_copy_ops:
                 if self.npu_to_cpu:
+                    _t_sw = time.monotonic()  # B134
                     torch.ops._C_ascend.swap_blocks_batch(src, dst, sizes, 1)
+                    emit("swap_d2h", f"job{job_id}", f"n={num_copy_ops} us={(time.monotonic() - _t_sw) * 1e6:.0f}")
                 else:
                     assert staging_buffer is not None
                     assert dma_src is not None
                     assert dma_dst is not None
                     assert dma_sizes is not None
                     dma_offset = 0
+                    _t_gather_total = 0.0  # B134
                     for chunk_start, chunk_end in _iter_transfer_chunks(
                         all_sizes,
                         self._staging_capacity_bytes,
                     ):
                         chunk_src = all_src[chunk_start:chunk_end]
                         chunk_sizes = all_sizes[chunk_start:chunk_end]
+                        _tg0 = time.monotonic()  # B134
                         chunk_dma_ops = _coalesce_host_pages(
                             chunk_src,
                             chunk_sizes,
@@ -352,6 +362,7 @@ class AscendSingleDirectionOffloadingHandler:
                             all_dma_dst[dma_offset:],
                             all_dma_sizes[dma_offset:],
                         )
+                        _t_gather_total += time.monotonic() - _tg0  # B134
                         offsets = (
                             chunk_sizes.cumsum(dtype=chunk_sizes.dtype) - chunk_sizes
                         )
@@ -371,7 +382,10 @@ class AscendSingleDirectionOffloadingHandler:
                         )
                         dma_offset = dma_end
                     num_dma_ops = dma_offset
+                    emit("gather_h2d", f"job{job_id}", f"us={_t_gather_total * 1e6:.0f} chunks={num_dma_ops}")
             end_event.record(self._stream)
+        _t_submit = time.monotonic()  # B134
+        emit("transfer_phase", f"job{job_id}", f"dir={'d2h' if self.npu_to_cpu else 'h2d'} bytes={num_transfer_bytes} n_ops={num_copy_ops} desc_us={(_t_desc - _t0) * 1e6:.0f} sync_us={(_t_sync - _t_desc) * 1e6:.0f} submit_us={(_t_submit - _t_sync) * 1e6:.0f}")
 
         if num_copy_ops and not self.npu_to_cpu:
             logger.debug(
@@ -396,6 +410,7 @@ class AscendSingleDirectionOffloadingHandler:
                 dma_dst=dma_dst,
                 dma_sizes=dma_sizes,
                 staging_buffer=staging_buffer,
+                submitted_at=_t_submit,
             )
         )
         return True
@@ -404,6 +419,10 @@ class AscendSingleDirectionOffloadingHandler:
         results: list[TransferResult] = []
         while self._transfers and self._transfers[0].end_event.query():
             transfer = self._transfers.popleft()
+            transfer.end_event.synchronize()  # B134: ensure completion ts is real
+            _wall_ms = (time.monotonic() - transfer.submitted_at) * 1e3
+            _evt_ms = transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
+            emit("copy_done", f"job{transfer.job_id}", f"dir={'d2h' if self.npu_to_cpu else 'h2d'} bytes={transfer.num_bytes} copy_ms_wall={_wall_ms:.3f} copy_ms_event={_evt_ms:.3f} note=wall_authoritative")
             results.append(
                 TransferResult(
                     job_id=transfer.job_id,

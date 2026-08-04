@@ -61,6 +61,7 @@ from vllm.v1.kv_offload.tiering.lifecycle import (
     has_stable_session_id,
 )
 from vllm.v1.kv_offload.tiering.residency import TieringMetrics
+from vllm.v1.b134_events import emit  # B134
 
 logger = init_logger(__name__)
 
@@ -885,6 +886,7 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
+        emit("restore_start", req_context.req_id, str(len(keys)))
         self._lifecycle.record_request_keys(req_context, keys)
         # Process completed promotions to ensure blocks are ready
         self._maybe_process_finished_jobs()
@@ -920,6 +922,7 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Blocks that finished loading.
             req_context: Per-request context.
         """
+        emit("restore_done", req_context.req_id, str(len(keys)))
         self.primary_tier.complete_load(keys, req_context)
         if self._track_residency:
             self._lifecycle.residency.finish_transfer(keys, "cpu", "device")
@@ -957,7 +960,10 @@ class TieringOffloadingManager(OffloadingManager):
         # Cascading of these newly-stored blocks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
+        _t_ev = time.monotonic()  # B134
         primary_result = self.primary_tier.prepare_store(keys, req_context)
+        if primary_result is not None:
+            emit("evict", req_context.req_id, f"n={len(primary_result.evicted_keys)} us={(time.monotonic() - _t_ev) * 1e6:.0f}")
 
         if primary_result is None:
             return None
@@ -1289,11 +1295,13 @@ class TieringOffloadingManager(OffloadingManager):
         Called once per scheduler step from
         OffloadingConnectorScheduler.build_connector_meta().
         """
+        _t0 = time.monotonic()  # B134
         self._maybe_process_finished_jobs()
         self._processed_jobs_this_step = False
         self._flush_pending_promotions()
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
+        emit("sched_step", "step", f"us={(time.monotonic() - _t0) * 1e6:.0f}")
 
         protected_keys = {
             key for metadata in self._transfer_jobs.values() for key in metadata.keys

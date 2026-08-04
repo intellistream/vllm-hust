@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import Any
 
 import numpy as np
+from vllm.v1.b134_events import emit  # B134
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -1025,14 +1026,17 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                emit("admission", request.request_id)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
+                    emit("scheduled", request.request_id)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
+                    emit("wakeup", request.request_id)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -1209,6 +1213,7 @@ class Scheduler(SchedulerInterface):
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+            emit("preempt", request.request_id)
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)

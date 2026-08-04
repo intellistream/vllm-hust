@@ -24,6 +24,8 @@ from vllm.v1.kv_offload.cpu.common import (
     CPUOffloadingMetrics,
 )
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+import time
+from vllm.v1.b134_events import emit  # B134
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 
@@ -179,6 +181,7 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
+        _t0 = time.monotonic()  # B134
         if self.counts is not None:
             num_keys = len(keys)
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
@@ -243,6 +246,7 @@ class CPUOffloadingManager(OffloadingManager):
             store_spec=store_spec,
             evicted_keys=to_evict,
         )
+        emit("cpu_store", req_context.req_id, f"us={(time.monotonic() - _t0) * 1e6:.0f} n={len(keys_to_store)} evict={len(to_evict)}")
 
     @override
     def complete_store(
@@ -279,6 +283,7 @@ class CPUOffloadingManager(OffloadingManager):
 
     def evict_keys(self, keys: Collection[OffloadKey]) -> list[OffloadKey]:
         """Explicitly evict ready, unreferenced blocks from the CPU tier."""
+        _t0 = time.monotonic()  # B134
         evicted: list[OffloadKey] = []
         for key in keys:
             block = self._policy.get(key)
@@ -298,6 +303,7 @@ class CPUOffloadingManager(OffloadingManager):
                     removed=True,
                 )
             )
+        emit("cpu_evict", "cpu", f"us={(time.monotonic() - _t0) * 1e6:.0f} n={len(evicted)}")
         return evicted
 
     @override
