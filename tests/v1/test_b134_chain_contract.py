@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Source-level contract tests for the B134 six-event chain ordering.
 
 These tests do not import vLLM runtime modules (no torch/tblib needed): they
@@ -35,12 +37,17 @@ def _emit_calls(tree: ast.AST) -> list[tuple[str, int]]:
 def _is_gated_on_log_stats(tree: ast.AST, emit_lineno: int) -> bool:
     """True if the emit at emit_lineno sits inside an ``if self.log_stats``."""
     for node in ast.walk(tree):
-        if (
+        if not (
             isinstance(node, ast.If)
             and isinstance(node.test, ast.Attribute)
             and node.test.attr == "log_stats"
-            and node.lineno < emit_lineno <= node.end_lineno
         ):
+            continue
+        end_lineno = node.end_lineno
+        if end_lineno is None:
+            # Defensive: ast.If always has end_lineno on Python >= 3.8.
+            continue
+        if node.lineno < emit_lineno <= end_lineno:
             return True
     return False
 

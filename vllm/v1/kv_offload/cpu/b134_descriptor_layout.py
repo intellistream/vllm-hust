@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Optional normalized descriptor capture for B134 layout probes."""
 
 import json
@@ -57,15 +59,15 @@ def capture_descriptor_layout(
     data = (
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
-    descriptor = os.open(
+    fd = os.open(
         output,
         os.O_CREAT | os.O_EXCL | os.O_WRONLY,
         0o600,
     )
     try:
-        written = os.write(descriptor, data)
+        written = os.write(fd, data)
         if written != len(data):
             raise OSError("short descriptor inventory write")
     finally:
-        os.close(descriptor)
+        os.close(fd)
     return output

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Runtime-path tests for the B134 event chain.
 
 Unlike the AST contract tests (test_b134_chain_contract.py), these tests

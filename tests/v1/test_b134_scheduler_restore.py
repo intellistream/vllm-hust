@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Runtime-path tests for the B134 event chain (scheduler restore branch).
 
 The scheduler restore branch lives deep inside ``Scheduler.schedule()``
@@ -25,7 +27,7 @@ def _make_module(name: str, **attrs) -> types.ModuleType:
         # multi-line `from X import A, B, C` always resolves.
         return MagicMock()
 
-    mod.__getattr__ = _fallback  # type: ignore[attr-defined]
+    mod.__getattr__ = _fallback  # type: ignore[method-assign]
     for k, v in attrs.items():
         setattr(mod, k, v)
     return mod
@@ -116,7 +118,7 @@ def _load_scheduler_module():
             PAUSED_ALL="PAUSED_ALL",
         ),
     )
-    stubs["vllm.v1.core.sched.interface"].PauseState = pause_state
+    stubs["vllm.v1.core.sched.interface"].PauseState = pause_state  # type: ignore[attr-defined]
     add(
         "vllm.v1.core.sched.output",
         SchedulerOutput=MagicMock,
