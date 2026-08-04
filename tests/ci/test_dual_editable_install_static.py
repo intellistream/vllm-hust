@@ -53,7 +53,12 @@ def test_workflow_clones_ascend_repo():
     text = WORKFLOW_PATH.read_text(encoding="utf-8")
     assert "Checkout vllm-ascend-hust" in text
     assert "vLLM-HUST/vllm-ascend-hust.git" in text
-    assert "git clone --depth 1" in text
+    # SHA-safe checkout: clone --no-checkout + fetch + checkout (not -b which
+    # only works for branch/tag refs, not 40-char SHA).
+    assert "git clone --no-checkout" in text
+    assert "git fetch origin" in text
+    assert "git checkout" in text
+    assert "-b " not in text.split("Checkout")[1] if "Checkout" in text else True
 
 
 def test_workflow_runs_validation_script():
@@ -69,7 +74,7 @@ def test_workflow_does_not_require_ascend_hardware():
 
 def test_script_installs_both_packages_editable():
     text = SCRIPT_PATH.read_text(encoding="utf-8")
-    assert "pip3 install -e" in text
+    assert "python -m pip install -e" in text
     assert "VLLM_ASCEND_HUST_REPO" in text
     assert "VLLM_TARGET_DEVICE=empty" in text
 
@@ -80,15 +85,24 @@ def test_script_sets_soc_version_for_ascend_build():
     assert "ascend910b1" in text
 
 
-def test_script_runs_import_smoke_tests():
+def test_script_runs_metadata_verification():
+    """Step 5 verifies installed package metadata, not actual imports.
+
+    Both editable installs use --no-deps, so runtime dependencies like numpy
+    are not installed and  would fail. The script verifies package
+    metadata via importlib.metadata instead.
+    """
     text = SCRIPT_PATH.read_text(encoding="utf-8")
-    assert "import vllm" in text
-    assert "import vllm_ascend" in text
+    assert "importlib.metadata" in text
+    assert "PackageNotFoundError" in text
+    # Must NOT attempt actual import (would fail with --no-deps)
+    assert "import vllm;" not in text
+    assert "import vllm_ascend;" not in text
 
 
 def test_script_runs_dependency_check():
     text = SCRIPT_PATH.read_text(encoding="utf-8")
-    assert "pip3 check" in text
+    assert "python -m pip check" in text
 
 
 def test_script_prints_dependency_versions():
@@ -100,3 +114,39 @@ def test_script_prints_dependency_versions():
 def test_script_uses_no_deps_for_editable_installs():
     text = SCRIPT_PATH.read_text(encoding="utf-8")
     assert "--no-deps" in text
+
+
+def test_workflow_supports_sha_ref():
+    """The ascend-hust checkout must support SHA refs, not just branch/tag.
+
+    git clone -b <ref> fails for 40-char SHA. The workflow uses
+    clone --no-checkout + fetch + checkout to support all ref types.
+    """
+    text = WORKFLOW_PATH.read_text(encoding="utf-8")
+    assert "git clone --no-checkout" in text
+    assert "git fetch origin" in text
+
+
+def test_workflow_has_pull_request_trigger():
+    """The workflow must auto-trigger on PR for packaging/workflow paths."""
+    text = WORKFLOW_PATH.read_text(encoding="utf-8")
+    assert "pull_request:" in text
+    assert "pyproject.toml" in text
+    assert "scripts/ci/validate_dual_editable_install.sh" in text
+
+
+def test_script_narrows_to_metadata_smoke():
+    """Step 7 must be scoped to metadata/build smoke, not dependency compat."""
+    text = SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "metadata/build smoke" in text.lower() or "metadata smoke" in text.lower()
+    # Must NOT claim to verify dependency compatibility
+    assert "without dependency conflicts" not in text
+
+
+def test_script_uses_python_m_pip():
+    """Script must use 'python -m pip' consistently, not bare pip3."""
+    text = SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "python -m pip install -e" in text
+    assert "python -m pip check" in text
+    assert "pip3 install -e" not in text
+    assert "pip3 check" not in text

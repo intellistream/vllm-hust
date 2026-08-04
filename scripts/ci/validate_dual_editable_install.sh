@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Validate that vllm-hust and vllm-ascend-hust can be installed as editable
-# packages into the same clean Python 3.12 environment without dependency
-# conflicts.
+# packages into the same clean Python 3.12 environment (metadata/build smoke).
+#
+# NOTE: This script performs a metadata/build smoke test, not a full dependency
+# compatibility check. Both editable installs use --no-deps, so pip check only
+# verifies metadata consistency of the installed distributions, not that the
+# union of runtime dependencies is jointly satisfiable. Full dependency
+# resolution is validated separately in the vllm-ascend-hust CI.
 #
 # Required environment variables:
 #   VLLM_ASCEND_HUST_REPO  - path to a vllm-ascend-hust checkout
@@ -112,12 +117,25 @@ VLLM_TARGET_DEVICE=empty python -m pip install -e "$VLLM_HUST_REPO" --no-build-i
 echo "::endgroup::"
 
 # --------------------------------------------------------------------------- #
-# Step 5 – Import smoke tests
+# Step 5 – Installed package metadata verification
 # --------------------------------------------------------------------------- #
-echo "::group::Step 5 – Import smoke tests"
-python -c "import vllm; print(f'vLLM version: {vllm.__version__}')"
-python -c "import vllm_ascend; print(f'vllm-ascend version: {vllm_ascend.__version__}')"
-echo "All imports passed."
+# Verify both packages are registered in the environment's metadata. This is a
+# metadata/build smoke check: since both editable installs used --no-deps, the
+# runtime dependencies (numpy, transformers, etc.) are NOT installed, so an
+# actual `import vllm` would fail with ModuleNotFoundError. Full import
+# validation is delegated to the vllm-ascend-hust CI which resolves the full
+# dependency set.
+echo "::group::Step 5 – Installed package metadata verification"
+python -c "
+import importlib.metadata as md
+for pkg_name in ['vllm', 'vllm-ascend-hust']:
+    try:
+        dist = md.distribution(pkg_name)
+        print(f'  {pkg_name:30s} {dist.version}')
+    except md.PackageNotFoundError:
+        raise SystemExit(f'ERROR: {pkg_name} not found in environment metadata')
+print('Both packages are registered in the environment.')
+"
 echo "::endgroup::"
 
 # --------------------------------------------------------------------------- #
@@ -152,26 +170,32 @@ for pkg in pkgs:
 echo "::endgroup::"
 
 # --------------------------------------------------------------------------- #
-# Step 7 – pip check (warn but do not fail on known optional gaps)
+# Step 7 – Metadata/build smoke check (NOT full dependency compatibility)
 # --------------------------------------------------------------------------- #
-echo "::group::Step 7 – pip check"
+# Both editable installs used --no-deps, so pip check here only verifies the
+# installed distributions' metadata is self-consistent (e.g. version pins in
+# pyproject.toml vs. installed versions). It does NOT prove the union of
+# runtime dependencies is jointly satisfiable. Full dependency resolution is
+# validated separately in the vllm-ascend-hust CI.
+echo "::group::Step 7 – Metadata/build smoke check"
 CHECK_OUTPUT=$(python -m pip check 2>&1) || true
 if [[ -z "$CHECK_OUTPUT" ]]; then
-  echo "pip check passed – no dependency conflicts detected."
+  echo "pip check passed – installed metadata is self-consistent."
 else
   echo "pip check reported the following issues:"
   echo "$CHECK_OUTPUT"
-  # Only fail if vllm or vllm-ascend-hust itself has a conflict.
+  # Only fail if vllm or vllm-ascend-hust itself has a metadata conflict.
   if echo "$CHECK_OUTPUT" | grep -qE "^vllm |^vllm-ascend-hust "; then
     echo ""
-    echo "::error::vllm or vllm-ascend-hust has a dependency conflict."
+    echo "::error::vllm or vllm-ascend-hust has a metadata conflict."
     exit 1
   fi
   echo ""
-  echo "Non-vllm conflicts are pre-existing and ignored."
+  echo "Non-vllm metadata issues are pre-existing and ignored."
 fi
 echo "::endgroup::"
 
 echo "============================================="
-echo " Dual-editable install validation succeeded."
+echo " Dual-editable install metadata/build smoke succeeded."
+echo " (Not a full dependency compatibility check.)"
 echo "============================================="
