@@ -32,3 +32,20 @@ def test_emit_writes_structured_jsonl(monkeypatch, tmp_path) -> None:
     assert record["fields"] == {"bytes": 4096, "descriptors": 4}
     assert isinstance(record["pid"], int)
     assert isinstance(record["ts_monotonic_ns"], int)
+
+
+def test_emit_chain_order_is_append_order(monkeypatch, tmp_path) -> None:
+    """JSONL must preserve the exact per-request event order across emits."""
+    output = tmp_path / "chain.jsonl"
+    monkeypatch.setenv("B134_EVENTS_FILE", str(output))
+    module = _load_module()
+
+    # Contract for restore requests: wakeup -> admission -> scheduled
+    for event in ("wakeup", "admission", "scheduled"):
+        module.emit(event, "request-1")
+
+    events = [
+        json.loads(line)["event"]
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert events == ["wakeup", "admission", "scheduled"]

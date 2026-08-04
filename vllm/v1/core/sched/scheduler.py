@@ -1030,6 +1030,8 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                if request.status == RequestStatus.PREEMPTED:
+                    emit("wakeup", request.request_id)
                 emit("admission", request.request_id)
                 if self.log_stats:
                     request.record_event(
@@ -1040,7 +1042,6 @@ class Scheduler(SchedulerInterface):
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
-                    emit("wakeup", request.request_id)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 

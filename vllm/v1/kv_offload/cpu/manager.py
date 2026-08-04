@@ -241,11 +241,6 @@ class CPUOffloadingManager(OffloadingManager):
         # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
 
-        return PrepareStoreOutput(
-            keys_to_store=keys_to_store,
-            store_spec=store_spec,
-            evicted_keys=to_evict,
-        )
         if EVENTS_ENABLED:
             emit(
                 "cpu_store",
@@ -254,6 +249,12 @@ class CPUOffloadingManager(OffloadingManager):
                 evicted_keys=len(to_evict),
                 stored_keys=len(keys_to_store),
             )
+
+        return PrepareStoreOutput(
+            keys_to_store=keys_to_store,
+            store_spec=store_spec,
+            evicted_keys=to_evict,
+        )
 
     @override
     def complete_store(
