@@ -253,6 +253,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+        self._synchronization_domain = async_output_copy_stream
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_ready_event = torch.Event()
@@ -287,13 +288,23 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.async_copy_ready_event.record()
 
+    @property
+    def synchronization_domain(self) -> object:
+        return self._synchronization_domain
+
+    def synchronize(self) -> None:
+        self.async_copy_ready_event.synchronize()
+
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
         This function blocks until the copy is finished.
         """
+        self.synchronize()
+        return self.get_output_without_sync()
+
+    def get_output_without_sync(self) -> ModelRunnerOutput:
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        self.async_copy_ready_event.synchronize()
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -386,6 +397,7 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
     ):
         self._model_runner_output = model_runner_output
+        self._synchronization_domain = async_output_copy_stream
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_ready_event = torch.Event()
@@ -404,12 +416,21 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
             )
             self.async_copy_ready_event.record()
 
+    @property
+    def synchronization_domain(self) -> object:
+        return self._synchronization_domain
+
+    def synchronize(self) -> None:
+        self.async_copy_ready_event.synchronize()
+
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
         This function blocks until the copy is finished.
         """
-        self.async_copy_ready_event.synchronize()
+        self.synchronize()
+        return self.get_output_without_sync()
 
+    def get_output_without_sync(self) -> ModelRunnerOutput:
         # Release the device tensors once the copy has completed.
         del self._raw_pooler_output
         return self._model_runner_output

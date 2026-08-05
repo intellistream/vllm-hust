@@ -25,6 +25,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.copy_event = torch.Event()
+        self._synchronization_domain = copy_stream
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -45,9 +46,18 @@ class AsyncOutput(AsyncModelRunnerOutput):
             }
             self.copy_event.record(copy_stream)
 
-    def get_output(self) -> ModelRunnerOutput:
+    @property
+    def synchronization_domain(self) -> object:
+        return self._synchronization_domain
+
+    def synchronize(self) -> None:
         self.copy_event.synchronize()
 
+    def get_output(self) -> ModelRunnerOutput:
+        self.synchronize()
+        return self.get_output_without_sync()
+
+    def get_output_without_sync(self) -> ModelRunnerOutput:
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
         # Going forward, we should keep the data structures as NumPy arrays
@@ -82,6 +92,7 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         self.pooler_output = pooler_output
         self.is_valid = is_valid
         self.copy_event = torch.Event()
+        self._synchronization_domain = copy_stream
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -92,9 +103,19 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
                 self.is_valid_cpu = None
             self.copy_event.record(copy_stream)
 
-    def get_output(self) -> ModelRunnerOutput:
-        pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
+    @property
+    def synchronization_domain(self) -> object:
+        return self._synchronization_domain
+
+    def synchronize(self) -> None:
         self.copy_event.synchronize()
+
+    def get_output(self) -> ModelRunnerOutput:
+        self.synchronize()
+        return self.get_output_without_sync()
+
+    def get_output_without_sync(self) -> ModelRunnerOutput:
+        pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
         if self.is_valid_cpu is not None:
             is_valid_cpu = self.is_valid_cpu.tolist()
             for i, is_valid in enumerate(is_valid_cpu):
