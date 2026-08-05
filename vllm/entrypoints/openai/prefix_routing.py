@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import secrets
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -49,6 +50,12 @@ logger = init_logger(__name__)
 
 PREFIX_ROUTING_BYPASS_HEADER = "x-vllm-prefix-routing"
 DATA_PARALLEL_RANK_HEADER = "x-data-parallel-rank"
+WORKER_INCARNATION_HEADER = "x-vllm-prefix-routing-worker-incarnation"
+REQUEST_ID_HEADERS = (
+    "x-request-id",
+    "x-correlation-id",
+    "x-openai-request-id",
+)
 DEFAULT_MAX_REQUEST_BODY_SIZE = 16 * 1024 * 1024
 DEFAULT_MAX_EVENT_INGEST_BODY_SIZE = 16 * 1024 * 1024
 
@@ -97,8 +104,13 @@ async def ingest_prefix_routing_kv_events(
     except msgspec.DecodeError as exc:
         raise HTTPException(status_code=400, detail="Invalid KV event batch") from exc
 
+    worker_incarnation = raw_request.headers.get(WORKER_INCARNATION_HEADER)
+    if worker_incarnation == "":
+        worker_incarnation = None
     try:
-        proxy.scheduler.apply_event_batch(node_id, batch)
+        proxy.scheduler.apply_event_batch(
+            node_id, batch, worker_incarnation=worker_incarnation
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -132,6 +144,8 @@ class PrefixRoutingConfig:
     routing_token: str | None = None
     event_replay_timeout: float = 2.0
     event_sync_interval: float = 5.0
+    view_ttl_seconds: float | None = 15.0
+    idempotency_cache_size: int = 4096
     max_request_body_size: int = DEFAULT_MAX_REQUEST_BODY_SIZE
     max_event_ingest_body_size: int = DEFAULT_MAX_EVENT_INGEST_BODY_SIZE
 
@@ -151,10 +165,14 @@ class PrefixRoutingProxy:
     ) -> None:
         self.config = config
         self.app_state = app_state
-        self.scheduler = GlobalPrefixScheduler()
+        self.scheduler = GlobalPrefixScheduler(view_ttl_seconds=config.view_ttl_seconds)
         self.nodes = {node.node_id: node for node in config.nodes}
         self._tasks: list[asyncio.Task] = []
         self._session: aiohttp.ClientSession | None = None
+        self._route_decision_cache: OrderedDict[str, PrefixRouteDecision | None] = (
+            OrderedDict()
+        )
+        self._route_decision_locks: dict[str, asyncio.Lock] = {}
 
         vllm_config = app_state.vllm_config
         caching_hash_fn = get_hash_fn_by_name(
@@ -226,7 +244,7 @@ class PrefixRoutingProxy:
                 block_hashes=cache_key_request.block_hashes,
                 prompt_num_tokens=cache_key_request.num_prompt_tokens,
             )
-            if decision is None:
+            if decision is None or decision.matched_tokens <= 0:
                 continue
             if (
                 best_decision is None
@@ -234,6 +252,42 @@ class PrefixRoutingProxy:
             ):
                 best_decision = decision
         return best_decision
+
+    async def choose_node_for_request_id(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+        request_id: str | None,
+    ) -> PrefixRouteDecision | None:
+        if request_id is None or self.config.idempotency_cache_size <= 0:
+            return await self.choose_node_for_request(path, payload)
+
+        lock = self._route_decision_locks.setdefault(request_id, asyncio.Lock())
+        async with lock:
+            if request_id in self._route_decision_cache:
+                decision = self._route_decision_cache[request_id]
+                self._route_decision_cache.move_to_end(request_id)
+                if decision is not None and not self.scheduler.is_decision_current(
+                    decision
+                ):
+                    self.record_route_decision(request_id, None)
+                    return None
+                return decision
+
+            decision = await self.choose_node_for_request(path, payload)
+            self.record_route_decision(request_id, decision)
+            return decision
+
+    def record_route_decision(
+        self, request_id: str | None, decision: PrefixRouteDecision | None
+    ) -> None:
+        if request_id is None or self.config.idempotency_cache_size <= 0:
+            return
+        self._route_decision_cache[request_id] = decision
+        self._route_decision_cache.move_to_end(request_id)
+        while len(self._route_decision_cache) > self.config.idempotency_cache_size:
+            evicted_request_id, _ = self._route_decision_cache.popitem(last=False)
+            self._route_decision_locks.pop(evicted_request_id, None)
 
     async def _render_request(
         self, path: str, payload: Mapping[str, Any]
@@ -410,7 +464,11 @@ class PrefixRoutingProxy:
 
         try:
             batch = decoder.decode(payload)
-            self.scheduler.apply_event_batch(node.node_id, batch)
+            self.scheduler.apply_event_batch(
+                node.node_id,
+                batch,
+                worker_incarnation=state.publisher_epoch,
+            )
         except (msgspec.DecodeError, KeyError, ValueError):
             await self._recover_zmq_events(node, state, force_snapshot=True)
             raise
@@ -482,6 +540,11 @@ class PrefixRoutingProxy:
             decoded.append(decoder.decode(response.snapshot))
         else:
             if state.publisher_epoch != response.publisher_epoch:
+                self.scheduler.invalidate_node(
+                    node.node_id,
+                    node.data_parallel_rank,
+                    worker_incarnation=response.publisher_epoch,
+                )
                 raise ValueError("publisher epoch changed without a snapshot")
             expected_seq = 0 if state.next_seq is None else state.next_seq
             for seq, payload in response.replayed_batches:
@@ -497,7 +560,17 @@ class PrefixRoutingProxy:
                 )
 
         for batch in decoded:
-            self.scheduler.apply_event_batch(node.node_id, batch)
+            self.scheduler.apply_event_batch(
+                node.node_id,
+                batch,
+                worker_incarnation=response.publisher_epoch,
+            )
+        if not decoded:
+            self.scheduler.record_worker_receipt(
+                node.node_id,
+                node.data_parallel_rank,
+                worker_incarnation=response.publisher_epoch,
+            )
         state.publisher_epoch = response.publisher_epoch
         state.next_seq = response.next_seq
 
@@ -541,7 +614,10 @@ class PrefixRoutingMiddleware:
             return
         try:
             payload = json.loads(body)
-            decision = await proxy.choose_node_for_request(path, payload)
+            request_id = _extract_prefix_routing_request_id(headers, payload)
+            decision = await _choose_node_for_request_id(
+                proxy, path, payload, request_id
+            )
             logger.info(
                 "Prefix routing chose node=%s matched_tokens=%s",
                 decision.node_id if decision else None,
@@ -574,6 +650,7 @@ class PrefixRoutingMiddleware:
             decision.data_parallel_rank,
         )
         if not forwarded:
+            _record_route_decision(proxy, request_id, None)
             logger.warning(
                 "Prefix routing upstream %s failed before responding; "
                 "falling back to local handling",
@@ -753,6 +830,24 @@ def _parse_prefix_routing_config(
     ):
         raise ValueError("prefix routing event_sync_interval must be positive")
 
+    view_ttl_seconds = raw_config.get(
+        "view_ttl_seconds", 3 * float(event_sync_interval)
+    )
+    if view_ttl_seconds is not None and (
+        not isinstance(view_ttl_seconds, int | float)
+        or isinstance(view_ttl_seconds, bool)
+        or view_ttl_seconds <= 0
+    ):
+        raise ValueError("prefix routing view_ttl_seconds must be positive or null")
+
+    idempotency_cache_size = raw_config.get("idempotency_cache_size", 4096)
+    if (
+        not isinstance(idempotency_cache_size, int)
+        or isinstance(idempotency_cache_size, bool)
+        or idempotency_cache_size < 0
+    ):
+        raise ValueError("prefix routing idempotency_cache_size must be non-negative")
+
     max_request_body_size = raw_config.get(
         "max_request_body_size", DEFAULT_MAX_REQUEST_BODY_SIZE
     )
@@ -786,6 +881,10 @@ def _parse_prefix_routing_config(
         routing_token=routing_token,
         event_replay_timeout=float(event_replay_timeout),
         event_sync_interval=float(event_sync_interval),
+        view_ttl_seconds=(
+            None if view_ttl_seconds is None else float(view_ttl_seconds)
+        ),
+        idempotency_cache_size=idempotency_cache_size,
         max_request_body_size=max_request_body_size,
         max_event_ingest_body_size=max_event_ingest_body_size,
     )
@@ -886,6 +985,39 @@ def _has_authenticated_bypass(headers: Headers, expected_token: str | None) -> b
         hashlib.sha256(token.encode("utf-8")).digest(),
         hashlib.sha256(expected_token.encode("utf-8")).digest(),
     )
+
+
+def _extract_prefix_routing_request_id(
+    headers: Headers, payload: Mapping[str, Any]
+) -> str | None:
+    for header_name in REQUEST_ID_HEADERS:
+        request_id = headers.get(header_name)
+        if request_id:
+            return request_id
+    payload_request_id = payload.get("request_id")
+    if isinstance(payload_request_id, str) and payload_request_id:
+        return payload_request_id
+    return None
+
+
+async def _choose_node_for_request_id(
+    proxy: Any,
+    path: str,
+    payload: Mapping[str, Any],
+    request_id: str | None,
+) -> PrefixRouteDecision | None:
+    choose = getattr(proxy, "choose_node_for_request_id", None)
+    if choose is not None:
+        return await choose(path, payload, request_id)
+    return await proxy.choose_node_for_request(path, payload)
+
+
+def _record_route_decision(
+    proxy: Any, request_id: str | None, decision: PrefixRouteDecision | None
+) -> None:
+    record = getattr(proxy, "record_route_decision", None)
+    if record is not None:
+        record(request_id, decision)
 
 
 async def _forward_request(

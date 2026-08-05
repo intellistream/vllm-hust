@@ -115,7 +115,10 @@ class KVEventBatch(EventBatch):
     events: list[BlockStored | BlockRemoved | AllBlocksCleared]
 
 
-class ZmqEventReplayRequest(msgspec.Struct, omit_defaults=True):
+class ZmqEventReplayRequest(
+    msgspec.Struct,
+    omit_defaults=True,  # type: ignore[call-arg]
+):
     """Request replay from ``start_seq`` or a full reconciliation snapshot."""
 
     publisher_epoch: str | None = None
@@ -123,7 +126,10 @@ class ZmqEventReplayRequest(msgspec.Struct, omit_defaults=True):
     force_snapshot: bool = False
 
 
-class ZmqEventReplayResponse(msgspec.Struct, omit_defaults=True):
+class ZmqEventReplayResponse(
+    msgspec.Struct,
+    omit_defaults=True,  # type: ignore[call-arg]
+):
     """Atomic response from the ZMQ replay control plane."""
 
     publisher_epoch: str
@@ -362,6 +368,10 @@ class HttpPrefixCacheEventUploader(EventPublisher):
         self._headers = {"Content-Type": "application/msgpack"}
         if token is not None:
             self._headers["Authorization"] = f"Bearer {token}"
+        self._publisher_epoch = uuid.uuid4().hex
+        self._headers["X-Vllm-Prefix-Routing-Worker-Incarnation"] = (
+            self._publisher_epoch
+        )
         self._event_queue = Queue[EventBatch | None](maxsize=max_queue_size)
         self._pack = msgspec.msgpack.Encoder()
         self._retry_interval = retry_interval
@@ -439,7 +449,9 @@ class HttpPrefixCacheEventUploader(EventPublisher):
     def _build_snapshot_batch(self) -> tuple[KVEventBatch, int]:
         with self._state_lock:
             generation = self._reconcile_generation
-            events: list[KVCacheEvent] = [AllBlocksCleared()]
+            events: list[BlockStored | BlockRemoved | AllBlocksCleared] = [
+                AllBlocksCleared()
+            ]
             for group_idx, block_size in self._group_block_sizes.items():
                 events.append(
                     BlockStored(
@@ -826,7 +838,9 @@ class ZmqEventPublisher(EventPublisher):
                     self._group_hashes.clear()
 
     def _build_snapshot_batch(self) -> KVEventBatch:
-        events: list[KVCacheEvent] = [AllBlocksCleared()]
+        events: list[BlockStored | BlockRemoved | AllBlocksCleared] = [
+            AllBlocksCleared()
+        ]
         for group_idx, block_size in self._group_block_sizes.items():
             events.append(
                 BlockStored(
