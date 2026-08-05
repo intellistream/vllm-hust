@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_recovery_profile import KVRecoveryRequeueReason
     from vllm.v1.request import Request
 
 # s_tensor_list, d_tensor_list, s_indices, d_indices, direction
@@ -529,14 +530,17 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
-    def observe_kv_recovery_requeue(self, request: "Request", reason: str) -> None:
+    def observe_kv_recovery_requeue(
+        self,
+        request: "Request",
+        reason: "KVRecoveryRequeueReason",
+    ) -> None:
         """Optional default-off observation of a post-wakeup scheduler defer."""
         return
 
     def observe_kv_recovery_first_compute(
         self,
-        scheduled_request_ids: frozenset[str],
-        timestamp_ns: int,
+        scheduled_request_ids: Iterable[str],
     ) -> None:
         """Optional default-off observation at the worker model-forward entry."""
         return

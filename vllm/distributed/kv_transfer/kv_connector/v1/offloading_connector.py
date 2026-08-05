@@ -114,13 +114,11 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
     def observe_kv_recovery_first_compute(
         self,
-        scheduled_request_ids: frozenset[str],
-        timestamp_ns: int,
+        scheduled_request_ids: Iterable[str],
     ) -> None:
         if self.connector_worker is not None:
             self.connector_worker.observe_kv_recovery_first_compute(
                 scheduled_request_ids,
-                timestamp_ns,
             )
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):

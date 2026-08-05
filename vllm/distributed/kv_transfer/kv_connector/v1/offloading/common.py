@@ -78,6 +78,10 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     jobs_to_flush: set[int] | None = None
     kv_recovery_contexts: dict[int, KVRecoveryTransferContext] | None = None
     kv_recovery_compute_contexts: dict[str, KVRecoveryComputeContext] | None = None
+    # Formal-observer contexts whose runtime ownership was actually abandoned.
+    # This is deliberately distinct from jobs_to_flush: a flush normally waits
+    # for a real transfer to complete and must retain its completion evidence.
+    kv_recovery_jobs_to_invalidate: set[int] | None = None
 
 
 @dataclass
