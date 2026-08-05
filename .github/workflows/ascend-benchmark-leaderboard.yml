@@ -1194,7 +1194,10 @@ jobs:
           "${PYTHON_BIN}" -m pip install --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" "wheel" "packaging>=24.2"
           VLLM_TARGET_DEVICE=empty "${PYTHON_BIN}" -m pip install -e . --no-build-isolation --no-deps
           "${PYTHON_BIN}" scripts/ensure_vllm_provider.py --remove-conflicts
-          "${PYTHON_BIN}" -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema
+          # vLLM is installed with --no-deps above because the Ascend runner
+          # provides its torch/runtime stack. Install this required runtime
+          # dependency explicitly so prefix caching can hash request blocks.
+          "${PYTHON_BIN}" -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema "xxhash>=3.5.0"
           "${PYTHON_BIN}" scripts/ensure_vllm_provider.py
 
       - name: Verify installation
@@ -1247,6 +1250,11 @@ jobs:
 
           if not ascend_plugin:
             raise SystemExit("ascend platform plugin entry point is not installed")
+          try:
+            import xxhash
+          except ImportError as exc:
+            raise SystemExit("xxhash is required by the configured prefix-caching hash algorithm") from exc
+          print(f"xxhash version: {metadata.version('xxhash')}")
           PY
 
       - name: Runner health preflight (before benchmark)
