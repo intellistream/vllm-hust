@@ -45,9 +45,14 @@ class AsyncOutput(AsyncModelRunnerOutput):
             }
             self.copy_event.record(copy_stream)
 
-    def get_output(self) -> ModelRunnerOutput:
+    def synchronize(self) -> None:
         self.copy_event.synchronize()
 
+    def get_output(self) -> ModelRunnerOutput:
+        self.synchronize()
+        return self.get_output_without_sync()
+
+    def get_output_without_sync(self) -> ModelRunnerOutput:
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
         # Going forward, we should keep the data structures as NumPy arrays
@@ -92,9 +97,15 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
                 self.is_valid_cpu = None
             self.copy_event.record(copy_stream)
 
-    def get_output(self) -> ModelRunnerOutput:
-        pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
+    def synchronize(self) -> None:
         self.copy_event.synchronize()
+
+    def get_output(self) -> ModelRunnerOutput:
+        self.synchronize()
+        return self.get_output_without_sync()
+
+    def get_output_without_sync(self) -> ModelRunnerOutput:
+        pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
         if self.is_valid_cpu is not None:
             is_valid_cpu = self.is_valid_cpu.tolist()
             for i, is_valid in enumerate(is_valid_cpu):

@@ -297,6 +297,11 @@ class ModelRunnerOutput:
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
     @abstractmethod
+    def synchronize(self) -> None:
+        """Wait until the asynchronous host copy is ready."""
+        pass
+
+    @abstractmethod
     def get_output(self) -> ModelRunnerOutput:
         """Get the ModelRunnerOutput for this async output.
 
@@ -304,6 +309,11 @@ class AsyncModelRunnerOutput(ABC):
         might involve copying device tensors to the host.
         This method should only be called once per AsyncModelRunnerOutput.
         """
+        pass
+
+    @abstractmethod
+    def get_output_without_sync(self) -> ModelRunnerOutput:
+        """Materialize output after the caller has already synchronized."""
         pass
 
 

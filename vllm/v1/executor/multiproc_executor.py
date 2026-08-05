@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
+import json
 import multiprocessing
 import os
 import pickle
@@ -19,6 +21,7 @@ from functools import partial
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as LockType
+from pathlib import Path
 from threading import Thread
 from typing import Any, cast
 
@@ -635,6 +638,43 @@ class WorkerProc:
 
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
+        self.host_batching_guard = os.getenv("VLLM_HOST_BATCHING_GUARD", "0") == "1"
+        try:
+            self.host_batching_max_outputs = max(
+                1, int(os.getenv("VLLM_HOST_BATCHING_MAX_OUTPUTS", "4"))
+            )
+            self.host_batching_max_wait_us = max(
+                0, int(os.getenv("VLLM_HOST_BATCHING_MAX_WAIT_US", "1000"))
+            )
+        except ValueError:
+            logger.warning(
+                "Invalid host batching guard configuration; disabling the guard"
+            )
+            self.host_batching_guard = False
+            self.host_batching_max_outputs = 1
+            self.host_batching_max_wait_us = 0
+        self.host_batching_stats_path = os.getenv("VLLM_HOST_BATCHING_STATS_PATH")
+        self._host_batching_stats = {
+            "guard_enabled": self.host_batching_guard,
+            "max_outputs": self.host_batching_max_outputs,
+            "max_wait_us": self.host_batching_max_wait_us,
+            "batches": 0,
+            "outputs": 0,
+            "batched_batches": 0,
+            "max_batch_size": 0,
+            "max_queue_depth": 0,
+            "queue_wait_us": 0.0,
+            "sync_calls": 0,
+            "sync_calls_saved": 0,
+        }
+        if self.host_batching_stats_path:
+            atexit.register(self._write_host_batching_stats)
+        if self.host_batching_guard:
+            logger.info(
+                "Host batching guard enabled: max_outputs=%d max_wait_us=%d",
+                self.host_batching_max_outputs,
+                self.host_batching_max_wait_us,
+            )
         if self.use_async_scheduling:
             self.async_output_queue: queue.Queue = queue.Queue()
             self.async_output_copy_thread = Thread(
@@ -933,14 +973,18 @@ class WorkerProc:
         SUCCESS = auto()
         FAILURE = auto()
 
-    def enqueue_output(self, output: Any):
+    def enqueue_output(self, output: Any, *, skip_async_sync: bool = False):
         """Prepares output from the worker and enqueues it to the
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
         if isinstance(output, AsyncModelRunnerOutput):
             try:
-                output = output.get_output()
+                if skip_async_sync:
+                    output = output.get_output_without_sync()
+                else:
+                    self._host_batching_stats["sync_calls"] += 1
+                    output = output.get_output()
             except Exception as e:
                 logger.exception("Error getting async model runner output")
                 output = e
@@ -951,6 +995,58 @@ class WorkerProc:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
+
+    def enqueue_output_batch(
+        self, outputs: list[AsyncModelRunnerOutput], queue_wait_us: float = 0.0
+    ):
+        """Synchronize one async output batch, then materialize each output."""
+        if len(outputs) <= 1:
+            self.enqueue_output(outputs[0])
+            return
+
+        self._host_batching_stats["batches"] += 1
+        self._host_batching_stats["outputs"] += len(outputs)
+        self._host_batching_stats["max_batch_size"] = max(
+            self._host_batching_stats["max_batch_size"], len(outputs)
+        )
+        self._host_batching_stats["max_queue_depth"] = max(
+            self._host_batching_stats["max_queue_depth"],
+            self.async_output_queue.qsize(),
+        )
+        self._host_batching_stats["queue_wait_us"] += queue_wait_us
+        self._host_batching_stats["batched_batches"] += 1
+
+        try:
+            # All outputs are produced by this worker's async copy stream. Waiting
+            # for the last event makes earlier events ready as well, while keeping
+            # the default one-output path unchanged when the guard is disabled.
+            outputs[-1].synchronize()
+        except Exception:
+            logger.exception("Error synchronizing guarded async output batch")
+            for output in outputs:
+                self.enqueue_output(output)
+            return
+
+        self._host_batching_stats["sync_calls"] += 1
+        self._host_batching_stats["sync_calls_saved"] += len(outputs) - 1
+        for output in outputs:
+            self.enqueue_output(output, skip_async_sync=True)
+
+    def _write_host_batching_stats(self):
+        if not self.host_batching_stats_path:
+            return
+        path = Path(self.host_batching_stats_path)
+        if path.suffix:
+            path = path.with_name(f"{path.stem}.rank{self.rank}{path.suffix}")
+        else:
+            path = Path(f"{path}.rank{self.rank}.json")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self._host_batching_stats, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            logger.exception("Failed to write host batching stats to %s", path)
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
@@ -978,7 +1074,38 @@ class WorkerProc:
 
         while True:
             output = self.async_output_queue.get()
-            self.enqueue_output(output)
+            if not self.host_batching_guard or not isinstance(
+                output, AsyncModelRunnerOutput
+            ):
+                self.enqueue_output(output)
+                continue
+
+            batch = [output]
+            wait_start = time.perf_counter()
+            deadline = wait_start + self.host_batching_max_wait_us / 1_000_000
+            while len(batch) < self.host_batching_max_outputs:
+                try:
+                    if self.host_batching_max_wait_us:
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            break
+                        candidate = self.async_output_queue.get(timeout=remaining)
+                    else:
+                        candidate = self.async_output_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                if not isinstance(candidate, AsyncModelRunnerOutput):
+                    queue_wait_us = (time.perf_counter() - wait_start) * 1_000_000
+                    self.enqueue_output_batch(batch, queue_wait_us)
+                    self.enqueue_output(candidate)
+                    batch = []
+                    break
+                batch.append(candidate)
+
+            if batch:
+                queue_wait_us = (time.perf_counter() - wait_start) * 1_000_000
+                self.enqueue_output_batch(batch, queue_wait_us)
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
