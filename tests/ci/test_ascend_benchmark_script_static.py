@@ -72,6 +72,25 @@ def test_benchmark_snapshot_sync_explains_missing_write_credentials():
     assert submit_index < finalize_index < sync_index
 
 
+def test_runner_collects_submission_evidence_before_admission():
+    text = script_text("run_ascend_benchmark_ci.sh")
+
+    collector_index = text.index("collect_submission_evidence() {")
+    finalize_index = text.index("\nfinalize_submission_artifact\n", collector_index)
+    status_index = text.index('cat "$SUBMISSION_DIR/STATUS"', finalize_index)
+    aggregation_index = text.index(
+        '"$PYTHON_BIN" -m vllm_hust_benchmark.cli publish-website'
+    )
+
+    assert "collect-run-artifact.sh" in text[collector_index:status_index]
+    assert 'CURRENT_RUNTIME_PYTHON="$PYTHON_BIN"' in text[collector_index:status_index]
+    assert (
+        text.index("collect_submission_evidence", collector_index + 1) < finalize_index
+    )
+    assert finalize_index < status_index
+    assert status_index < aggregation_index
+
+
 def test_same_spec_benchmark_failure_prints_server_log_tail():
     text = script_text("run_ascend_benchmark_ci.sh")
     same_spec_block = text[text.index("run_same_spec_current_benchmark() {") :]

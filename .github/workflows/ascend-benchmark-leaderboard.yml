@@ -949,7 +949,7 @@ jobs:
             exit 2
           fi
 
-      - name: Configure Hugging Face cache directories
+      - name: Prepare Hugging Face cache directories
         run: |
           cache_root="${VLLM_HUST_HF_CACHE_ROOT:-${GITHUB_WORKSPACE}/../.hf-cache}"
           cache_root="${cache_root%/}"
