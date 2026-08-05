@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parents[2] / ".github/workflows/scripts"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_DIR = REPO_ROOT / ".github/workflows/scripts"
+WORKFLOW = REPO_ROOT / ".github/workflows/ascend-benchmark-leaderboard.yml"
 
 
 def script_text(name: str) -> str:
     return (SCRIPT_DIR / name).read_text(encoding="utf-8")
+
+
+def workflow_text() -> str:
+    return WORKFLOW.read_text(encoding="utf-8")
 
 
 def test_run_ascend_benchmark_propagates_benchmark_repo_publish_env():
@@ -140,6 +146,35 @@ def test_ascend_server_readiness_windows_allow_cold_start():
     assert (
         "SAME_SPEC_READY_TIMEOUT_SECONDS=${SAME_SPEC_READY_TIMEOUT_SECONDS:-1200}"
     ) in benchmark_text
+
+
+def test_same_spec_readiness_timeout_reaches_runner_in_both_execution_modes():
+    workflow = workflow_text()
+    benchmark_text = script_text("run_ascend_benchmark_ci.sh")
+    same_spec_block = benchmark_text[
+        benchmark_text.index("run_same_spec_current_benchmark() {") :
+    ]
+    preserve_block = benchmark_text[
+        benchmark_text.index("SUDO_PRESERVE_ENV_VARS=(") : benchmark_text.index(
+            "build_sudo_env_preserve_list()"
+        )
+    ]
+
+    assert 'SAME_SPEC_READY_TIMEOUT_SECONDS: "2400"' in workflow
+    assert (
+        "local same_spec_ready_timeout_seconds=${SAME_SPEC_READY_TIMEOUT_SECONDS:-1200}"
+    ) in same_spec_block
+    assert (
+        same_spec_block.count(
+            'READY_TIMEOUT_SECONDS="$same_spec_ready_timeout_seconds" \\'
+        )
+        == 2
+    )
+    assert "READY_TIMEOUT_SECONDS" in preserve_block
+    assert (
+        'echo "[same-spec-current] effective readiness timeout: '
+        '${same_spec_ready_timeout_seconds}s"'
+    ) in same_spec_block
 
 
 def test_benchmark_pins_named_runner_to_its_npu():

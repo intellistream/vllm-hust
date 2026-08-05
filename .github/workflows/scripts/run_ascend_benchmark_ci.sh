@@ -1095,6 +1095,8 @@ PY
     echo "Using PR preview same-spec compatibility overlay: $effective_same_spec_file"
   fi
 
+  echo "[same-spec-current] effective readiness timeout: ${same_spec_ready_timeout_seconds}s"
+
   run_same_spec_runner() {
     if [[ "$ASCEND_BENCHMARK_USE_SUDO" == "1" ]]; then
       READY_TIMEOUT_SECONDS="$same_spec_ready_timeout_seconds" \
