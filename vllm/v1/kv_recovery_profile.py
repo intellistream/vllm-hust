@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
+from collections.abc import Set
 from dataclasses import dataclass
 from threading import Lock
 from typing import Literal, Protocol
+
+import regex as re
 
 KVRecoveryOperation = Literal["d2h_preserve", "h2d_restore"]
 KVRecoveryCapacity = Literal["prepared_transfer", "pending_h2d", "pending_d2h"]
@@ -576,7 +578,7 @@ class KVRecoveryWorkerObserver(Protocol):
 
     def invalidate_transfers(
         self,
-        connector_job_ids: frozenset[int],
+        connector_job_ids: Set[int],
     ) -> None: ...
 
     def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None: ...
@@ -1077,8 +1079,8 @@ class BoundedKVRecoveryWorkerObserver:
                 )
             )
 
-    def invalidate_transfers(self, connector_job_ids: frozenset[int]) -> None:
-        """Consume formal contexts named by an EngineCore flush handoff."""
+    def invalidate_transfers(self, connector_job_ids: Set[int]) -> None:
+        """Consume bounded contexts named by an explicit discard handoff."""
         if not connector_job_ids:
             return
         with self._lifecycle_lock:
@@ -1086,27 +1088,31 @@ class BoundedKVRecoveryWorkerObserver:
                 if self._closed:
                     return
                 invalidated: list[KVRecoveryTransferAttempt] = []
-                for connector_job_id in sorted(connector_job_ids):
-                    prepared = self._prepared_by_job_id.pop(connector_job_id, None)
-                    if prepared is not None:
-                        invalidated.append(prepared)
-                    transfer_id = self._h2d_transfer_id_by_connector_job_id.pop(
-                        connector_job_id, None
-                    )
-                    if transfer_id is not None:
-                        pending_h2d = self._pending_h2d_by_transfer_id.pop(
-                            transfer_id, None
+                for connector_job_id in tuple(self._prepared_by_job_id):
+                    if connector_job_id in connector_job_ids:
+                        invalidated.append(
+                            self._prepared_by_job_id.pop(connector_job_id)
                         )
-                        if pending_h2d is not None:
-                            invalidated.append(pending_h2d.attempt)
-                    pending_d2h = self._pending_d2h_by_job_id.pop(
-                        connector_job_id, None
+                for connector_job_id, transfer_id in tuple(
+                    self._h2d_transfer_id_by_connector_job_id.items()
+                ):
+                    if connector_job_id not in connector_job_ids:
+                        continue
+                    del self._h2d_transfer_id_by_connector_job_id[connector_job_id]
+                    pending_h2d = self._pending_h2d_by_transfer_id.pop(
+                        transfer_id, None
                     )
-                    if pending_d2h is not None:
-                        invalidated.append(pending_d2h.attempt)
+                    if pending_h2d is not None:
+                        invalidated.append(pending_h2d.attempt)
+                for connector_job_id in tuple(self._pending_d2h_by_job_id):
+                    if connector_job_id in connector_job_ids:
+                        invalidated.append(
+                            self._pending_d2h_by_job_id.pop(connector_job_id).attempt
+                        )
                 if invalidated:
                     self._evidence_disabled = True
             if invalidated:
+                invalidated.sort(key=lambda attempt: attempt.connector_job_id)
                 self._sink.evidence_failure(
                     reason="connector_flush_invalidation",
                     connector_job_ids=tuple(

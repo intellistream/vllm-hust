@@ -3,6 +3,7 @@
 import math
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import replace
 from itertools import islice
@@ -514,12 +515,6 @@ class OffloadingConnectorWorker:
         self._submit_pending_stores()
 
         if kv_connector_metadata.jobs_to_flush:
-            observer = self._kv_recovery_observer
-            if observer is not None:
-                with suppress(Exception):
-                    observer.invalidate_transfers(
-                        frozenset(kv_connector_metadata.jobs_to_flush)
-                    )
             wait_membership = self._prepare_kv_recovery_wait(
                 kv_connector_metadata.jobs_to_flush
             )
@@ -532,6 +527,17 @@ class OffloadingConnectorWorker:
                     wait_membership,
                     entry_timestamp_ns,
                 )
+
+        # A flush is normally a completion fence, not an abandonment. Only
+        # consume contexts named by the scheduler's explicit discard handoff,
+        # and do so after any required backend wait has completed.
+        if kv_connector_metadata.kv_recovery_jobs_to_invalidate:
+            observer = self._kv_recovery_observer
+            if observer is not None:
+                with suppress(Exception):
+                    observer.invalidate_transfers(
+                        kv_connector_metadata.kv_recovery_jobs_to_invalidate
+                    )
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
@@ -570,13 +576,21 @@ class OffloadingConnectorWorker:
 
     def observe_kv_recovery_first_compute(
         self,
-        scheduled_request_ids: frozenset[str],
-        timestamp_ns: int,
+        scheduled_request_ids: Iterable[str],
     ) -> None:
         """Consume the exact admitted sidecars at the worker forward entry."""
         observer = self._kv_recovery_observer
         contexts = self._kv_recovery_compute_contexts
-        if observer is None or contexts is None:
+        if observer is None or not contexts:
+            return
+        try:
+            scheduled_request_ids = frozenset(scheduled_request_ids)
+        except Exception:
+            self._fail_unobserved_first_compute()
+            return
+        timestamp_ns = self._profile_clock_ns()
+        if timestamp_ns is None:
+            self._fail_unobserved_first_compute()
             return
         pending = tuple(contexts.items())
         contexts.clear()

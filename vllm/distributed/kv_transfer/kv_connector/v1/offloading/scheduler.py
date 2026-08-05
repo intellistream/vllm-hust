@@ -385,6 +385,9 @@ class OffloadingConnectorScheduler:
         self._current_batch_kv_recovery_contexts: (
             dict[int, KVRecoveryTransferContext] | None
         ) = {} if kv_recovery_observer is not None else None
+        self._current_batch_kv_recovery_jobs_to_invalidate: set[int] | None = (
+            set() if kv_recovery_observer is not None else None
+        )
         self._kv_recovery_receipt_ready: dict[ReqId, int] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
@@ -1221,6 +1224,12 @@ class OffloadingConnectorScheduler:
                 self._kv_recovery_receipt_ready.pop(req_id, None)
                 req_status = self._req_status.get(req_id)
                 if req_status is not None:
+                    assert (
+                        self._current_batch_kv_recovery_jobs_to_invalidate is not None
+                    )
+                    self._current_batch_kv_recovery_jobs_to_invalidate.update(
+                        req_status.transfer_jobs
+                    )
                     with suppress(Exception):
                         observer.request_preempted(
                             req_id,
@@ -1323,10 +1332,16 @@ class OffloadingConnectorScheduler:
             jobs_to_flush=self._current_batch_jobs_to_flush,
             kv_recovery_contexts=self._current_batch_kv_recovery_contexts,
             kv_recovery_compute_contexts=compute_contexts,
+            kv_recovery_jobs_to_invalidate=(
+                self._current_batch_kv_recovery_jobs_to_invalidate
+            ),
         )
         self._current_batch_load_jobs = {}
         self._current_batch_kv_recovery_contexts = (
             {} if self._kv_recovery_observer is not None else None
+        )
+        self._current_batch_kv_recovery_jobs_to_invalidate = (
+            set() if self._kv_recovery_observer is not None else None
         )
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
@@ -1469,9 +1484,11 @@ class OffloadingConnectorScheduler:
                         receipts_incomplete,
                     )
                     for receipt in fresh_receipts:
-                        self._kv_recovery_receipt_ready[
-                            receipt.identity.runtime_request_id
-                        ] = receipt.identity.recovery_epoch
+                        recovery_epoch = receipt.identity.recovery_epoch
+                        if recovery_epoch is not None:
+                            self._kv_recovery_receipt_ready[
+                                receipt.identity.runtime_request_id
+                            ] = recovery_epoch
             except Exception:
                 pass
 
@@ -1527,6 +1544,12 @@ class OffloadingConnectorScheduler:
 
         self.manager.on_request_finished(req_status.req_context)
 
+        if observer is not None:
+            assert self._current_batch_kv_recovery_jobs_to_invalidate is not None
+            self._current_batch_kv_recovery_jobs_to_invalidate.update(
+                req_status.transfer_jobs
+            )
+
         if not req_status.transfer_jobs:
             # No in-flight jobs: no later complete_store()/complete_load() calls
             # need this request's state.
@@ -1562,11 +1585,14 @@ class OffloadingConnectorScheduler:
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
         assert not self._current_batch_kv_recovery_contexts
+        assert not self._current_batch_kv_recovery_jobs_to_invalidate
         assert not self._current_batch_jobs_to_flush
         assert not self._current_batch_allocated_block_ids
 
         # Flush all in-flight jobs
         self._current_batch_jobs_to_flush.update(self._jobs.keys())
+        if self._current_batch_kv_recovery_jobs_to_invalidate is not None:
+            self._current_batch_kv_recovery_jobs_to_invalidate.update(self._jobs.keys())
 
         for req_id, status in list(self._req_status.items()):
             if status.req.is_finished():

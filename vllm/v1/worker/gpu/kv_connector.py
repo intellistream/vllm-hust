@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -86,8 +85,7 @@ class ActiveKVConnector(KVConnector):
         if self._disabled:
             return
         self.kv_connector.observe_kv_recovery_first_compute(
-            frozenset(scheduler_output.num_scheduled_tokens),
-            time.monotonic_ns(),
+            scheduler_output.num_scheduled_tokens,
         )
 
     def post_forward(

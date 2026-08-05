@@ -87,6 +87,7 @@ class RecordingObserver:
         self.attempts: dict[int, KVRecoveryTransferAttempt] = {}
         self.transfer_seq = 0
         self.wait_completed_calls: list[KVRecoveryWaitAttempt] = []
+        self.invalidation_calls: list[frozenset[int]] = []
         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
         self.first_compute_observations: list[tuple[object, int]] = []
         self.missing_first_compute: list[object] = []
@@ -168,6 +169,16 @@ class RecordingObserver:
         )
         return KVRecoveryWaitMembership(transfer_ids)
 
+    def invalidate_transfers(self, connector_job_ids):
+        self._raise_if_requested("invalidate_transfers")
+        membership = frozenset(connector_job_ids)
+        if self.attempts.keys().isdisjoint(membership):
+            return
+        self.events.append(("observer_invalidate", membership))
+        self.invalidation_calls.append(membership)
+        for job_id in membership:
+            self.attempts.pop(job_id, None)
+
     def wait_completed(self, attempt):
         self._raise_if_requested("wait_completed")
         self.events.append(("observer_wait_completed", attempt.transfer_ids))
@@ -197,9 +208,10 @@ class RecordingEvidenceSink:
         ] = []
         self.failures: list[tuple[str, tuple[int, ...]]] = []
         self.waits: list[KVRecoveryWaitAttempt] = []
+        self.wait_invalidation_events: list[tuple[str, object]] = []
         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
         self.close_calls: list[tuple[tuple[KVRecoveryTransferAttempt, ...], bool]] = []
-        self.first_compute_observations: list[tuple[object, int, str, str]] = []
+        self.first_compute_observations: list[tuple[object, int]] = []
 
     def transfer_submitted(self, attempt, timestamp_ns):
         self.submissions.append((attempt, timestamp_ns))
@@ -257,9 +269,11 @@ class RecordingEvidenceSink:
         timestamp_ns,
     ):
         self.failures.append((reason, connector_job_ids))
+        self.wait_invalidation_events.append(("failure", reason))
 
     def wait_completed(self, attempt):
         self.waits.append(attempt)
+        self.wait_invalidation_events.append(("wait", attempt.transfer_ids))
 
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         self.receipt_capacity_losses.append((receipt, loss_reason))
@@ -345,6 +359,7 @@ def metadata(
     jobs_to_flush: set[int] | None = None,
     kv_recovery_contexts: Iterable[tuple[int, KVRecoveryTransferContext]] = (),
     kv_recovery_compute_contexts: Iterable[tuple[str, KVRecoveryComputeContext]] = (),
+    kv_recovery_jobs_to_invalidate: set[int] | None = None,
 ) -> OffloadingConnectorMetadata:
     contexts = dict(kv_recovery_contexts)
     compute_contexts = dict(kv_recovery_compute_contexts)
@@ -354,6 +369,7 @@ def metadata(
         jobs_to_flush=jobs_to_flush,
         kv_recovery_contexts=contexts or None,
         kv_recovery_compute_contexts=compute_contexts or None,
+        kv_recovery_jobs_to_invalidate=kv_recovery_jobs_to_invalidate,
     )
 
 
@@ -385,11 +401,13 @@ def test_connector_metadata_sidecar_round_trips_and_defaults_off():
 
     assert disabled_copy.kv_recovery_contexts is None
     assert disabled_copy.kv_recovery_compute_contexts is None
+    assert disabled_copy.kv_recovery_jobs_to_invalidate is None
     assert active_copy.kv_recovery_contexts == {7: context}
     assert active_copy.kv_recovery_compute_contexts == {"request-0": compute_context}
+    assert active_copy.kv_recovery_jobs_to_invalidate is None
 
 
-def test_worker_first_compute_consumes_exact_admitted_roster_once():
+def test_worker_first_compute_consumes_exact_admitted_roster_once(monkeypatch):
     events: list[tuple] = []
     observer = RecordingObserver(events)
     worker, _backend, _events = make_worker(observer)
@@ -400,13 +418,15 @@ def test_worker_first_compute_consumes_exact_admitted_roster_once():
         )
     )
 
-    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}), 200)
-    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}), 201)
+    monkeypatch.setattr(worker_module.time, "monotonic_ns", lambda: 200)
+
+    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}))
+    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}))
 
     assert observer.first_compute_observations == [(context, 200)]
 
 
-def test_worker_first_compute_fails_closed_for_roster_mismatch():
+def test_worker_first_compute_fails_closed_for_roster_mismatch(monkeypatch):
     events: list[tuple] = []
     observer = RecordingObserver(events)
     worker, _backend, _events = make_worker(observer)
@@ -415,7 +435,40 @@ def test_worker_first_compute_fails_closed_for_roster_mismatch():
         metadata(kv_recovery_compute_contexts=(("request-0", context),))
     )
 
-    worker.observe_kv_recovery_first_compute(frozenset({"request-1"}), 200)
+    monkeypatch.setattr(worker_module.time, "monotonic_ns", lambda: 200)
+
+    worker.observe_kv_recovery_first_compute(frozenset({"request-1"}))
+
+    assert observer.first_compute_observations == []
+    assert observer.missing_first_compute == [context]
+
+
+def test_disabled_worker_first_compute_does_not_read_clock(monkeypatch):
+    worker, _backend, _events = make_worker()
+
+    def unexpected_clock_read():
+        raise AssertionError("disabled KV-recovery path read the clock")
+
+    monkeypatch.setattr(worker_module.time, "monotonic_ns", unexpected_clock_read)
+
+    worker.observe_kv_recovery_first_compute({"request-0"})
+
+
+def test_first_compute_clock_failure_is_fail_open_and_marks_missing(monkeypatch):
+    events: list[tuple] = []
+    observer = RecordingObserver(events)
+    worker, _backend, _events = make_worker(observer)
+    context = make_compute_context()
+    worker.start_kv_transfers(
+        metadata(kv_recovery_compute_contexts=(("request-0", context),))
+    )
+
+    def unavailable_clock():
+        raise RuntimeError("clock unavailable")
+
+    monkeypatch.setattr(worker_module.time, "monotonic_ns", unavailable_clock)
+
+    worker.observe_kv_recovery_first_compute({"request-0"})
 
     assert observer.first_compute_observations == []
     assert observer.missing_first_compute == [context]
@@ -778,7 +831,12 @@ def test_successful_wait_preparation_is_not_recorded_when_backend_raises():
     backend.wait_error = RuntimeError("backend wait failed")
 
     with pytest.raises(RuntimeError, match="backend wait failed"):
-        worker.handle_preemptions(metadata(jobs_to_flush={3}))
+        worker.handle_preemptions(
+            metadata(
+                jobs_to_flush={3},
+                kv_recovery_jobs_to_invalidate={3},
+            )
+        )
 
     assert events[-2:] == [
         ("observer_prepare_wait", frozenset({3})),
@@ -821,6 +879,129 @@ def test_successful_wait_is_recorded_only_after_backend_returns():
     ]
     assert len(observer.wait_completed_calls) == 1
     assert observer.wait_completed_calls[0].transfer_ids == (f"{'a' * 32}:t:0",)
+    assert observer.invalidation_calls == []
+
+
+@pytest.mark.parametrize("operation", ["h2d_restore", "d2h_preserve"])
+def test_bounded_observer_flush_records_wait_and_completion(operation):
+    sink = RecordingEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver(
+        "a" * 32,
+        "0" * 32,
+        "c" * 32,
+        sink,
+    )
+    worker, backend, events = make_worker(observer)
+    backend.events = events
+    context = make_context(operation)
+    if operation == "h2d_restore":
+        worker.start_kv_transfers(
+            metadata(
+                load_jobs=((3, make_load_job()),),
+                kv_recovery_contexts=((3, context),),
+            )
+        )
+    else:
+        worker.prepare_store_kv(
+            metadata(
+                store_jobs=((3, make_store_job()),),
+                kv_recovery_contexts=((3, context),),
+            )
+        )
+
+    worker.handle_preemptions(metadata(jobs_to_flush={3}))
+
+    assert [event[0] for event in events] == [
+        "backend_submit_load" if operation == "h2d_restore" else "backend_submit_store",
+        "backend_wait",
+    ]
+    assert len(sink.waits) == 1
+    assert sink.waits[0].transfer_ids == (f"{'a' * 32}:t:0",)
+    assert sink.failures == []
+    assert sink.wait_invalidation_events == [
+        ("wait", (f"{'a' * 32}:t:0",)),
+    ]
+    assert not observer.evidence_disabled
+
+    backend.finished.append(TransferResult(3, True, 128, 0.25))
+    assert worker.get_finished(set()) == (
+        set(),
+        {"request-0"} if operation == "h2d_restore" else set(),
+    )
+
+    assert sink.completions == [3]
+    assert observer.pending_h2d_count == 0
+    assert observer.pending_d2h_count == 0
+    assert not observer.evidence_disabled
+
+
+def test_bounded_observer_wait_precedes_explicit_discard_invalidation():
+    sink = RecordingEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver(
+        "a" * 32,
+        "0" * 32,
+        "c" * 32,
+        sink,
+    )
+    worker, backend, events = make_worker(observer)
+    backend.events = events
+    worker.prepare_store_kv(
+        metadata(
+            store_jobs=((3, make_store_job()),),
+            kv_recovery_contexts=((3, make_context("d2h_preserve")),),
+        )
+    )
+
+    worker.handle_preemptions(
+        metadata(
+            jobs_to_flush={3},
+            kv_recovery_jobs_to_invalidate={3},
+        )
+    )
+
+    assert sink.wait_invalidation_events == [
+        ("wait", (f"{'a' * 32}:t:0",)),
+        ("failure", "connector_flush_invalidation"),
+    ]
+    assert sink.completions == []
+    assert observer.pending_d2h_count == 0
+    assert observer.evidence_disabled
+
+
+def test_bounded_observer_wait_failure_keeps_transfer_pending():
+    sink = RecordingEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver(
+        "a" * 32,
+        "0" * 32,
+        "c" * 32,
+        sink,
+    )
+    worker, backend, _events = make_worker(observer)
+    context = make_context("d2h_preserve")
+    job = make_store_job()
+    worker.prepare_store_kv(
+        metadata(
+            store_jobs=((3, job),),
+            kv_recovery_contexts=((3, context),),
+        )
+    )
+    backend.wait_error = RuntimeError("backend wait failed")
+
+    with pytest.raises(RuntimeError, match="backend wait failed"):
+        worker.handle_preemptions(metadata(jobs_to_flush={3}))
+
+    assert sink.waits == []
+    assert sink.failures == []
+    assert sink.wait_invalidation_events == []
+    assert observer.pending_d2h_count == 1
+    assert not observer.evidence_disabled
+
+    backend.finished.append(TransferResult(3, True, 128, 0.25))
+    assert worker.get_finished(set()) == (set(), set())
+
+    assert sink.completions == [3]
+    assert observer.pending_d2h_count == 0
+    assert not observer.evidence_disabled
 
 
 def test_prepared_transfer_capacity_is_distinct_and_fail_open(

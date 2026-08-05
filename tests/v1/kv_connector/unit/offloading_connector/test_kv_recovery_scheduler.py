@@ -33,6 +33,7 @@ from vllm.v1.kv_recovery_profile import (
     canonical_block_set_id,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 
 pytestmark = pytest.mark.cpu_test
 
@@ -164,6 +165,8 @@ class RecordingWorkerObserver:
         self.contexts: list[KVRecoveryTransferContext] = []
         self.transfer_seq = 0
         self.waits: list[KVRecoveryWaitAttempt] = []
+        self.invalidations: list[frozenset[int]] = []
+        self.wait_invalidation_events: list[tuple[str, object]] = []
         self.first_compute_observations: list[tuple[KVRecoveryComputeContext, int]] = []
         self.missing_first_compute: list[KVRecoveryComputeContext] = []
 
@@ -218,6 +221,8 @@ class RecordingWorkerObserver:
         )
 
     def prepare_wait(self, connector_job_ids):
+        membership = frozenset(connector_job_ids)
+        self.wait_invalidation_events.append(("prepare_wait", membership))
         transfer_ids = tuple(
             sorted(self.attempts[job_id].transfer_id for job_id in connector_job_ids)
         )
@@ -225,6 +230,14 @@ class RecordingWorkerObserver:
 
     def wait_completed(self, attempt):
         self.waits.append(attempt)
+        self.wait_invalidation_events.append(("wait_completed", attempt.transfer_ids))
+
+    def invalidate_transfers(self, connector_job_ids):
+        membership = frozenset(connector_job_ids)
+        self.invalidations.append(membership)
+        self.wait_invalidation_events.append(("invalidate", membership))
+        for job_id in membership:
+            self.attempts.pop(job_id, None)
 
     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
         raise AssertionError("receipt capacity unexpectedly exhausted")
@@ -388,6 +401,16 @@ def test_pressure_preemption_preserves_identity_through_real_connector_path(
     assert factory.scheduler.preemptions == [(runtime_request_id, 1)]
     assert factory.scheduler.admission_starts == [(runtime_request_id, 1)]
     assert factory.scheduler.admissions == [(runtime_request_id, 1, "decode")]
+    flushed_transfer_job_ids = frozenset({0, 1})
+    assert factory.worker.invalidations == [flushed_transfer_job_ids]
+    assert factory.worker.wait_invalidation_events == [
+        ("prepare_wait", flushed_transfer_job_ids),
+        (
+            "wait_completed",
+            tuple(f"{'a' * 32}:t:{transfer_seq}" for transfer_seq in range(2)),
+        ),
+        ("invalidate", flushed_transfer_job_ids),
+    ]
     connector_worker = runner.worker_connector.connector_worker
     assert connector_worker is not None
     compute_contexts = connector_worker._kv_recovery_compute_contexts
@@ -496,7 +519,7 @@ def test_recovery_coordinate_capture_is_bounded_by_one_overflow_sentinel(
             observed_lengths.append(len(coordinates))
             return None
 
-    coordinates = []
+    coordinates: list[recovery_profile.KVRecoveryBlockCoordinate] = []
     for ordinal in range(recovery_profile.MAX_LOGICAL_BLOCKS_PER_SET + 100):
         scheduler_module.OffloadingConnectorScheduler._append_kv_recovery_coordinate(
             coordinates,
@@ -541,6 +564,65 @@ def test_disabled_scheduler_never_constructs_recovery_coordinates(
     )
 
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+
+    assert (
+        runner.connector_scheduler._current_batch_kv_recovery_jobs_to_invalidate is None
+    )
+
+
+def test_terminal_handoff_invalidates_only_existing_profiled_jobs(
+    request_runner,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    factory = RecordingFactory()
+    enable_test_observer_factory(monkeypatch, factory)
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+    )
+    runner.new_request(token_ids=[0] * 4)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0], complete_transfers=False)
+
+    scheduler = runner.connector_scheduler
+    req_status = scheduler._req_status["0"]
+    existing_job_ids = set(req_status.transfer_jobs)
+    assert existing_job_ids
+
+    req_status.req.status = RequestStatus.FINISHED_STOPPED
+    scheduler.request_finished(req_status.req)
+
+    assert scheduler._current_batch_kv_recovery_jobs_to_invalidate == (existing_job_ids)
+
+
+def test_reset_handoff_waits_for_and_invalidates_exact_inflight_jobs(
+    request_runner,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    factory = RecordingFactory()
+    enable_test_observer_factory(monkeypatch, factory)
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+    )
+    runner.new_request(token_ids=[0] * 4)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0], complete_transfers=False)
+
+    scheduler = runner.connector_scheduler
+    existing_job_ids = set(scheduler._jobs)
+    assert existing_job_ids
+
+    scheduler.reset_cache()
+
+    assert scheduler._current_batch_jobs_to_flush == existing_job_ids
+    assert scheduler._current_batch_kv_recovery_jobs_to_invalidate == (existing_job_ids)
 
 
 def test_reset_notifies_observer_and_filters_stale_or_unmatched_receipts(

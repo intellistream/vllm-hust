@@ -4,7 +4,6 @@
 Define KV connector functionality mixin for model runners.
 """
 
-import time
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -41,8 +40,7 @@ class KVConnectorModelRunnerMixin:
         if not has_kv_transfer_group():
             return
         get_kv_transfer_group().observe_kv_recovery_first_compute(
-            frozenset(scheduler_output.num_scheduled_tokens),
-            time.monotonic_ns(),
+            scheduler_output.num_scheduled_tokens,
         )
 
     @staticmethod
