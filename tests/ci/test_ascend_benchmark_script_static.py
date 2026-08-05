@@ -38,6 +38,21 @@ def test_perfgate_store_baseline_cleans_scoped_writer_credentials_on_exit():
     assert "trap cleanup EXIT" in text
 
 
+def test_perfgate_store_baseline_retries_target_main_fetch():
+    text = script_text("perfgate_store_baseline.sh")
+    fetch_start = text.index("fetch_target_main_with_retry() {")
+    fetch_end = text.index("\nfetch_target_main_with_retry\n", fetch_start)
+    fetch_block = text[fetch_start:fetch_end]
+
+    assert "PERFGATE_TARGET_FETCH_MAX_ATTEMPTS:-4" in fetch_block
+    assert "PERFGATE_TARGET_FETCH_INITIAL_DELAY_SECONDS:-15" in fetch_block
+    assert 'git -C "$TARGET_GIT_REPOSITORY" fetch --quiet' in fetch_block
+    assert "origin main:refs/remotes/origin/main" in fetch_block
+    assert 'sleep "$delay_seconds"' in fetch_block
+    assert "delay_seconds=$((delay_seconds * 2))" in fetch_block
+    assert "Failed to fetch target main after" in fetch_block
+
+
 def test_benchmark_snapshot_sync_explains_missing_write_credentials():
     text = script_text("sync_benchmark_snapshots_to_github.sh")
     runner_text = script_text("run_ascend_benchmark_ci.sh")
