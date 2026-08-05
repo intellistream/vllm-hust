@@ -1675,6 +1675,29 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                # PEARL_ACCEPTANCE_DEBUG_V3
+                if __import__("os").environ.get("PEARL_ACCEPTANCE_DEBUG", "0") == "1":
+                    round_draft = int(num_draft_tokens)
+                    round_accepted = int(num_accepted)
+                    self._pearl_debug_rounds = getattr(self, "_pearl_debug_rounds", 0) + 1
+                    self._pearl_debug_draft_tokens = getattr(self, "_pearl_debug_draft_tokens", 0) + round_draft
+                    self._pearl_debug_accepted_tokens = getattr(self, "_pearl_debug_accepted_tokens", 0) + round_accepted
+                    total_rounds = self._pearl_debug_rounds
+                    total_draft = self._pearl_debug_draft_tokens
+                    total_accepted = self._pearl_debug_accepted_tokens
+                    round_rate = 100.0 * round_accepted / round_draft if round_draft else float("nan")
+                    total_rate = 100.0 * total_accepted / total_draft if total_draft else float("nan")
+                    mean_acceptance_length = 1.0 + total_accepted / total_rounds
+                    print(
+                        "[PEARL_ACCEPTANCE_DEBUG_V3] "
+                        f"round_draft={round_draft} round_accepted={round_accepted} "
+                        f"round_rejected={int(num_rejected)} round_rate={round_rate:.2f}% "
+                        f"total_draft={total_draft} total_accepted={total_accepted} "
+                        f"total_rate={total_rate:.2f}% "
+                        f"mean_acceptance_length={mean_acceptance_length:.3f}",
+                        flush=True,
+                    )
+
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,

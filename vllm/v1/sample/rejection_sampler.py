@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -180,6 +182,72 @@ class RejectionSampler(nn.Module):
             use_fp64_gumbel=self.use_fp64_gumbel,
         )
 
+        # PEARL_ACCEPTANCE_DEBUG_V1
+        # ``output_token_ids`` contains accepted draft tokens plus one
+        # recovered/bonus token.  The latter is not a draft token.
+        if os.environ.get("PEARL_ACCEPTANCE_DEBUG", "0") == "1":
+            valid_counts = (
+                (output_token_ids != PLACEHOLDER_TOKEN_ID)
+                .sum(dim=1)
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            draft_lens = [int(x) for x in metadata.num_draft_tokens]
+            accepted_lens = [
+                max(0, min(draft_len, int(valid_count) - 1))
+                for draft_len, valid_count in zip(draft_lens, valid_counts)
+            ]
+            debug_rows = [
+                (index, draft_len, accepted_len)
+                for index, (draft_len, accepted_len) in enumerate(
+                    zip(draft_lens, accepted_lens)
+                )
+                if draft_len > 0
+            ]
+            if debug_rows:
+                round_draft = sum(row[1] for row in debug_rows)
+                round_accepted = sum(row[2] for row in debug_rows)
+                self._pearl_debug_rounds = (
+                    getattr(self, "_pearl_debug_rounds", 0) + len(debug_rows)
+                )
+                self._pearl_debug_draft_tokens = (
+                    getattr(self, "_pearl_debug_draft_tokens", 0) + round_draft
+                )
+                self._pearl_debug_accepted_tokens = (
+                    getattr(self, "_pearl_debug_accepted_tokens", 0)
+                    + round_accepted
+                )
+                total_draft = self._pearl_debug_draft_tokens
+                total_accepted = self._pearl_debug_accepted_tokens
+                total_rounds = self._pearl_debug_rounds
+                round_rate = (
+                    100.0 * round_accepted / round_draft
+                    if round_draft > 0
+                    else float("nan")
+                )
+                total_rate = (
+                    100.0 * total_accepted / total_draft
+                    if total_draft > 0
+                    else float("nan")
+                )
+                mean_acceptance_length = (
+                    1.0 + total_accepted / total_rounds
+                    if total_rounds > 0
+                    else float("nan")
+                )
+                print(
+                    "[PEARL_ACCEPTANCE_DEBUG] "
+                    f"rows={debug_rows} "
+                    f"round_draft={round_draft} "
+                    f"round_accepted={round_accepted} "
+                    f"round_rate={round_rate:.2f}% "
+                    f"total_draft={total_draft} "
+                    f"total_accepted={total_accepted} "
+                    f"total_rate={total_rate:.2f}% "
+                    f"mean_acceptance_length={mean_acceptance_length:.3f}",
+                    flush=True,
+                )
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(
