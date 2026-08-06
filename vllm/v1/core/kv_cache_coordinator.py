@@ -286,6 +286,11 @@ class KVCacheCoordinator(ABC):
         ]
         return max(cached_blocks_per_manager, default=0)
 
+    def retain_request_boundary(self, request_id: str, valid_len: int) -> None:
+        """Propagate a nano-PEARL logical boundary to all KV groups."""
+        for manager in self.single_type_managers:
+            manager.retain_request_boundary(request_id, valid_len)
+
     def free(self, request_id: str) -> None:
         """
         Free the blocks for the request.

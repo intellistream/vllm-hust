@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -1593,6 +1594,21 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        # nano-PEARL carries an explicit per-request boundary from the
+        # target sampler. Older runners do not provide this field and use
+        # the standard speculative-decoding correction below.
+        nanoparl_results_by_req_id: dict[str, Any] = {}
+        for verify_result in (
+            getattr(model_runner_output, "nanoparl_verify_results", None)
+            or []
+        ):
+            if isinstance(verify_result, dict):
+                result_req_id = verify_result.get("request_id")
+            else:
+                result_req_id = getattr(verify_result, "request_id", None)
+            if result_req_id is not None:
+                nanoparl_results_by_req_id[str(result_req_id)] = verify_result
+
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
@@ -1668,12 +1684,60 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            nanoparl_result = nanoparl_results_by_req_id.get(req_id)
+            no_bonus = (
+                os.environ.get("PEARL_STAGE5_NANOPEARL_NO_BONUS", "0") == "1"
+                and nanoparl_result is not None
+            )
             if scheduled_spec_token_ids and (
-                generated_token_ids or self.num_sampled_tokens_per_step == 0
+                generated_token_ids
+                or self.num_sampled_tokens_per_step == 0
+                or no_bonus
             ):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
-                num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                reported_draft_len = None
+                reported_accepted_len = None
+                reported_valid_len = None
+                reported_finished = False
+                if nanoparl_result is not None:
+                    if isinstance(nanoparl_result, dict):
+                        get_result = nanoparl_result.get
+                    else:
+                        get_result = lambda key, default=None: getattr(
+                            nanoparl_result, key, default
+                        )
+                    try:
+                        reported_draft_len = int(
+                            get_result("draft_len", num_draft_tokens)
+                        )
+                        reported_accepted_len = int(
+                            get_result("accepted_len", 0)
+                        )
+                        reported_valid_len = get_result("valid_len")
+                        if reported_valid_len is not None:
+                            reported_valid_len = int(reported_valid_len)
+                        reported_finished = bool(get_result("finished", False))
+                    except (TypeError, ValueError):
+                        reported_draft_len = None
+                        reported_accepted_len = None
+                        reported_valid_len = None
+                        reported_finished = False
+
+                all_accepted_no_bonus = (
+                    no_bonus
+                    and reported_draft_len == num_draft_tokens
+                    and reported_accepted_len == reported_draft_len
+                    and len(generated_token_ids) == reported_accepted_len
+                )
+                if (
+                    no_bonus
+                    and reported_accepted_len is not None
+                    and 0 <= reported_accepted_len <= num_draft_tokens
+                ):
+                    num_accepted = reported_accepted_len
+                else:
+                    num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
                 # PEARL_ACCEPTANCE_DEBUG_V3
                 if __import__("os").environ.get("PEARL_ACCEPTANCE_DEBUG", "0") == "1":
@@ -1698,12 +1762,53 @@ class Scheduler(SchedulerInterface):
                         flush=True,
                     )
 
+                # Prefer the explicit nano-PEARL boundary only when it
+                # agrees with the scheduler's authoritative token accounting.
+                # A mismatch falls back to standard correction rather than
+                # risking a stale or off-by-one KV boundary.
+                nanoparl_boundary_applied = False
+                if (
+                    nanoparl_result is not None
+                    and reported_draft_len is not None
+                    and reported_accepted_len is not None
+                    and reported_valid_len is not None
+                ):
+                    expected_valid_len = request.num_computed_tokens - num_rejected
+                    if all_accepted_no_bonus:
+                        expected_valid_len -= num_sampled
+                    if (
+                        reported_draft_len == num_draft_tokens
+                        and reported_accepted_len == num_accepted
+                        and reported_valid_len == expected_valid_len
+                        and reported_valid_len >= 0
+                    ):
+                        request.num_computed_tokens = reported_valid_len
+                        if not reported_finished:
+                            self.kv_cache_manager.retain_request_boundary(
+                                request, reported_valid_len
+                            )
+                        nanoparl_boundary_applied = True
+                    else:
+                        logger.warning(
+                            "Ignoring invalid nano-PEARL boundary for %s: "
+                            "reported=(draft=%s, accepted=%s, valid=%s), "
+                            "expected=(draft=%s, accepted=%s, valid=%s)",
+                            req_id,
+                            reported_draft_len,
+                            reported_accepted_len,
+                            reported_valid_len,
+                            num_draft_tokens,
+                            num_accepted,
+                            expected_valid_len,
+                        )
+
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
-                # tokens.
-                if request.num_computed_tokens > 0:
+                # tokens. This remains the compatibility path for runners
+                # without an explicit nano-PEARL result.
+                if not nanoparl_boundary_applied and request.num_computed_tokens > 0:
                     request.num_computed_tokens -= num_rejected
                 # If async scheduling, num_output_placeholders also includes
                 # the scheduled spec tokens count and so is similarly adjusted.

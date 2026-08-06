@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from copy import copy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import numpy as np
 import torch
@@ -273,6 +273,11 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Explicit target verification boundary for nano-PEARL. The list is
+    # keyed by stable request_id after the worker remaps sampler rows.
+    # Each item contains at least accepted_len, valid_len, and draft_len.
+    nanoparl_verify_results: list[dict[str, Any]] | None = None
 
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,

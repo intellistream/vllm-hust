@@ -385,6 +385,34 @@ class SingleTypeKVCacheManager(ABC):
         """
         return None
 
+    def retain_request_boundary(self, request_id: str, valid_len: int) -> None:
+        """Commit a logical boundary while retaining request-owned blocks.
+
+        Blocks are intentionally not removed from req_to_blocks. If the
+        boundary lands inside a block, the whole containing block is
+        removed from prefix-cache lookup because its hash represents a
+        longer prefix; the physical block remains available for overwrite.
+        Cross-attention blocks are unrelated to the decoder token boundary.
+        """
+        if isinstance(self.kv_cache_spec, CrossAttentionSpec):
+            return
+        if valid_len < 0:
+            raise ValueError(f"valid_len must be non-negative, got {valid_len}")
+
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            return
+
+        first_invalid_block = min(valid_len // self.block_size, len(blocks))
+        for block in blocks[first_invalid_block:]:
+            self.block_pool.invalidate_cached_block(block)
+
+        cached_blocks = self.num_cached_block.get(request_id)
+        if cached_blocks is not None:
+            self.num_cached_block[request_id] = min(
+                cached_blocks, first_invalid_block
+            )
+
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """
         Pop the request's bookkeeping and return its blocks without yet

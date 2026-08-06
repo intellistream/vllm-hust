@@ -1418,6 +1418,9 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            self.input_batch.block_table.set_nanoparl_logical_boundary(
+                req_index, num_computed_tokens
+            )
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 

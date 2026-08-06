@@ -73,6 +73,13 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     }
 )
 
+NANO_PEARL_CUSTOM_PROPOSERS = frozenset(
+    {
+        # PEARL_STAGE5_TARGET_ASYNC_CUSTOM_CLASS_V1
+        "pearl_stage5_nanoparl_proposer_v3.PearlNanoPearlProposer",
+    }
+)
+
 
 class OptimizationLevel(IntEnum):
     """Optimization level enum."""
@@ -573,6 +580,26 @@ class VllmConfig:
             or not model_config.is_moe
         )
 
+    def _spec_decode_supports_async_scheduling(self) -> bool:
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return True
+
+        if spec_config.method in get_args(EagleModelTypes):
+            return True
+        if spec_config.method in get_args(NgramGPUTypes):
+            return True
+        if spec_config.method in ("draft_model", "dspark"):
+            return True
+        return (
+            spec_config.method == "custom_class"
+            and spec_config.model in NANO_PEARL_CUSTOM_PROPOSERS
+            and os.environ.get(
+                "PEARL_STAGE5_EXPERIMENTAL_TARGET_ASYNC_CUSTOM_CLASS", "0"
+            )
+            == "1"
+        )
+
     @property
     def needs_dp_coordinator(self) -> bool:
         """
@@ -967,16 +994,11 @@ class VllmConfig:
                     "select a different all2all backend."
                 )
             if self.speculative_config is not None:
-                if (
-                    self.speculative_config.method not in get_args(EagleModelTypes)
-                    and self.speculative_config.method not in get_args(NgramGPUTypes)
-                    and self.speculative_config.method != "draft_model"
-                    and self.speculative_config.method != "dspark"
-                ):
+                if not self._spec_decode_supports_async_scheduling():
                     raise ValueError(
                         "Currently, async scheduling is only supported "
-                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark kind of "
-                        "speculative decoding"
+                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark or "
+                        "nano-PEARL custom-class speculative decoding"
                     )
                 if self.speculative_config.disable_padded_drafter_batch:
                     raise ValueError(

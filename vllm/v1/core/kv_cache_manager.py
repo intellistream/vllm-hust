@@ -550,6 +550,10 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    def retain_request_boundary(self, request: Request, valid_len: int) -> None:
+        """Keep physical blocks and commit the request logical boundary."""
+        self.coordinator.retain_request_boundary(request.request_id, valid_len)
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted

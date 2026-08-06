@@ -377,6 +377,9 @@ class InputBatch:
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.block_table.add_row(request.block_ids, req_index)
+        self.block_table.set_nanoparl_logical_boundary(
+            req_index, request.num_computed_tokens
+        )
 
         if sampling_params := request.sampling_params:
             if sampling_params.sampling_type == SamplingType.GREEDY:

@@ -505,6 +505,20 @@ class BlockPool:
         block.reset_hash()
         return removed_hashes
 
+    def invalidate_cached_block(self, block: KVCacheBlock) -> None:
+        """Remove prefix-cache metadata without releasing a physical block.
+
+        A speculative rejection can leave a request-owned block physically
+        allocated while its token prefix is no longer valid. Freeing the
+        block would force the next step through allocation/requeue. Removing
+        only its cache hashes prevents stale prefix hits while preserving
+        block ownership and the append-only block table.
+        """
+        if block.is_null:
+            return
+        removed_hashes = self._remove_cached_block_hashes(block)
+        self._emit_block_removed_events(removed_hashes)
+
     def _emit_block_removed_events(
         self,
         block_hashes: list[BlockHashWithGroupId],
