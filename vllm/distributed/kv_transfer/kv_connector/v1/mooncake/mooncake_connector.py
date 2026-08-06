@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -65,6 +66,13 @@ from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
+
+# Mooncake Transfer Engine's default server port. On Ascend, the local
+# server name advertised via the P2P handshake must carry a unique port per
+# instance, otherwise co-located instances (e.g. disaggregated prefill and
+# decode) resolve to the same RPC endpoint. The port is derived from the
+# physical NPU id so that instances on different NPUs stay addressable.
+_MOONCAKE_ASCEND_BASE_PORT = 12001
 
 try:
     from mooncake.engine import TransferEngine
@@ -934,8 +942,23 @@ class MooncakeConnectorWorker:
         logger.info(
             "The Mooncake Transfer Engine is using %s as its protocol.", protocol
         )
+        # The local server name must be "ip:port". On Ascend, the RPC endpoint
+        # advertised via the P2P handshake has to be unique per instance,
+        # otherwise two co-located vLLM instances (e.g. disaggregated prefill
+        # and decode) resolve to the same endpoint and KV transfer fails to
+        # connect. Derive a per-instance port from the physical NPU id when
+        # running on Ascend. This is a no-op on other platforms because
+        # ASCEND_RT_VISIBLE_DEVICES is only set by the Ascend runtime.
+        local_server_name = self.hostname
+        ascend_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+        if ascend_devices:
+            phys_ids = [dev.strip() for dev in ascend_devices.split(",")]
+            phys_id = phys_ids[self.device_id]
+            local_server_name = (
+                f"{self.hostname}:{_MOONCAKE_ASCEND_BASE_PORT + int(phys_id)}"
+            )
         ret_value = self.engine.initialize(
-            self.hostname, "P2PHANDSHAKE", protocol, device_name
+            local_server_name, "P2PHANDSHAKE", protocol, device_name
         )
         if ret_value != 0:
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
