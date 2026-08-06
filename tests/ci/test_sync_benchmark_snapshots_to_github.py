@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -98,6 +99,24 @@ printf '{}\\n' > "$output_dir/last_updated.json"
     return fake_python
 
 
+def write_submission_evidence(submission: Path) -> None:
+    """Write the complete evidence set required by publication admission."""
+    submission.mkdir(parents=True, exist_ok=True)
+    files = {
+        "leaderboard_manifest.json": "{}\n",
+        "run_leaderboard.json": "{}\n",
+        "env-manifest.json": '{"git_info": {}}\n',
+    }
+    for name, content in files.items():
+        (submission / name).write_text(content, encoding="utf-8")
+    checksums = "".join(
+        f"{hashlib.sha256((submission / name).read_bytes()).hexdigest()}  ./{name}\n"
+        for name in files
+    )
+    (submission / "checksums.sha256").write_text(checksums, encoding="utf-8")
+    (submission / "STATUS").write_text("OK\n", encoding="utf-8")
+
+
 def write_flaky_git(tmp_path: Path) -> Path:
     fake_git = tmp_path / "fake-bin" / "git"
     fake_git.parent.mkdir()
@@ -144,10 +163,7 @@ def test_sync_benchmark_snapshots_verifies_published_commit(tmp_path):
     (vllm_hust_repo / "pyproject.toml").write_text(
         "[project]\nname='fake'\n", encoding="utf-8"
     )
-    submission.mkdir()
-    (submission / "leaderboard_manifest.json").write_text("{}\n", encoding="utf-8")
-    (submission / "run_leaderboard.json").write_text("{}\n", encoding="utf-8")
-    (submission / "STATUS").write_text("OK\n", encoding="utf-8")
+    write_submission_evidence(submission)
 
     env = os.environ.copy()
     env.update(
@@ -223,10 +239,7 @@ def test_invalid_snapshot_does_not_change_benchmark_remote(
     (vllm_hust_repo / "pyproject.toml").write_text(
         "[project]\nname='fake'\n", encoding="utf-8"
     )
-    submission.mkdir()
-    (submission / "leaderboard_manifest.json").write_text("{}\n", encoding="utf-8")
-    (submission / "run_leaderboard.json").write_text("{}\n", encoding="utf-8")
-    (submission / "STATUS").write_text("OK\n", encoding="utf-8")
+    write_submission_evidence(submission)
     remote_head = run(
         ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
     ).stdout.strip()
@@ -302,10 +315,7 @@ def test_push_retry_rebuilds_staging_from_fresh_remote(tmp_path):
     (vllm_hust_repo / "pyproject.toml").write_text(
         "[project]\nname='fake'\n", encoding="utf-8"
     )
-    submission.mkdir()
-    (submission / "leaderboard_manifest.json").write_text("{}\n", encoding="utf-8")
-    (submission / "run_leaderboard.json").write_text("{}\n", encoding="utf-8")
-    (submission / "STATUS").write_text("OK\n", encoding="utf-8")
+    write_submission_evidence(submission)
 
     env = os.environ.copy()
     env.update(

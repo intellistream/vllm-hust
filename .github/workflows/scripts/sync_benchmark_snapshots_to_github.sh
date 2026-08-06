@@ -19,7 +19,13 @@ BENCHMARK_REPO_SLUG=${BENCHMARK_REPO_SLUG:-vLLM-HUST/vllm-hust-benchmark}
 BENCHMARK_REPO_GH_TOKEN=${BENCHMARK_REPO_GH_TOKEN:-}
 BENCHMARK_REPO_SSH_KEY=${BENCHMARK_REPO_SSH_KEY:-}
 
-required_submission_files=(leaderboard_manifest.json run_leaderboard.json STATUS)
+required_submission_files=(
+  leaderboard_manifest.json
+  run_leaderboard.json
+  env-manifest.json
+  checksums.sha256
+  STATUS
+)
 required_snapshot_files=(
   leaderboard_single.json
   leaderboard_multi.json

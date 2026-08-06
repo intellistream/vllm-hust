@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -33,21 +34,32 @@ def write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
-@pytest.mark.skipif(
-    not supports_bash_case_conversion(),
-    reason="perfgate_store_baseline.sh requires Bash 4+ case conversion",
-)
-def test_store_baseline_forwards_runtime_manager_provenance(
-    tmp_path: Path,
-) -> None:
+def run_store_baseline(
+    tmp_path: Path, *, fetch_failures: int
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     capture_file = tmp_path / "publish-arguments.json"
+    fetch_counter_file = tmp_path / "fetch-counter"
 
     write_executable(
         fake_bin / "git",
         f"""#!/bin/bash
 set -euo pipefail
+if [[ "$*" == *"fetch --quiet origin main:refs/remotes/origin/main"* ]]; then
+  counter_file=${{FETCH_COUNTER_FILE:?}}
+  count=0
+  if [[ -f "$counter_file" ]]; then
+    count=$(<"$counter_file")
+  fi
+  count=$((count + 1))
+  printf '%s\\n' "$count" > "$counter_file"
+  if [[ "$count" -le "${{FETCH_FAILURES:?}}" ]]; then
+    echo "fatal: simulated target fetch failure" >&2
+    exit 128
+  fi
+  exit 0
+fi
 if [[ "$*" == *"rev-parse origin/main"* ]]; then
   printf '%s\\n' '{TARGET_SHA}'
 fi
@@ -84,7 +96,7 @@ printf 'test-sha256  %s\\n' "$1"
     )
     write_executable(
         fake_bin / "python",
-        """#!/usr/bin/env python3
+        f"""#!{sys.executable}
 import json
 import os
 import sys
@@ -120,8 +132,12 @@ Path(os.environ["CAPTURE_FILE"]).write_text(
     env = {
         **os.environ,
         "CAPTURE_FILE": str(capture_file),
+        "FETCH_COUNTER_FILE": str(fetch_counter_file),
+        "FETCH_FAILURES": str(fetch_failures),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "PERFGATE_BASELINE_WRITER_TOKEN": "test-token",
+        "PERFGATE_TARGET_FETCH_INITIAL_DELAY_SECONDS": "0",
+        "PERFGATE_TARGET_FETCH_MAX_ATTEMPTS": "4",
         "PERFGATE_TARGET_REPOSITORY": "vLLM-HUST/vllm-hust",
         "PERFGATE_TARGET_SHA": TARGET_SHA,
         "PERFGATE_TARGET_GIT_REPOSITORY": str(tmp_path),
@@ -141,7 +157,40 @@ Path(os.environ["CAPTURE_FILE"]).write_text(
         env=env,
     )
 
+    return result, capture_file, fetch_counter_file
+
+
+@pytest.mark.skipif(
+    not supports_bash_case_conversion(),
+    reason="perfgate_store_baseline.sh requires Bash 4+ case conversion",
+)
+def test_store_baseline_retries_target_fetch_and_forwards_provenance(
+    tmp_path: Path,
+) -> None:
+    result, capture_file, fetch_counter_file = run_store_baseline(
+        tmp_path, fetch_failures=2
+    )
+
     assert result.returncode == 0, result.stdout + result.stderr
+    assert fetch_counter_file.read_text(encoding="utf-8").strip() == "3"
+    assert "target main fetch attempt 1/4" in result.stdout
+    assert "target main fetch attempt 3/4" in result.stdout
     arguments = json.loads(capture_file.read_text(encoding="utf-8"))
     runtime_manager_index = arguments.index("--runtime-manager-sha")
     assert arguments[runtime_manager_index + 1] == RUNTIME_MANAGER_SHA
+
+
+@pytest.mark.skipif(
+    not supports_bash_case_conversion(),
+    reason="perfgate_store_baseline.sh requires Bash 4+ case conversion",
+)
+def test_store_baseline_fails_after_target_fetch_retries(tmp_path: Path) -> None:
+    result, capture_file, fetch_counter_file = run_store_baseline(
+        tmp_path, fetch_failures=4
+    )
+
+    assert result.returncode != 0
+    assert fetch_counter_file.read_text(encoding="utf-8").strip() == "4"
+    assert not capture_file.exists()
+    assert "target main fetch attempt 4/4" in result.stdout
+    assert "Failed to fetch target main after 4 attempts" in result.stderr
