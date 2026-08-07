@@ -49,13 +49,10 @@ class MaterializationObservation:
     hit_tokens: int
     hit_blocks: int
     kv_bytes: int = 0
-    copy_queue_wait_ms: float | None = None
-    copy_service_ms: float | None = None
-    copy_bandwidth_bytes_per_ms: float | None = None
-    copy_observation_age_ms: float | None = None
-    copy_sample_count: int = 0
-    recompute_queue_wait_ms: float | None = None
-    recompute_service_ms: float | None = None
+    load_total_ms: float | None = None
+    load_observation_age_ms: float | None = None
+    load_sample_count: int = 0
+    recompute_total_ms: float | None = None
     recompute_observation_age_ms: float | None = None
     recompute_sample_count: int = 0
 
@@ -100,31 +97,18 @@ def _validate_observation(
     if not isinstance(observation.kv_bytes, int) or observation.kv_bytes < 0:
         invalid.append("kv_bytes")
 
-    for field_name in ("copy_queue_wait_ms", "recompute_queue_wait_ms"):
-        if not _finite_nonnegative(getattr(observation, field_name)):
-            invalid.append(field_name)
+    if not _finite_nonnegative(observation.load_total_ms):
+        invalid.append("load_total_ms")
+    if not _finite_nonnegative(observation.recompute_total_ms):
+        invalid.append("recompute_total_ms")
 
-    if observation.copy_service_ms is None:
-        has_bandwidth = (
-            observation.kv_bytes > 0
-            and _finite_nonnegative(observation.copy_bandwidth_bytes_per_ms)
-            and float(observation.copy_bandwidth_bytes_per_ms) > 0.0
-        )
-        if not has_bandwidth:
-            invalid.append("copy_estimate")
-    elif not _finite_nonnegative(observation.copy_service_ms):
-        invalid.append("copy_service_ms")
-
-    if not _finite_nonnegative(observation.recompute_service_ms):
-        invalid.append("recompute_service_ms")
-
-    if observation.copy_sample_count < config.min_copy_samples:
-        invalid.append("copy_sample_count")
+    if observation.load_sample_count < config.min_copy_samples:
+        invalid.append("load_sample_count")
     if observation.recompute_sample_count < config.min_recompute_samples:
         invalid.append("recompute_sample_count")
 
     for field_name in (
-        "copy_observation_age_ms",
+        "load_observation_age_ms",
         "recompute_observation_age_ms",
     ):
         age = getattr(observation, field_name)
@@ -158,23 +142,10 @@ def choose_materialization(
     if invalid_fields:
         return _fallback(config, "invalid_or_missing_observation", invalid_fields)
 
-    if observation.copy_service_ms is not None:
-        copy_service_ms = float(observation.copy_service_ms)
-        estimate_source = "service_time"
-    else:
-        assert observation.copy_bandwidth_bytes_per_ms is not None
-        copy_service_ms = observation.kv_bytes / float(
-            observation.copy_bandwidth_bytes_per_ms
-        )
-        estimate_source = "bandwidth"
-
-    assert observation.copy_queue_wait_ms is not None
-    assert observation.recompute_queue_wait_ms is not None
-    assert observation.recompute_service_ms is not None
-    predicted_load_ms = float(observation.copy_queue_wait_ms) + copy_service_ms
-    predicted_recompute_ms = float(observation.recompute_queue_wait_ms) + float(
-        observation.recompute_service_ms
-    )
+    assert observation.load_total_ms is not None
+    assert observation.recompute_total_ms is not None
+    predicted_load_ms = float(observation.load_total_ms)
+    predicted_recompute_ms = float(observation.recompute_total_ms)
 
     if not all(math.isfinite(x) for x in (predicted_load_ms, predicted_recompute_ms)):
         return _fallback(config, "non_finite_prediction", ("prediction",))
@@ -185,12 +156,12 @@ def choose_materialization(
             reason="predicted_load_is_lower",
             predicted_load_ms=predicted_load_ms,
             predicted_recompute_ms=predicted_recompute_ms,
-            estimate_source=estimate_source,
+            estimate_source="end_to_end_median",
         )
     return MaterializationDecision(
         mode="recompute",
         reason="predicted_recompute_is_not_slower",
         predicted_load_ms=predicted_load_ms,
         predicted_recompute_ms=predicted_recompute_ms,
-        estimate_source=estimate_source,
+        estimate_source="end_to_end_median",
     )

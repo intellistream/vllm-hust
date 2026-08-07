@@ -18,12 +18,10 @@ def make_observation(**overrides: object) -> MaterializationObservation:
         "hit_tokens": 256,
         "hit_blocks": 2,
         "kv_bytes": 1024,
-        "copy_queue_wait_ms": 1.0,
-        "copy_service_ms": 4.0,
-        "copy_observation_age_ms": 10.0,
-        "copy_sample_count": 3,
-        "recompute_queue_wait_ms": 2.0,
-        "recompute_service_ms": 20.0,
+        "load_total_ms": 5.0,
+        "load_observation_age_ms": 10.0,
+        "load_sample_count": 3,
+        "recompute_total_ms": 22.0,
         "recompute_observation_age_ms": 10.0,
         "recompute_sample_count": 3,
     }
@@ -31,8 +29,8 @@ def make_observation(**overrides: object) -> MaterializationObservation:
     return MaterializationObservation(**values)  # type: ignore[arg-type]
 
 
-def test_dynamic_load_uses_queue_and_service_time() -> None:
-    """Load wins only after both queue and service costs are included."""
+def test_dynamic_load_uses_end_to_end_time() -> None:
+    """Load wins when its recent end-to-end cost is lower."""
     decision = choose_materialization(
         make_observation(),
         MaterializationDecisionConfig(
@@ -52,8 +50,7 @@ def test_equal_prediction_deterministically_chooses_recompute() -> None:
     """Equal predictions use one deterministic side of the boundary."""
     decision = choose_materialization(
         make_observation(
-            copy_queue_wait_ms=2.0,
-            copy_service_ms=20.0,
+            load_total_ms=22.0,
         ),
         MaterializationDecisionConfig(enabled=True),
     )
@@ -67,11 +64,9 @@ def test_forced_mode_does_not_require_observations(forced_mode: str) -> None:
     """Forced modes remain usable during cold start."""
     decision = choose_materialization(
         make_observation(
-            copy_queue_wait_ms=None,
-            copy_service_ms=None,
-            copy_observation_age_ms=None,
-            recompute_queue_wait_ms=None,
-            recompute_service_ms=None,
+            load_total_ms=None,
+            load_observation_age_ms=None,
+            recompute_total_ms=None,
             recompute_observation_age_ms=None,
         ),
         MaterializationDecisionConfig(
@@ -87,11 +82,9 @@ def test_disabled_dynamic_preserves_load_fallback() -> None:
     """The default configuration retains the native load behavior."""
     decision = choose_materialization(
         make_observation(
-            copy_queue_wait_ms=None,
-            copy_service_ms=None,
-            copy_observation_age_ms=None,
-            recompute_queue_wait_ms=None,
-            recompute_service_ms=None,
+            load_total_ms=None,
+            load_observation_age_ms=None,
+            recompute_total_ms=None,
             recompute_observation_age_ms=None,
         ),
         MaterializationDecisionConfig(),
@@ -104,11 +97,11 @@ def test_disabled_dynamic_preserves_load_fallback() -> None:
 @pytest.mark.parametrize(
     "field, value",
     [
-        ("copy_sample_count", 0),
+        ("load_sample_count", 0),
         ("recompute_sample_count", 0),
-        ("copy_observation_age_ms", 6000.0),
-        ("recompute_service_ms", math.nan),
-        ("copy_queue_wait_ms", -1.0),
+        ("load_observation_age_ms", 6000.0),
+        ("recompute_total_ms", math.nan),
+        ("load_total_ms", -1.0),
     ],
 )
 def test_invalid_or_stale_observation_falls_back(field: str, value: object) -> None:
@@ -123,18 +116,17 @@ def test_invalid_or_stale_observation_falls_back(field: str, value: object) -> N
     assert decision.invalid_fields
 
 
-def test_bandwidth_is_used_when_direct_copy_service_is_missing() -> None:
-    """Bandwidth is an explicit fallback estimator, not a nominal constant."""
+def test_end_to_end_prediction_is_recorded() -> None:
+    """The decision exposes the end-to-end estimate source."""
     decision = choose_materialization(
         make_observation(
-            copy_service_ms=None,
-            copy_bandwidth_bytes_per_ms=100.0,
+            load_total_ms=11.24,
         ),
         MaterializationDecisionConfig(enabled=True),
     )
 
     assert decision.mode == "load"
-    assert decision.estimate_source == "bandwidth"
+    assert decision.estimate_source == "end_to_end_median"
     assert decision.predicted_load_ms == pytest.approx(11.24)
 
 

@@ -19,8 +19,6 @@ class DynamicCPUOffloadMetadata(SimpleCPUOffloadMetadata):
 
     recompute_requests: dict[str, int] = field(default_factory=dict)
     load_block_counts: dict[str, int] = field(default_factory=dict)
-    load_decision_times: dict[str, float] = field(default_factory=dict)
-    recompute_queue_wait_ms: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_base(
@@ -28,8 +26,6 @@ class DynamicCPUOffloadMetadata(SimpleCPUOffloadMetadata):
         base: SimpleCPUOffloadMetadata,
         recompute_requests: dict[str, int],
         load_block_counts: dict[str, int],
-        load_decision_times: dict[str, float],
-        recompute_queue_wait_ms: dict[str, float],
     ) -> DynamicCPUOffloadMetadata:
         """Copy native metadata without changing its semantics."""
         return cls(
@@ -43,8 +39,6 @@ class DynamicCPUOffloadMetadata(SimpleCPUOffloadMetadata):
             need_flush=base.need_flush,
             recompute_requests=recompute_requests,
             load_block_counts=load_block_counts,
-            load_decision_times=load_decision_times,
-            recompute_queue_wait_ms=recompute_queue_wait_ms,
         )
 
 
@@ -55,7 +49,6 @@ class TimingSampleMetadata:
     request_id: str
     size: int
     service_ms: float
-    queue_wait_ms: float = 0.0
     kv_bytes: int = 0
 
 

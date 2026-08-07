@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from kv_materialization_plugin.decision import MaterializationDecision
 
@@ -20,16 +21,35 @@ class AuditRecord:
     predicted_load_ms: float | None
     predicted_recompute_ms: float | None
     fallback: bool
+    run_id: str | None = None
+    mode: str | None = None
+    gpu_local_hit_tokens: int | None = None
+    invalid_fields: tuple[str, ...] = ()
     actual_branch: str | None = None
     actual_cost_ms: float | None = None
+    service_ms: float | None = None
+    extra_wait_ms: float | None = None
     status: str = "decided"
 
 
 class AuditLog:
     """Collect records without imposing a logging framework on vLLM."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        output_path: str | Path | None = None,
+        run_id: str | None = None,
+        mode: str | None = None,
+    ) -> None:
         self._records: dict[str, AuditRecord] = {}
+        if output_path:
+            destination = Path(output_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self._output = destination.open("a", encoding="utf-8", buffering=1)
+        else:
+            self._output = None
+        self._run_id = run_id
+        self._mode = mode
 
     def start(
         self,
@@ -37,6 +57,7 @@ class AuditLog:
         hit_tokens: int,
         hit_blocks: int,
         decision: MaterializationDecision,
+        gpu_local_hit_tokens: int | None = None,
     ) -> None:
         """Start or replace a record for a request."""
         self._records[request_id] = AuditRecord(
@@ -48,6 +69,10 @@ class AuditLog:
             predicted_load_ms=decision.predicted_load_ms,
             predicted_recompute_ms=decision.predicted_recompute_ms,
             fallback=decision.fallback,
+            run_id=self._run_id,
+            mode=self._mode,
+            gpu_local_hit_tokens=gpu_local_hit_tokens,
+            invalid_fields=decision.invalid_fields,
         )
 
     def complete(
@@ -55,6 +80,8 @@ class AuditLog:
         request_id: str,
         actual_branch: str,
         actual_cost_ms: float,
+        service_ms: float | None = None,
+        extra_wait_ms: float | None = None,
         status: str = "completed",
     ) -> None:
         """Complete an existing record."""
@@ -63,7 +90,16 @@ class AuditLog:
             return
         record.actual_branch = actual_branch
         record.actual_cost_ms = actual_cost_ms
+        record.service_ms = service_ms
+        record.extra_wait_ms = extra_wait_ms
         record.status = status
+        self._write(record)
+
+    def close(self) -> None:
+        """Flush and close the optional NDJSON output."""
+        if self._output is not None:
+            self._output.close()
+            self._output = None
 
     def records(self) -> list[AuditRecord]:
         """Return records in insertion order."""
@@ -74,3 +110,8 @@ class AuditLog:
         return "\n".join(
             json.dumps(asdict(record), sort_keys=True) for record in self.records()
         )
+
+    def _write(self, record: AuditRecord) -> None:
+        if self._output is None:
+            return
+        self._output.write(json.dumps(asdict(record), sort_keys=True) + "\n")

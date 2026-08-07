@@ -15,8 +15,8 @@ select a mode in `kv_connector_extra_config`:
 - `load`: force the native CPU KV load path (the default and cold-start
   fallback).
 - `recompute`: force prefix recomputation.
-- `dynamic`: compare recent copy queue/service time with recent recompute
-  queue/service time. A tie chooses recompute deterministically.
+- `dynamic`: compare the median recent end-to-end cost of loading and
+  recomputing. A tie chooses recompute deterministically.
 
 Dynamic mode is conservative about data quality: missing, stale, or invalid
 measurements use the configured fallback. Every decision records the selected
@@ -37,8 +37,8 @@ Example extra configuration:
 ```
 
 Set `kv_bytes_per_block` when the deployment can provide the KV footprint per
-scheduler block; it enables the bandwidth estimate when only bandwidth-based
-copy telemetry is available. `0` keeps the direct copy-service estimate.
+scheduler block. The value is retained in telemetry for audit and later
+calibration; it is not used to replace the measured end-to-end cost.
 
 The package has no install-time dependency on a PyPI vLLM release. Install it
 in the same environment as the checked-out `vllm-hust` tree, or add its

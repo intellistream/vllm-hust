@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from kv_materialization_plugin.audit import AuditLog
@@ -14,13 +15,12 @@ from kv_materialization_plugin.decision import (
 )
 from kv_materialization_plugin.metadata import (
     DynamicCPUOffloadMetadata,
+    DynamicCPUOffloadWorkerMetadata,
     TimingSampleMetadata,
     as_worker_metadata,
 )
 from kv_materialization_plugin.telemetry import TelemetryWindow
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorRole,
-)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (
     SimpleCPUOffloadConnector,
 )
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 
 class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
-    """Choose CPU KV load or recompute without changing vLLM core code."""
+    """Choose CPU KV load or prefix recompute without changing vLLM core code."""
 
     def __init__(
         self,
@@ -64,7 +64,9 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
             forced_mode=forced_mode,
             fallback_mode=fallback_mode,
             min_copy_samples=int(extra_config.get("min_copy_samples", 1)),
-            min_recompute_samples=int(extra_config.get("min_recompute_samples", 1)),
+            min_recompute_samples=int(
+                extra_config.get("min_recompute_samples", 1)
+            ),
             max_observation_age_ms=float(
                 extra_config.get("max_observation_age_ms", 5000.0)
             ),
@@ -72,19 +74,32 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
         self._kv_bytes_per_block = int(extra_config.get("kv_bytes_per_block", 0))
         if self._kv_bytes_per_block < 0:
             raise ValueError("kv_bytes_per_block must be non-negative")
+
         self._telemetry = TelemetryWindow(
             max_samples=int(extra_config.get("sample_window_size", 32))
         )
-        self._audit = AuditLog()
+        self._telemetry_input_path = extra_config.get("telemetry_input_path")
+        self._telemetry_output_path = extra_config.get("telemetry_output_path")
+        if role == KVConnectorRole.SCHEDULER and self._telemetry_input_path:
+            self._telemetry.load_json(self._telemetry_input_path)
+
+        audit_enabled = bool(extra_config.get("audit_enabled", True))
+        audit_path = extra_config.get("audit_output_path")
+        self._audit = AuditLog(
+            output_path=(
+                audit_path
+                if role == KVConnectorRole.SCHEDULER and audit_enabled
+                else None
+            ),
+            run_id=extra_config.get("run_id"),
+            mode=materialization_mode,
+        )
         self._decisions: dict[str, MaterializationDecision] = {}
         self._decision_hit_tokens: dict[str, int] = {}
         self._decision_times: dict[str, float] = {}
-        self._recompute_queue_wait_ms: dict[str, float] = {}
         self._worker_copy_samples: list[TimingSampleMetadata] = []
         self._worker_recompute_samples: list[TimingSampleMetadata] = []
-        self._load_events_started: dict[
-            int, tuple[float, dict[str, tuple[int, float | None]]]
-        ] = {}
+        self._load_events_started: dict[int, tuple[float, dict[str, int]]] = {}
         self._recompute_started_at: float | None = None
         self._recompute_reported = False
 
@@ -97,10 +112,7 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
         hit_tokens, is_async = super().get_num_new_matched_tokens(
             request, num_computed_tokens
         )
-        self._decisions.pop(request.request_id, None)
-        self._decision_hit_tokens.pop(request.request_id, None)
-        self._decision_times.pop(request.request_id, None)
-        self._recompute_queue_wait_ms.pop(request.request_id, None)
+        self._clear_request_state(request.request_id)
         if not hit_tokens:
             return hit_tokens, is_async
 
@@ -114,11 +126,13 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
         self._decisions[request.request_id] = decision
         self._decision_hit_tokens[request.request_id] = hit_tokens
         self._decision_times[request.request_id] = time.monotonic()
-        self._recompute_queue_wait_ms[request.request_id] = max(
-            0.0,
-            (time.time() - request.arrival_time) * 1000.0,
+        self._audit.start(
+            request.request_id,
+            hit_tokens,
+            hit_blocks,
+            decision,
+            gpu_local_hit_tokens=num_computed_tokens,
         )
-        self._audit.start(request.request_id, hit_tokens, hit_blocks, decision)
         if decision.mode == "recompute":
             return 0, False
         return hit_tokens, is_async
@@ -147,24 +161,12 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
             for request_id in load_request_ids
             if request_id in self._decision_hit_tokens
         }
-        load_decision_times = {
-            request_id: self._decision_times[request_id]
-            for request_id in load_request_ids
-            if request_id in self._decision_times
-        }
-        recompute_queue_wait_ms = {
-            request_id: self._recompute_queue_wait_ms[request_id]
-            for request_id in recompute_requests
-            if request_id in self._recompute_queue_wait_ms
-        }
-        if not recompute_requests and not load_decision_times:
+        if not recompute_requests and not load_block_counts:
             return base
         return DynamicCPUOffloadMetadata.from_base(
             base,
             recompute_requests,
             load_block_counts,
-            load_decision_times,
-            recompute_queue_wait_ms,
         )
 
     def bind_connector_metadata(
@@ -179,7 +181,7 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
             isinstance(connector_metadata, DynamicCPUOffloadMetadata)
             and connector_metadata.recompute_requests
         ):
-            self._recompute_started_at = time.perf_counter()
+            self._recompute_started_at = time.monotonic()
 
     def clear_connector_metadata(self) -> None:
         """Clear native metadata and per-step worker timing state."""
@@ -193,7 +195,7 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
     ) -> tuple[set[str] | None, set[str] | None]:
         """Observe native completion notifications around worker execution."""
         metadata = self._connector_metadata
-        launch_started_at = time.perf_counter()
+        launch_started_at = time.monotonic()
         if (
             isinstance(metadata, DynamicCPUOffloadMetadata)
             and metadata.load_event >= 0
@@ -208,7 +210,9 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
                         // max(
                             1,
                             len(
-                                metadata.load_event_to_reqs.get(metadata.load_event, [])
+                                metadata.load_event_to_reqs.get(
+                                    metadata.load_event, []
+                                )
                             ),
                         ),
                     ),
@@ -217,13 +221,6 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
                     metadata.load_event, []
                 )
             }
-            request_blocks = {
-                request_id: (
-                    block_count,
-                    metadata.load_decision_times.get(request_id),
-                )
-                for request_id, block_count in request_blocks.items()
-            }
             self._load_events_started.setdefault(
                 metadata.load_event,
                 (launch_started_at, request_blocks),
@@ -231,26 +228,21 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
 
         result = super().get_finished(finished_req_ids)
         finished_recving = result[1] or set()
-        completed_at = time.perf_counter()
+        completed_at = time.monotonic()
         for event_idx, (started_at, request_blocks) in list(
             self._load_events_started.items()
         ):
-            if not finished_recving.intersection(request_blocks):
+            completed_request_ids = finished_recving.intersection(request_blocks)
+            if not completed_request_ids:
                 continue
-            for request_id in finished_recving.intersection(request_blocks):
-                block_count, decision_time = request_blocks[request_id]
-                queue_wait_ms = 0.0
-                if decision_time is not None:
-                    queue_wait_ms = max(
-                        0.0,
-                        (started_at - decision_time) * 1000.0,
-                    )
+            service_ms = (completed_at - started_at) * 1000.0
+            for request_id in completed_request_ids:
+                block_count = request_blocks[request_id]
                 self._worker_copy_samples.append(
                     TimingSampleMetadata(
                         request_id=request_id,
                         size=block_count,
-                        service_ms=(completed_at - started_at) * 1000.0,
-                        queue_wait_ms=queue_wait_ms,
+                        service_ms=service_ms,
                         kv_bytes=block_count * self._kv_bytes_per_block,
                     )
                 )
@@ -269,9 +261,6 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
                         request_id=request_id,
                         size=max(1, hit_tokens),
                         service_ms=service_ms,
-                        queue_wait_ms=metadata.recompute_queue_wait_ms.get(
-                            request_id, 0.0
-                        ),
                     )
                 )
             self._recompute_reported = True
@@ -290,38 +279,81 @@ class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
         return result
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
-        """Consume timing samples on the scheduler side."""
+        """Consume worker samples and derive scheduler-side total latency."""
         super().update_connector_output(connector_output)
         metadata = connector_output.kv_connector_worker_meta
-        if not hasattr(metadata, "copy_samples"):
+        if not isinstance(metadata, DynamicCPUOffloadWorkerMetadata):
             return
-        for sample in metadata.copy_samples:
-            self._telemetry.observe_copy(
-                sample.size,
-                sample.service_ms,
-                sample.queue_wait_ms,
-                sample.kv_bytes,
-            )
-            self._audit.complete(
-                sample.request_id,
-                "cpu_kv_load",
-                sample.service_ms,
-            )
-        for sample in metadata.recompute_samples:
-            self._telemetry.observe_recompute(
-                sample.size,
-                sample.service_ms,
-                sample.queue_wait_ms,
-            )
-            self._audit.complete(
-                sample.request_id,
-                "full_prefix_recompute",
-                sample.service_ms,
-            )
+
+        self._consume_samples(metadata.copy_samples, "cpu_kv_load", is_load=True)
+        self._consume_samples(
+            metadata.recompute_samples,
+            "full_prefix_recompute",
+            is_load=False,
+        )
+        if self._telemetry_output_path:
+            self._telemetry.save_json(self._telemetry_output_path)
 
     def take_audit_records(self):
-        """Return accumulated audit records for the parent runtime."""
+        """Return accumulated audit records for tests and diagnostics."""
         return self._audit.records()
+
+    def _consume_samples(
+        self,
+        samples: list[TimingSampleMetadata],
+        actual_branch: str,
+        is_load: bool,
+    ) -> None:
+        """Aggregate worker samples and complete scheduler-side observations."""
+        grouped: dict[str, list[TimingSampleMetadata]] = defaultdict(list)
+        for sample in samples:
+            grouped[sample.request_id].append(sample)
+
+        for request_id, request_samples in grouped.items():
+            critical_sample = max(request_samples, key=lambda sample: sample.service_ms)
+            decision_time = self._decision_times.get(request_id)
+            if decision_time is None:
+                continue
+            total_ms = (time.monotonic() - decision_time) * 1000.0
+            service_ms = critical_sample.service_ms
+            if service_ms > total_ms:
+                self._audit.complete(
+                    request_id,
+                    actual_branch,
+                    total_ms,
+                    service_ms=service_ms,
+                    status="invalid",
+                )
+                self._clear_request_state(request_id)
+                continue
+            extra_wait_ms = total_ms - service_ms
+            if is_load:
+                self._telemetry.observe_load(
+                    critical_sample.size,
+                    total_ms,
+                    service_ms,
+                    critical_sample.kv_bytes,
+                )
+            else:
+                self._telemetry.observe_recompute(
+                    critical_sample.size,
+                    total_ms,
+                    service_ms,
+                )
+            self._audit.complete(
+                request_id,
+                actual_branch,
+                total_ms,
+                service_ms=service_ms,
+                extra_wait_ms=extra_wait_ms,
+            )
+            self._clear_request_state(request_id)
+
+    def _clear_request_state(self, request_id: str) -> None:
+        """Release scheduler-side state after a request is decided/completed."""
+        self._decisions.pop(request_id, None)
+        self._decision_hit_tokens.pop(request_id, None)
+        self._decision_times.pop(request_id, None)
 
     def _estimate_hit_blocks(self, hit_tokens: int) -> int:
         """Convert hit tokens to the connector's scheduler block count."""
