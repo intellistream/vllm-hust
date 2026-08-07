@@ -7,6 +7,7 @@ CURRENT_SUBMISSION_DIR=${CURRENT_SUBMISSION_DIR:?CURRENT_SUBMISSION_DIR is requi
 VLLM_HUST_REPO_DIR=${VLLM_HUST_REPO_DIR:-${VLLM_HUST_REPO:-$BENCHMARK_REPO_DIR/../vllm-hust}}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 SNAPSHOT_TARGET_BRANCH=${SNAPSHOT_TARGET_BRANCH:-main}
+SNAPSHOT_EXPECTED_BASE_SHA=${SNAPSHOT_EXPECTED_BASE_SHA:-}
 SNAPSHOT_OUTPUT_DIR=${SNAPSHOT_OUTPUT_DIR:-$BENCHMARK_REPO_DIR/leaderboard-data/snapshots}
 LOCAL_SNAPSHOT_OUTPUT_DIR=${LOCAL_SNAPSHOT_OUTPUT_DIR:-}
 SNAPSHOT_MAX_PUSH_ATTEMPTS=${SNAPSHOT_MAX_PUSH_ATTEMPTS:-4}
@@ -79,6 +80,12 @@ fetch_target_branch_with_retry() {
 }
 
 validate_fetch_retry_configuration
+
+if [[ -n "$SNAPSHOT_EXPECTED_BASE_SHA" \
+  && ! "$SNAPSHOT_EXPECTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "SNAPSHOT_EXPECTED_BASE_SHA must be a full lowercase Git SHA" >&2
+  exit 2
+fi
 
 configure_push_remote() {
   local remote_url=
@@ -166,8 +173,18 @@ export VLLM_HUST_WEBSITE_REPO="$WEBSITE_REPO_DIR"
 export VLLM_HUST_REPO="$VLLM_HUST_REPO_DIR"
 
 prepare_publication_commit() {
+  local fetched_target_sha
+
   reset_publication_staging || return $?
   fetch_target_branch_with_retry prepare || return $?
+  if [[ -n "$SNAPSHOT_EXPECTED_BASE_SHA" ]]; then
+    fetched_target_sha=$(git -C "$BENCHMARK_REPO_DIR" rev-parse \
+      "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH") || return $?
+    if [[ "$fetched_target_sha" != "$SNAPSHOT_EXPECTED_BASE_SHA" ]]; then
+      echo "benchmark publication base moved: expected $SNAPSHOT_EXPECTED_BASE_SHA, got $fetched_target_sha" >&2
+      return 2
+    fi
+  fi
   git -C "$BENCHMARK_REPO_DIR" checkout -B "$SNAPSHOT_TARGET_BRANCH" "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH" || return $?
 
   mkdir -p "$staged_submission_dir" || return $?

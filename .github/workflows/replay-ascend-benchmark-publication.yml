@@ -1,0 +1,135 @@
+name: Replay Ascend Benchmark Publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Completed Core Actions run containing the immutable artifact
+        required: true
+        type: string
+        default: "31004708110"
+      source_run_attempt:
+        description: Source run attempt used in the artifact and submission IDs
+        required: true
+        type: string
+        default: "1"
+      expected_target_sha:
+        description: Exact Core SHA recorded by the source artifact
+        required: true
+        type: string
+        default: "4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0"
+      expected_benchmark_main_sha:
+        description: Benchmark main SHA approved by the local rehearsal
+        required: true
+        type: string
+        default: "734f3fc3cc7a809889ac1780a1fd980e98226cef"
+      confirmation:
+        description: Enter publish-<run-id>-<attempt> to authorize the write
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ascend-benchmark-publication-replay-main
+  cancel-in-progress: false
+
+jobs:
+  replay-publication:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+      EXPECTED_TARGET_SHA: ${{ inputs.expected_target_sha }}
+      EXPECTED_BENCHMARK_MAIN_SHA: ${{ inputs.expected_benchmark_main_sha }}
+      REPLAY_CONFIRMATION: ${{ inputs.confirmation }}
+      REPLAY_ARTIFACT_ROOT: ${{ github.workspace }}/source-artifact
+      BENCHMARK_REPO_DIR: ${{ github.workspace }}/vllm-hust-benchmark
+      WEBSITE_REPO_DIR: ${{ github.workspace }}/vllm-hust-website
+      VLLM_HUST_REPO_DIR: ${{ github.workspace }}
+      EXPECTED_WEBSITE_SHA: 9740d1470e8a9dbd2191f5c082498e24ef414a6e
+      EXPECTED_SYNC_SCRIPT_SHA256: 1e647db41b7bc458cf051c8ae124c51381ea47a694afbc566b7c8aa9b71ec267
+      REPLAY_RECEIPT_FILE: ${{ github.workspace }}/.replay-output/benchmark-publication-replay.env
+      LOCAL_SNAPSHOT_OUTPUT_DIR: ${{ github.workspace }}/.replay-output/benchmark-publication-snapshots
+
+    steps:
+      - name: Checkout Core replay controller
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Checkout approved benchmark main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: vLLM-HUST/vllm-hust-benchmark
+          ref: ${{ inputs.expected_benchmark_main_sha }}
+          fetch-depth: 0
+          path: vllm-hust-benchmark
+          persist-credentials: false
+
+      - name: Checkout pinned website aggregator
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: vLLM-HUST/vllm-hust-website
+          ref: 9740d1470e8a9dbd2191f5c082498e24ef414a6e
+          path: vllm-hust-website
+          persist-credentials: false
+
+      - name: Download immutable source artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ascend-benchmark-${{ inputs.source_run_id }}-${{ inputs.source_run_attempt }}
+          path: source-artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Set up validation Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install publication validation dependency
+        run: python -m pip install --disable-pip-version-check jsonschema==4.23.0
+
+      - name: Validate replay without writer credential
+        run: bash .github/workflows/scripts/replay_benchmark_publication.sh preflight
+
+      - name: Publish and verify historical artifact
+        env:
+          REPLAY_WRITER_TOKEN: ${{ secrets.VLLM_HUST_BENCHMARK_GH_TOKEN }}
+        run: |
+          bash .github/workflows/scripts/replay_benchmark_publication.sh publish
+          cat "$REPLAY_RECEIPT_FILE" >> "$GITHUB_ENV"
+
+      - name: Write replay summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "### Ascend benchmark publication replay"
+            echo
+            echo "- Source run: \`${SOURCE_RUN_ID}\`"
+            echo "- Source attempt: \`${SOURCE_RUN_ATTEMPT}\`"
+            echo "- Expected target SHA: \`${EXPECTED_TARGET_SHA}\`"
+            echo "- Approved benchmark base: \`${EXPECTED_BENCHMARK_MAIN_SHA}\`"
+            if [[ -f "$REPLAY_RECEIPT_FILE" ]]; then
+              sed 's/^/- /' "$REPLAY_RECEIPT_FILE"
+            else
+              echo "- Receipt: \`not-created\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload replay receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-publication-replay-${{ inputs.source_run_id }}-${{ inputs.source_run_attempt }}
+          path: |
+            ${{ github.workspace }}/.replay-output/benchmark-publication-replay.env
+            ${{ github.workspace }}/.replay-output/benchmark-publication-snapshots
+          if-no-files-found: warn
+          retention-days: 30

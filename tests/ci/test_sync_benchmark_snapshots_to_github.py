@@ -374,6 +374,38 @@ def test_invalid_snapshot_does_not_change_benchmark_remote(
     )
 
 
+def test_expected_base_mismatch_rejects_before_publication(tmp_path):
+    env, remote, benchmark_repo, github_env = prepare_sync_environment(
+        tmp_path, "expected-base-mismatch"
+    )
+    remote_head = run(
+        ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
+    ).stdout.strip()
+    env["SNAPSHOT_EXPECTED_BASE_SHA"] = "0" * 40
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT_PATH)],
+        cwd=tmp_path,
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "benchmark publication base moved" in result.stderr
+    assert (
+        run(
+            ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
+        ).stdout.strip()
+        == remote_head
+    )
+    assert not (benchmark_repo / "submissions" / "expected-base-mismatch").exists()
+    assert "GITHUB_SNAPSHOT_SYNC_STATUS=rejected" in github_env.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_push_retry_rebuilds_staging_from_fresh_remote(tmp_path):
     remote, seed = init_bare_remote(tmp_path)
     stale_submission = seed / "submissions" / "stale-ci"
