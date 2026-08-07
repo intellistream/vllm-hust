@@ -349,6 +349,108 @@ def test_stage2_provenance_match_or_mismatch_is_recorded(
     )
 
 
+def test_stage2_provenance_failure_reaches_enforced_final_compare(
+    tmp_path: Path,
+) -> None:
+    """A Stage 2 provenance failure must remain a failed enforce result."""
+    target_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
+    ).strip()
+    metadata = tmp_path / "baseline-metadata.json"
+    write_json(metadata, {"provenance": baseline_provenance()})
+    candidate = tmp_path / "candidate.json"
+    write_json(
+        candidate,
+        candidate_provenance(
+            vllm_hust_sha=target_sha,
+            runtime_manager_sha="not-a-sha",
+        ),
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    make_stage2_bash_stub(fake_bin / "bash", candidate, metadata)
+    make_stage2_git_stub(fake_bin / "git")
+    write_executable(
+        fake_bin / "python",
+        f'#!/bin/bash\nexec {sys.executable} "$@"\n',
+    )
+    stage2_env_file = tmp_path / "stage2-github-env"
+    stage2_env_file.touch()
+    stage2_env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "GITHUB_ENV": str(stage2_env_file),
+        "GITHUB_WORKSPACE": str(REPO_ROOT),
+        "RUN_ID": "run",
+        "PERFGATE_STAGE2_RUN_ID": "stage2-run",
+        "PERFGATE_STAGE2_RESULT_ROOT": str(tmp_path / "stage2-results"),
+        "FORK_POINT": "0" * 40,
+        "TEST_TARGET_SHA": target_sha,
+        "PYTHON_BIN": "",
+        "NODE_ENV_RETRY_MAX_ATTEMPTS": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    stage2_result = run_script(STAGE2_SCRIPT, stage2_env)
+
+    assert stage2_result.returncode == 0, stage2_result.stdout + stage2_result.stderr
+    assert env_value(stage2_env_file, "PERFGATE_STAGE2_PROVENANCE_VALID") == "0"
+    reason = env_value(stage2_env_file, "PERFGATE_STAGE2_NOT_RUN_REASON")
+    assert "candidate provenance validation failed" in reason
+    assert env_value(stage2_env_file, "PERFGATE_STAGE2_B1PRIME_FILE") == ""
+
+    def write_result(path: Path) -> None:
+        write_json(
+            path,
+            {
+                "engine": "vllm-hust",
+                "metrics": {
+                    "throughput_tps": 100.0,
+                    "ttft_ms": 50.0,
+                    "tbt_ms": 10.0,
+                },
+                "same_spec": {
+                    "spec_id": "perfgate-ascend-qwen25-3b-910b3",
+                    "resolved_spec_hash": "abc123",
+                },
+            },
+        )
+
+    stage1_baseline = tmp_path / "stage1-baseline.json"
+    stage1_current = tmp_path / "stage1-current.json"
+    write_result(stage1_baseline)
+    write_result(stage1_current)
+    report_file = tmp_path / "final-report.md"
+    compare_env_file = tmp_path / "compare-github-env"
+    benchmark_repo = Path(
+        os.environ.get(
+            "VLLM_HUST_BENCHMARK_REPO", str(REPO_ROOT / "vllm-hust-benchmark")
+        )
+    )
+    compare_env = {
+        **os.environ,
+        "PYTHONPATH": str(benchmark_repo / "src"),
+        "PYTHON_BIN": sys.executable,
+        "GITHUB_ENV": str(compare_env_file),
+        "PERFGATE_MODE": "enforce",
+        "PERFGATE_REPORT_FILE": str(report_file),
+        "PERFGATE_BASELINE_AVAILABLE": "1",
+        "PERFGATE_BASELINE_FILE": str(stage1_baseline),
+        "PERFGATE_STAGE1_CURRENT_FILE": str(stage1_current),
+        "PERFGATE_STAGE1_PROVENANCE_VALID": "1",
+        "PERFGATE_STAGE2_PROVENANCE_VALID": "0",
+        "PERFGATE_STAGE2_NOT_RUN_REASON": reason,
+        "PERFGATE_M2_COMMIT": "m2-commit",
+        "FORK_POINT": "0" * 40,
+    }
+    compare_result = run_script(COMPARE_SCRIPT, compare_env)
+
+    assert compare_result.returncode == 1, compare_result.stdout + compare_result.stderr
+    report = report_file.read_text(encoding="utf-8")
+    assert "Stage 2: NOT RUN" in report
+    assert "candidate provenance validation failed" in report
+    assert "**Overall: FAIL**" in report
+
+
 @pytest.mark.parametrize(
     "mutation", [None, "missing-manifest", "missing-checksum-entry", "tamper"]
 )
