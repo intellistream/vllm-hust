@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 from kv_materialization_plugin.audit import AuditLog
@@ -21,10 +22,21 @@ from kv_materialization_plugin.metadata import (
 )
 from kv_materialization_plugin.telemetry import TelemetryWindow
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
-from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (
-    SimpleCPUOffloadConnector,
-)
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
+
+_ASCEND_CONNECTOR_MODULE = (
+    "vllm_ascend.distributed.kv_transfer.kv_pool."
+    "simple_cpu_offload.simple_cpu_offload_connector"
+)
+try:
+    _SimpleCPUOffloadConnector = import_module(
+        _ASCEND_CONNECTOR_MODULE
+    ).AscendSimpleCPUOffloadConnector
+except ImportError:
+    _SimpleCPUOffloadConnector = import_module(
+        "vllm.distributed.kv_transfer.kv_connector.v1."
+        "simple_cpu_offload_connector"
+    ).SimpleCPUOffloadConnector
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -37,7 +49,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-class DynamicSimpleCPUOffloadConnector(SimpleCPUOffloadConnector):
+class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
     """Choose CPU KV load or prefix recompute without changing vLLM core code."""
 
     def __init__(
