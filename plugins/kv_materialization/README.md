@@ -45,8 +45,10 @@ in the same environment as the checked-out `vllm-hust` tree, or add its
 `src/` directory to `PYTHONPATH` as the parent repository's experiment runner
 does.
 
-CPU-only tests can be run from this directory with:
+Use the existing vLLM-HUST runtime environment for tests; do not create a
+second virtual environment inside this plugin directory. From the parent
+repository root, run:
 
 ```bash
-uv run --with pytest --with pytest-cov pytest -q
+python -m pytest -q upstream/vllm-hust/plugins/kv_materialization/tests
 ```
