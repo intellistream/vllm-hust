@@ -665,7 +665,7 @@ def test_store_baseline_step_expects_measurement_policy():
     assert 'PERFGATE_EXPECTED_AGGREGATION: "primary-median-run"' in store_block
 
 
-def test_pr_stage1_and_stage2_emit_provenance_with_repeated_measurements():
+def test_pr_stage1_and_stage2_keep_single_measurement_policy():
     text = workflow_text()
 
     formal_step = text.index("- name: Run benchmark CI and optional formal publish")
@@ -680,12 +680,17 @@ def test_pr_stage1_and_stage2_emit_provenance_with_repeated_measurements():
     pr_block = text[formal_step:stage1_step]
     stage2_block = text[stage2_step:final_compare_step]
 
-    assert "PERFGATE_WARMUP_RUNS:" in pr_block
-    assert "PERFGATE_MEASURED_RUNS:" in pr_block
+    assert 'PERFGATE_WARMUP_RUNS: "0"' in pr_block
+    assert 'PERFGATE_MEASURED_RUNS: "1"' in pr_block
     assert 'PERFGATE_AGGREGATION: "primary-median-run"' in pr_block
-    assert 'PERFGATE_WARMUP_RUNS: "1"' in stage2_block
-    assert 'PERFGATE_MEASURED_RUNS: "3"' in stage2_block
+    assert "PERFGATE_REQUIRE_PROVENANCE:" in pr_block
+    assert "&& '1' || '0'" in pr_block
+    assert 'PERFGATE_WARMUP_RUNS: "0"' in stage2_block
+    assert 'PERFGATE_MEASURED_RUNS: "1"' in stage2_block
     assert 'PERFGATE_AGGREGATION: "primary-median-run"' in stage2_block
+    assert 'PERFGATE_REQUIRE_PROVENANCE: "1"' in stage2_block
+    assert 'PERFGATE_WARMUP_RUNS: "1"' not in pr_block + stage2_block
+    assert 'PERFGATE_MEASURED_RUNS: "3"' not in pr_block + stage2_block
 
 
 def test_runner_script_forwards_perfgate_measurement_env():
@@ -694,6 +699,7 @@ def test_runner_script_forwards_perfgate_measurement_env():
     for name in (
         "PERFGATE_AGGREGATION",
         "PERFGATE_MEASURED_RUNS",
+        "PERFGATE_REQUIRE_PROVENANCE",
         "PERFGATE_WARMUP_RUNS",
     ):
         assert f"\n  {name}\n" in text, f"{name} missing from SUDO_PRESERVE_ENV_VARS"
@@ -714,6 +720,7 @@ def test_runner_script_copies_measurement_json_fail_closed():
     assert '"${PERFGATE_WARMUP_RUNS:-0}" -gt 0' in text
     assert '"${PERFGATE_MEASURED_RUNS:-1}" -gt 1' in text
     assert "perfgate-provenance.json" in text
+    assert '"${PERFGATE_REQUIRE_PROVENANCE:-0}" == "1"' in text
     assert '"schema_version": "perfgate-runtime-provenance/v1"' in text
     assert 'PERFGATE_CANN_VERSION="${HUST_ASCEND_RUNTIME_VERSION:-}"' in text
     assert 'git -C "${HUST_ASCEND_MANAGER_REPO:-}" rev-parse HEAD' in text

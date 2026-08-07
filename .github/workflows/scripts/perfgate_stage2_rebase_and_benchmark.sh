@@ -2,6 +2,7 @@
 set -euo pipefail
 
 GITHUB_ENV=${GITHUB_ENV:-/dev/null}
+MODE=${PERFGATE_MODE:-report}
 ORIGINAL_REF=$(git rev-parse HEAD)
 FORK_POINT=${FORK_POINT:-}
 M2_COMMIT=$(git rev-parse origin/main 2>/dev/null || true)
@@ -66,11 +67,14 @@ git fetch origin main
 M2_COMMIT=$(git rev-parse origin/main)
 write_env PERFGATE_M2_COMMIT "$M2_COMMIT"
 
-if [[ -n "$FORK_POINT" && "$FORK_POINT" == "$M2_COMMIT" ]]; then
+if [[ -n "$FORK_POINT" && "$FORK_POINT" == "$M2_COMMIT" && "$MODE" != "enforce" ]]; then
   write_env PERFGATE_STAGE2_SKIPPED 1
   write_env PERFGATE_STAGE2_SKIP_REASON "fork-point is already latest main"
   echo "Stage 2 skipped: fork-point is already latest main"
   exit 0
+fi
+if [[ -n "$FORK_POINT" && "$FORK_POINT" == "$M2_COMMIT" ]]; then
+  echo "Stage 2 required revalidation: fork-point is already latest main"
 fi
 
 git checkout -B "$TEMP_BRANCH" "$ORIGINAL_REF"
@@ -87,6 +91,9 @@ if [[ "$rebase_rc" -ne 0 ]]; then
   write_env PERFGATE_STAGE2_REBASE_CONFLICT 1
   write_env PERFGATE_STAGE2_REBASE_CONFLICT_FILE "$CONFLICT_FILE"
   echo "Stage 2 rebase conflict recorded at $CONFLICT_FILE"
+  if [[ "$MODE" == "enforce" ]]; then
+    exit 2
+  fi
   exit 0
 fi
 
@@ -130,16 +137,26 @@ fi
 
 stage2_env_file="$GITHUB_ENV.stage2"
 rm -f "$stage2_env_file"
+set +e
 PERFGATE_BASELINE_OUTPUT_DIR="${RUNNER_TEMP:-/tmp}/perfgate-stage2-baseline" \
   PERFGATE_ALLOW_BASELINE_FALLBACK="${PERFGATE_ALLOW_STAGE2_BASELINE_FALLBACK:-0}" \
   GITHUB_ENV="$stage2_env_file" \
   bash .github/workflows/scripts/perfgate_fetch_baseline.sh "$M2_COMMIT"
+stage2_fetch_rc=$?
+set -e
 
-stage2_baseline_available=$(read_env_value PERFGATE_BASELINE_AVAILABLE "$stage2_env_file" || echo "1")
-if [[ "$stage2_baseline_available" != "1" ]]; then
+stage2_baseline_available=$(read_env_value PERFGATE_BASELINE_AVAILABLE "$stage2_env_file" || echo "0")
+write_env PERFGATE_STAGE2_BASELINE_AVAILABLE "$stage2_baseline_available"
+if [[ "$stage2_fetch_rc" -ne 0 || "$stage2_baseline_available" != "1" ]]; then
   stage2_unavailable_reason=$(read_env_value PERFGATE_BASELINE_UNAVAILABLE_REASON "$stage2_env_file" || echo "Stage 2 M2 baseline is unavailable")
   write_env PERFGATE_STAGE2_NOT_RUN_REASON "Stage 2 M2 baseline is unavailable: $stage2_unavailable_reason"
   echo "Stage 2 comparison not run: $stage2_unavailable_reason"
+  if [[ "$MODE" == "enforce" ]]; then
+    if [[ "$stage2_fetch_rc" -ne 0 ]]; then
+      exit "$stage2_fetch_rc"
+    fi
+    exit 2
+  fi
   exit 0
 fi
 
@@ -172,5 +189,6 @@ write_env PERFGATE_STAGE2_M2_BASELINE_COMMIT "$stage2_baseline_commit"
 write_env PERFGATE_STAGE2_M2_BASELINE_SOURCE "$stage2_baseline_source"
 write_env PERFGATE_STAGE2_REBASE_CONFLICT 0
 write_env PERFGATE_STAGE2_SKIPPED 0
+write_env PERFGATE_STAGE2_EXECUTED 1
 
 echo "Stage 2 benchmark ready: $b1prime_file vs $stage2_baseline_file"

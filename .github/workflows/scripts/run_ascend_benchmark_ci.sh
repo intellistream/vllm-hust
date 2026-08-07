@@ -384,6 +384,7 @@ SUDO_PRESERVE_ENV_VARS=(
   PATH
   PERFGATE_AGGREGATION
   PERFGATE_MEASURED_RUNS
+  PERFGATE_REQUIRE_PROVENANCE
   PERFGATE_WARMUP_RUNS
   PIP_CACHE_DIR
   PORT
@@ -1226,7 +1227,7 @@ PY
     return 2
   fi
 
-  if [[ "${PERFGATE_WARMUP_RUNS:-0}" -gt 0 || "${PERFGATE_MEASURED_RUNS:-1}" -gt 1 ]]; then
+  if [[ "${PERFGATE_REQUIRE_PROVENANCE:-0}" == "1" || "${PERFGATE_WARMUP_RUNS:-0}" -gt 0 || "${PERFGATE_MEASURED_RUNS:-1}" -gt 1 ]]; then
     local provenance_sha
     for provenance_sha in "$current_vllm_hust_commit" "$current_plugin_commit" "$benchmark_runner_commit" "$runtime_manager_commit"; do
       if ! [[ "$provenance_sha" =~ ^[0-9a-f]{40}$ ]]; then
