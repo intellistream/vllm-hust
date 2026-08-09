@@ -511,7 +511,11 @@ class WorkerWrapperBase:
             if physical.accepted:
                 trial_manager = candidate
                 continue
-            trial_manager.apply(command, external_reject_error=physical.error)
+            reject_error = physical.error or (
+                "physical request-owned KV store rejected the command "
+                "without an error"
+            )
+            trial_manager.apply(command, external_reject_error=reject_error)
 
         for token in scheduler_output.scheduled_owner_leases:
             if token.owner_id == self.global_rank:

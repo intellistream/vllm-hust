@@ -167,12 +167,13 @@ class SchedulerConfig:
     by batching multiple tokens before sending."""
 
     enable_request_owned_attention: bool = False
-    """RESERVED EXPERIMENTAL GATE: run attention with per-request owned state.
+    """Experimental per-request attention ownership.
 
-    Defaults to False. This flag is a reserved experimental control/layout
-    contract (G1): enabling it currently always fails closed at ``VllmConfig``
-    validation until physical owner-local KV allocation/routing (G2) exists.
-    No execution path accepts an enabled configuration today."""
+    Defaults to False. The supported G2 envelope enables receipt-gated
+    scheduling and worker-local physical KV allocation in eager Multiproc
+    mode. Token-bearing execution remains fail-closed until the G3 owner-local
+    Q/KV/O routing path is connected; unsupported features are rejected by
+    ``VllmConfig`` validation."""
 
     @staticmethod
     def default_factory(**kwargs):

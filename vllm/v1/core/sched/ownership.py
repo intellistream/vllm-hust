@@ -1022,10 +1022,11 @@ class AttentionLeaseManager:
         ordinary apply -- including higher-epoch supersession and the
         stale-old-epoch RELEASE tombstone exception -- and is then rejected
         with ``external_reject_error`` before any RESERVE/EXTEND/PREEMPT/
-        RESTORE/RELEASE logical state transition is dispatched.  No lease,
-        commitment, or publication state is created or mutated on that path,
-        but the authoritative fences still advance so the coordinator's
-        command stream stays in sync and the preflight cannot be replayed.
+        RESTORE/RELEASE logical state transition is dispatched.  No state for
+        the rejected key is created or advanced; a higher epoch may still
+        tombstone older leases as part of the authoritative epoch fence.  The
+        command/epoch fences advance so the coordinator's stream stays in
+        sync and the rejected command cannot be replayed.
         Fence violations keep their canonical errors (``wrong owner rank``,
         ``stale or duplicate command sequence``, ``stale request epoch``)
         rather than the caller-supplied error.  When ``None`` (default), the
