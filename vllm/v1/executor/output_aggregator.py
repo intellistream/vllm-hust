@@ -47,6 +47,7 @@ other; adapters reuse the existing executor transport aggregator slots
 """
 
 from copy import copy
+from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.v1.core.sched.ownership import OwnerReceipt, OwnerReceiptBatch
@@ -80,11 +81,13 @@ class ModelRunnerOutputAggregator:
     def for_step(self, step_seq: int) -> "ModelRunnerOutputAggregatorStepAdapter":
         """Return an immutable, stateless per-step adapter bound to ``step_seq``.
 
-        The adapter delegates every :meth:`aggregate` call with
-        ``expected_step_seq=step_seq`` so stale or future worker receipts fail
-        closed at this exact call site.  The shared aggregator itself stores
-        no mutable per-step state, so one aggregator can serve any number of
-        concurrently bound adapters without cross-step interference.
+        ``step_seq`` must be a nonnegative non-bool ``int``; anything else
+        fails closed at this call.  The adapter delegates every
+        :meth:`aggregate` call with ``expected_step_seq=step_seq`` so stale or
+        future worker receipts fail closed at this exact call site.  The
+        shared aggregator itself stores no mutable per-step state, so one
+        aggregator can serve any number of concurrently bound adapters
+        without cross-step interference.
         """
         return ModelRunnerOutputAggregatorStepAdapter(self, step_seq)
 
@@ -248,9 +251,11 @@ class ModelRunnerOutputAggregatorStepAdapter:
 
     Binds one exact ``step_seq``: every :meth:`aggregate` call delegates to
     the shared aggregator with ``expected_step_seq`` set to that step, so a
-    stale or future worker emission fails closed.  The adapter is immutable
-    and stores no mutable state beyond its bound step; creating or using it
-    never mutates the shared aggregator or any other adapter.
+    stale or future worker emission fails closed.  The adapter is frozen
+    after construction: ``_aggregator`` and ``_step_seq`` cannot be
+    reassigned, no new attributes can be added, and ``step_seq`` must be a
+    nonnegative non-bool ``int``.  Creating or using it never mutates the
+    shared aggregator or any other adapter.
 
     It exposes the same duck-typed ``aggregate(outputs, output_rank=...)``
     surface as :class:`KVOutputAggregator`, so executors can pass it through
@@ -259,9 +264,29 @@ class ModelRunnerOutputAggregatorStepAdapter:
     aggregator) without new keywords.
     """
 
+    __slots__ = ("_aggregator", "_step_seq", "_frozen")
+
     def __init__(self, aggregator: ModelRunnerOutputAggregator, step_seq: int) -> None:
+        if isinstance(step_seq, bool) or not isinstance(step_seq, int):
+            raise TypeError(
+                "ModelRunnerOutputAggregatorStepAdapter: step_seq must be an "
+                f"int, got {type(step_seq).__name__} ({step_seq!r})."
+            )
+        if step_seq < 0:
+            raise ValueError(
+                "ModelRunnerOutputAggregatorStepAdapter: step_seq must be "
+                f"nonnegative, got {step_seq}."
+            )
         self._aggregator = aggregator
         self._step_seq = step_seq
+        self._frozen = True
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                f"{type(self).__name__} is immutable after construction."
+            )
+        object.__setattr__(self, name, value)
 
     @property
     def step_seq(self) -> int:

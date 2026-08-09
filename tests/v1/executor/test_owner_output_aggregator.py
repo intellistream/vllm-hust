@@ -297,6 +297,60 @@ def test_shared_aggregator_holds_no_step_state():
     ]
 
 
+def test_for_step_rejects_non_int_step_seq():
+    """for_step fails closed on non-int step values."""
+    aggregator = _aggregator(0, 1, 2)
+    for bad in ("7", 7.0, None, [7]):
+        with pytest.raises(TypeError, match="step_seq"):
+            aggregator.for_step(bad)
+
+
+def test_for_step_rejects_bool_step_seq():
+    """bool is an int subclass but never a valid step sequence."""
+    aggregator = _aggregator(0, 1, 2)
+    for bad in (True, False):
+        with pytest.raises(TypeError, match="step_seq"):
+            aggregator.for_step(bad)
+
+
+def test_for_step_rejects_negative_step_seq():
+    aggregator = _aggregator(0, 1, 2)
+    for bad in (-1, -7):
+        with pytest.raises(ValueError, match="nonnegative"):
+            aggregator.for_step(bad)
+
+
+def test_for_step_adapter_frozen_after_construction():
+    """The adapter is immutable after construction: the bound step and the
+    aggregator cannot be reassigned, the class-level step_seq property cannot
+    be overwritten, no new attributes can be added, and the adapter cannot be
+    unfrozen.  The binding survives all failed mutation attempts and the
+    shared aggregator stays untouched."""
+    shared = _aggregator(0, 1, 2)
+    adapter = shared.for_step(7)
+
+    with pytest.raises(AttributeError, match="immutable"):
+        adapter._step_seq = 99
+    with pytest.raises(AttributeError, match="immutable"):
+        adapter._aggregator = None
+    with pytest.raises(AttributeError, match="immutable"):
+        adapter.step_seq = 99
+    with pytest.raises(AttributeError, match="immutable"):
+        adapter.extra_attr = 1
+    with pytest.raises(AttributeError, match="immutable"):
+        adapter._frozen = False
+
+    assert adapter.step_seq == 7
+    outputs = _three_worker_outputs(step_seq=7)
+    assert [b.owner_rank for b in adapter.aggregate(outputs).owner_receipt_batches] == [
+        0,
+        1,
+        2,
+    ]
+    # The shared aggregator carries no per-step state after the attempts.
+    assert not hasattr(shared, "expected_step_seq")
+
+
 def test_for_step_adapter_sync_and_future_duck_typing():
     """The adapter matches the KVOutputAggregator duck-typed surface used by
     sync and FutureWrapper paths: direct ``aggregate(outputs,
