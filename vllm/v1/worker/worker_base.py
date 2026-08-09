@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from copy import copy
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
@@ -15,6 +16,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
+from vllm.v1.core.sched.ownership import AttentionLeaseManager
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 if TYPE_CHECKING:
@@ -29,6 +31,12 @@ else:
 logger = init_logger(__name__)
 
 _R = TypeVar("_R")
+
+# G1 binds the command/receipt transport without pretending that the legacy
+# replicated KV allocator is owner-local capacity.  Zero makes every reserve
+# fail before publication; G2 replaces this control-only reference manager
+# with physical owner-local allocation authority.
+_REQUEST_OWNED_CONTROL_ONLY_CAPACITY = 0
 
 
 class CompilationTimes(NamedTuple):
@@ -214,6 +222,7 @@ class WorkerWrapperBase:
         # Initialized after init_worker is called
         self.worker: WorkerBase
         self.vllm_config: VllmConfig
+        self._request_owned_control_manager: AttentionLeaseManager | None = None
 
     def shutdown(self) -> None:
         if self.worker is not None:
@@ -346,9 +355,83 @@ class WorkerWrapperBase:
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if self.vllm_config.scheduler_config.enable_request_owned_attention:
+            return self._execute_request_owned_control_step(scheduler_output)
+
         self._apply_mm_cache(scheduler_output)
 
         return self.worker.execute_model(scheduler_output)
+
+    def _execute_request_owned_control_step(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput:
+        """Execute the G1 control-only worker boundary.
+
+        Public configuration currently rejects this feature until G2.  This
+        internal seam exists so command ordering, zero-work receipts, and the
+        live executor return path can be tested without granting fake physical
+        KV authority.  It therefore refuses every token-bearing step before
+        calling the underlying worker.
+        """
+        step_seq = scheduler_output.step_seq
+        if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
+            raise RuntimeError(
+                "request-owned control step requires a positive non-bool "
+                f"step_seq, got {step_seq!r}."
+            )
+
+        manager = self._request_owned_control_manager
+        if manager is None:
+            manager = AttentionLeaseManager(
+                owner_rank=self.global_rank,
+                capacity=_REQUEST_OWNED_CONTROL_ONLY_CAPACITY,
+            )
+            self._request_owned_control_manager = manager
+
+        # Commands form one reliable in-order stream per owner.  Every worker
+        # receives the global envelope but consumes only its own commands.
+        for command in scheduler_output.owner_commands:
+            if command.owner_id == self.global_rank:
+                manager.apply(command)
+        for token in scheduler_output.scheduled_owner_leases:
+            if token.owner_id == self.global_rank:
+                manager.record_published(token)
+
+        if scheduler_output.total_num_scheduled_tokens != 0:
+            raise RuntimeError(
+                "request-owned attention G1 is control-only: refusing to "
+                "execute scheduled tokens through replicated KV before the "
+                "G2 owner-local allocator/routing prerequisite exists."
+            )
+
+        self._apply_mm_cache(scheduler_output)
+        output = self.worker.execute_model(scheduler_output)
+        if output is None:
+            raise RuntimeError(
+                "request-owned attention G1 does not support split sampling: "
+                "execute_model returned None and no exact receipt FIFO exists."
+            )
+
+        # Async outputs can overlap subsequent steps.  Until receipt state is
+        # kept in a step-keyed FIFO, decorating them here could drain events
+        # into the wrong step, so fail explicitly rather than guessing.
+        from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+
+        if isinstance(output, AsyncModelRunnerOutput):
+            raise RuntimeError(
+                "request-owned attention G1 does not support async model "
+                "runner outputs without a step-keyed receipt FIFO."
+            )
+        if not isinstance(output, ModelRunnerOutput):
+            raise RuntimeError(
+                "request-owned attention worker returned an unexpected "
+                f"output type {type(output).__name__}."
+            )
+
+        # Never mutate a worker-owned output or EMPTY_MODEL_RUNNER_OUTPUT.
+        result = copy(output)
+        result.owner_receipt_batches = [manager.emit_batch(step_seq)]
+        return result
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
