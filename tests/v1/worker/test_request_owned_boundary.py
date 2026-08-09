@@ -41,6 +41,7 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.request_owned_kv import (
     AllocationResult,
     DeferredFreeResult,
+    RequestOwnedStepMetadata,
 )
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
@@ -79,11 +80,16 @@ class _FakeStore:
     construction validates.
     """
 
-    def __init__(self, owner_rank: int, reject=(), reject_keys=()) -> None:
+    def __init__(
+        self, owner_rank: int, reject=(), reject_keys=(), reject_build=False
+    ) -> None:
         self.owner_rank = owner_rank
         self.reject = set(reject)
         self.reject_keys = set(reject_keys)
+        self.reject_build = reject_build
         self.calls: list[str] = []
+        self.last_build_step: int | None = None
+        self.last_build_tokens: tuple = ()
 
     def reserve(self, command):
         self.calls.append("reserve")
@@ -107,6 +113,26 @@ class _FakeStore:
             accepted=False,
             key=command.key,
             error="RESTORE is out of scope for the physical KV store",
+        )
+
+    def build_step_metadata(self, step_seq, tokens):
+        self.calls.append("build")
+        self.last_build_step = step_seq
+        self.last_build_tokens = tuple(tokens)
+        if self.reject_build:
+            return SimpleNamespace(
+                accepted=False,
+                step_seq=step_seq,
+                metadata=None,
+                error="fake build failure",
+            )
+        return SimpleNamespace(
+            accepted=True,
+            step_seq=step_seq,
+            metadata=RequestOwnedStepMetadata(
+                step_seq=step_seq, owner_rank=self.owner_rank, entries=()
+            ),
+            error=None,
         )
 
     def flush(self):
@@ -315,7 +341,7 @@ def test_physical_reserve_accepted_yields_accepted_receipt_and_snapshot() -> Non
     assert batch.cache_pool.owner_rank == 0
     assert batch.cache_pool.total_blocks == 32
     assert batch.cache_pool.free_blocks == 32
-    assert store.calls == ["reserve", "flush", "pool_snapshot"]
+    assert store.calls == ["reserve", "build", "flush", "pool_snapshot"]
 
 
 def test_physical_reserve_failure_no_logical_grant_next_command_works() -> None:
@@ -351,7 +377,7 @@ def test_physical_reserve_failure_no_logical_grant_next_command_works() -> None:
     receipt2 = result2.owner_receipt_batches[0].events[0]
     assert not receipt2.accepted
     assert receipt2.error == "no lease to release"
-    assert store.calls == ["flush", "pool_snapshot"]
+    assert store.calls == ["build", "flush", "pool_snapshot"]
 
     # Next higher command on a fresh key works.
     store.calls.clear()
@@ -389,7 +415,7 @@ def test_logical_stale_command_never_touches_store() -> None:
     assert not events[1].accepted
     assert events[1].error == "stale or duplicate command sequence"
     # The stale command never reached the physical store.
-    assert store.calls == ["reserve", "flush", "pool_snapshot"]
+    assert store.calls == ["reserve", "build", "flush", "pool_snapshot"]
 
 
 def test_foreign_commands_and_publications_are_ignored() -> None:
@@ -410,7 +436,7 @@ def test_foreign_commands_and_publications_are_ignored() -> None:
     result = _wrapper(0, worker, store).execute_model(step)
     assert worker.calls == 1
     assert result.owner_receipt_batches[0].events == ()
-    assert store.calls == ["flush", "pool_snapshot"]
+    assert store.calls == ["build", "flush", "pool_snapshot"]
 
 
 def test_own_rank_command_accepted_while_other_rank_emits_empty_batch() -> None:
@@ -497,7 +523,7 @@ def test_deferred_free_flushed_before_accepted_receipt_and_snapshot() -> None:
     assert batch.events[0].accepted
     # The physical free is deferred until after the synchronous execute and
     # is flushed before the receipt batch and capacity snapshot are emitted.
-    assert store.calls == ["release", "worker", "flush", "pool_snapshot"]
+    assert store.calls == ["release", "build", "worker", "flush", "pool_snapshot"]
 
 
 # -- real KVCacheManager integration -----------------------------------------
@@ -690,3 +716,93 @@ def test_default_off_path_is_unchanged() -> None:
     result = wrapper.execute_model(SchedulerOutput.make_empty())
     assert result is EMPTY_MODEL_RUNNER_OUTPUT
     assert worker.calls == 1
+
+
+# -- G3 step metadata seam ----------------------------------------------------
+
+
+def test_g3_seam_builds_step_metadata_after_command_publication_validation() -> None:
+    step = _output(step_seq=1)
+    step.owner_commands = [_reserve(owner_id=0, command_seq=1)]
+    step.scheduled_owner_leases = [
+        OwnerLeaseToken(
+            key=OwnerLeaseKey("other", 0),
+            owner_id=1,
+            step_seq=1,
+            command_seq=1,
+            runnable_num_tokens=8,
+        )
+    ]
+    worker = _FakeWorker()
+    store = _FakeStore(0)
+    wrapper = _wrapper(0, worker, store)
+
+    result = wrapper.execute_model(step)
+    assert worker.calls == 1
+    assert result.owner_receipt_batches[0].events[0].accepted
+
+    # The seam runs after command+publication validation and receives only
+    # the exact own-rank tokens; ordering against the underlying worker is
+    # covered by test_deferred_free_flushed_before_accepted_receipt_and_snapshot.
+    assert store.calls == ["reserve", "build", "flush", "pool_snapshot"]
+    assert store.last_build_step == 1
+    assert store.last_build_tokens == ()
+    metadata = wrapper._request_owned_step_metadata
+    assert metadata is not None
+    assert metadata.step_seq == 1
+    assert metadata.owner_rank == 0
+    assert metadata.entries == ()
+
+
+def test_g3_seam_fails_closed_when_build_rejected() -> None:
+    step = _output(step_seq=1)
+    step.owner_commands = [_reserve(owner_id=0, command_seq=1)]
+    worker = _FakeWorker()
+    store = _FakeStore(0, reject_build=True)
+    wrapper = _wrapper(0, worker, store)
+
+    with pytest.raises(RuntimeError, match="step metadata build failed"):
+        wrapper.execute_model(step)
+    assert worker.calls == 0
+    # Fail-stop: neither the logical manager nor the worker advanced.
+    assert wrapper._request_owned_control_manager is None
+    assert wrapper._request_owned_step_metadata is None
+    assert store.calls == ["reserve", "build"]
+
+
+def test_no_local_id_on_scheduler_wires_while_metadata_is_worker_local() -> None:
+    wrapper = _real_wrapper(_FakeWorker())
+    store = wrapper._request_owned_kv_store
+    step = _output(step_seq=1)
+    command = _real_reserve(owner_id=0, command_seq=1)
+    step.owner_commands = [command]
+
+    result = wrapper.execute_model(step)
+    batch = result.owner_receipt_batches[0]
+    receipt = batch.events[0]
+    assert receipt.accepted
+
+    # Receipts and pool snapshots on the scheduler-facing output carry no
+    # local block ids; the metadata stays worker-local and is not attached.
+    assert not hasattr(receipt, "tables")
+    assert not hasattr(receipt, "block_ids")
+    assert not hasattr(receipt, "delta")
+    assert not hasattr(batch.cache_pool, "tables")
+    assert not hasattr(batch.cache_pool, "block_ids")
+    assert not hasattr(result, "request_owned_step_metadata")
+
+    # Wire objects are untouched: the same command object is still on the
+    # scheduler output, and the metadata is the immutable empty batch.
+    assert step.owner_commands[0] is command
+    metadata = wrapper._request_owned_step_metadata
+    assert metadata is not None
+    assert metadata.owner_rank == 0
+    assert metadata.entries == ()
+
+    # The store's G3 snapshot of a later executed lease carries local ids
+    # (worker-local), while the receipt for the same key still does not.
+    assert store.build_step_metadata(2, []).accepted
+    built = store.build_step_metadata(3, [])
+    assert built.accepted
+    assert built.metadata.step_seq == 3
+    assert built.metadata.entries == ()

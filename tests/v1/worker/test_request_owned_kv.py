@@ -9,6 +9,8 @@ sliding window, both block_size 4, prefix caching disabled) so the manager
 stays the authority on block counts and pool accounting.
 """
 
+from dataclasses import FrozenInstanceError
+
 import pytest
 import torch
 
@@ -21,6 +23,7 @@ from vllm.v1.core.sched.ownership import (
     OwnerCommand,
     OwnerCommandKind,
     OwnerLeaseKey,
+    OwnerLeaseToken,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -91,6 +94,22 @@ def _command(
         kind=kind,
         required_num_tokens=required,
         allocation=allocation,
+    )
+
+
+def _token(
+    key: OwnerLeaseKey,
+    runnable: int,
+    step_seq: int = 1,
+    owner_id: int = 0,
+    command_seq: int = 1,
+) -> OwnerLeaseToken:
+    return OwnerLeaseToken(
+        key=key,
+        owner_id=owner_id,
+        step_seq=step_seq,
+        command_seq=command_seq,
+        runnable_num_tokens=runnable,
     )
 
 
@@ -568,3 +587,380 @@ def test_wrong_kind_and_duplicate_guards():
         _command(key, OwnerCommandKind.RELEASE, required=10, seq=5)
     )
     assert not wrong_free.accepted and "PREEMPT" in wrong_free.error
+
+
+# -- G3 execution metadata ---------------------------------------------------
+
+
+def test_build_zero_local_owner_batch_valid_and_one_step_fenced():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("z")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+
+    empty = store.build_step_metadata(1, [])
+    assert empty.accepted
+    assert empty.error is None
+    assert empty.metadata is not None
+    assert empty.metadata.step_seq == 1
+    assert empty.metadata.owner_rank == 0
+    assert empty.metadata.entries == ()
+
+    # One-step fence: the same or an older step cannot be rebuilt.
+    assert not store.build_step_metadata(1, []).accepted
+    assert not store.build_step_metadata(0, []).accepted
+    assert not store.build_step_metadata(True, []).accepted
+    assert not store.build_step_metadata(-1, []).accepted
+    assert not store.build_step_metadata("1", []).accepted
+    assert not store.build_step_metadata(None, []).accepted
+
+
+def test_build_rejects_same_step_allocation_plus_authorization():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("s")
+    # RESERVE for this step, then an execution token for the same key in the
+    # same step: the scheduler must allocate and authorize in different steps.
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    same = store.build_step_metadata(1, [_token(key, 8, step_seq=1)])
+    assert not same.accepted
+    assert "same-step" in same.error
+
+    # The allocation step itself is valid; the token belongs to the next step.
+    assert store.build_step_metadata(1, []).accepted
+    next_step = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert next_step.accepted
+    assert next_step.metadata.entries[0].key == key
+
+
+def test_build_rejects_wrong_missing_extra_duplicate_owner_step_state():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("a")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, []).accepted
+
+    wrong_owner = store.build_step_metadata(2, [_token(key, 8, step_seq=2, owner_id=1)])
+    assert not wrong_owner.accepted
+    assert "wrong-owner" in wrong_owner.error
+
+    missing = store.build_step_metadata(2, [_token(_key("ghost"), 8, step_seq=2)])
+    assert not missing.accepted
+    assert "missing lease" in missing.error
+
+    extra = store.build_step_metadata(2, [_token(key, 12, step_seq=2)])
+    assert not extra.accepted
+    assert "out-of-horizon" in extra.error
+
+    for count in (0, -1, True):
+        bad_count = store.build_step_metadata(2, [_token(key, count, step_seq=2)])
+        assert not bad_count.accepted
+        assert "runnable_num_tokens" in bad_count.error
+
+    wrong_step = store.build_step_metadata(2, [_token(key, 8, step_seq=99)])
+    assert not wrong_step.accepted
+    assert "does not match" in wrong_step.error
+
+    duplicate = store.build_step_metadata(
+        2, [_token(key, 8, step_seq=2), _token(key, 8, step_seq=2)]
+    )
+    assert not duplicate.accepted
+    assert "duplicate" in duplicate.error
+
+    ok = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert ok.accepted
+    assert [entry.key for entry in ok.metadata.entries] == [key]
+
+    stale = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert not stale.accepted
+    assert "stale" in stale.error
+    assert not store.build_step_metadata(1, []).accepted
+
+
+def test_build_rejects_pending_free_lease():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("p")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, []).accepted
+    assert store.preempt(
+        _command(key, OwnerCommandKind.PREEMPT, required=8, seq=2)
+    ).accepted
+
+    pending = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert not pending.accepted
+    assert "pending free" in pending.error
+
+
+def test_build_exact_epoch():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    epoch0 = _key("e", epoch=0)
+    assert store.reserve(
+        _command(epoch0, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, []).accepted
+
+    # A token for the same request id at another epoch has no record.
+    wrong_epoch = store.build_step_metadata(
+        2, [_token(_key("e", epoch=1), 8, step_seq=2)]
+    )
+    assert not wrong_epoch.accepted
+    assert "missing lease" in wrong_epoch.error
+
+    exact = store.build_step_metadata(2, [_token(epoch0, 8, step_seq=2)])
+    assert exact.accepted
+    assert [entry.key for entry in exact.metadata.entries] == [epoch0]
+
+
+def test_step_metadata_detached_immutability_and_pre_flush_readability():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("d")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, []).accepted
+    first = store.build_step_metadata(2, [_token(key, 10, step_seq=2)])
+    assert first.accepted
+    snapshot = first.metadata
+    entry = snapshot.entries[0]
+
+    # The snapshot is readable pre-flush and matches the live tables.
+    assert store.get_block_table(key) == entry.tables
+
+    # Frozen: neither the batch nor an entry can be mutated.
+    with pytest.raises(FrozenInstanceError):
+        entry.tables = ()
+    with pytest.raises(FrozenInstanceError):
+        snapshot.entries = ()
+    with pytest.raises(FrozenInstanceError):
+        entry.key = _key("other")
+
+    # Fully detached: a later EXTEND changes the live tables but never the
+    # already-built snapshot.
+    assert store.extend(
+        _command(key, OwnerCommandKind.EXTEND, required=14, seq=3)
+    ).accepted
+    assert store.build_step_metadata(3, []).accepted
+    later = store.build_step_metadata(4, [_token(key, 14, step_seq=4)])
+    assert later.accepted
+    later_entry = later.metadata.entries[0]
+    assert later_entry.tables != entry.tables
+    assert _sizes(later_entry.tables) > _sizes(entry.tables)
+    assert later_entry.tables == store.get_block_table(key)
+
+    # Flush removes the record, but the detached snapshots keep their facts.
+    assert store.release(
+        _command(key, OwnerCommandKind.RELEASE, required=14, seq=5)
+    ).accepted
+    store.flush()
+    assert store.get_block_table(key) is None
+    assert later_entry.tables == later.metadata.entries[0].tables
+
+
+def test_step_metadata_heterogeneous_group_order():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("h")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, []).accepted
+    built = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert built.accepted
+    entry = built.metadata.entries[0]
+
+    assert len(store._group_specs) == 2
+    assert len(entry.tables) == 2
+    assert len(entry.delta) == 2
+    # Group order is the store's heterogeneous group order and both tables
+    # and deltas follow it; the two groups hold distinct block id spaces.
+    assert _sizes(entry.tables) == (2, 2)
+    assert _sizes(entry.delta) == (2, 2)
+    assert entry.tables == store.get_block_table(key)
+    assert all(set(entry.tables[0]).isdisjoint(entry.tables[1]) for _ in (0,))
+
+
+def test_extend_full_table_replacement_and_delta():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("x")
+    reserve_result = store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
+    )
+    assert reserve_result.accepted
+    assert store.build_step_metadata(1, []).accepted
+    extend_result = store.extend(
+        _command(key, OwnerCommandKind.EXTEND, required=14, seq=2)
+    )
+    assert extend_result.accepted
+    assert store.build_step_metadata(2, []).accepted
+
+    built = store.build_step_metadata(3, [_token(key, 14, step_seq=3)])
+    assert built.accepted
+    entry = built.metadata.entries[0]
+
+    # Full replacement: the snapshot table is the complete current table.
+    assert entry.tables == store.get_block_table(key)
+    # The delta accumulates every block allocated since the last handoff
+    # (reserve blocks plus extend blocks), needed for local zeroing.
+    expected_delta = tuple(
+        reserve_result.delta[g] + extend_result.delta[g]
+        for g in range(len(reserve_result.delta))
+    )
+    assert entry.delta == expected_delta
+    assert entry.pre_step_num_computed_tokens == 0
+    assert entry.post_step_num_tokens == 14
+    assert entry.allocation_generation >= 1
+
+    # The delta was handed into the step: a later build sees nothing pending.
+    assert store.build_step_metadata(4, [_token(key, 14, step_seq=4)]).accepted
+    second = store.build_step_metadata(5, [_token(key, 14, step_seq=5)])
+    assert second.accepted
+    assert second.metadata.entries[0].delta == ((), ())
+
+
+def test_same_key_preempt_flush_reserve_generation_change():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("g")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, []).accepted
+    first = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert first.accepted
+    first_generation = first.metadata.entries[0].allocation_generation
+
+    # Same-key ABA: preempt, flush, and re-reserve the exact same key before
+    # the handed-in step is ever marked complete.
+    assert store.preempt(
+        _command(key, OwnerCommandKind.PREEMPT, required=8, seq=3)
+    ).accepted
+    store.flush()
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=12, seq=4)
+    ).accepted
+    assert store.build_step_metadata(3, []).accepted
+    second = store.build_step_metadata(4, [_token(key, 12, step_seq=4)])
+    assert second.accepted
+    second_generation = second.metadata.entries[0].allocation_generation
+    assert second_generation != first_generation
+
+    # A stale snapshot's mark is rejected: generation fenced.
+    assert not store.mark_computed(key, first.metadata.entries[0].post_step_num_tokens)
+    # The correct post-step target of the recycled record is accepted.
+    assert not store.mark_computed(key, 8)
+    assert store.mark_computed(key, 12)
+
+
+def test_allocation_deltas_not_lost_on_failed_build():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("n")
+    reserve_result = store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    )
+    assert reserve_result.accepted
+    assert store.build_step_metadata(1, []).accepted
+
+    # A failing build (duplicate token) must not consume or lose the delta.
+    failed = store.build_step_metadata(
+        2, [_token(key, 8, step_seq=2), _token(key, 8, step_seq=2)]
+    )
+    assert not failed.accepted
+    assert "duplicate" in failed.error
+
+    # The same step is retryable and still hands the full pending delta.
+    retry = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert retry.accepted
+    assert retry.metadata.entries[0].delta == reserve_result.delta
+
+
+def test_mark_computed_strict_after_step_handoff():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("m3")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, []).accepted
+    built = store.build_step_metadata(2, [_token(key, 10, step_seq=2)])
+    assert built.accepted
+    record = store._records[key]
+    assert record.num_computed_tokens == 0
+
+    # While handed into the step, only the exact post-step target is legal.
+    assert not store.mark_computed(key, 8)
+    assert not store.mark_computed(key, 12)
+    assert not store.mark_computed(key, True)
+    # Explicit success: the exact post-step target is accepted once.
+    assert store.mark_computed(key, 10)
+    assert record.num_computed_tokens == 10
+
+    # After success, duplicate target is idempotent; anything else is not.
+    assert store.mark_computed(key, 10)
+    assert not store.mark_computed(key, 9)
+    assert not store.mark_computed(key, 11)
+
+
+def test_step_metadata_exposes_local_ids_but_never_wire_fields():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("w")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, []).accepted
+    built = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert built.accepted
+    entry = built.metadata.entries[0]
+
+    # The metadata does carry the local block ids the local zeroing needs...
+    assert all(
+        isinstance(block_id, int) and block_id >= 0
+        for group in entry.tables
+        for block_id in group
+    )
+    assert all(
+        isinstance(block_id, int) and block_id >= 0
+        for group in entry.delta
+        for block_id in group
+    )
+    # ...but never allocator ids, block objects, managers, or mutation/free
+    # methods.
+    assert not hasattr(entry, "allocator_id")
+    assert not hasattr(entry, "blocks")
+    assert not hasattr(entry, "manager")
+    assert not hasattr(entry, "free")
+    assert not hasattr(entry, "flush")
+    assert not hasattr(built.metadata, "allocator_id")
+    assert not hasattr(built.metadata, "manager")
+
+    # Wire protocol objects carry no local block id fields at all.
+    from dataclasses import fields
+
+    token_fields = {field.name for field in fields(OwnerLeaseToken)}
+    assert token_fields == {
+        "key",
+        "owner_id",
+        "step_seq",
+        "command_seq",
+        "runnable_num_tokens",
+    }
+    command_fields = {field.name for field in fields(OwnerCommand)}
+    assert "tables" not in command_fields
+    assert "block_ids" not in command_fields
+    assert "delta" not in command_fields
+    pool_fields = {field.name for field in fields(OwnerCachePoolSnapshot)}
+    assert "tables" not in pool_fields
+    assert "block_ids" not in pool_fields

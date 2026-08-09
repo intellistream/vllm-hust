@@ -29,6 +29,7 @@ from vllm.v1.worker.request_owned_kv import (
     AllocationResult,
     DeferredFreeResult,
     RequestOwnedKVStore,
+    RequestOwnedStepMetadata,
 )
 
 if TYPE_CHECKING:
@@ -230,6 +231,11 @@ class WorkerWrapperBase:
         self.vllm_config: VllmConfig
         self._request_owned_control_manager: AttentionLeaseManager | None = None
         self._request_owned_kv_store: RequestOwnedKVStore | None = None
+        #: Immutable worker-local G3 execution metadata of the last step
+        #: whose command+publication validation succeeded.  Never attached
+        #: to a scheduler wire; the model-runner handoff is a later
+        #: milestone.
+        self._request_owned_step_metadata: RequestOwnedStepMetadata | None = None
 
     def shutdown(self) -> None:
         if self.worker is not None:
@@ -520,6 +526,16 @@ class WorkerWrapperBase:
             if token.owner_id == self.global_rank:
                 trial_manager.record_published(token)
 
+        # G3 seam: after command+publication validation, freeze the
+        # immutable worker-local execution metadata for this step.  The
+        # zero-token terminal gate above still refuses every token-bearing
+        # schedule before the model runner, so this metadata is not yet
+        # handed to any runner; it is kept worker-locally for the milestone
+        # that connects it.
+        self._request_owned_step_metadata = self._build_request_owned_step_metadata(
+            store, step_seq, scheduler_output
+        )
+
         self._apply_mm_cache(scheduler_output)
         output = self.worker.execute_model(scheduler_output)
         if output is None:
@@ -576,6 +592,36 @@ class WorkerWrapperBase:
         if command.kind is OwnerCommandKind.RESTORE:
             return store.restore(command)
         raise RuntimeError(f"unknown owner command kind {command.kind}")
+
+    def _build_request_owned_step_metadata(
+        self,
+        store: RequestOwnedKVStore,
+        step_seq: int,
+        scheduler_output: SchedulerOutput,
+    ) -> RequestOwnedStepMetadata:
+        """G3 wrapper seam: build the one-step immutable worker-local
+        execution metadata from the exact scheduled own-rank lease tokens
+        after command+publication validation.  The builder itself rejects
+        wrong/missing/extra/duplicate/stale/pending-free/out-of-horizon
+        lease state and is one-step fenced; a rejection here is fail-stop
+        because the store retains every pending delta and the step is
+        retryable.  No scheduler wire object is mutated."""
+        own_rank_tokens = [
+            token
+            for token in scheduler_output.scheduled_owner_leases
+            if token.owner_id == self.global_rank
+        ]
+        build = store.build_step_metadata(step_seq, own_rank_tokens)
+        if not build.accepted:
+            raise RuntimeError(
+                "request-owned step metadata build failed: "
+                f"{build.error or 'unknown error'}"
+            )
+        if build.metadata is None:
+            raise RuntimeError(
+                "request-owned step metadata build accepted without metadata"
+            )
+        return build.metadata
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache

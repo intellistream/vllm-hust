@@ -31,10 +31,28 @@ while the request is still alive leaves an exact-key tombstone so the
 subsequent valid RELEASE (request aborted while preempted) is accepted as a
 non-deferred no-op; a RESERVE on that key consumes the tombstone and
 allocates fresh blocks.
+
+G3 adds the worker-local one-step execution metadata API
+(:meth:`RequestOwnedKVStore.build_step_metadata`): it freezes an immutable,
+fully detached per-step snapshot (step sequence, exact lease keys, full
+per-group block tables, pre-step computed counts, post-step targets, a
+physical allocation generation, and the newly allocated local block deltas
+needed for local zeroing) from the exact own-rank scheduled lease tokens.
+The snapshot never exposes allocator ids, block objects, the injected
+manager, or any mutation/free method, and no local block id ever travels on
+a scheduler wire: the metadata is handed only to the local step consumer.
+The builder is one-step fenced (stale step reuse is rejected), rejects
+missing/extra/duplicate/wrong-owner/pending-free/out-of-horizon lease state
+and same-step RESERVE/EXTEND-plus-authorization for one key, and hands newly
+allocated deltas into a step only when the build succeeds: a failed build
+retains every pending delta.  A handed-in mark expectation is fenced by the
+record's physical allocation generation, so a stale snapshot can never
+advance computed progress on a recycled same-key record.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -44,6 +62,7 @@ from vllm.v1.core.sched.ownership import (
     OwnerCommand,
     OwnerCommandKind,
     OwnerLeaseKey,
+    OwnerLeaseToken,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -97,6 +116,18 @@ class _Record:
     #: True when the pending free was caused by PREEMPT (a flushed preempt
     #: leaves an exact-key tombstone for the later logical RELEASE).
     preempted: bool = False
+    #: Monotonic physical allocation generation: changes on every record
+    #: creation so a recycled same-key record (preempt/flush/reserve) can
+    #: never be confused with its predecessor by a stale snapshot.
+    generation: int = 0
+    #: Newly allocated local block ids since the last successful step build
+    #: handoff (accumulated across RESERVE/EXTEND), or ``None`` when nothing
+    #: is pending.  Only a successful build may clear it.
+    pending_delta: tuple[tuple[int, ...], ...] | None = None
+    #: True while the record's last allocation happened after the previous
+    #: successful build: the scheduler must not both allocate and authorize
+    #: execution for the same key in one step.
+    allocated_since_build: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +153,109 @@ class DeferredFreeResult:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RequestOwnedStepEntry:
+    """Immutable worker-local execution metadata for one lease of one step.
+
+    Carries only detached facts: the exact lease key, the physical
+    allocation generation (rejects same-key ABA), the pre-step computed
+    count, the post-step token target the step must mark on explicit
+    success, the full detached per-group block tables, and the newly
+    allocated local block ids (per group) that still need local zeroing.
+    No allocator id, block object, manager reference, or mutation/free
+    method is exposed.
+    """
+
+    key: OwnerLeaseKey
+    allocation_generation: int
+    pre_step_num_computed_tokens: int
+    post_step_num_tokens: int
+    tables: tuple[tuple[int, ...], ...]
+    delta: tuple[tuple[int, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, OwnerLeaseKey):
+            raise TypeError(f"key must be an OwnerLeaseKey, got {self.key!r}.")
+        for name in (
+            "allocation_generation",
+            "pre_step_num_computed_tokens",
+            "post_step_num_tokens",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(
+                    f"{name} must be a nonnegative non-bool int, got {value!r}."
+                )
+        if self.post_step_num_tokens == 0:
+            raise ValueError(
+                "post_step_num_tokens must be positive: a published lease "
+                "token is never empty, got 0."
+            )
+        if not isinstance(self.tables, tuple) or not isinstance(self.delta, tuple):
+            raise TypeError("tables and delta must be tuples of group tables")
+        if len(self.tables) != len(self.delta):
+            raise ValueError(
+                "tables and delta must cover the same groups, got "
+                f"{len(self.tables)} != {len(self.delta)}."
+            )
+        for tables in (self.tables, self.delta):
+            for group in tables:
+                if not isinstance(group, tuple):
+                    raise TypeError("each group table must be a tuple of block ids")
+                for block_id in group:
+                    if (
+                        isinstance(block_id, bool)
+                        or not isinstance(block_id, int)
+                        or block_id < 0
+                    ):
+                        raise TypeError(
+                            "block ids must be nonnegative non-bool ints, "
+                            f"got {block_id!r}."
+                        )
+
+
+@dataclass(frozen=True, slots=True)
+class RequestOwnedStepMetadata:
+    """Immutable, fully detached execution metadata batch for one step.
+
+    ``entries`` carries exactly the scheduled own-rank lease keys of the
+    step (in batch order) and nothing else; a zero-local-owner batch is a
+    valid empty tuple.  The batch is worker-local by contract: it may carry
+    local block ids, but no scheduler wire object ever does.
+    """
+
+    step_seq: int
+    owner_rank: int
+    entries: tuple[RequestOwnedStepEntry, ...]
+
+    def __post_init__(self) -> None:
+        for name in ("step_seq", "owner_rank"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(
+                    f"{name} must be a nonnegative non-bool int, got {value!r}."
+                )
+        if self.step_seq == 0:
+            raise ValueError("step_seq must be positive, got 0.")
+        if not isinstance(self.entries, tuple):
+            raise TypeError(f"entries must be a tuple, got {self.entries!r}.")
+        for entry in self.entries:
+            if not isinstance(entry, RequestOwnedStepEntry):
+                raise TypeError(
+                    f"entries must contain RequestOwnedStepEntry, got {entry!r}."
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class RequestOwnedStepMetadataResult:
+    """Outcome of :meth:`RequestOwnedKVStore.build_step_metadata`."""
+
+    accepted: bool
+    step_seq: int
+    metadata: RequestOwnedStepMetadata | None = None
+    error: str | None = None
+
+
 def _reject_allocation(command: OwnerCommand, error: str) -> AllocationResult:
     return AllocationResult(accepted=False, key=command.key, error=error)
 
@@ -144,6 +278,21 @@ def _derivable_bytes_per_block(config: KVCacheConfig, total_blocks: int) -> int 
     return sum(tensor.size // total_blocks for tensor in config.kv_cache_tensors)
 
 
+@dataclass(frozen=True, slots=True)
+class _MarkExpectation:
+    """Private handed-in mark contract for one lease key.
+
+    Set when a successful step build hands the key into a step and consumed
+    by the exact post-step-target ``mark_computed``.  ``allocation_generation``
+    fences the expectation against a recycled same-key record (ABA), and
+    ``step_seq`` documents which step handed the key in.
+    """
+
+    step_seq: int
+    allocation_generation: int
+    post_step_num_tokens: int
+
+
 class RequestOwnedKVStore:
     """Worker-local physical KV store over one injected KVCacheManager;
     the injected manager stays the authority on the shared block pool."""
@@ -160,6 +309,19 @@ class RequestOwnedKVStore:
             group.kv_cache_spec
             for group in kv_cache_manager.kv_cache_config.kv_cache_groups
         )
+        #: Monotonic physical allocation generation; every record creation
+        #: consumes the next value so same-key ABA is observable.
+        self._generation_counter: int = 0
+        #: Step fence of the last successful G3 build (one-step fenced).
+        self._last_built_step_seq: int | None = None
+        #: The immutable metadata of the last successful build, readable
+        #: pre-flush; replaced by the next successful build.
+        self._active_metadata: RequestOwnedStepMetadata | None = None
+        #: Handed-in mark expectations keyed by lease key; fenced by the
+        #: record's allocation generation and consumed by a successful
+        #: ``mark_computed``.  Deliberately survives record flush so a stale
+        #: snapshot cannot advance a recycled same-key record.
+        self._pending_marks: dict[OwnerLeaseKey, _MarkExpectation] = {}
 
     def reserve(self, command: OwnerCommand) -> AllocationResult:
         """Physically reserve the chunk of a RESERVE command; request
@@ -196,12 +358,20 @@ class RequestOwnedKVStore:
             if blocks is None:
                 return _reject_allocation(command, "insufficient KV cache to reserve")
 
+        self._generation_counter += 1
         record = _Record(
             key=command.key,
             allocator_id=allocator_id,
             num_prompt_tokens=command.allocation.num_prompt_tokens,
             num_computed_tokens=computed,
             reserved_num_tokens=command.required_num_tokens,
+            generation=self._generation_counter,
+            pending_delta=(
+                tuple(tuple(group) for group in blocks.get_block_ids())
+                if blocks is not None
+                else None
+            ),
+            allocated_since_build=True,
         )
         self._records[command.key] = record
         self._tombstones.discard(command.key)
@@ -233,6 +403,17 @@ class RequestOwnedKVStore:
         if blocks is None:
             return _reject_allocation(command, "insufficient KV cache to extend")
         record.reserved_num_tokens = command.required_num_tokens
+        base = (
+            record.pending_delta
+            if record.pending_delta is not None
+            else tuple(() for _ in range(self._num_groups))
+        )
+        new_blocks = tuple(tuple(group) for group in blocks.get_block_ids())
+        record.pending_delta = tuple(
+            base[group_index] + new_blocks[group_index]
+            for group_index in range(self._num_groups)
+        )
+        record.allocated_since_build = True
         return self._accepted_allocation(command, record, blocks)
 
     def preempt(self, command: OwnerCommand) -> DeferredFreeResult:
@@ -277,11 +458,30 @@ class RequestOwnedKVStore:
     def mark_computed(self, key: OwnerLeaseKey, num_tokens: int) -> bool:
         """Record monotonic computed progress for an active lease; False
         (changing nothing) on unknown/pending-free/malformed/regressive
-        updates or on progress beyond the reserved chunk horizon."""
-        record = self._records.get(key)
-        if record is None or record.pending_free:
-            return False
+        updates or on progress beyond the reserved chunk horizon.
+
+        Once a step build handed the key into a step (a mark expectation is
+        pending), the strict G3 contract applies: the only accepted value is
+        the exact post-step target of that handoff, fenced by the record's
+        physical allocation generation so a stale snapshot can never advance
+        a recycled same-key record.  Accepting the target is the explicit
+        success declaration and consumes the expectation.  Outside a
+        handoff the legacy monotonic behavior is unchanged."""
         if isinstance(num_tokens, bool) or not isinstance(num_tokens, int):
+            return False
+        record = self._records.get(key)
+        expectation = self._pending_marks.get(key)
+        if record is not None and expectation is not None:
+            if record.pending_free:
+                return False
+            if record.generation != expectation.allocation_generation:
+                return False
+            if num_tokens != expectation.post_step_num_tokens:
+                return False
+            record.num_computed_tokens = num_tokens
+            del self._pending_marks[key]
+            return True
+        if record is None or record.pending_free:
             return False
         if num_tokens < 0 or num_tokens < record.num_computed_tokens:
             return False
@@ -289,6 +489,157 @@ class RequestOwnedKVStore:
             return False
         record.num_computed_tokens = num_tokens
         return True
+
+    def build_step_metadata(
+        self,
+        step_seq: int,
+        tokens: Sequence[OwnerLeaseToken],
+    ) -> RequestOwnedStepMetadataResult:
+        """Freeze the immutable worker-local G3 execution metadata for one
+        step from the exact scheduled own-rank lease tokens.
+
+        The batch is one-step fenced (``step_seq`` must be strictly newer
+        than the last successful build), and every token must be
+        own-rank, carry this step's sequence, be unique, reference an
+        active non-pending-free record, stay within the reserved horizon,
+        and not be combined with a same-step RESERVE/EXTEND for the same
+        key.  On success the newly allocated pending deltas of the batch
+        keys are handed into the step (the snapshot carries them for local
+        zeroing) and mark expectations are armed; on any rejection nothing
+        changes, so pending deltas are never silently lost and the same
+        step can be retried.  No scheduler wire object is mutated."""
+        if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
+            return RequestOwnedStepMetadataResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=f"step_seq must be a positive non-bool int, got {step_seq!r}.",
+            )
+        if (
+            self._last_built_step_seq is not None
+            and step_seq <= self._last_built_step_seq
+        ):
+            return RequestOwnedStepMetadataResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=f"stale step_seq {step_seq}: already built through "
+                f"{self._last_built_step_seq}.",
+            )
+        if tokens is None:
+            return RequestOwnedStepMetadataResult(
+                accepted=False,
+                step_seq=step_seq,
+                error="tokens must be the exact scheduled own-rank lease "
+                "tokens, got None.",
+            )
+        lease_tokens = tuple(tokens)
+        seen: set[OwnerLeaseKey] = set()
+        for token in lease_tokens:
+            if not isinstance(token, OwnerLeaseToken):
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"batch entry must be an OwnerLeaseToken, got {token!r}.",
+                )
+            if token.owner_id != self._owner_rank:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"wrong-owner lease token for {token.key!r}: "
+                    f"owner {token.owner_id} != store rank {self._owner_rank}.",
+                )
+            if token.step_seq != step_seq:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"lease token step_seq {token.step_seq} does not "
+                    f"match the built step {step_seq} for {token.key!r}.",
+                )
+            count = token.runnable_num_tokens
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"runnable_num_tokens must be a positive non-bool "
+                    f"int, got {count!r} for {token.key!r}.",
+                )
+            if token.key in seen:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"duplicate lease token for {token.key!r}.",
+                )
+            seen.add(token.key)
+            record = self._records.get(token.key)
+            if record is None:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"missing lease: no active record for {token.key!r}.",
+                )
+            if record.pending_free:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"lease {token.key!r} is held pending free until "
+                    "the flush fence.",
+                )
+            if record.allocated_since_build:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"same-step RESERVE/EXTEND plus execution "
+                    f"authorization for {token.key!r}.",
+                )
+            if count > record.reserved_num_tokens:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"out-of-horizon lease token for {token.key!r}: "
+                    f"{count} > reserved {record.reserved_num_tokens}.",
+                )
+
+        empty_delta = tuple(() for _ in range(self._num_groups))
+        entries = tuple(
+            RequestOwnedStepEntry(
+                key=token.key,
+                allocation_generation=self._records[token.key].generation,
+                pre_step_num_computed_tokens=(
+                    self._records[token.key].num_computed_tokens
+                ),
+                post_step_num_tokens=token.runnable_num_tokens,
+                tables=self._tables(self._records[token.key]),
+                delta=(
+                    self._records[token.key].pending_delta
+                    if self._records[token.key].pending_delta is not None
+                    else empty_delta
+                ),
+            )
+            for token in lease_tokens
+        )
+        metadata = RequestOwnedStepMetadata(
+            step_seq=step_seq,
+            owner_rank=self._owner_rank,
+            entries=entries,
+        )
+
+        # Commit atomically: hand the pending deltas of the batch keys into
+        # the step, arm the mark expectations, and advance the one-step
+        # fence.  The rejected paths above changed nothing.
+        for token in lease_tokens:
+            record = self._records[token.key]
+            record.pending_delta = None
+            self._pending_marks[token.key] = _MarkExpectation(
+                step_seq=step_seq,
+                allocation_generation=record.generation,
+                post_step_num_tokens=token.runnable_num_tokens,
+            )
+        for record in self._records.values():
+            record.allocated_since_build = False
+        self._last_built_step_seq = step_seq
+        self._active_metadata = metadata
+        return RequestOwnedStepMetadataResult(
+            accepted=True, step_seq=step_seq, metadata=metadata
+        )
 
     def get_block_table(self, key: OwnerLeaseKey) -> tuple[tuple[int, ...], ...] | None:
         """Private full per-group tables; readable until :meth:`flush`."""
