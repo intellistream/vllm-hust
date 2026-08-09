@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
+
+from vllm.v1.core.sched.ownership import (
+    OwnerAssignmentObservation,
+    OwnerCommand,
+    OwnerLeaseToken,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -43,6 +49,12 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # G0 request-owned attention: stable owner assignment and its reuse
+    # epoch, carried with the request's first scheduling step. Defaults keep
+    # existing constructors and non-participating schedulers unchanged.
+    attention_owner: int | None = None
+    attention_owner_epoch: int = 0
+
     @classmethod
     def from_request(
         cls,
@@ -62,6 +74,8 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            attention_owner=request.attention_owner,
+            attention_owner_epoch=request.attention_owner_epoch,
         )
 
     def __repr__(self) -> str:
@@ -249,6 +263,16 @@ class SchedulerOutput:
     # underlying HBM region is preallocated at engine startup.
     kv_cache_usage: float = 0.0
 
+    # G0 request-owned attention: step sequence number and per-step owner
+    # protocol carriers. Default-off; schedulers not participating in the
+    # protocol leave these at their defaults.
+    step_seq: int = 0
+    owner_commands: list[OwnerCommand] = field(default_factory=list)
+    owner_assignment_observations: list[OwnerAssignmentObservation] = field(
+        default_factory=list
+    )
+    scheduled_owner_leases: list[OwnerLeaseToken] = field(default_factory=list)
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -261,6 +285,10 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            step_seq=0,
+            owner_commands=[],
+            owner_assignment_observations=[],
+            scheduled_owner_leases=[],
         )
 
 

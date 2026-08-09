@@ -77,6 +77,8 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        attention_owner: int | None = None,
+        attention_owner_epoch: int = 0,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -193,6 +195,12 @@ class Request:
         # If True, request should be aborted immediately after being added to
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
+
+        # G0 request-owned attention: stable owner assignment and its reuse
+        # epoch, carried with the request. The owner does not alter
+        # RequestStatus.
+        self.attention_owner: int | None = attention_owner
+        self.attention_owner_epoch: int = attention_owner_epoch
 
     @classmethod
     def from_engine_core_request(

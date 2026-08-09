@@ -1,0 +1,927 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""G0 request-owner protocol for request-owned attention.
+
+This module is intentionally dependency-neutral: it only uses the standard
+library and never imports the engine, scheduler, workers, or torch.  It
+defines the wire-level protocol types (commands, receipts, batches, lease
+tokens) together with two pure-Python reference implementations:
+
+* :class:`OwnerLeaseCoordinator`: the scheduler-side reference state machine
+  implementing deterministic least-committed-work assignment with local
+  per-owner charges, epoch fencing for reused request ids, abandon/retry of
+  provisional assignments, horizon gating, and exact-once release.
+* :class:`AttentionLeaseManager`: the worker-side reference lease manager
+  that consumes commands, produces receipts, and emits exactly one
+  :class:`OwnerReceiptBatch` per step even when no events occurred.
+
+Request lifecycle: ``runnable -> preempting -> waiting -> reserving ->
+resumed``.  A PREEMPT receipt releases the active runnable capacity while
+preserving the sticky owner/key; a later RESERVE reacquires a lease on the
+same owner.  RESTORE is the separate DMA/cold-residency intent and does not
+reacquire capacity.
+
+All horizons are absolute token positions (never relative step counts).
+Nothing here is wired into the scheduler; consumers (G1+) integrate through
+the public types below.
+"""
+
+import enum
+from dataclasses import dataclass
+
+# ---------------------------------------------------------------------------
+# Protocol types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OwnerLeaseKey:
+    """Identity of a request lease, fenced by the request-id reuse epoch."""
+
+    request_id: str
+    owner_epoch: int
+
+
+class OwnerCommandKind(enum.Enum):
+    """Kinds of owner commands issued by the coordinator."""
+
+    RESERVE = "RESERVE"
+    EXTEND = "EXTEND"
+    PREEMPT = "PREEMPT"
+    RELEASE = "RELEASE"
+    RESTORE = "RESTORE"
+
+
+@dataclass(frozen=True)
+class OwnerAssignmentObservation:
+    """Observation used by the coordinator for least-work assignment.
+
+    ``owner_id`` and ``observation_seq`` are required; all workload fields
+    are optional so partial observations can be fed as they arrive.  Later
+    observations with the same ``owner_id`` supersede earlier ones.
+    """
+
+    owner_id: int
+    observation_seq: int
+    #: Prefix tokens already computed for the candidate request on this owner.
+    prefix_len: int | None = None
+    #: Committed (scheduled/queued) work tokens on this owner.
+    work: int | None = None
+    #: Total token capacity of this owner.
+    capacity: int | None = None
+    #: Resident KV pages held on this owner (preferred on ties).
+    residency: int | None = None
+    #: Total request length of the candidate request.
+    request_length: int | None = None
+    #: Pending DMA work (pages/bytes) on this owner.
+    pending_dma: int | None = None
+
+
+@dataclass(frozen=True)
+class OwnerCommand:
+    """A fenced command from the coordinator to a worker lease manager."""
+
+    key: OwnerLeaseKey
+    owner_id: int
+    #: Monotonically increasing per-owner fence; stale/duplicate commands are
+    #: rejected by the receiver.
+    command_seq: int
+    kind: OwnerCommandKind
+    #: Absolute requested token horizon (inclusive).
+    requested_through: int
+
+
+@dataclass(frozen=True)
+class OwnerReceipt:
+    """Per-command/request receipt from a worker lease manager."""
+
+    key: OwnerLeaseKey
+    owner_id: int
+    command_seq: int
+    accepted: bool
+    #: Absolute horizon the worker can legally run to.  ``None`` on rejection.
+    runnable_through: int | None = None
+    #: True when a RELEASE fully completed; set exactly once per lease.
+    released: bool = False
+    pending_dma: int | None = None
+    free_capacity: int | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class OwnerLeaseToken:
+    """Immutable token covering a lease published at a scheduler step.
+
+    Published tokens are legally binding: a worker must not refuse tokens at
+    or below ``runnable_through``.
+    """
+
+    key: OwnerLeaseKey
+    owner_id: int
+    step_seq: int
+    command_seq: int
+    #: Absolute horizon the worker must honor (<= worker-granted horizon).
+    runnable_through: int
+
+
+@dataclass(frozen=True)
+class OwnerReceiptBatch:
+    """One envelope a worker emits per step; empty events differ from a
+    missing response, so an enabled worker always emits exactly one batch."""
+
+    owner_rank: int
+    emitted_step_seq: int
+    events: tuple[OwnerReceipt, ...]
+    free_capacity: int | None = None
+    resident_pages: int | None = None
+    pending_dma: int | None = None
+
+
+class OwnershipError(Exception):
+    """Base error for the request-owner protocol."""
+
+
+class EpochFenceError(OwnershipError):
+    """Assignment attempted with a request-id epoch below the current fence."""
+
+
+class PublicationViolationError(OwnershipError):
+    """A publish/receipt would exceed the granted horizon or refuse published
+    tokens."""
+
+
+# ---------------------------------------------------------------------------
+# Scheduler-side reference coordinator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _LeaseState:
+    """Per-lease bookkeeping kept by the reference coordinator."""
+
+    owner_id: int
+    requested_through: int = 0
+    last_requested: int = 0
+    runnable_through: int | None = None
+    preempted: bool = False
+    restored: bool = False
+    superseded: bool = False
+    release_pending: bool = False
+    released: bool = False
+    command_seq: int = 0
+    command_kind: OwnerCommandKind | None = None
+
+
+class OwnerLeaseCoordinator:
+    """Pure-Python reference coordinator for request-owned attention.
+
+    Assignment picks the owner with the least committed work, where the
+    score combines the latest observation (``work`` + ``pending_dma``) with
+    coordinator-local projected charges made exactly once per assignment
+    (refunded exactly once on release or abandon).  Ties resolve by higher
+    residency, then by stable numeric global rank (``owner_id``).
+
+    Other invariants: idempotent same-request assignment; an epoch fence for
+    reused request ids that keeps the old-epoch lease as a tombstone until
+    its own RELEASE receipt (commitments are never silently freed); reserve/
+    extend requested-vs-receipted horizon gating; accepted receipts fail
+    closed when they exceed the command's requested horizon or regress below
+    the published watermark; publication only at or below the granted
+    horizon; preempt preserves the owner and releases active capacity;
+    finish/abort leaves ``release_pending`` until the matching RELEASE
+    receipt frees the commitment (and its charge) exactly once.
+    """
+
+    def __init__(self) -> None:
+        self._leases: dict[OwnerLeaseKey, _LeaseState] = {}
+        self._epoch_fence: dict[str, int] = {}
+        self._observations: dict[int, OwnerAssignmentObservation] = {}
+        self._owner_command_seq: dict[int, int] = {}
+        self._processed: dict[OwnerLeaseKey, int] = {}
+        self._publish_watermark: dict[OwnerLeaseKey, int] = {}
+        #: Coordinator-local projected work per owner (charge bookkeeping).
+        self._charges: dict[int, int] = {}
+        self._key_charge: dict[OwnerLeaseKey, int] = {}
+        self._release_count = 0
+
+    # -- observations and assignment ----------------------------------------
+
+    def observe(self, observation: OwnerAssignmentObservation) -> None:
+        """Feed the latest observation for ``observation.owner_id``."""
+        current = self._observations.get(observation.owner_id)
+        if current is None or observation.observation_seq >= current.observation_seq:
+            self._observations[observation.owner_id] = observation
+
+    def assign(
+        self,
+        key: OwnerLeaseKey,
+        requested_through: int | None = None,
+        projected_work: int | None = None,
+    ) -> int:
+        """Assign ``key`` to the least-committed-work owner.
+
+        Returns the existing owner unchanged when the key is already
+        assigned (idempotent; the projected charge is applied exactly once).
+        Raises :class:`EpochFenceError` when the request id was already
+        admitted at a higher epoch; the lower-epoch lease (if any) is kept
+        as a tombstone and never silently freed.
+        """
+        fence = self._epoch_fence.get(key.request_id)
+        if fence is not None and key.owner_epoch < fence:
+            raise EpochFenceError(
+                f"request {key.request_id} already fenced at epoch {fence}; "
+                f"cannot assign stale epoch {key.owner_epoch}"
+            )
+        if fence is None:
+            self._epoch_fence[key.request_id] = key.owner_epoch
+        elif key.owner_epoch > fence:
+            # Request-id reuse: tombstone the old-epoch lease(s).  Their
+            # commitments stay charged until their own RELEASE receipts.
+            for old_key in [
+                k
+                for k in self._leases
+                if k.request_id == key.request_id and k.owner_epoch < key.owner_epoch
+            ]:
+                self._leases[old_key].superseded = True
+            self._epoch_fence[key.request_id] = key.owner_epoch
+
+        existing = self._leases.get(key)
+        if existing is not None:
+            return existing.owner_id
+
+        candidates = [o for o in self._observations.values() if o.owner_id >= 0]
+        if not candidates:
+            raise OwnershipError(
+                f"cannot assign {key}: no owner observations available"
+            )
+
+        def score(obs: OwnerAssignmentObservation) -> tuple[int, int, int]:
+            committed = (
+                (obs.work or 0)
+                + (obs.pending_dma or 0)
+                + self._charges.get(obs.owner_id, 0)
+            )
+            # Prefer higher residency, then lower global rank (owner_id).
+            return (committed, -(obs.residency or 0), obs.owner_id)
+
+        owner = min(candidates, key=score).owner_id
+        projected = (
+            projected_work if projected_work is not None else (requested_through or 0)
+        )
+        self._charges[owner] = self._charges.get(owner, 0) + projected
+        self._key_charge[key] = projected
+        self._leases[key] = _LeaseState(
+            owner_id=owner,
+            requested_through=requested_through or 0,
+        )
+        return owner
+
+    # -- command issuance ----------------------------------------------------
+
+    def _issue(
+        self,
+        key: OwnerLeaseKey,
+        kind: OwnerCommandKind,
+        requested_through: int,
+    ) -> OwnerCommand:
+        lease = self._leases.get(key)
+        if lease is None:
+            raise OwnershipError(f"cannot issue {kind.name} for unassigned {key}")
+        self._owner_command_seq[lease.owner_id] = (
+            self._owner_command_seq.get(lease.owner_id, 0) + 1
+        )
+        lease.command_seq = self._owner_command_seq[lease.owner_id]
+        lease.command_kind = kind
+        lease.last_requested = requested_through
+        lease.requested_through = max(lease.requested_through, requested_through)
+        return OwnerCommand(
+            key=key,
+            owner_id=lease.owner_id,
+            command_seq=lease.command_seq,
+            kind=kind,
+            requested_through=requested_through,
+        )
+
+    def reserve(self, key: OwnerLeaseKey, requested_through: int) -> OwnerCommand:
+        lease = self._leases[key]
+        if lease.released or lease.release_pending:
+            raise OwnershipError(f"cannot RESERVE released {key}")
+        if lease.superseded:
+            raise OwnershipError(f"cannot RESERVE superseded {key}")
+        if lease.command_seq != 0:
+            raise OwnershipError(f"cannot RESERVE already-reserved {key}")
+        return self._issue(key, OwnerCommandKind.RESERVE, requested_through)
+
+    def resume(self, key: OwnerLeaseKey, requested_through: int) -> OwnerCommand:
+        """Reacquire a lease on the same (sticky) owner after a preempt.
+
+        Issues a RESERVE-kind command; the worker grants a fresh runnable
+        horizon instead of silently retaining the preempt-released capacity.
+        """
+        lease = self._leases[key]
+        if lease.released or lease.release_pending:
+            raise OwnershipError(f"cannot RESUME released {key}")
+        if lease.superseded:
+            raise OwnershipError(f"cannot RESUME superseded {key}")
+        if not lease.preempted:
+            raise OwnershipError(f"cannot RESUME non-preempted {key}")
+        return self._issue(key, OwnerCommandKind.RESERVE, requested_through)
+
+    def extend(self, key: OwnerLeaseKey, requested_through: int) -> OwnerCommand:
+        lease = self._leases[key]
+        if lease.released or lease.release_pending:
+            raise OwnershipError(f"cannot EXTEND released {key}")
+        if lease.superseded:
+            raise OwnershipError(f"cannot EXTEND superseded {key}")
+        if lease.command_seq == 0:
+            raise OwnershipError(f"cannot EXTEND un-reserved {key}")
+        return self._issue(key, OwnerCommandKind.EXTEND, requested_through)
+
+    def preempt(
+        self,
+        key: OwnerLeaseKey,
+        preempt_through: int | None = None,
+    ) -> OwnerCommand:
+        lease = self._leases[key]
+        if lease.released or lease.release_pending:
+            raise OwnershipError(f"cannot PREEMPT released {key}")
+        if lease.superseded:
+            raise OwnershipError(f"cannot PREEMPT superseded {key}")
+        through = (
+            preempt_through
+            if preempt_through is not None
+            else (lease.runnable_through or lease.requested_through)
+        )
+        return self._issue(key, OwnerCommandKind.PREEMPT, through)
+
+    def restore(self, key: OwnerLeaseKey, requested_through: int) -> OwnerCommand:
+        """Request the separate DMA/cold-residency restore intent.
+
+        Does not reacquire runnable capacity; use :meth:`resume` for that.
+        """
+        lease = self._leases[key]
+        if lease.released or lease.release_pending:
+            raise OwnershipError(f"cannot RESTORE released {key}")
+        if lease.superseded:
+            raise OwnershipError(f"cannot RESTORE superseded {key}")
+        if not lease.preempted:
+            raise OwnershipError(f"cannot RESTORE non-preempted {key}")
+        return self._issue(key, OwnerCommandKind.RESTORE, requested_through)
+
+    def finish(self, key: OwnerLeaseKey) -> OwnerCommand:
+        """Finish/abort the lease: leave ``release_pending`` until the
+        matching RELEASE receipt frees the commitment exactly once."""
+        lease = self._leases[key]
+        if lease.released:
+            raise OwnershipError(f"cannot finish already-released {key}")
+        lease.release_pending = True
+        through = lease.runnable_through or lease.requested_through
+        return self._issue(key, OwnerCommandKind.RELEASE, through)
+
+    def abandon(self, key: OwnerLeaseKey) -> bool:
+        """Abandon a provisional (not-yet-admitted) assignment.
+
+        Refunds the projected charge and purges the lease so the scheduler
+        can retry another owner.  Raises :class:`OwnershipError` once the
+        lease is admitted (accepted receipt or publication): the owner is
+        sticky after admission.  Returns False when no such lease exists.
+        """
+        lease = self._leases.get(key)
+        if lease is None:
+            return False
+        if lease.runnable_through is not None:
+            raise OwnershipError(f"cannot abandon admitted lease {key}")
+        if lease.release_pending or lease.released or lease.preempted:
+            raise OwnershipError(f"cannot abandon non-provisional lease {key}")
+        charge = self._key_charge.pop(key, 0)
+        if charge:
+            self._charges[lease.owner_id] -= charge
+        del self._leases[key]
+        self._publish_watermark.pop(key, None)
+        self._processed.pop(key, None)
+        return True
+
+    # -- receipts ------------------------------------------------------------
+
+    def apply_receipt(self, receipt: OwnerReceipt) -> bool:
+        """Apply a worker receipt; returns True when state advanced.
+
+        Receipts are fenced by full key (request id + epoch): stale,
+        duplicate, wrong-owner, and unknown-key receipts are ignored and
+        never advance or free state.  An accepted receipt that exceeds the
+        command's requested horizon or regresses below the published
+        watermark fails closed with :class:`PublicationViolationError`
+        instead of silently advancing.
+        """
+        lease = self._leases.get(receipt.key)
+        if lease is None:
+            return False
+        if receipt.owner_id != lease.owner_id:
+            return False
+        if receipt.command_seq != lease.command_seq:
+            # Stale: a newer command superseded this sequence.
+            return False
+        if self._processed.get(receipt.key, 0) >= receipt.command_seq:
+            # Duplicate: this sequence was already applied.
+            return False
+        if not receipt.accepted:
+            return False
+        if lease.superseded and lease.command_kind is not OwnerCommandKind.RELEASE:
+            # Tombstoned lease: only its own RELEASE receipt may apply.
+            return False
+
+        if receipt.runnable_through is not None:
+            if receipt.runnable_through > lease.last_requested:
+                raise PublicationViolationError(
+                    f"receipt for {receipt.key} grants {receipt.runnable_through} "
+                    f"beyond requested horizon {lease.last_requested}"
+                )
+            watermark = self._publish_watermark.get(receipt.key, 0)
+            if receipt.runnable_through < watermark:
+                raise PublicationViolationError(
+                    f"receipt for {receipt.key} regresses below published "
+                    f"horizon {watermark}"
+                )
+            lease.runnable_through = receipt.runnable_through
+        self._processed[receipt.key] = receipt.command_seq
+
+        if lease.command_kind is OwnerCommandKind.PREEMPT:
+            # PREEMPT preserves the owner; the active runnable capacity was
+            # released by the worker, so the receipt horizon is the honored
+            # (published) horizon only.
+            lease.preempted = True
+        elif lease.command_kind is OwnerCommandKind.RESTORE:
+            lease.restored = True
+        elif lease.command_kind is OwnerCommandKind.RESERVE:
+            lease.preempted = False
+        if (
+            receipt.released
+            and lease.command_kind is OwnerCommandKind.RELEASE
+            and lease.release_pending
+            and not lease.released
+        ):
+            lease.released = True
+            lease.release_pending = False
+            self._release_count += 1
+            charge = self._key_charge.pop(receipt.key, 0)
+            if charge:
+                self._charges[lease.owner_id] -= charge
+        return True
+
+    # -- publication ----------------------------------------------------------
+
+    def publish(self, step_seq: int) -> list[OwnerLeaseToken]:
+        """Publish lease tokens for the step, only at/below granted horizons.
+
+        Raises :class:`PublicationViolationError` when a publish would
+        exceed the worker-granted horizon or regress an already-published
+        horizon.
+        """
+        tokens: list[OwnerLeaseToken] = []
+        for key, lease in sorted(
+            self._leases.items(),
+            key=lambda kv: (kv[0].request_id, kv[0].owner_epoch),
+        ):
+            if (
+                lease.released
+                or lease.release_pending
+                or lease.preempted
+                or lease.superseded
+            ):
+                continue
+            if lease.runnable_through is None:
+                # Not yet granted: nothing legal to publish.
+                continue
+            horizon = min(lease.runnable_through, lease.requested_through)
+            watermark = self._publish_watermark.get(key, 0)
+            if horizon < watermark:
+                raise PublicationViolationError(
+                    f"publish horizon {horizon} for {key} regresses "
+                    f"published horizon {watermark}"
+                )
+            if horizon <= watermark:
+                continue
+            self._publish_watermark[key] = horizon
+            tokens.append(
+                OwnerLeaseToken(
+                    key=key,
+                    owner_id=lease.owner_id,
+                    step_seq=step_seq,
+                    command_seq=lease.command_seq,
+                    runnable_through=horizon,
+                )
+            )
+        return tokens
+
+    # -- introspection --------------------------------------------------------
+
+    def owner_of(self, key: OwnerLeaseKey) -> int | None:
+        lease = self._leases.get(key)
+        return lease.owner_id if lease is not None else None
+
+    def requested_through_of(self, key: OwnerLeaseKey) -> int:
+        return self._leases[key].requested_through
+
+    def runnable_through_of(self, key: OwnerLeaseKey) -> int | None:
+        return self._leases[key].runnable_through
+
+    def published_through(self, key: OwnerLeaseKey) -> int:
+        return self._publish_watermark.get(key, 0)
+
+    def is_preempted(self, key: OwnerLeaseKey) -> bool:
+        return self._leases[key].preempted
+
+    def is_restored(self, key: OwnerLeaseKey) -> bool:
+        return self._leases[key].restored
+
+    def is_superseded(self, key: OwnerLeaseKey) -> bool:
+        return self._leases[key].superseded
+
+    def is_release_pending(self, key: OwnerLeaseKey) -> bool:
+        return self._leases[key].release_pending
+
+    def is_released(self, key: OwnerLeaseKey) -> bool:
+        return self._leases[key].released
+
+    def release_count(self) -> int:
+        """Number of leases whose commitments were released (exactly once)."""
+        return self._release_count
+
+
+# ---------------------------------------------------------------------------
+# Worker-side reference lease manager
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _WorkerLease:
+    """Per-lease bookkeeping kept by the reference worker manager.
+
+    ``runnable_through``/``published_through`` are the logical horizons the
+    worker is legally bound to honor; ``committed_tokens`` is the separate
+    active physical commitment that occupies capacity.  PREEMPT zeroes the
+    commitment while retaining the logical fence, so a post-step preempt is
+    not a horizon regression.
+    """
+
+    runnable_through: int
+    published_through: int = 0
+    committed_tokens: int = 0
+    preempted: bool = False
+    restoring: bool = False
+    superseded: bool = False
+    released: bool = False
+    resident_pages: int = 0
+    pending_dma: int = 0
+
+
+class AttentionLeaseManager:
+    """Pure-Python reference worker-side lease manager (no GPU).
+
+    ``capacity`` models the worker's total request-owned attention budget in
+    tokens; each active lease commits ``min(runnable_through, capacity)``
+    tokens.  ``grant_ceiling`` optionally caps how much absolute horizon a
+    single command may grant, which models chunk-horizon gating.
+
+    The manager enforces the protocol invariants locally: monotonically
+    fenced command sequences, a per-request-id epoch fence (a stale
+    lower-epoch RESERVE cannot recreate state), refusal of published tokens
+    is illegal, PREEMPT releases the active runnable capacity while the
+    owner/key stay sticky, RESUME (a RESERVE on a preempted lease) reacquires
+    capacity on the same owner, RESTORE only signals the DMA/cold-residency
+    intent, and each lease's commitment is released exactly once.
+    """
+
+    def __init__(
+        self,
+        owner_rank: int,
+        capacity: int,
+        grant_ceiling: int | None = None,
+    ) -> None:
+        self.owner_rank = owner_rank
+        self.capacity = capacity
+        self.grant_ceiling = grant_ceiling
+        self._leases: dict[OwnerLeaseKey, _WorkerLease] = {}
+        self._command_fence: dict[int, int] = {}
+        self._epoch_fence: dict[str, int] = {}
+        self._outbox: list[OwnerReceipt] = []
+        self._released_count = 0
+
+    # -- command handling ------------------------------------------------------
+
+    def apply(self, command: OwnerCommand) -> OwnerReceipt:
+        """Consume one owner command and produce its receipt."""
+        if command.owner_id != self.owner_rank:
+            return self._receipt(command, accepted=False, error="wrong owner rank")
+        fence = self._command_fence.get(command.owner_id, 0)
+        if command.command_seq <= fence:
+            return self._receipt(
+                command,
+                accepted=False,
+                error="stale or duplicate command sequence",
+            )
+        self._command_fence[command.owner_id] = command.command_seq
+
+        # Per-request epoch fence: a stale lower-epoch command cannot
+        # recreate state for a superseded request id.  The one exception is
+        # a matching lower-epoch RELEASE for an existing superseded
+        # tombstone: it must be honored so the old commitment is freed
+        # exactly once instead of leaking forever.
+        epoch_fence = self._epoch_fence.get(command.key.request_id, -1)
+        if command.key.owner_epoch < epoch_fence:
+            tombstone = self._leases.get(command.key)
+            if not (
+                command.kind is OwnerCommandKind.RELEASE
+                and tombstone is not None
+                and tombstone.superseded
+            ):
+                return self._receipt(
+                    command, accepted=False, error="stale request epoch"
+                )
+        elif command.kind is not OwnerCommandKind.RELEASE:
+            if command.key.owner_epoch > epoch_fence:
+                for old_key in [
+                    k
+                    for k in self._leases
+                    if k.request_id == command.key.request_id
+                    and k.owner_epoch < command.key.owner_epoch
+                ]:
+                    # Tombstone, do not silently free: capacity stays
+                    # committed until the old lease's own RELEASE receipt.
+                    self._leases[old_key].superseded = True
+                self._epoch_fence[command.key.request_id] = command.key.owner_epoch
+
+        lease = self._leases.get(command.key)
+        if command.kind is OwnerCommandKind.RESERVE:
+            return self._on_reserve(command, lease)
+        if command.kind is OwnerCommandKind.EXTEND:
+            return self._on_extend(command, lease)
+        if command.kind is OwnerCommandKind.PREEMPT:
+            return self._on_preempt(command, lease)
+        if command.kind is OwnerCommandKind.RESTORE:
+            return self._on_restore(command, lease)
+        if command.kind is OwnerCommandKind.RELEASE:
+            return self._on_release(command, lease)
+        return self._receipt(command, accepted=False, error="unknown command kind")
+
+    def _grant(self, command: OwnerCommand, lease: _WorkerLease) -> int:
+        """Grant an absolute horizon for ``command`` on ``lease``."""
+        cap = max(0, self.capacity - self._committed_others(lease))
+        if self.grant_ceiling is not None:
+            cap = min(cap, lease.runnable_through + self.grant_ceiling)
+        return min(command.requested_through, cap)
+
+    def _committed_others(self, lease: _WorkerLease) -> int:
+        return sum(
+            other.committed_tokens
+            for other in self._leases.values()
+            if other is not lease and not other.released
+        )
+
+    def _on_reserve(
+        self, command: OwnerCommand, lease: _WorkerLease | None
+    ) -> OwnerReceipt:
+        if lease is not None:
+            if lease.released:
+                return self._receipt(
+                    command, accepted=False, error="lease already released"
+                )
+            if lease.superseded:
+                return self._receipt(command, accepted=False, error="lease superseded")
+            if not lease.preempted:
+                return self._receipt(command, accepted=False, error="duplicate reserve")
+            # Resume: reacquire capacity on the same owner; the old runnable
+            # capacity was released by the PREEMPT receipt.
+            if command.requested_through < lease.published_through:
+                return self._receipt(
+                    command,
+                    accepted=False,
+                    error="refuses published tokens",
+                )
+            granted = self._grant(command, lease)
+            if granted < lease.published_through or granted <= 0:
+                # Reacquiring below the honored (published) horizon would
+                # refuse published tokens; reacquiring nothing is a refusal.
+                return self._receipt(
+                    command,
+                    accepted=False,
+                    error="insufficient capacity to resume",
+                )
+            lease.runnable_through = granted
+            lease.committed_tokens = granted
+            lease.preempted = False
+            lease.restoring = False
+            lease.pending_dma = 0
+            return self._receipt(command, accepted=True, runnable_through=granted)
+        committed = sum(
+            active.committed_tokens
+            for active in self._leases.values()
+            if not active.released
+        )
+        granted = min(command.requested_through, max(0, self.capacity - committed))
+        if self.grant_ceiling is not None:
+            granted = min(granted, self.grant_ceiling)
+        if granted <= 0:
+            # Real pre-publication refusal: zero/insufficient capacity must
+            # not be reported as an accepted zero-horizon grant.
+            return self._receipt(
+                command,
+                accepted=False,
+                error="insufficient capacity to reserve",
+            )
+        self._leases[command.key] = _WorkerLease(
+            runnable_through=granted, committed_tokens=granted
+        )
+        return self._receipt(command, accepted=True, runnable_through=granted)
+
+    def _on_extend(
+        self, command: OwnerCommand, lease: _WorkerLease | None
+    ) -> OwnerReceipt:
+        if lease is None or lease.released:
+            return self._receipt(
+                command, accepted=False, error="no active lease to extend"
+            )
+        if lease.superseded:
+            return self._receipt(command, accepted=False, error="lease superseded")
+        if lease.preempted:
+            return self._receipt(command, accepted=False, error="lease is preempted")
+        if command.requested_through < lease.published_through:
+            return self._receipt(
+                command,
+                accepted=False,
+                error="refuses published tokens",
+            )
+        granted = self._grant(command, lease)
+        if granted < lease.runnable_through:
+            reason = (
+                "insufficient capacity to extend"
+                if command.requested_through >= lease.runnable_through
+                else "extend would shrink the runnable horizon"
+            )
+            return self._receipt(command, accepted=False, error=reason)
+        lease.committed_tokens += granted - lease.runnable_through
+        lease.runnable_through = granted
+        return self._receipt(command, accepted=True, runnable_through=granted)
+
+    def _on_preempt(
+        self, command: OwnerCommand, lease: _WorkerLease | None
+    ) -> OwnerReceipt:
+        if lease is None or lease.released:
+            return self._receipt(
+                command, accepted=False, error="no active lease to preempt"
+            )
+        if lease.superseded:
+            return self._receipt(command, accepted=False, error="lease superseded")
+        if command.requested_through < lease.published_through:
+            return self._receipt(
+                command,
+                accepted=False,
+                error="refuses published tokens",
+            )
+        lease.preempted = True
+        # Release the active physical commitment while retaining the
+        # logical run/published fence: published tokens stay honored and
+        # the preempt is not a horizon regression.
+        lease.committed_tokens = 0
+        return self._receipt(
+            command, accepted=True, runnable_through=lease.runnable_through
+        )
+
+    def _on_restore(
+        self, command: OwnerCommand, lease: _WorkerLease | None
+    ) -> OwnerReceipt:
+        if lease is None or lease.released:
+            return self._receipt(
+                command, accepted=False, error="no active lease to restore"
+            )
+        if lease.superseded:
+            return self._receipt(command, accepted=False, error="lease superseded")
+        if not lease.preempted:
+            return self._receipt(
+                command, accepted=False, error="lease is not preempted"
+            )
+        if command.requested_through < lease.published_through:
+            return self._receipt(
+                command,
+                accepted=False,
+                error="refuses published tokens",
+            )
+        # Separate DMA/cold-residency intent: marks the restore in flight
+        # without reacquiring runnable capacity.
+        lease.restoring = True
+        lease.pending_dma = 1
+        return self._receipt(
+            command,
+            accepted=True,
+            runnable_through=lease.runnable_through,
+            pending_dma=1,
+        )
+
+    def _on_release(
+        self, command: OwnerCommand, lease: _WorkerLease | None
+    ) -> OwnerReceipt:
+        if lease is None:
+            return self._receipt(command, accepted=False, error="no lease to release")
+        if lease.released:
+            return self._receipt(
+                command, accepted=False, error="lease already released"
+            )
+        if command.requested_through < lease.published_through:
+            return self._receipt(
+                command,
+                accepted=False,
+                error="refuses published tokens",
+            )
+        lease.released = True
+        self._released_count += 1
+        return self._receipt(
+            command,
+            accepted=True,
+            runnable_through=lease.runnable_through,
+            released=True,
+        )
+
+    def _receipt(
+        self,
+        command: OwnerCommand,
+        *,
+        accepted: bool,
+        runnable_through: int | None = None,
+        released: bool = False,
+        pending_dma: int | None = None,
+        error: str | None = None,
+    ) -> OwnerReceipt:
+        lease = self._leases.get(command.key)
+        receipt = OwnerReceipt(
+            key=command.key,
+            owner_id=command.owner_id,
+            command_seq=command.command_seq,
+            accepted=accepted,
+            runnable_through=runnable_through,
+            released=released,
+            pending_dma=(
+                pending_dma
+                if pending_dma is not None
+                else (lease.pending_dma if lease is not None else None)
+            ),
+            free_capacity=self.free_capacity(),
+            error=error,
+        )
+        self._outbox.append(receipt)
+        return receipt
+
+    # -- publication ----------------------------------------------------------
+
+    def record_published(self, token: OwnerLeaseToken) -> None:
+        """Record a published lease token; refuses are illegal from here on."""
+        if token.owner_id != self.owner_rank:
+            return
+        lease = self._leases.get(token.key)
+        if lease is None or lease.released or lease.superseded:
+            return
+        if token.runnable_through > lease.runnable_through:
+            raise PublicationViolationError(
+                f"token for {token.key} exceeds granted horizon "
+                f"{lease.runnable_through}"
+            )
+        lease.published_through = max(lease.published_through, token.runnable_through)
+
+    # -- batch emission --------------------------------------------------------
+
+    def emit_batch(self, emitted_step_seq: int) -> OwnerReceiptBatch:
+        """Emit exactly one receipt batch, draining pending events.
+
+        An enabled worker always emits one batch per step, even when
+        ``events`` is empty, so empty work differs from a missing response.
+        """
+        events = tuple(self._outbox)
+        self._outbox.clear()
+        return OwnerReceiptBatch(
+            owner_rank=self.owner_rank,
+            emitted_step_seq=emitted_step_seq,
+            events=events,
+            free_capacity=self.free_capacity(),
+            resident_pages=sum(lease.resident_pages for lease in self._leases.values()),
+            pending_dma=sum(lease.pending_dma for lease in self._leases.values()),
+        )
+
+    # -- introspection ----------------------------------------------------------
+
+    def free_capacity(self) -> int:
+        committed = sum(
+            lease.committed_tokens
+            for lease in self._leases.values()
+            if not lease.released
+        )
+        return max(0, self.capacity - committed)
+
+    def published_through(self, key: OwnerLeaseKey) -> int:
+        lease = self._leases.get(key)
+        return lease.published_through if lease is not None else 0
+
+    def is_released(self, key: OwnerLeaseKey) -> bool:
+        lease = self._leases.get(key)
+        return lease is not None and lease.released
+
+    def release_count(self) -> int:
+        return self._released_count
