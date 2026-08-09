@@ -187,6 +187,62 @@ def test_assignment_charges_local_commitment_exactly_once() -> None:
 # -- epoch fence ---------------------------------------------------------------
 
 
+def test_explicit_owner_forces_selection_and_records_charge() -> None:
+    coordinator = _coordinator_with_owners(0, 1, 2)
+    # Least-work would pick owner 0; the explicit owner wins instead.
+    assert coordinator.assign(_key("req-0"), explicit_owner=2) == 2
+    assert coordinator.owner_of(_key("req-0")) == 2
+    # The projected charge is recorded exactly once for explicit choices:
+    # owner 2 now carries a 10-unit local commitment, so the default path
+    # avoids it and picks owner 0.
+    assert coordinator.assign(_key("req-1"), explicit_owner=2, projected_work=10) == 2
+    assert coordinator.assign(_key("req-2")) == 0
+
+
+def test_explicit_owner_must_be_currently_observed_nonnegative() -> None:
+    coordinator = _coordinator_with_owners(0, 1)
+    with pytest.raises(OwnershipError, match="explicit owner"):
+        coordinator.assign(_key("req-0"), explicit_owner=2)
+    with pytest.raises(OwnershipError, match="explicit owner"):
+        coordinator.assign(_key("req-0"), explicit_owner=-1)
+    # An already-assigned key stays sticky: the idempotent return happens
+    # before any explicit-owner validation.
+    assert coordinator.assign(_key("req-0"), explicit_owner=1) == 1
+    assert coordinator.assign(_key("req-0"), explicit_owner=0) == 1
+    assert coordinator.assign(_key("req-0"), explicit_owner=99) == 1
+    assert coordinator.assign(_key("req-0")) == 1
+
+
+def test_live_lease_count_tracks_provisional_sticky_and_finishing() -> None:
+    coordinator = _coordinator_with_owners(0, 1)
+    key_a = _key("req-a")
+    key_b = _key("req-b")
+    assert coordinator.live_lease_count(0) == 0
+    # A fresh (provisional) assignment counts immediately.
+    assert coordinator.assign(key_a, explicit_owner=0) == 0
+    assert coordinator.live_lease_count(0) == 1
+    # An admitted (sticky) lease still counts.
+    command = coordinator.reserve(key_a, 8)
+    receipt = OwnerReceipt(
+        key=key_a,
+        owner_id=0,
+        command_seq=command.command_seq,
+        accepted=True,
+        runnable_num_tokens=8,
+    )
+    assert coordinator.apply_receipt(receipt)
+    assert coordinator.live_lease_count(0) == 1
+    # Leases on other owners are counted per owner.
+    assert coordinator.assign(key_b, explicit_owner=1) == 1
+    assert coordinator.live_lease_count(1) == 1
+    # finish() leaves release_pending: the lease stops counting as live.
+    coordinator.finish(key_a)
+    assert coordinator.live_lease_count(0) == 0
+    # A superseded (tombstoned) lease is excluded too.
+    coordinator.assign(_key("req-b", epoch=1), explicit_owner=1)
+    assert coordinator.live_lease_count(1) == 1
+
+
 def test_epoch_fence_blocks_stale_request_id_reuse() -> None:
     coordinator = _coordinator_with_owners(1, 2)
     old = _key("req-reused", epoch=0)

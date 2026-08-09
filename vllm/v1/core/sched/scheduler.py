@@ -53,11 +53,13 @@ from vllm.v1.core.sched.ownership import (
     OwnerAdmissionStatus,
     OwnerAllocationDescriptor,
     OwnerAssignmentObservation,
+    OwnerCachePoolSnapshot,
     OwnerCommand,
     OwnerCommandKind,
     OwnerLeaseCoordinator,
     OwnerLeaseKey,
     OwnerReceipt,
+    OwnerReceiptBatch,
 )
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
@@ -387,6 +389,12 @@ class Scheduler(SchedulerInterface):
         # Internal per-step RUNNING token plans (never dispatched for
         # execution; see _schedule_request_owned).
         self._owner_token_plans: dict[str, int] = {}
+        # Global rank -> latest worker-confirmed physical pool snapshot
+        # (block-ID-free), empty until the first non-None receipt envelope.
+        self._owner_pool_snapshots: dict[int, OwnerCachePoolSnapshot] = {}
+        # True once any rank published a physical snapshot; afterwards every
+        # step must re-publish one per rank (no silent stale physical facts).
+        self._owner_pool_snapshot_seen = False
         if self.scheduler_config.enable_request_owned_attention:
             self._init_request_owned_control_plane()
 
@@ -2037,22 +2045,32 @@ class Scheduler(SchedulerInterface):
         """Initialize the owner coordinator and its deterministic per-rank
         observations for every process-global rank."""
         self.owner_coordinator = OwnerLeaseCoordinator()
+        self._owner_pool_snapshots = {}
+        self._owner_pool_snapshot_seen = False
         for owner_id in range(self.parallel_config.world_size):
             self.owner_coordinator.observe(self._owner_observation(owner_id))
 
     def _owner_observation(self, owner_id: int) -> OwnerAssignmentObservation:
-        """Deterministic zero-base-work observation for one owner rank.
+        """Deterministic per-rank observation for one owner rank.
 
-        The scheduler owns no external workload signal, so every process-
-        global rank starts from the same base; the coordinator's least-work
-        assignment is therefore deterministic (stable numeric rank breaks
-        ties).  The emitted observation explicitly excludes coordinator-local
-        projected charges.
+        Once worker-confirmed physical pool snapshots are stored for every
+        rank, the observation reports pool facts as
+        ``work = total_blocks - free_blocks`` with zero residency (the
+        prefix cluster cache is off, so aggregate residency must not be
+        misused as a hit signal) and zero pending DMA.  Before the first
+        snapshot every rank starts from the same zero-work base, so the
+        coordinator's default least-work assignment is deterministic
+        (stable numeric rank breaks ties).  The emitted observation
+        explicitly excludes coordinator-local projected charges.
         """
+        snapshot = self._owner_pool_snapshots.get(owner_id)
+        work = (
+            snapshot.total_blocks - snapshot.free_blocks if snapshot is not None else 0
+        )
         return OwnerAssignmentObservation(
             owner_id=owner_id,
             observation_seq=self.current_step,
-            work=0,
+            work=work,
             residency=0,
             pending_dma=0,
         )
@@ -2269,20 +2287,65 @@ class Scheduler(SchedulerInterface):
             request.num_computed_tokens + self.max_num_scheduled_tokens,
         )
 
-    def _assign_owner_and_reserve(
-        self, request: Request, key: OwnerLeaseKey
-    ) -> None:
-        """Assign to the least-committed-work owner and issue the RESERVE."""
+    def _assign_owner_and_reserve(self, request: Request, key: OwnerLeaseKey) -> None:
+        """Assign the scheduler-computed owner and issue the RESERVE.
+
+        The scheduler picks the first-admission owner itself from
+        worker-confirmed physical pool facts (or lease counts before any
+        snapshot) and forces it through the coordinator with
+        ``projected_work=0`` so token units never mix with block facts.
+        """
         coordinator = self.owner_coordinator
         assert coordinator is not None
         required = self._owner_reserve_required(request)
+        owner = self._select_owner_for_admission()
         try:
-            coordinator.assign(key, required_num_tokens=required)
+            coordinator.assign(
+                key,
+                required_num_tokens=required,
+                explicit_owner=owner,
+                projected_work=0,
+            )
         except EpochFenceError:
             # Request-id reuse raced a higher fence: roll forward once.
             key = self._roll_owner_epoch(request)
-            coordinator.assign(key, required_num_tokens=required)
+            coordinator.assign(
+                key,
+                required_num_tokens=required,
+                explicit_owner=owner,
+                projected_work=0,
+            )
         self._issue_owner_reserve(request, key)
+
+    def _select_owner_for_admission(self) -> int:
+        """Pick the owner for a fresh G2 first admission.
+
+        With physical pool snapshots present, the emptiest pool (greatest
+        ``free_blocks``) wins; ties break by fewest live/sticky leases plus
+        provisional choices already made in this admission pass (the
+        coordinator counts them as soon as they are assigned), then by
+        stable global rank.  Without snapshots the choice falls back to
+        lease-count balance then rank.  No request tokens are converted to
+        blocks and no block/pool IDs are consulted.
+        """
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        ranks = range(self.parallel_config.world_size)
+        if self._owner_pool_snapshots:
+            snapshots = self._owner_pool_snapshots
+
+            def score(owner_id: int) -> tuple[int, int, int]:
+                return (
+                    -snapshots[owner_id].free_blocks,
+                    coordinator.live_lease_count(owner_id),
+                    owner_id,
+                )
+        else:
+
+            def score(owner_id: int) -> tuple[int, int]:
+                return (coordinator.live_lease_count(owner_id), owner_id)
+
+        return min(ranks, key=score)
 
     def _issue_owner_reserve(self, request: Request, key: OwnerLeaseKey) -> None:
         """Issue RESERVE (first admission) or RESUME (PREEMPTED) with the
@@ -2502,9 +2565,39 @@ class Scheduler(SchedulerInterface):
                 "request-owned receipt ingress requires the G2 owner "
                 "coordinator; the scheduler was not initialized for it."
             )
+        self._store_owner_pool_snapshots(batches)
         for batch in batches:
             for event in batch.events:
                 self._apply_owner_receipt(event)
+
+    def _store_owner_pool_snapshots(self, batches: list[OwnerReceiptBatch]) -> None:
+        """Record the latest physical pool snapshot per global rank.
+
+        Runs only after the full receipt envelope validated, so the stored
+        snapshots are worker-confirmed facts (and never expose block/pool
+        IDs).  All-None envelopes are tolerated before the first physical
+        snapshot (the initial/legacy control path); partial envelopes within
+        a step and any missing snapshot after the first one was observed
+        fail closed, so the scheduler never silently reuses stale pool
+        facts.
+        """
+        non_null = [batch for batch in batches if batch.cache_pool is not None]
+        if non_null and len(non_null) != len(batches):
+            raise RuntimeError(
+                "request-owned receipt ingress requires every owner batch "
+                f"to carry a cache_pool snapshot, got {len(non_null)} of "
+                f"{len(batches)}."
+            )
+        if non_null:
+            self._owner_pool_snapshot_seen = True
+            for batch in batches:
+                self._owner_pool_snapshots[batch.owner_rank] = batch.cache_pool
+        elif self._owner_pool_snapshot_seen:
+            raise RuntimeError(
+                "request-owned receipt ingress requires a cache_pool "
+                "snapshot for every owner rank once physical snapshots are "
+                "in use; got an all-None envelope."
+            )
 
     def _apply_owner_receipt(self, event: OwnerReceipt) -> None:
         """Apply one worker receipt to the coordinator and scheduler state.
@@ -2521,6 +2614,13 @@ class Scheduler(SchedulerInterface):
         if key is None or key != event.key:
             # Unknown or fenced-out lease: the coordinator ignores it and the
             # current incarnation's pending command is never touched.
+            coordinator.apply_receipt(event)
+            return
+        if event.owner_id != coordinator.owner_of(key):
+            # Wrong-owner receipt for a live lease: the coordinator ignores
+            # it (the lease's assigned owner differs), and the in-flight
+            # command must stay pending so the genuine worker receipt can
+            # still land.  Clearing it here would stall the incarnation.
             coordinator.apply_receipt(event)
             return
         pending = self._owner_pending_command.get(request_id)

@@ -213,8 +213,7 @@ class OwnerCommand:
             )
         if self.kind is not OwnerCommandKind.RESERVE:
             raise ValueError(
-                "allocation is only legal on RESERVE commands, got "
-                f"{self.kind.value}."
+                f"allocation is only legal on RESERVE commands, got {self.kind.value}."
             )
         if self.allocation.num_tokens != self.required_num_tokens:
             raise ValueError(
@@ -515,14 +514,21 @@ class OwnerLeaseCoordinator:
         key: OwnerLeaseKey,
         required_num_tokens: int | None = None,
         projected_work: int | None = None,
+        explicit_owner: int | None = None,
     ) -> int:
         """Assign ``key`` to the least-committed-work owner.
 
-        Returns the existing owner unchanged when the key is already
-        assigned (idempotent; the projected charge is applied exactly once).
-        Raises :class:`EpochFenceError` when the request id was already
-        admitted at a higher epoch; the lower-epoch lease (if any) is kept
-        as a tombstone and never silently freed.
+        ``explicit_owner`` forces the assignment onto one currently observed
+        nonnegative owner (for example a scheduler-side physical-pool
+        choice), bypassing the least-work score; the projected charge is
+        still recorded exactly once.  The default ``None`` path is
+        unchanged.  Returns the existing owner unchanged when the key is
+        already assigned (idempotent; the projected charge is applied
+        exactly once).  Raises :class:`EpochFenceError` when the request id
+        was already admitted at a higher epoch; the lower-epoch lease (if
+        any) is kept as a tombstone and never silently freed.  Raises
+        :class:`OwnershipError` when ``explicit_owner`` is not a currently
+        observed nonnegative owner.
         """
         fence = self._epoch_fence.get(key.request_id)
         if fence is not None and key.owner_epoch < fence:
@@ -547,22 +553,35 @@ class OwnerLeaseCoordinator:
         if existing is not None:
             return existing.owner_id
 
-        candidates = [o for o in self._observations.values() if o.owner_id >= 0]
-        if not candidates:
-            raise OwnershipError(
-                f"cannot assign {key}: no owner observations available"
-            )
+        if explicit_owner is not None:
+            observation = self._observations.get(explicit_owner)
+            if (
+                observation is None
+                or observation.owner_id != explicit_owner
+                or observation.owner_id < 0
+            ):
+                raise OwnershipError(
+                    f"cannot assign {key}: explicit owner {explicit_owner} "
+                    "is not a currently observed nonnegative owner"
+                )
+            owner = explicit_owner
+        else:
+            candidates = [o for o in self._observations.values() if o.owner_id >= 0]
+            if not candidates:
+                raise OwnershipError(
+                    f"cannot assign {key}: no owner observations available"
+                )
 
-        def score(obs: OwnerAssignmentObservation) -> tuple[int, int, int]:
-            committed = (
-                (obs.work or 0)
-                + (obs.pending_dma or 0)
-                + self._charges.get(obs.owner_id, 0)
-            )
-            # Prefer higher residency, then lower global rank (owner_id).
-            return (committed, -(obs.residency or 0), obs.owner_id)
+            def score(obs: OwnerAssignmentObservation) -> tuple[int, int, int]:
+                committed = (
+                    (obs.work or 0)
+                    + (obs.pending_dma or 0)
+                    + self._charges.get(obs.owner_id, 0)
+                )
+                # Prefer higher residency, then lower global rank (owner_id).
+                return (committed, -(obs.residency or 0), obs.owner_id)
 
-        owner = min(candidates, key=score).owner_id
+            owner = min(candidates, key=score).owner_id
         projected = (
             projected_work
             if projected_work is not None
@@ -867,6 +886,24 @@ class OwnerLeaseCoordinator:
         lease = self._leases.get(key)
         return lease.owner_id if lease is not None else None
 
+    def live_lease_count(self, owner_id: int) -> int:
+        """Number of live leases currently assigned to ``owner_id``.
+
+        Counts provisional (assigned, receipt not yet applied) and admitted
+        (sticky) leases alike; released, release-pending, and superseded
+        (tombstoned) leases are excluded because their capacity is leaving
+        or already gone.  The scheduler's physical-pool selection uses this
+        as the lease-balance tie-break.
+        """
+        return sum(
+            1
+            for lease in self._leases.values()
+            if lease.owner_id == owner_id
+            and not lease.released
+            and not lease.release_pending
+            and not lease.superseded
+        )
+
     def required_num_tokens_of(self, key: OwnerLeaseKey) -> int:
         return self._leases[key].required_num_tokens
 
@@ -1039,9 +1076,7 @@ class AttentionLeaseManager:
             # were enforced/advanced exactly as ordinary apply, so the
             # coordinator stream stays authoritative, but no logical state
             # transition is dispatched and no lease/commitment is created.
-            return self._receipt(
-                command, accepted=False, error=external_reject_error
-            )
+            return self._receipt(command, accepted=False, error=external_reject_error)
 
         lease = self._leases.get(command.key)
         if command.kind is OwnerCommandKind.RESERVE:

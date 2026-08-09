@@ -20,6 +20,7 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.ownership import (
     OwnerAdmissionStatus,
     OwnerAllocationDescriptor,
+    OwnerCachePoolSnapshot,
     OwnerCommandKind,
     OwnerLeaseKey,
     OwnerReceipt,
@@ -67,9 +68,7 @@ class _KVCacheSpy:
 
     def __getattr__(self, name: str):
         if name in self.FORBIDDEN:
-            raise AssertionError(
-                f"kv_cache_manager.{name}() must never run in G2 mode"
-            )
+            raise AssertionError(f"kv_cache_manager.{name}() must never run in G2 mode")
         raise AttributeError(name)
 
 
@@ -147,6 +146,42 @@ def _apply_receipts(scheduler, scheduler_output, events_by_rank) -> None:
     )
 
 
+def _pool(
+    owner_rank: int,
+    total_blocks: int = 1000,
+    free_blocks: int = 300,
+) -> OwnerCachePoolSnapshot:
+    return OwnerCachePoolSnapshot(
+        owner_rank=owner_rank,
+        total_blocks=total_blocks,
+        free_blocks=free_blocks,
+    )
+
+
+def _apply_pool_receipts(
+    scheduler,
+    scheduler_output,
+    pools_by_rank,
+    events_by_rank=None,
+) -> None:
+    """Feed an all-worker receipt envelope with per-rank pool snapshots."""
+    batches = [
+        OwnerReceiptBatch(
+            owner_rank=rank,
+            emitted_step_seq=scheduler_output.step_seq,
+            events=tuple((events_by_rank or {}).get(rank, ())),
+            cache_pool=pools_by_rank.get(rank),
+        )
+        for rank in range(scheduler.parallel_config.world_size)
+    ]
+    scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[], req_id_to_index={}, owner_receipt_batches=batches
+        ),
+    )
+
+
 def _receipt(
     key: OwnerLeaseKey,
     owner_id: int,
@@ -180,8 +215,13 @@ def _admit(scheduler, request, *, grant: int):
     _apply_receipts(
         scheduler,
         out1,
-        {command.owner_id: [_receipt(command.key, command.owner_id,
-                                     command.command_seq, runnable=grant)]},
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key, command.owner_id, command.command_seq, runnable=grant
+                )
+            ]
+        },
     )
     out2 = scheduler.schedule()
     assert request.status == RequestStatus.RUNNING
@@ -230,9 +270,11 @@ def test_two_step_admission_reserves_then_promotes_and_publishes() -> None:
     assert scheduler.has_requests()
 
     # No promotion until the accepted receipt is applied.
-    _apply_receipts(scheduler, out1, {0: [_receipt(command.key, 0,
-                                                   command.command_seq,
-                                                   runnable=32)]})
+    _apply_receipts(
+        scheduler,
+        out1,
+        {0: [_receipt(command.key, 0, command.command_seq, runnable=32)]},
+    )
     assert request.attention_owner == 0
     assert request.attention_owner_epoch == 0
     assert request.status == RequestStatus.WAITING
@@ -261,8 +303,18 @@ def test_refused_reserve_abandons_and_retries_without_token_mutation() -> None:
     _apply_receipts(
         scheduler,
         out1,
-        {0: [_receipt(key, 0, command.command_seq, accepted=False,
-                      runnable=None, error="insufficient capacity")]},
+        {
+            0: [
+                _receipt(
+                    key,
+                    0,
+                    command.command_seq,
+                    accepted=False,
+                    runnable=None,
+                    error="insufficient capacity",
+                )
+            ]
+        },
     )
     # Refusal abandons the provisional assignment; nothing was mutated.
     assert key not in scheduler._owner_key
@@ -302,8 +354,18 @@ def test_horizon_cap_extend_stall_and_refused_extend_retry() -> None:
     _apply_receipts(
         scheduler,
         out3,
-        {0: [_receipt(extend.key, 0, extend.command_seq, accepted=False,
-                      runnable=None, error="no capacity")]},
+        {
+            0: [
+                _receipt(
+                    extend.key,
+                    0,
+                    extend.command_seq,
+                    accepted=False,
+                    runnable=None,
+                    error="no capacity",
+                )
+            ]
+        },
     )
     out4 = scheduler.schedule()
     (retry,) = out4.owner_commands
@@ -456,8 +518,18 @@ def test_refused_release_fails_closed() -> None:
         _apply_receipts(
             scheduler,
             out,
-            {0: [_receipt(key, 0, release.command_seq, accepted=False,
-                          runnable=None, error="busy")]},
+            {
+                0: [
+                    _receipt(
+                        key,
+                        0,
+                        release.command_seq,
+                        accepted=False,
+                        runnable=None,
+                        error="busy",
+                    )
+                ]
+            },
         )
 
 
@@ -476,8 +548,18 @@ def test_refused_preempt_fails_closed() -> None:
         _apply_receipts(
             scheduler,
             out,
-            {0: [_receipt(preempt.key, 0, preempt.command_seq, accepted=False,
-                          runnable=None, error="not honored")]},
+            {
+                0: [
+                    _receipt(
+                        preempt.key,
+                        0,
+                        preempt.command_seq,
+                        accepted=False,
+                        runnable=None,
+                        error="not honored",
+                    )
+                ]
+            },
         )
 
 
@@ -493,8 +575,7 @@ def test_request_id_reuse_fences_to_a_fresh_epoch() -> None:
     _apply_receipts(
         scheduler,
         out,
-        {0: [_receipt(old_key, 0, release.command_seq, runnable=8,
-                      released=True)]},
+        {0: [_receipt(old_key, 0, release.command_seq, runnable=8, released=True)]},
     )
 
     # Same request id is admitted at epoch 1; the old lease is gone.
@@ -543,8 +624,9 @@ def test_zero_token_control_envelope_is_legal() -> None:
 
 
 def test_deterministic_owner_assignment() -> None:
-    # Zero-required reserves carry no projected charge: all requests tie on
-    # committed work and the stable lowest global rank wins.
+    # Before any physical snapshot, first admission balances by live/
+    # provisional lease count then stable rank: the second request leaves
+    # rank 0 even when its RESERVE carries no projected charge.
     scheduler = _make_scheduler(world_size=3, max_num_scheduled_tokens=0)
     a = _request("req-a")
     b = _request("req-b")
@@ -553,14 +635,13 @@ def test_deterministic_owner_assignment() -> None:
     out = scheduler.schedule()
     assert [(c.owner_id, c.command_seq) for c in out.owner_commands] == [
         (0, 1),
-        (0, 2),
+        (1, 1),
     ]
     assert out.owner_commands == sorted(
         out.owner_commands, key=lambda c: (c.owner_id, c.command_seq)
     )
 
-    # With charged reserves, the second request goes to the least-committed
-    # owner (rank 1) instead of piling onto rank 0.
+    # With charged reserves, lease-count balancing gives the same owners.
     scheduler2 = _make_scheduler(world_size=3, max_num_scheduled_tokens=64)
     scheduler2.add_request(_request("req-a"))
     scheduler2.add_request(_request("req-b"))
@@ -597,3 +678,189 @@ def test_wire_purity_no_scheduler_kv_apis_and_no_new_request_data() -> None:
     assert request.status == RequestStatus.RUNNING
     (token,) = out2.scheduled_owner_leases
     assert token.runnable_num_tokens == 32
+
+
+def test_no_snapshot_admission_balances_by_live_lease_count() -> None:
+    scheduler = _make_scheduler(world_size=3)
+    for request_id in ("req-a", "req-b", "req-c", "req-d"):
+        scheduler.add_request(_request(request_id))
+    out = scheduler.schedule()
+    # Before any physical snapshot, first admission balances on the live/
+    # provisional lease count and then stable rank.  The wire drains in
+    # per-owner command order, so assert the assignment map itself.
+    assert [c.owner_id for c in out.owner_commands] == [0, 0, 1, 2]
+    for request_id, owner in (("req-a", 0), ("req-b", 1), ("req-c", 2), ("req-d", 0)):
+        assert (
+            scheduler.owner_coordinator.owner_of(OwnerLeaseKey(request_id, 0)) == owner
+        )
+
+
+def test_greater_free_blocks_wins_regardless_of_token_count() -> None:
+    scheduler = _make_scheduler()
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(0, total_blocks=1000, free_blocks=100),
+            1: _pool(1, total_blocks=1000, free_blocks=900),
+        },
+    )
+    # A long and a short request both land on the emptiest pool (rank 1):
+    # free blocks dominate, never token counts.
+    scheduler.add_request(_request("req-a", num_prompt_tokens=256))
+    scheduler.add_request(_request("req-b", num_prompt_tokens=16))
+    out1 = scheduler.schedule()
+    assert [c.owner_id for c in out1.owner_commands] == [1, 1]
+
+
+def test_same_step_admissions_balance_on_provisional_count_under_equal_free() -> None:
+    scheduler = _make_scheduler(world_size=3)
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(0, free_blocks=500),
+            1: _pool(1, free_blocks=500),
+            2: _pool(2, free_blocks=500),
+        },
+    )
+    for request_id in ("req-a", "req-b", "req-c", "req-d"):
+        scheduler.add_request(_request(request_id))
+    out1 = scheduler.schedule()
+    # Equal free blocks: provisional choices made earlier in this same
+    # admission pass break the tie, then stable rank.  The wire drains in
+    # per-owner command order, so assert the assignment map itself.
+    assert [c.owner_id for c in out1.owner_commands] == [0, 0, 1, 2]
+    for request_id, owner in (("req-a", 0), ("req-b", 1), ("req-c", 2), ("req-d", 0)):
+        assert (
+            scheduler.owner_coordinator.owner_of(OwnerLeaseKey(request_id, 0)) == owner
+        )
+
+
+def test_partial_snapshot_envelope_fails_closed() -> None:
+    scheduler = _make_scheduler()
+    out = scheduler.schedule()
+    with pytest.raises(RuntimeError, match="cache_pool snapshot"):
+        _apply_pool_receipts(scheduler, out, {0: _pool(0, free_blocks=500)})
+
+
+def test_missing_snapshot_after_first_fails_closed() -> None:
+    scheduler = _make_scheduler()
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {0: _pool(0, free_blocks=500), 1: _pool(1, free_blocks=500)},
+    )
+    # Once physical snapshots are in use, an all-None envelope is stale
+    # facts, not a legacy control step.
+    out1 = scheduler.schedule()
+    with pytest.raises(RuntimeError, match="all-None envelope"):
+        _apply_receipts(scheduler, out1, {})
+
+
+def test_observations_reflect_physical_facts_without_ids() -> None:
+    scheduler = _make_scheduler()
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(0, total_blocks=1000, free_blocks=300),
+            1: _pool(1, total_blocks=2000, free_blocks=800),
+        },
+    )
+    out1 = scheduler.schedule()
+    by_owner = {o.owner_id: o for o in out1.owner_assignment_observations}
+    # work = total_blocks - free_blocks; residency/pending_dma stay 0.
+    assert by_owner[0].work == 700
+    assert by_owner[1].work == 1200
+    assert by_owner[0].residency == 0
+    assert by_owner[0].pending_dma == 0
+    # Stored snapshots are block-ID-free facts per rank.
+    for rank, free in ((0, 300), (1, 800)):
+        snapshot = scheduler._owner_pool_snapshots[rank]
+        assert snapshot.owner_rank == rank
+        assert snapshot.free_blocks == free
+        assert not hasattr(snapshot, "block_id")
+
+
+def test_sticky_owner_unaffected_by_later_pool_imbalance() -> None:
+    scheduler = _make_scheduler(max_num_scheduled_tokens=8)
+    request = _request("req-0")
+    # Rank 0 has the emptiest pool at first admission.
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {0: _pool(0, free_blocks=800), 1: _pool(1, free_blocks=200)},
+    )
+    scheduler.add_request(request)
+    out1 = scheduler.schedule()
+    (reserve,) = out1.owner_commands
+    assert reserve.owner_id == 0
+    _apply_pool_receipts(
+        scheduler,
+        out1,
+        {0: _pool(0, free_blocks=800), 1: _pool(1, free_blocks=200)},
+        {0: [_receipt(reserve.key, 0, reserve.command_seq, runnable=8)]},
+    )
+    scheduler.schedule()
+    assert request.status == RequestStatus.RUNNING
+    assert request.attention_owner == 0
+
+    # Preempt, then flip the pools so rank 1 is by far the emptiest.
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    out3 = scheduler.schedule()
+    (preempt,) = out3.owner_commands
+    assert preempt.kind is OwnerCommandKind.PREEMPT
+    _apply_pool_receipts(
+        scheduler,
+        out3,
+        {
+            0: _pool(0, total_blocks=1000, free_blocks=50),
+            1: _pool(1, total_blocks=1000, free_blocks=950),
+        },
+        {0: [_receipt(preempt.key, 0, preempt.command_seq, runnable=8)]},
+    )
+    # Resume stays on the sticky owner despite the later imbalance.
+    out4 = scheduler.schedule()
+    (resume,) = out4.owner_commands
+    assert resume.kind is OwnerCommandKind.RESERVE
+    assert resume.owner_id == 0
+    assert request.attention_owner == 0
+
+
+def test_wrong_owner_receipt_does_not_clear_pending_command() -> None:
+    scheduler = _make_scheduler()
+    request = _request("req-0")
+    scheduler.add_request(request)
+    out1 = scheduler.schedule()
+    (command,) = out1.owner_commands
+    assert command.owner_id == 0
+
+    # A wrong-owner batch event (rank 1 echoes key/seq) must not clear the
+    # real in-flight command: the coordinator ignores it and the pending
+    # state survives so the genuine receipt can still land.
+    _apply_receipts(
+        scheduler,
+        out1,
+        {1: [_receipt(command.key, 1, command.command_seq, runnable=8)]},
+    )
+    assert scheduler._owner_pending_command["req-0"] == (
+        command.command_seq,
+        OwnerCommandKind.RESERVE,
+    )
+    assert scheduler.owner_coordinator.owner_of(command.key) == 0
+
+    # The genuine owner-0 receipt still promotes the request.
+    _apply_receipts(
+        scheduler,
+        out1,
+        {0: [_receipt(command.key, 0, command.command_seq, runnable=8)]},
+    )
+    scheduler.schedule()
+    assert request.status == RequestStatus.RUNNING
+    assert request.attention_owner == 0
