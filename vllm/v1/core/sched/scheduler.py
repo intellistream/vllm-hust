@@ -1563,6 +1563,10 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._validate_request_owned_receipt_ingress(
+            scheduler_output, model_runner_output
+        )
+
         # Knorm: route block scores from model runner to KV cache manager.
         knorm_scores = getattr(model_runner_output, "knorm_block_scores", None)
         if knorm_scores:
@@ -1906,6 +1910,72 @@ class Scheduler(SchedulerInterface):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
+    def _validate_request_owned_receipt_ingress(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Fail closed at the G1 scheduler receipt boundary.
+
+        G1 proves exact per-step all-worker transport but deliberately does
+        not apply resource events: applying them would require the G2
+        owner-local allocator/coordinator authority.  Structural violations
+        and nonempty events raise before ordinary output or request mutation.
+        """
+        if not self.scheduler_config.enable_request_owned_attention:
+            return
+
+        step_seq = scheduler_output.step_seq
+        if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
+            raise RuntimeError(
+                "request-owned receipt ingress requires a positive non-bool "
+                f"step_seq, got {step_seq!r}."
+            )
+
+        batches = model_runner_output.owner_receipt_batches
+        if batches is None:
+            raise RuntimeError(
+                "request-owned receipt ingress is missing all-worker receipt batches."
+            )
+        expected_ranks = list(range(self.parallel_config.world_size))
+        ranks = [batch.owner_rank for batch in batches]
+        if (
+            any(isinstance(rank, bool) or not isinstance(rank, int) for rank in ranks)
+            or len(ranks) != len(expected_ranks)
+            or sorted(ranks) != expected_ranks
+        ):
+            raise RuntimeError(
+                "request-owned receipt ingress requires exactly one batch per "
+                f"process-global owner rank {expected_ranks}, got {ranks}."
+            )
+        for batch in batches:
+            if (
+                isinstance(batch.emitted_step_seq, bool)
+                or not isinstance(batch.emitted_step_seq, int)
+                or batch.emitted_step_seq != step_seq
+            ):
+                raise RuntimeError(
+                    "request-owned receipt ingress got emitted_step_seq "
+                    f"{batch.emitted_step_seq} from owner {batch.owner_rank}, "
+                    f"expected {step_seq}."
+                )
+            for event in batch.events:
+                if (
+                    isinstance(event.owner_id, bool)
+                    or not isinstance(event.owner_id, int)
+                    or event.owner_id != batch.owner_rank
+                ):
+                    raise RuntimeError(
+                        "request-owned receipt ingress got an event for owner "
+                        f"{event.owner_id} in owner {batch.owner_rank}'s batch."
+                    )
+        if any(batch.events for batch in batches):
+            raise RuntimeError(
+                "request-owned attention G1 cannot apply resource receipt "
+                "events without the G2 owner-local allocator/coordinator; "
+                "refusing to ignore them."
+            )
 
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:

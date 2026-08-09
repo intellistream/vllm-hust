@@ -75,13 +75,22 @@ class ModelRunnerOutputAggregator:
         expected_owner_ranks: list[int],
         kv_aggregator: KVOutputAggregator | None = None,
     ) -> None:
-        self._expected_owner_ranks: list[int] = sorted(set(expected_owner_ranks))
+        if any(
+            isinstance(rank, bool) or not isinstance(rank, int) or rank < 0
+            for rank in expected_owner_ranks
+        ):
+            raise TypeError(
+                "expected_owner_ranks must contain nonnegative non-bool ints."
+            )
+        if len(set(expected_owner_ranks)) != len(expected_owner_ranks):
+            raise ValueError("expected_owner_ranks must not contain duplicates.")
+        self._expected_owner_ranks = sorted(expected_owner_ranks)
         self._kv_aggregator = kv_aggregator
 
     def for_step(self, step_seq: int) -> "ModelRunnerOutputAggregatorStepAdapter":
         """Return an immutable, stateless per-step adapter bound to ``step_seq``.
 
-        ``step_seq`` must be a nonnegative non-bool ``int``; anything else
+        ``step_seq`` must be a positive non-bool ``int``; anything else
         fails closed at this call.  The adapter delegates every
         :meth:`aggregate` call with ``expected_step_seq=step_seq`` so stale or
         future worker receipts fail closed at this exact call site.  The
@@ -150,6 +159,23 @@ class ModelRunnerOutputAggregator:
             if output is None:
                 continue
             for batch in output.owner_receipt_batches or ():
+                if isinstance(batch.owner_rank, bool) or not isinstance(
+                    batch.owner_rank, int
+                ):
+                    raise RuntimeError(
+                        "ModelRunnerOutputAggregator: owner_rank must be a "
+                        f"non-bool int, got {batch.owner_rank!r}."
+                    )
+                if (
+                    isinstance(batch.emitted_step_seq, bool)
+                    or not isinstance(batch.emitted_step_seq, int)
+                    or batch.emitted_step_seq <= 0
+                ):
+                    raise RuntimeError(
+                        "ModelRunnerOutputAggregator: emitted_step_seq must be "
+                        "a positive non-bool int, got "
+                        f"{batch.emitted_step_seq!r}."
+                    )
                 if batch.owner_rank not in self._expected_owner_ranks:
                     raise RuntimeError(
                         "ModelRunnerOutputAggregator: unexpected owner rank "
@@ -254,7 +280,7 @@ class ModelRunnerOutputAggregatorStepAdapter:
     stale or future worker emission fails closed.  The adapter is frozen
     after construction: ``_aggregator`` and ``_step_seq`` cannot be
     reassigned, no new attributes can be added, and ``step_seq`` must be a
-    nonnegative non-bool ``int``.  Creating or using it never mutates the
+    positive non-bool ``int``.  Creating or using it never mutates the
     shared aggregator or any other adapter.
 
     It exposes the same duck-typed ``aggregate(outputs, output_rank=...)``
@@ -272,10 +298,10 @@ class ModelRunnerOutputAggregatorStepAdapter:
                 "ModelRunnerOutputAggregatorStepAdapter: step_seq must be an "
                 f"int, got {type(step_seq).__name__} ({step_seq!r})."
             )
-        if step_seq < 0:
+        if step_seq <= 0:
             raise ValueError(
                 "ModelRunnerOutputAggregatorStepAdapter: step_seq must be "
-                f"nonnegative, got {step_seq}."
+                f"positive, got {step_seq}."
             )
         self._aggregator = aggregator
         self._step_seq = step_seq

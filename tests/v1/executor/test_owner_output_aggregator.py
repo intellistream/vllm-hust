@@ -194,6 +194,27 @@ def test_unexpected_owner_rank_fails_closed():
         _aggregator(0, 1, 2).aggregate(outputs)
 
 
+def test_bool_owner_rank_fails_closed() -> None:
+    outputs = [
+        _output(0, [_batch(False)], empty=True),
+        _output(1, [_batch(1)], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="owner_rank must be"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+@pytest.mark.parametrize("step_seq", [0, -1, True, False, 7.0, "7"])
+def test_invalid_emitted_step_seq_fails_closed(step_seq) -> None:
+    outputs = [
+        _output(0, [_batch(0, emitted_step_seq=step_seq)], empty=True),
+        _output(1, [_batch(1)], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="positive non-bool"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
 def test_mixed_step_seq_fails_closed():
     outputs = [
         _output(0, [_batch(0, emitted_step_seq=7)], empty=True),
@@ -341,11 +362,19 @@ def test_for_step_rejects_bool_step_seq():
             aggregator.for_step(bad)
 
 
-def test_for_step_rejects_negative_step_seq():
+def test_for_step_rejects_nonpositive_step_seq():
     aggregator = _aggregator(0, 1, 2)
-    for bad in (-1, -7):
-        with pytest.raises(ValueError, match="nonnegative"):
+    for bad in (0, -1, -7):
+        with pytest.raises(ValueError, match="positive"):
             aggregator.for_step(bad)
+
+
+def test_expected_owner_ranks_fail_closed() -> None:
+    with pytest.raises(ValueError, match="duplicates"):
+        ModelRunnerOutputAggregator([0, 1, 1])
+    for bad in ([False, 1], [-1, 1], [0, "1"]):
+        with pytest.raises(TypeError, match="nonnegative non-bool"):
+            ModelRunnerOutputAggregator(bad)
 
 
 def test_for_step_adapter_frozen_after_construction():
