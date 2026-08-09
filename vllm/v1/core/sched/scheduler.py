@@ -48,6 +48,17 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.ownership import (
+    EpochFenceError,
+    OwnerAdmissionStatus,
+    OwnerAllocationDescriptor,
+    OwnerAssignmentObservation,
+    OwnerCommand,
+    OwnerCommandKind,
+    OwnerLeaseCoordinator,
+    OwnerLeaseKey,
+    OwnerReceipt,
+)
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -356,6 +367,29 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # G2 request-owned attention: scheduler-side receipt-gated admission
+        # and control plane.  Inert while the experimental flag is off; when
+        # on, the scheduler issues owner commands, applies worker receipts,
+        # and publishes leases without allocating scheduler KV blocks or
+        # dispatching token execution (executor/worker terminal gates reject
+        # token-bearing steps until owner-local KV routing lands).
+        self.owner_coordinator: OwnerLeaseCoordinator | None = None
+        # request_id -> lease key (request id + reuse epoch) tracked here.
+        self._owner_key: dict[str, OwnerLeaseKey] = {}
+        # request_id -> next lease epoch (request-id reuse fences forward).
+        self._owner_epoch: dict[str, int] = {}
+        # request_id -> (command_seq, kind) of the in-flight owner command.
+        self._owner_pending_command: dict[str, tuple[int, OwnerCommandKind]] = {}
+        # owner rank -> highest command_seq already placed on the wire.
+        self._owner_emitted_command_seq: dict[int, int] = {}
+        # Commands issued since the last schedule() call, drained per step.
+        self._owner_outbox: list[OwnerCommand] = []
+        # Internal per-step RUNNING token plans (never dispatched for
+        # execution; see _schedule_request_owned).
+        self._owner_token_plans: dict[str, int] = {}
+        if self.scheduler_config.enable_request_owned_attention:
+            self._init_request_owned_control_plane()
+
     def _should_get_num_common_prefix_blocks(self) -> bool:
         device_config = getattr(self.vllm_config, "device_config", None)
         device_type = getattr(device_config, "device_type", None)
@@ -441,6 +475,8 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if self.scheduler_config.enable_request_owned_attention:
+            return self._schedule_request_owned()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1208,6 +1244,9 @@ class Scheduler(SchedulerInterface):
         NOTE: The request should be popped from the running queue outside of this
         method.
         """
+        if self.scheduler_config.enable_request_owned_attention:
+            self._preempt_request_owned(request, timestamp)
+            return
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
@@ -1563,9 +1602,14 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        self._validate_request_owned_receipt_ingress(
-            scheduler_output, model_runner_output
-        )
+        if self.scheduler_config.enable_request_owned_attention:
+            # G2: apply structurally valid receipts before any ordinary
+            # output or request mutation below.
+            self._apply_request_owned_receipts(scheduler_output, model_runner_output)
+        else:
+            self._validate_request_owned_receipt_ingress(
+                scheduler_output, model_runner_output
+            )
 
         # Knorm: route block scores from model runner to KV cache manager.
         knorm_scores = getattr(model_runner_output, "knorm_block_scores", None)
@@ -1985,6 +2029,551 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
+    # ------------------------------------------------------------------
+    # G2 request-owned attention: receipt-gated admission/control plane
+    # ------------------------------------------------------------------
+
+    def _init_request_owned_control_plane(self) -> None:
+        """Initialize the owner coordinator and its deterministic per-rank
+        observations for every process-global rank."""
+        self.owner_coordinator = OwnerLeaseCoordinator()
+        for owner_id in range(self.parallel_config.world_size):
+            self.owner_coordinator.observe(self._owner_observation(owner_id))
+
+    def _owner_observation(self, owner_id: int) -> OwnerAssignmentObservation:
+        """Deterministic zero-base-work observation for one owner rank.
+
+        The scheduler owns no external workload signal, so every process-
+        global rank starts from the same base; the coordinator's least-work
+        assignment is therefore deterministic (stable numeric rank breaks
+        ties).  The emitted observation explicitly excludes coordinator-local
+        projected charges.
+        """
+        return OwnerAssignmentObservation(
+            owner_id=owner_id,
+            observation_seq=self.current_step,
+            work=0,
+            residency=0,
+            pending_dma=0,
+        )
+
+    def _schedule_request_owned(self) -> SchedulerOutput:
+        """Run the G2 scheduler-side receipt-gated control plane.
+
+        This replaces the ordinary schedule path when
+        ``enable_request_owned_attention`` is on: no scheduler KV blocks are
+        allocated, no block IDs are zeroed, no common-prefix facts are
+        computed, and no token execution payload is emitted (the executor and
+        worker terminal gates reject token-bearing steps until owner-local KV
+        routing lands; this slice only constructs internal token plans).
+        The step emits owner commands in per-owner order and publishes leases
+        from the coordinator only after their accepted receipts were applied.
+        Empty control steps are valid.
+        """
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+
+        # Deterministic observations for every process-global owner rank.
+        observations = [
+            self._owner_observation(owner_id)
+            for owner_id in range(self.parallel_config.world_size)
+        ]
+        for observation in observations:
+            coordinator.observe(observation)
+
+        scheduled_timestamp = time.monotonic()
+        self._owner_token_plans = {}
+
+        if self._pause_state != PauseState.PAUSED_ALL:
+            self._owner_admission_pass(scheduled_timestamp)
+            self._owner_running_pass()
+
+        # Drain newly issued commands, per-owner ordered, each exactly once.
+        owner_commands = self._drain_owner_outbox()
+
+        # Publish only leases whose commands were already receipted.
+        scheduled_owner_leases = coordinator.publish(self.current_step)
+
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            preempted_req_ids=self.reset_preempted_req_ids,
+            new_block_ids_to_zero=None,
+            num_spec_tokens_to_schedule=self.num_spec_tokens,
+            kv_cache_usage=0.0,
+            step_seq=self.current_step,
+            owner_commands=owner_commands,
+            owner_assignment_observations=observations,
+            scheduled_owner_leases=scheduled_owner_leases,
+        )
+
+        with record_function_or_nullcontext("schedule: update_after_schedule"):
+            self._update_after_schedule(scheduler_output)
+
+        return scheduler_output
+
+    def _owner_admission_pass(self, scheduled_timestamp: float) -> None:
+        """Admission pass over the waiting queues.
+
+        First admission assigns the least-committed-work owner and issues a
+        small chunk-scaled RESERVE with a WAITING allocation descriptor,
+        leaving the request provisional and unscheduled until its receipt is
+        applied.  PREEMPTED requests resume with a PREEMPTED descriptor on
+        their sticky owner.  Accepted leases promote the request to RUNNING.
+        """
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        step_skipped_waiting = create_request_queue(self.policy)
+        while (self.waiting or self.skipped_waiting) and (
+            len(self.running) + self.num_waiting_for_streaming_input
+            < self.max_num_running_reqs
+        ):
+            request_queue = self._select_waiting_queue_for_scheduling()
+            assert request_queue is not None
+            request = request_queue.peek_request()
+            request_id = request.request_id
+
+            if self._is_blocked_waiting_status(
+                request.status
+            ) and not self._try_promote_blocked_waiting_request(request):
+                request_queue.pop_request()
+                step_skipped_waiting.prepend_request(request)
+                continue
+
+            key = self._owner_key_for(request)
+            if coordinator.owner_of(key) is None:
+                # First admission: least-work/stable-rank assignment plus a
+                # small chunk-scaled RESERVE(WAITING); the request stays
+                # provisional until the worker receipt is applied.
+                self._assign_owner_and_reserve(request, key)
+            elif self._owner_pending_command.get(request_id) is not None:
+                # A command is in flight: stall for its receipt.
+                pass
+            elif (
+                coordinator.is_release_pending(key)
+                or coordinator.is_released(key)
+                or coordinator.is_superseded(key)
+            ):
+                # Stale incarnation (finished/reused request id): fence
+                # forward to a fresh epoch and admit again.
+                key = self._roll_owner_epoch(request)
+                self._assign_owner_and_reserve(request, key)
+            elif coordinator.runnable_num_tokens_of(key) is None:
+                # Defensive: RESERVE in flight without a tracked pending.
+                pass
+            elif coordinator.is_preempted(key):
+                # PREEMPT receipt applied: reacquire on the sticky owner.
+                self._issue_owner_reserve(request, key)
+            else:
+                # Accepted lease: promote to RUNNING.
+                self._promote_owner_request(request, key, scheduled_timestamp)
+
+            request_queue.pop_request()
+            if request.status == RequestStatus.RUNNING:
+                # Promoted: do not requeue.
+                continue
+            step_skipped_waiting.prepend_request(request)
+        if step_skipped_waiting:
+            self.waiting.prepend_requests(step_skipped_waiting)
+
+    def _owner_running_pass(self) -> None:
+        """Plan RUNNING token counts strictly capped by the granted horizon.
+
+        At the horizon with work remaining, issue EXTEND and stall until its
+        receipt is applied.  Plans are internal only: nothing is dispatched
+        for execution by this slice.
+        """
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        for request in self.running:
+            if request.is_finished():
+                continue
+            request_id = request.request_id
+            key = self._owner_key.get(request_id)
+            if key is None:
+                continue
+            if self._owner_pending_command.get(request_id) is not None:
+                continue
+            if (
+                coordinator.is_release_pending(key)
+                or coordinator.is_released(key)
+                or coordinator.is_preempted(key)
+            ):
+                continue
+            plan = self._owner_plan_num_new_tokens(request)
+            self._owner_token_plans[request_id] = plan
+            if plan == 0 and request.num_computed_tokens < request.num_tokens:
+                # At the granted horizon with work remaining: EXTEND and stall.
+                self._issue_owner_extend(request, key)
+
+    def _owner_key_for(self, request: Request) -> OwnerLeaseKey:
+        """Return (and remember) the lease key for a request incarnation."""
+        request_id = request.request_id
+        key = self._owner_key.get(request_id)
+        if key is None:
+            epoch = self._owner_epoch.get(request_id, 0)
+            key = OwnerLeaseKey(request_id=request_id, owner_epoch=epoch)
+            self._owner_key[request_id] = key
+            self._owner_epoch[request_id] = epoch
+        return key
+
+    def _roll_owner_epoch(self, request: Request) -> OwnerLeaseKey:
+        """Fence a reused request id forward to a fresh lease epoch."""
+        request_id = request.request_id
+        epoch = self._owner_epoch.get(request_id, 0) + 1
+        key = OwnerLeaseKey(request_id=request_id, owner_epoch=epoch)
+        self._owner_key[request_id] = key
+        self._owner_epoch[request_id] = epoch
+        return key
+
+    def _owner_reserve_required(self, request: Request) -> int:
+        """Small chunk-scaled exact required count for a fresh RESERVE.
+
+        Scaled to the scheduling chunk, never the full request length.
+        """
+        remaining = request.num_tokens - request.num_computed_tokens
+        return min(self.max_num_scheduled_tokens, remaining)
+
+    def _owner_resume_required(self, request: Request) -> int:
+        """Chunk-scaled RESERVE required count on resume.
+
+        Never below the already-published count: the worker refuses a resume
+        that would regress its honored (published) fence.
+        """
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        published = coordinator.published_num_tokens(
+            self._owner_key[request.request_id]
+        )
+        return min(
+            request.num_tokens,
+            max(published, self.max_num_scheduled_tokens),
+        )
+
+    def _owner_extend_required(self, request: Request) -> int:
+        """Chunk-scaled cumulative EXTEND requirement past the horizon.
+
+        ``required_num_tokens`` is the new exclusive upper bound the lease
+        asks the worker to honor, so the next chunk starts at the current
+        computed position (which equals the granted horizon when extending).
+        """
+        return min(
+            request.num_tokens,
+            request.num_computed_tokens + self.max_num_scheduled_tokens,
+        )
+
+    def _assign_owner_and_reserve(
+        self, request: Request, key: OwnerLeaseKey
+    ) -> None:
+        """Assign to the least-committed-work owner and issue the RESERVE."""
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        required = self._owner_reserve_required(request)
+        try:
+            coordinator.assign(key, required_num_tokens=required)
+        except EpochFenceError:
+            # Request-id reuse raced a higher fence: roll forward once.
+            key = self._roll_owner_epoch(request)
+            coordinator.assign(key, required_num_tokens=required)
+        self._issue_owner_reserve(request, key)
+
+    def _issue_owner_reserve(self, request: Request, key: OwnerLeaseKey) -> None:
+        """Issue RESERVE (first admission) or RESUME (PREEMPTED) with the
+        matching allocation descriptor and record the in-flight command."""
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        if request.status == RequestStatus.PREEMPTED:
+            command = coordinator.resume(key, self._owner_resume_required(request))
+            status = OwnerAdmissionStatus.PREEMPTED
+            num_computed_tokens = 0
+        else:
+            command = coordinator.reserve(key, self._owner_reserve_required(request))
+            status = OwnerAdmissionStatus.WAITING
+            num_computed_tokens = request.num_computed_tokens
+        allocation = OwnerAllocationDescriptor(
+            key=key,
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_tokens=command.required_num_tokens,
+            status=status,
+        )
+        self._owner_outbox.append(replace(command, allocation=allocation))
+        self._owner_pending_command[request.request_id] = (
+            command.command_seq,
+            command.kind,
+        )
+
+    def _issue_owner_extend(self, request: Request, key: OwnerLeaseKey) -> None:
+        """Issue EXTEND at the horizon and record the in-flight command."""
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        command = coordinator.extend(key, self._owner_extend_required(request))
+        self._owner_outbox.append(command)
+        self._owner_pending_command[request.request_id] = (
+            command.command_seq,
+            command.kind,
+        )
+
+    def _owner_plan_num_new_tokens(self, request: Request) -> int:
+        """Internal RUNNING token plan, strictly capped by the horizon.
+
+        The granted ``runnable_num_tokens`` is an exclusive upper bound
+        (positions ``0 <= p < runnable`` are runnable), so the plan never
+        pushes ``num_computed_tokens`` to or past the horizon.  The plan is
+        constructed for tests/future slices only and is never dispatched.
+        """
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        key = self._owner_key[request.request_id]
+        horizon = coordinator.runnable_num_tokens_of(key)
+        if horizon is None:
+            return 0
+        remaining = request.num_tokens - request.num_computed_tokens
+        desired = min(self.max_num_scheduled_tokens, remaining)
+        return max(0, min(desired, horizon - request.num_computed_tokens))
+
+    def _promote_owner_request(
+        self, request: Request, key: OwnerLeaseKey, scheduled_timestamp: float
+    ) -> None:
+        """Promote an accepted lease to RUNNING with its sticky owner."""
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        request.attention_owner = coordinator.owner_of(key)
+        request.attention_owner_epoch = key.owner_epoch
+        request.status = RequestStatus.RUNNING
+        self.running.append(request)
+        self._inflight_prefills.discard(request)
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+
+    def _drain_owner_outbox(self) -> list[OwnerCommand]:
+        """Emit outbox commands in per-owner order, each exactly once."""
+        commands: list[OwnerCommand] = []
+        for command in self._owner_outbox:
+            owner = command.owner_id
+            if command.command_seq <= self._owner_emitted_command_seq.get(owner, 0):
+                continue
+            commands.append(command)
+            self._owner_emitted_command_seq[owner] = command.command_seq
+        self._owner_outbox = []
+        commands.sort(key=lambda command: (command.owner_id, command.command_seq))
+        return commands
+
+    def _preempt_request_owned(self, request: Request, timestamp: float) -> None:
+        """Preempt with the owner protocol: sticky owner+epoch, zero
+        recompute, PREEMPT command instead of freeing scheduler KV blocks."""
+        assert request.status == RequestStatus.RUNNING
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        key = self._owner_key[request.request_id]
+        command = coordinator.preempt(key)
+        self._owner_outbox.append(command)
+        self._owner_pending_command[request.request_id] = (
+            command.command_seq,
+            command.kind,
+        )
+        self.encoder_cache_manager.free(request)
+        self._inflight_prefills.discard(request)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        if request.spec_token_ids:
+            request.spec_token_ids = []
+        request.num_preemptions += 1
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        self.waiting.prepend_request(request)
+        self.reset_preempted_req_ids.add(request.request_id)
+
+    def _finish_owner_lease(self, request: Request) -> None:
+        """Finish/abort the owner lease.
+
+        Before admission the provisional assignment is abandoned (refunded,
+        retryable); after admission an idempotent RELEASE keeps command-only
+        liveness until its accepted receipt.  Sticky owner+epoch facts are
+        preserved so request-id reuse fences forward via the coordinator.
+        """
+        coordinator = self.owner_coordinator
+        if coordinator is None:
+            return
+        request_id = request.request_id
+        key = self._owner_key.get(request_id)
+        if key is None or coordinator.owner_of(key) is None:
+            return
+        if coordinator.is_released(key):
+            return
+        if coordinator.runnable_num_tokens_of(key) is None:
+            # Before admission: refund the provisional assignment.
+            coordinator.abandon(key)
+            self._owner_key.pop(request_id, None)
+            self._owner_pending_command.pop(request_id, None)
+            return
+        # After admission: idempotent RELEASE while release_pending.
+        if not coordinator.is_release_pending(key):
+            command = coordinator.finish(key)
+            self._owner_outbox.append(command)
+            self._owner_pending_command[request_id] = (
+                command.command_seq,
+                command.kind,
+            )
+
+    def _has_pending_owner_control(self) -> bool:
+        """True while an owner command is in flight or a RELEASE is pending.
+
+        Keeps the engine stepping (command-only liveness) until the accepted
+        release receipt lands, even after the request left the queues.
+        """
+        coordinator = self.owner_coordinator
+        if coordinator is None:
+            return False
+        if self._owner_pending_command:
+            return True
+        return any(
+            coordinator.owner_of(key) is not None
+            and coordinator.is_release_pending(key)
+            for key in self._owner_key.values()
+        )
+
+    def _apply_request_owned_receipts(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Validate the all-worker receipt envelope and apply every event.
+
+        Runs before ordinary output/request mutation.  Structural violations
+        fail closed exactly like the G1 ingress boundary; structurally valid
+        nonempty receipts are applied to the coordinator.
+        """
+        # Envelope violations fail closed exactly like the G1 ingress
+        # boundary, before any authority/coordinator access.
+        step_seq = scheduler_output.step_seq
+        if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
+            raise RuntimeError(
+                "request-owned receipt ingress requires a positive non-bool "
+                f"step_seq, got {step_seq!r}."
+            )
+        batches = model_runner_output.owner_receipt_batches
+        if batches is None:
+            raise RuntimeError(
+                "request-owned receipt ingress is missing all-worker receipt batches."
+            )
+        expected_ranks = list(range(self.parallel_config.world_size))
+        ranks = [batch.owner_rank for batch in batches]
+        if (
+            any(isinstance(rank, bool) or not isinstance(rank, int) for rank in ranks)
+            or len(ranks) != len(expected_ranks)
+            or sorted(ranks) != expected_ranks
+        ):
+            raise RuntimeError(
+                "request-owned receipt ingress requires exactly one batch per "
+                f"process-global owner rank {expected_ranks}, got {ranks}."
+            )
+        for batch in batches:
+            if (
+                isinstance(batch.emitted_step_seq, bool)
+                or not isinstance(batch.emitted_step_seq, int)
+                or batch.emitted_step_seq != step_seq
+            ):
+                raise RuntimeError(
+                    "request-owned receipt ingress got emitted_step_seq "
+                    f"{batch.emitted_step_seq} from owner {batch.owner_rank}, "
+                    f"expected {step_seq}."
+                )
+            for event in batch.events:
+                if (
+                    isinstance(event.owner_id, bool)
+                    or not isinstance(event.owner_id, int)
+                    or event.owner_id != batch.owner_rank
+                ):
+                    raise RuntimeError(
+                        "request-owned receipt ingress got an event for owner "
+                        f"{event.owner_id} in owner {batch.owner_rank}'s batch."
+                    )
+        coordinator = getattr(self, "owner_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError(
+                "request-owned receipt ingress requires the G2 owner "
+                "coordinator; the scheduler was not initialized for it."
+            )
+        for batch in batches:
+            for event in batch.events:
+                self._apply_owner_receipt(event)
+
+    def _apply_owner_receipt(self, event: OwnerReceipt) -> None:
+        """Apply one worker receipt to the coordinator and scheduler state.
+
+        Accepted RESERVE promotes the request (sticky owner + epoch); a
+        refused provisional RESERVE abandons and retries without any token
+        mutation; an accepted RELEASE completes the incarnation so request-id
+        reuse fences forward.
+        """
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        request_id = event.key.request_id
+        key = self._owner_key.get(request_id)
+        if key is None or key != event.key:
+            # Unknown or fenced-out lease: the coordinator ignores it and the
+            # current incarnation's pending command is never touched.
+            coordinator.apply_receipt(event)
+            return
+        pending = self._owner_pending_command.get(request_id)
+        if pending is not None and pending[0] == event.command_seq:
+            self._owner_pending_command.pop(request_id, None)
+        applied = coordinator.apply_receipt(event)
+        if not applied:
+            if not event.accepted:
+                # A matching-current rejected PREEMPT/RELEASE is not
+                # recoverable by waiting: the worker fence rejects a
+                # duplicate command_seq, and the scheduler never re-issues
+                # either command, so the protocol/authority stream has
+                # diverged. Fail closed instead of stalling forever.
+                if (
+                    pending is not None
+                    and pending[0] == event.command_seq
+                    and pending[1]
+                    in (OwnerCommandKind.PREEMPT, OwnerCommandKind.RELEASE)
+                ):
+                    raise RuntimeError(
+                        "worker refused fenced "
+                        f"{pending[1].value} for {event.key}: unrecoverable "
+                        "protocol/authority divergence"
+                    )
+                # Refused RESERVE/EXTEND is ordinary backpressure: a
+                # provisional RESERVE abandons and retries.
+                if (
+                    coordinator.owner_of(key) is not None
+                    and coordinator.runnable_num_tokens_of(key) is None
+                    and not coordinator.is_release_pending(key)
+                ):
+                    coordinator.abandon(key)
+                    self._owner_key.pop(request_id, None)
+            return
+        if not event.accepted:
+            return
+        if coordinator.is_released(key) and self._owner_key.get(request_id) == key:
+            # Accepted release: the incarnation is done.  Fence request-id
+            # reuse forward so the next incarnation gets a fresh epoch.
+            if key.owner_epoch >= self._owner_epoch.get(request_id, 0):
+                self._owner_epoch[request_id] = key.owner_epoch + 1
+            self._owner_key.pop(request_id, None)
+            return
+        # Accepted RESERVE promotes the request (sticky owner + epoch).
+        request = self.requests.get(request_id)
+        if (
+            request is not None
+            and request.attention_owner is None
+            and coordinator.runnable_num_tokens_of(key) is not None
+        ):
+            request.attention_owner = coordinator.owner_of(key)
+            request.attention_owner_epoch = key.owner_epoch
+
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
             self.skipped_waiting.add_request(request)
@@ -2228,6 +2817,11 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        if self.scheduler_config.enable_request_owned_attention:
+            # G2: finish/abort the owner lease (abandon before admission,
+            # idempotent RELEASE after) before the request leaves the queues.
+            self._finish_owner_lease(request)
+
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
@@ -2258,6 +2852,11 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if self.scheduler_config.enable_request_owned_attention:
+            # G2: physical KV is owned by the worker-local allocator.  The
+            # scheduler never allocated blocks in this mode and must not free
+            # them (PREEMPT/RELEASE flow through the owner protocol instead).
+            return
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.
@@ -2318,6 +2917,7 @@ class Scheduler(SchedulerInterface):
             self.has_unfinished_requests()
             or self.has_finished_requests()
             or (self.connector is not None and self.connector.has_pending_push_work())
+            or self._has_pending_owner_control()
         )
 
     def reset_prefix_cache(
