@@ -26,7 +26,11 @@ does not match the record simply misses the lookup and is rejected without
 touching any state.  Commands whose kind or record state the store does not
 own are rejected with ``accepted=False`` and never advance local records.
 PREEMPT/RELEASE only mark the record pending a free; blocks stay resident
-(and the allocator id non-reusable) until :meth:`flush`.
+(and the allocator id non-reusable) until :meth:`flush`.  A PREEMPT flushed
+while the request is still alive leaves an exact-key tombstone so the
+subsequent valid RELEASE (request aborted while preempted) is accepted as a
+non-deferred no-op; a RESERVE on that key consumes the tombstone and
+allocates fresh blocks.
 """
 
 
@@ -91,6 +95,9 @@ class _Record:
     #: upper bound that ``mark_computed`` must not exceed.
     reserved_num_tokens: int = 0
     pending_free: bool = False
+    #: True when the pending free was caused by PREEMPT (a flushed preempt
+    #: leaves an exact-key tombstone for the later logical RELEASE).
+    preempted: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,6 +153,9 @@ class RequestOwnedKVStore:
         self._manager = kv_cache_manager
         self._owner_rank = owner_rank
         self._records: dict[OwnerLeaseKey, _Record] = {}
+        #: Exact keys physically freed by a flushed PREEMPT while the
+        #: request may still be alive; consumed by RELEASE or RESERVE.
+        self._tombstones: set[OwnerLeaseKey] = set()
         self._num_groups = kv_cache_manager.num_kv_cache_groups
         self._group_specs: tuple[KVCacheSpec, ...] = tuple(
             group.kv_cache_spec
@@ -195,6 +205,7 @@ class RequestOwnedKVStore:
             reserved_num_tokens=command.required_num_tokens,
         )
         self._records[command.key] = record
+        self._tombstones.discard(command.key)
         return self._accepted_allocation(command, record, blocks)
 
     def extend(self, command: OwnerCommand) -> AllocationResult:
@@ -233,6 +244,7 @@ class RequestOwnedKVStore:
         if record is None:
             return _reject_free(command, "no active lease to preempt")
         record.pending_free = True
+        record.preempted = True
         return DeferredFreeResult(accepted=True, key=command.key, deferred=True)
 
     def release(self, command: OwnerCommand) -> DeferredFreeResult:
@@ -240,13 +252,19 @@ class RequestOwnedKVStore:
 
         The lookup is keyed by the full lease key (request id plus epoch),
         so a stale-epoch RELEASE can never free the newer epoch's blocks:
-        it misses the newer record and is rejected."""
+        it misses the newer record and is rejected.  A RELEASE for an
+        exact key that was physically freed by a flushed PREEMPT is a
+        valid non-deferred no-op that ends the tombstone."""
         if command.kind is not OwnerCommandKind.RELEASE:
             return _reject_free(command, "release() requires a RELEASE command")
         record = self._records.get(command.key)
         if record is None:
-            return _reject_free(command, "no lease to release")
+            if command.key not in self._tombstones:
+                return _reject_free(command, "no lease to release")
+            self._tombstones.discard(command.key)
+            return DeferredFreeResult(accepted=True, key=command.key, deferred=False)
         record.pending_free = True
+        record.preempted = False
         return DeferredFreeResult(accepted=True, key=command.key, deferred=True)
 
     def restore(self, command: OwnerCommand) -> DeferredFreeResult:
@@ -297,6 +315,8 @@ class RequestOwnedKVStore:
                     num_prompt_tokens=record.num_prompt_tokens,
                 )
             )
+            if record.preempted:
+                self._tombstones.add(key)
             del self._records[key]
             freed.append(key)
         return tuple(freed)

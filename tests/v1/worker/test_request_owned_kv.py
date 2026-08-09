@@ -360,6 +360,81 @@ def test_mark_computed_respects_reserved_horizon():
     assert not store.mark_computed(key, 15)
 
 
+def test_preempt_flush_release_tombstone():
+    """A request aborted while preempted: PREEMPT + flush frees the blocks
+    and leaves an exact-key tombstone, so the later valid RELEASE is a
+    non-deferred no-op instead of a rejection."""
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("pfr")
+    initial = _free(manager)
+
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
+    ).accepted
+    assert store.preempt(
+        _command(key, OwnerCommandKind.PREEMPT, required=10, seq=2)
+    ).accepted
+    assert store.flush() == (key,)
+    assert _free(manager) == initial
+    assert store.get_block_table(key) is None
+    # The request is still alive logically; other commands still miss.
+    assert not store.mark_computed(key, 1)
+    assert not store.extend(
+        _command(key, OwnerCommandKind.EXTEND, required=14, seq=3)
+    ).accepted
+
+    # The aborting RELEASE is accepted as a non-deferred no-op and ends
+    # the tombstone: a repeated RELEASE is now unknown again.
+    release = store.release(
+        _command(key, OwnerCommandKind.RELEASE, required=10, seq=4)
+    )
+    assert release.accepted
+    assert not release.deferred
+    assert _free(manager) == initial
+    again = store.release(
+        _command(key, OwnerCommandKind.RELEASE, required=10, seq=5)
+    )
+    assert not again.accepted
+    assert "no lease to release" in again.error
+
+
+def test_preempt_flush_resume():
+    """A request resumed while preempted: RESERVE on the tombstoned key
+    consumes the tombstone and allocates a fresh table."""
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("pfrs")
+    initial = _free(manager)
+
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
+    ).accepted
+    assert store.preempt(
+        _command(key, OwnerCommandKind.PREEMPT, required=10, seq=2)
+    ).accepted
+    assert store.flush() == (key,)
+    assert _free(manager) == initial
+
+    resume = store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=10, seq=3)
+    )
+    assert resume.accepted
+    assert _sizes(resume.tables) == (3, 3)
+    assert _free(manager) == initial - 6
+    # Tombstone consumed: the resumed lease frees via the normal RELEASE
+    # deferral path, and the release-flush leaves no tombstone behind.
+    release = store.release(
+        _command(key, OwnerCommandKind.RELEASE, required=10, seq=4)
+    )
+    assert release.accepted and release.deferred
+    store.flush()
+    assert _free(manager) == initial
+    assert not store.release(
+        _command(key, OwnerCommandKind.RELEASE, required=10, seq=5)
+    ).accepted
+
+
 def test_pool_snapshot_is_canonical_and_block_id_free():
     manager = _make_manager()
     store = RequestOwnedKVStore(manager, owner_rank=7)
