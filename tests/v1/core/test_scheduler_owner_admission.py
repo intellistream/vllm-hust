@@ -106,7 +106,11 @@ def _make_scheduler(
     scheduler.perf_metrics = None
     scheduler.connector = None
     scheduler.prev_step_scheduled_req_ids = set()
-    # G2 control-plane state (normally initialized at the tail of __init__).
+    # MRV1 logical-token state (the request-owned path preserves it).
+    scheduler.use_v2_model_runner = False
+    scheduler.use_pp = False
+    # G2/G3 control-plane state (normally initialized at the tail of
+    # __init__).
     scheduler.owner_coordinator = None
     scheduler._owner_key = {}
     scheduler._owner_epoch = {}
@@ -114,6 +118,7 @@ def _make_scheduler(
     scheduler._owner_emitted_command_seq = {}
     scheduler._owner_outbox = []
     scheduler._owner_token_plans = {}
+    scheduler._owner_promoted = {}
     scheduler._init_request_owned_control_plane()
     return scheduler
 
@@ -439,12 +444,24 @@ def test_preempt_receipt_resume_keeps_sticky_owner_and_restarts_prefill() -> Non
     assert request.status == RequestStatus.RUNNING
     assert request.attention_owner == 0
     assert request.attention_owner_epoch == 0
-    # Resume reacquires the same horizon as the published watermark, so no
-    # new lease token publishes until EXTEND passes the watermark.
-    assert out3.scheduled_owner_leases == []
+    # Resume reacquires the same horizon as the published watermark, so the
+    # resumed first step is a token-bearing decode that re-publishes the
+    # authorization at the unchanged horizon.
+    assert out3.num_scheduled_tokens == {"req-0": 8}
+    assert out3.total_num_scheduled_tokens == 8
+    assert out3.scheduled_new_reqs == []
+    assert out3.scheduled_cached_reqs.req_ids == ["req-0"]
+    assert "req-0" in out3.scheduled_cached_reqs.resumed_req_ids
+    assert out3.scheduled_cached_reqs.new_block_ids == [None]
+    assert out3.scheduled_cached_reqs.all_token_ids == {"req-0": list(range(32))}
+    (resumed_token,) = out3.scheduled_owner_leases
+    assert resumed_token.key == key
+    assert resumed_token.owner_id == 0
+    assert resumed_token.step_seq == 5
+    assert resumed_token.runnable_num_tokens == 8
+    assert request.num_computed_tokens == 8
 
     # EXTEND past the resumed horizon publishes new runnable tokens.
-    request.num_computed_tokens = 8
     out4 = scheduler.schedule()
     (extend,) = out4.owner_commands
     assert extend.kind is OwnerCommandKind.EXTEND
@@ -653,7 +670,7 @@ def test_deterministic_owner_assignment() -> None:
     )
 
 
-def test_wire_purity_no_scheduler_kv_apis_and_no_new_request_data() -> None:
+def test_wire_purity_no_scheduler_kv_apis_and_empty_block_ids() -> None:
     scheduler = _make_scheduler()
     request = _request("req-0")
     scheduler.add_request(request)
@@ -664,20 +681,39 @@ def test_wire_purity_no_scheduler_kv_apis_and_no_new_request_data() -> None:
         {0: [_receipt(OwnerLeaseKey("req-0", 0), 0, 1, runnable=32)]},
     )
     out2 = scheduler.schedule()
-    for out in (out1, out2):
-        assert out.scheduled_new_reqs == []
-        assert out.num_scheduled_tokens == {}
-        assert out.total_num_scheduled_tokens == 0
-        assert out.new_block_ids_to_zero is None
-        assert out.num_common_prefix_blocks == []
-        assert out.scheduled_spec_decode_tokens == {}
+    # The RESERVE step is a command-only zero-token heartbeat.
+    assert out1.scheduled_new_reqs == []
+    assert out1.num_scheduled_tokens == {}
+    assert out1.total_num_scheduled_tokens == 0
+    assert out1.scheduled_owner_leases == []
+    assert out1.new_block_ids_to_zero is None
+    assert out1.num_common_prefix_blocks == []
+    assert out1.scheduled_spec_decode_tokens == {}
+    # The promotion step carries the first logical token payload with empty
+    # block-ID fields and exactly one authorization lease.
+    assert out2.total_num_scheduled_tokens == 32
+    assert out2.num_scheduled_tokens == {"req-0": 32}
+    assert out2.new_block_ids_to_zero is None
+    assert out2.num_common_prefix_blocks == []
+    assert out2.scheduled_spec_decode_tokens == {}
+    (new_data,) = out2.scheduled_new_reqs
+    assert new_data.req_id == "req-0"
+    assert new_data.block_ids == ()
+    assert new_data.num_computed_tokens == 0
+    assert new_data.attention_owner == 0
+    assert out2.scheduled_cached_reqs.req_ids == []
+    (token,) = out2.scheduled_owner_leases
+    assert token.key == OwnerLeaseKey("req-0", 0)
+    assert token.step_seq == 2
+    assert token.runnable_num_tokens == 32
     # new_step_starts / allocate_slots / get_blocks / free /
     # pop_blocks_for_free / take_new_block_ids never ran (the spy raises if
     # any is touched). take_events is the one legitimate output-path call.
     assert scheduler.kv_cache_manager.take_events_calls == 1
     assert request.status == RequestStatus.RUNNING
-    (token,) = out2.scheduled_owner_leases
-    assert token.runnable_num_tokens == 32
+    assert request.num_computed_tokens == 32
+    # MRV1: the first-dispatch request is recorded for the next step.
+    assert scheduler.prev_step_scheduled_req_ids == {"req-0"}
 
 
 def test_no_snapshot_admission_balances_by_live_lease_count() -> None:
@@ -864,3 +900,117 @@ def test_wrong_owner_receipt_does_not_clear_pending_command() -> None:
     scheduler.schedule()
     assert request.status == RequestStatus.RUNNING
     assert request.attention_owner == 0
+
+
+# ---------------------------------------------------------------------------
+# G3 scheduler slice: budgeted logical token payload + per-step authorizations
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_budget_freezes_plan_in_running_order() -> None:
+    scheduler = _make_scheduler(max_num_scheduled_tokens=48)
+    a = _request("req-a")
+    b = _request("req-b")
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+
+    out1 = scheduler.schedule()
+    commands = {c.key.request_id: c for c in out1.owner_commands}
+    assert set(commands) == {"req-a", "req-b"}
+    _apply_receipts(
+        scheduler,
+        out1,
+        {
+            c.owner_id: [_receipt(c.key, c.owner_id, c.command_seq, runnable=32)]
+            for c in commands.values()
+        },
+    )
+    # Both requests promote in RUNNING (admission) order; the global budget
+    # freezes the plan: req-a keeps its full 32, req-b takes the remainder.
+    out2 = scheduler.schedule()
+    assert out2.num_scheduled_tokens == {"req-a": 32, "req-b": 16}
+    assert out2.total_num_scheduled_tokens == 48
+    assert [d.req_id for d in out2.scheduled_new_reqs] == ["req-a", "req-b"]
+    for data in out2.scheduled_new_reqs:
+        assert data.block_ids == ()
+    # Exactly one authorization lease per scheduled key, in key order.
+    assert [
+        (t.key.request_id, t.runnable_num_tokens) for t in out2.scheduled_owner_leases
+    ] == [("req-a", 32), ("req-b", 32)]
+    assert scheduler._owner_token_plans == {"req-a": 32, "req-b": 16}
+
+    # Decode continuation with the horizon unchanged re-publishes exactly
+    # the scheduled key (req-b), at the same count, via the cached payload.
+    out3 = scheduler.schedule()
+    assert out3.num_scheduled_tokens == {"req-b": 16}
+    assert out3.scheduled_new_reqs == []
+    assert out3.scheduled_cached_reqs.req_ids == ["req-b"]
+    assert out3.scheduled_cached_reqs.resumed_req_ids == set()
+    assert out3.scheduled_cached_reqs.new_block_ids == [None]
+    # req-b was scheduled last step (MRV1): full token ids are not resent.
+    assert out3.scheduled_cached_reqs.all_token_ids == {}
+    assert [
+        (t.key.request_id, t.runnable_num_tokens) for t in out3.scheduled_owner_leases
+    ] == [("req-b", 32)]
+    assert scheduler.prev_step_scheduled_req_ids == {"req-b"}
+
+
+def test_command_only_extend_step_excludes_payload_and_leases() -> None:
+    scheduler = _make_scheduler(max_num_scheduled_tokens=8)
+    request = _request("req-0")
+    scheduler.add_request(request)
+    _admit(scheduler, request, grant=8)
+    request.append_output_token_ids([42])
+    # computed == horizon with work remaining: EXTEND step is command-only.
+    out = scheduler.schedule()
+    assert request.num_computed_tokens == 8
+    (extend,) = out.owner_commands
+    assert extend.kind is OwnerCommandKind.EXTEND
+    assert out.num_scheduled_tokens == {}
+    assert out.total_num_scheduled_tokens == 0
+    assert out.scheduled_new_reqs == []
+    assert out.scheduled_cached_reqs.req_ids == []
+    assert out.scheduled_owner_leases == []
+    # No same-key command + execution token in one step.
+    assert [c.key for c in out.owner_commands] == [OwnerLeaseKey("req-0", 0)]
+
+
+def test_first_dispatch_then_cached_continuation_preserves_mrv1_state() -> None:
+    scheduler = _make_scheduler(max_num_scheduled_tokens=16)
+    request = _request("req-0", num_prompt_tokens=64)
+    scheduler.add_request(request)
+    _admit(scheduler, request, grant=16)
+    # First dispatch: NewRequestData with empty block IDs.
+    assert scheduler.prev_step_scheduled_req_ids == {"req-0"}
+    assert request.num_computed_tokens == 16
+
+    # At the horizon with new output work: EXTEND command-only step.
+    request.append_output_token_ids([42])
+    out_ext = scheduler.schedule()
+    (extend,) = out_ext.owner_commands
+    assert extend.kind is OwnerCommandKind.EXTEND
+    assert out_ext.num_scheduled_tokens == {}
+    assert out_ext.scheduled_owner_leases == []
+    _apply_receipts(
+        scheduler,
+        out_ext,
+        {0: [_receipt(extend.key, 0, extend.command_seq, runnable=32)]},
+    )
+
+    # Decode continuation: cached payload, full token ids only on first
+    # appearance (never on a continuation).
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {"req-0": 16}
+    assert out.scheduled_new_reqs == []
+    assert out.scheduled_cached_reqs.req_ids == ["req-0"]
+    assert out.scheduled_cached_reqs.resumed_req_ids == set()
+    assert out.scheduled_cached_reqs.new_block_ids == [None]
+    # MRV1: after a command-only gap step the persistent batch was not
+    # scheduled, so full token ids are re-propagated on the next step.
+    assert out.scheduled_cached_reqs.all_token_ids == {"req-0": list(range(64)) + [42]}
+    assert out.scheduled_cached_reqs.num_computed_tokens == [16]
+    (token,) = out.scheduled_owner_leases
+    assert token.key == OwnerLeaseKey("req-0", 0)
+    assert token.runnable_num_tokens == 32
+    assert request.num_computed_tokens == 32
+    assert scheduler.prev_step_scheduled_req_ids == {"req-0"}

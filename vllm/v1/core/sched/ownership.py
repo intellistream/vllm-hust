@@ -822,41 +822,120 @@ class OwnerLeaseCoordinator:
 
     # -- publication ----------------------------------------------------------
 
-    def publish(self, step_seq: int) -> list[OwnerLeaseToken]:
+    def publish(
+        self,
+        step_seq: int,
+        scheduled_keys: set[OwnerLeaseKey] | None = None,
+    ) -> list[OwnerLeaseToken]:
         """Publish lease tokens for the step, only at/below granted counts.
 
-        A lease with zero runnable tokens (an accepted empty RESERVE)
-        publishes no token.  Raises :class:`PublicationViolationError` when
-        a publish would exceed the worker-granted count or regress an
-        already-published count.
+        With ``scheduled_keys=None`` (advance-only mode) a lease publishes a
+        token only when its horizon advances past the already-published
+        watermark, and a lease with zero runnable tokens (an accepted empty
+        RESERVE) publishes no token at all.
+
+        With an explicit ``scheduled_keys`` set (per-step authorization
+        mode), exactly one authorization token is emitted for every key in
+        the set -- every token-bearing step, even when the horizon is
+        unchanged -- carrying the lease's current granted horizon.  The
+        scheduler may only schedule keys whose grants are already receipted,
+        so a scheduled key with an in-flight command, an unreceipted grant,
+        or no active lease fails closed here instead of silently dropping
+        the authorization (missing authorization) or emitting an
+        unscheduled key (extra authorization).
+
+        Raises :class:`PublicationViolationError` when a publish would
+        exceed the worker-granted count, regress an already-published
+        count, or (in per-step authorization mode) when a scheduled key has
+        no publishable grant.
         """
         tokens: list[OwnerLeaseToken] = []
-        for key, lease in sorted(
-            self._leases.items(),
-            key=lambda kv: (kv[0].request_id, kv[0].owner_epoch),
+        if scheduled_keys is None:
+            for key, lease in sorted(
+                self._leases.items(),
+                key=lambda kv: (kv[0].request_id, kv[0].owner_epoch),
+            ):
+                if (
+                    lease.released
+                    or lease.release_pending
+                    or lease.preempted
+                    or lease.superseded
+                ):
+                    continue
+                if lease.command_seq != lease.receipt_seq:
+                    # The current command is still in flight: nothing may
+                    # publish until its receipt is applied.
+                    continue
+                if lease.command_kind not in (
+                    OwnerCommandKind.RESERVE,
+                    OwnerCommandKind.EXTEND,
+                ):
+                    # Only accepted RESERVE/EXTEND grants are publishable;
+                    # PREEMPT, RELEASE, and RESTORE receipts never advance
+                    # publication.
+                    continue
+                if lease.runnable_num_tokens is None:
+                    # Not yet granted: nothing legal to publish.
+                    continue
+                horizon = min(lease.runnable_num_tokens, lease.required_num_tokens)
+                watermark = self._publish_watermark.get(key, 0)
+                if horizon < watermark:
+                    raise PublicationViolationError(
+                        f"publish count {horizon} for {key} regresses "
+                        f"published count {watermark}"
+                    )
+                # Zero runnable tokens: the empty lease publishes no token,
+                # and the watermark never advances below an already-published
+                # count.
+                if horizon <= watermark:
+                    continue
+                self._publish_watermark[key] = horizon
+                tokens.append(
+                    OwnerLeaseToken(
+                        key=key,
+                        owner_id=lease.owner_id,
+                        step_seq=step_seq,
+                        command_seq=lease.command_seq,
+                        runnable_num_tokens=horizon,
+                    )
+                )
+            return tokens
+
+        for key in sorted(
+            scheduled_keys,
+            key=lambda k: (k.request_id, k.owner_epoch),
         ):
+            lease = self._leases.get(key)
+            if lease is None:
+                raise PublicationViolationError(
+                    f"cannot authorize scheduled {key}: no lease"
+                )
             if (
                 lease.released
                 or lease.release_pending
                 or lease.preempted
                 or lease.superseded
             ):
-                continue
+                raise PublicationViolationError(
+                    f"cannot authorize scheduled {key}: lease is not active"
+                )
             if lease.command_seq != lease.receipt_seq:
-                # The current command is still in flight: nothing may
-                # publish until its receipt is applied.
-                continue
+                raise PublicationViolationError(
+                    f"cannot authorize scheduled {key}: command "
+                    f"{lease.command_seq} is still in flight"
+                )
             if lease.command_kind not in (
                 OwnerCommandKind.RESERVE,
                 OwnerCommandKind.EXTEND,
             ):
-                # Only accepted RESERVE/EXTEND grants are publishable;
-                # PREEMPT, RELEASE, and RESTORE receipts never advance
-                # publication.
-                continue
+                raise PublicationViolationError(
+                    f"cannot authorize scheduled {key}: only RESERVE/EXTEND "
+                    f"grants publish, got {lease.command_kind}"
+                )
             if lease.runnable_num_tokens is None:
-                # Not yet granted: nothing legal to publish.
-                continue
+                raise PublicationViolationError(
+                    f"cannot authorize scheduled {key}: grant not yet applied"
+                )
             horizon = min(lease.runnable_num_tokens, lease.required_num_tokens)
             watermark = self._publish_watermark.get(key, 0)
             if horizon < watermark:
@@ -864,11 +943,11 @@ class OwnerLeaseCoordinator:
                     f"publish count {horizon} for {key} regresses "
                     f"published count {watermark}"
                 )
-            # Zero runnable tokens: the empty lease publishes no token, and
-            # the watermark never advances below an already-published count.
-            if horizon <= watermark:
-                continue
-            self._publish_watermark[key] = horizon
+            if horizon <= 0:
+                raise PublicationViolationError(
+                    f"cannot authorize scheduled {key}: zero-token grant"
+                )
+            self._publish_watermark[key] = max(watermark, horizon)
             tokens.append(
                 OwnerLeaseToken(
                     key=key,

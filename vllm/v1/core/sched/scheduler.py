@@ -389,6 +389,10 @@ class Scheduler(SchedulerInterface):
         # Internal per-step RUNNING token plans (never dispatched for
         # execution; see _schedule_request_owned).
         self._owner_token_plans: dict[str, int] = {}
+        # request_id -> status BEFORE promotion this step (WAITING = first
+        # dispatch, PREEMPTED = resumed); filled by the admission pass so
+        # the payload can classify first dispatch vs cached/resumed.
+        self._owner_promoted: dict[str, RequestStatus] = {}
         # Global rank -> latest worker-confirmed physical pool snapshot
         # (block-ID-free), empty until the first non-None receipt envelope.
         self._owner_pool_snapshots: dict[int, OwnerCachePoolSnapshot] = {}
@@ -2076,17 +2080,21 @@ class Scheduler(SchedulerInterface):
         )
 
     def _schedule_request_owned(self) -> SchedulerOutput:
-        """Run the G2 scheduler-side receipt-gated control plane.
+        """Run the G3 scheduler-side request-owned control plane.
 
         This replaces the ordinary schedule path when
-        ``enable_request_owned_attention`` is on: no scheduler KV blocks are
-        allocated, no block IDs are zeroed, no common-prefix facts are
-        computed, and no token execution payload is emitted (the executor and
-        worker terminal gates reject token-bearing steps until owner-local KV
-        routing lands; this slice only constructs internal token plans).
-        The step emits owner commands in per-owner order and publishes leases
-        from the coordinator only after their accepted receipts were applied.
-        Empty control steps are valid.
+        ``enable_request_owned_attention`` is on: the step freezes a global
+        token plan within ``max_num_scheduled_tokens`` in RUNNING order,
+        emits the block-ID-free logical token payload (``NewRequestData`` /
+        ``CachedRequestData`` with empty block ids, no scheduler KV
+        allocation/free/block-ID calls anywhere), and publishes exactly one
+        authorization lease per scheduled key on every token-bearing step
+        (even when the horizon is unchanged).  A key with an in-flight
+        command is stalled and therefore never carries both a command and an
+        execution token in the same step.  The executor and worker terminal
+        gates still reject token-bearing steps until owner-local KV routing
+        lands; this slice only constructs the payload.  Empty command-only
+        control steps remain valid zero-token heartbeats.
         """
         coordinator = self.owner_coordinator
         assert coordinator is not None
@@ -2101,6 +2109,7 @@ class Scheduler(SchedulerInterface):
 
         scheduled_timestamp = time.monotonic()
         self._owner_token_plans = {}
+        self._owner_promoted = {}
 
         if self._pause_state != PauseState.PAUSED_ALL:
             self._owner_admission_pass(scheduled_timestamp)
@@ -2109,14 +2118,79 @@ class Scheduler(SchedulerInterface):
         # Drain newly issued commands, per-owner ordered, each exactly once.
         owner_commands = self._drain_owner_outbox()
 
-        # Publish only leases whose commands were already receipted.
-        scheduled_owner_leases = coordinator.publish(self.current_step)
+        # Freeze the global token plan: only positive per-request plans are
+        # scheduled this step (the running pass already applied the global
+        # budget in RUNNING order).
+        num_scheduled_tokens = {
+            req_id: plan for req_id, plan in self._owner_token_plans.items() if plan > 0
+        }
+        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+
+        # Classify first dispatch vs cached/resumed exactly: requests
+        # promoted this step from WAITING are first dispatch, from PREEMPTED
+        # are resumed; the remaining scheduled RUNNING requests are ordinary
+        # continuations.
+        first_dispatch: list[Request] = []
+        scheduled_resumed_reqs: list[Request] = []
+        for request_id, prior_status in self._owner_promoted.items():
+            if self._owner_token_plans.get(request_id, 0) <= 0:
+                continue
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            if prior_status is RequestStatus.WAITING:
+                first_dispatch.append(request)
+            elif prior_status is RequestStatus.PREEMPTED:
+                scheduled_resumed_reqs.append(request)
+            else:
+                raise RuntimeError(
+                    "request-owned promotion requires WAITING or PREEMPTED "
+                    f"prior status, got {prior_status}"
+                )
+        scheduled_running_reqs = [
+            request
+            for request in self.running
+            if request.request_id not in self._owner_promoted
+            and num_scheduled_tokens.get(request.request_id, 0) > 0
+        ]
+
+        # Block-ID-free logical token payload.
+        if self.use_v2_model_runner:
+            first_dispatch.extend(scheduled_resumed_reqs)
+            scheduled_resumed_reqs = []
+            new_reqs_data = [
+                NewRequestData.from_request(request, (), request._all_token_ids)
+                for request in first_dispatch
+            ]
+        else:
+            new_reqs_data = [
+                NewRequestData.from_request(request, ()) for request in first_dispatch
+            ]
+        cached_reqs_data = self._make_request_owned_cached_data(
+            scheduled_running_reqs,
+            scheduled_resumed_reqs,
+            num_scheduled_tokens,
+        )
+
+        # Record the request ids scheduled in this step (MRV1-only), so the
+        # worker-side persistent batch can skip re-propagating their full
+        # token ids next step.
+        if not self.use_v2_model_runner:
+            self.prev_step_scheduled_req_ids.clear()
+            self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        # Authorization leases for exactly the scheduled keys, every
+        # token-bearing step even when the horizon is unchanged.  Missing or
+        # un-receipted grants for a scheduled key fail closed here.
+        scheduled_keys = {self._owner_key[req_id] for req_id in num_scheduled_tokens}
+        scheduled_owner_leases = coordinator.publish(self.current_step, scheduled_keys)
 
         scheduler_output = SchedulerOutput(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
-            num_scheduled_tokens={},
-            total_num_scheduled_tokens=0,
+            scheduled_new_reqs=new_reqs_data,
+            scheduled_cached_reqs=cached_reqs_data,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
@@ -2136,6 +2210,68 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
 
         return scheduler_output
+
+    def _make_request_owned_cached_data(
+        self,
+        running_reqs: list[Request],
+        resumed_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+    ) -> CachedRequestData:
+        """Block-ID-free MRV1 cached payload for the request-owned path.
+
+        Mirrors ``_make_cached_request_data`` but never touches the
+        scheduler KV pool: every ``new_block_ids`` entry is ``None`` (the
+        request-owned mode allocates no scheduler KV blocks), and only the
+        logical MRV1 token state is propagated (``all_token_ids`` for
+        requests not scheduled in the prior step, ``num_computed_tokens``,
+        ``num_output_tokens``).
+        """
+        req_ids: list[str] = []
+        new_token_ids: list[list[int]] = []
+        new_block_ids: list[tuple[list[int], ...] | None] = []
+        all_token_ids: dict[str, list[int]] = {}
+        num_computed_tokens: list[int] = []
+        num_output_tokens: list[int] = []
+        resumed_req_ids = set()
+
+        num_running_reqs = len(running_reqs)
+        for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
+            req_id = req.request_id
+            req_ids.append(req_id)
+            # NOTE: In PP+async scheduling, token ids are consumed via a
+            # direct GPU broadcast path, so the payload may omit them.
+            if self.use_pp and not self.scheduler_config.async_scheduling:
+                num_tokens = num_scheduled_tokens[req_id]
+                token_ids = req.all_token_ids[
+                    req.num_computed_tokens : req.num_computed_tokens + num_tokens
+                ]
+                new_token_ids.append(token_ids)
+            if idx >= num_running_reqs:
+                resumed_req_ids.add(req_id)
+            # MRV1-only: propagate full token ids for requests not scheduled
+            # in the prior step.
+            if (
+                not self.use_v2_model_runner
+                and req_id not in self.prev_step_scheduled_req_ids
+            ):
+                all_token_ids[req_id] = req.all_token_ids.copy()
+            # No scheduler KV blocks exist in request-owned mode: never a
+            # new block ID to append (continuation) or replace (resume).
+            new_block_ids.append(None)
+            num_computed_tokens.append(req.num_computed_tokens)
+            num_output_tokens.append(
+                req.num_output_tokens + req.num_output_placeholders
+            )
+
+        return CachedRequestData(
+            req_ids=req_ids,
+            resumed_req_ids=resumed_req_ids,
+            new_token_ids=new_token_ids,
+            all_token_ids=all_token_ids,
+            new_block_ids=new_block_ids,
+            num_computed_tokens=num_computed_tokens,
+            num_output_tokens=num_output_tokens,
+        )
 
     def _owner_admission_pass(self, scheduled_timestamp: float) -> None:
         """Admission pass over the waiting queues.
@@ -2202,14 +2338,20 @@ class Scheduler(SchedulerInterface):
             self.waiting.prepend_requests(step_skipped_waiting)
 
     def _owner_running_pass(self) -> None:
-        """Plan RUNNING token counts strictly capped by the granted horizon.
+        """Plan RUNNING token counts capped by the horizon and global budget.
 
-        At the horizon with work remaining, issue EXTEND and stall until its
-        receipt is applied.  Plans are internal only: nothing is dispatched
-        for execution by this slice.
+        Per-request plans are strictly capped by the granted horizon; the
+        global step budget (``max_num_scheduled_tokens``) freezes the plan
+        in RUNNING order: earlier requests keep their full per-request plan,
+        the first request that would overflow takes the remainder, and later
+        requests are left unscheduled until budget frees.  At the horizon
+        with work remaining, EXTEND is issued and the request stalls until
+        its receipt is applied.  Plans are logical payload only: nothing is
+        dispatched for execution by this slice.
         """
         coordinator = self.owner_coordinator
         assert coordinator is not None
+        budget = self.max_num_scheduled_tokens
         for request in self.running:
             if request.is_finished():
                 continue
@@ -2226,10 +2368,21 @@ class Scheduler(SchedulerInterface):
             ):
                 continue
             plan = self._owner_plan_num_new_tokens(request)
+            if plan == 0:
+                self._owner_token_plans[request_id] = 0
+                if request.num_computed_tokens < request.num_tokens:
+                    # At the granted horizon with work remaining: EXTEND and
+                    # stall.
+                    self._issue_owner_extend(request, key)
+                continue
+            if budget <= 0:
+                # Global step budget exhausted in RUNNING order: this and
+                # later requests wait for a future step.
+                self._owner_token_plans[request_id] = 0
+                continue
+            plan = min(plan, budget)
             self._owner_token_plans[request_id] = plan
-            if plan == 0 and request.num_computed_tokens < request.num_tokens:
-                # At the granted horizon with work remaining: EXTEND and stall.
-                self._issue_owner_extend(request, key)
+            budget -= plan
 
     def _owner_key_for(self, request: Request) -> OwnerLeaseKey:
         """Return (and remember) the lease key for a request incarnation."""
@@ -2410,6 +2563,9 @@ class Scheduler(SchedulerInterface):
         assert coordinator is not None
         request.attention_owner = coordinator.owner_of(key)
         request.attention_owner_epoch = key.owner_epoch
+        # G3: remember whether this promotion is a first dispatch (WAITING)
+        # or a resume (PREEMPTED) so the payload classifies exactly.
+        self._owner_promoted[request.request_id] = request.status
         request.status = RequestStatus.RUNNING
         self.running.append(request)
         self._inflight_prefills.discard(request)

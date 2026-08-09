@@ -1146,3 +1146,80 @@ def test_publish_only_from_reserve_or_extend_grants() -> None:
     _grant(coordinator, manager, coordinator.finish(key))
     assert _publish(coordinator, manager, step_seq=4) == []
     assert coordinator.is_released(key)
+
+
+# -- G3 per-step authorization publication --------------------------------------
+
+
+def test_publish_republishes_scheduled_key_at_unchanged_horizon() -> None:
+    coordinator = OwnerLeaseCoordinator()
+    manager = AttentionLeaseManager(owner_rank=1, capacity=1000, grant_ceiling=40)
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=1, observation_seq=1, work=0)
+    )
+    key = _key()
+    coordinator.assign(key)
+    _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=100))
+
+    # Every token-bearing step re-publishes the scheduled key's current
+    # horizon, even when the horizon does not advance.
+    first = coordinator.publish(1, scheduled_keys={key})
+    assert [t.runnable_num_tokens for t in first] == [40]
+    for token in first:
+        manager.record_published(token)
+    second = coordinator.publish(2, scheduled_keys={key})
+    assert [(t.key, t.step_seq, t.runnable_num_tokens) for t in second] == [
+        (key, 2, 40)
+    ]
+    for token in second:
+        manager.record_published(token)
+
+    # Advance-only mode (no scheduled keys) does not re-emit the watermark.
+    assert coordinator.publish(3) == []
+
+
+def test_publish_scheduled_keys_exactly_and_rejects_unscheduled_extras() -> None:
+    coordinator = OwnerLeaseCoordinator()
+    manager = AttentionLeaseManager(owner_rank=1, capacity=1000, grant_ceiling=40)
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=1, observation_seq=1, work=0)
+    )
+    key_a = _key("req-a")
+    key_b = _key("req-b")
+    coordinator.assign(key_a)
+    coordinator.assign(key_b)
+    _grant(coordinator, manager, coordinator.reserve(key_a, required_num_tokens=100))
+    _grant(coordinator, manager, coordinator.reserve(key_b, required_num_tokens=100))
+
+    # Only the scheduled keys publish; an unscheduled key never leaks a
+    # lease (no extra live leases).
+    tokens = coordinator.publish(1, scheduled_keys={key_b})
+    assert [t.key for t in tokens] == [key_b]
+    for token in tokens:
+        manager.record_published(token)
+
+
+def test_publish_scheduled_keys_fails_closed_on_missing_or_unreceipted_grant() -> None:
+    coordinator = OwnerLeaseCoordinator()
+    manager = AttentionLeaseManager(owner_rank=1, capacity=1000, grant_ceiling=40)
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=1, observation_seq=1, work=0)
+    )
+    key = _key()
+    coordinator.assign(key)
+
+    # A scheduled key without any lease (missing authorization) fails closed.
+    with pytest.raises(PublicationViolationError, match="no lease"):
+        coordinator.publish(1, scheduled_keys={_key("ghost")})
+
+    # A scheduled key whose RESERVE is still in flight fails closed instead
+    # of silently dropping the authorization.
+    command = coordinator.reserve(key, required_num_tokens=100)
+    with pytest.raises(PublicationViolationError, match="in flight"):
+        coordinator.publish(1, scheduled_keys={key})
+
+    # A preempted lease cannot authorize execution.
+    _grant(coordinator, manager, command)
+    _grant(coordinator, manager, coordinator.preempt(key, preempt_num_tokens=40))
+    with pytest.raises(PublicationViolationError, match="not active"):
+        coordinator.publish(2, scheduled_keys={key})
