@@ -288,6 +288,11 @@ class ModelRunnerOutputAggregatorStepAdapter:
             )
         object.__setattr__(self, name, value)
 
+    def __delattr__(self, name: str) -> None:
+        # Unconditional: deleting the frozen flag would unlock mutation, so
+        # attribute deletion is never allowed on the adapter.
+        raise AttributeError(f"{type(self).__name__} is immutable after construction.")
+
     @property
     def step_seq(self) -> int:
         """The exact scheduler step sequence this adapter is bound to."""

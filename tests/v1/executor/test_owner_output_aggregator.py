@@ -297,6 +297,34 @@ def test_shared_aggregator_holds_no_step_state():
     ]
 
 
+def test_for_step_adapter_delattr_rejected():
+    """Attribute deletion is unconditionally rejected: deleting _frozen would
+    unlock mutation and deleting _step_seq would break the binding, so both
+    (and any other attribute) fail closed and the binding stays unchanged."""
+    shared = _aggregator(0, 1, 2)
+    adapter = shared.for_step(7)
+
+    with pytest.raises(AttributeError, match="immutable"):
+        del adapter._frozen
+    with pytest.raises(AttributeError, match="immutable"):
+        del adapter._step_seq
+    with pytest.raises(AttributeError, match="immutable"):
+        del adapter._aggregator
+
+    # The adapter is still frozen and still bound to the original step.
+    assert adapter.step_seq == 7
+    with pytest.raises(AttributeError, match="immutable"):
+        adapter._step_seq = 99
+    outputs = _three_worker_outputs(step_seq=7)
+    assert [b.owner_rank for b in adapter.aggregate(outputs).owner_receipt_batches] == [
+        0,
+        1,
+        2,
+    ]
+    # The shared aggregator is untouched.
+    assert not hasattr(shared, "expected_step_seq")
+
+
 def test_for_step_rejects_non_int_step_seq():
     """for_step fails closed on non-int step values."""
     aggregator = _aggregator(0, 1, 2)
