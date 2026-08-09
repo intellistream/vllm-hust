@@ -452,7 +452,8 @@ def test_preempt_receipt_resume_keeps_sticky_owner_and_restarts_prefill() -> Non
     assert out3.scheduled_new_reqs == []
     assert out3.scheduled_cached_reqs.req_ids == ["req-0"]
     assert "req-0" in out3.scheduled_cached_reqs.resumed_req_ids
-    assert out3.scheduled_cached_reqs.new_block_ids == [None]
+    # MRV1 _update_states requires a non-None reset for resumed requests.
+    assert out3.scheduled_cached_reqs.new_block_ids == [()]
     assert out3.scheduled_cached_reqs.all_token_ids == {"req-0": list(range(32))}
     (resumed_token,) = out3.scheduled_owner_leases
     assert resumed_token.key == key
@@ -1014,3 +1015,47 @@ def test_first_dispatch_then_cached_continuation_preserves_mrv1_state() -> None:
     assert token.runnable_num_tokens == 32
     assert request.num_computed_tokens == 32
     assert scheduler.prev_step_scheduled_req_ids == {"req-0"}
+
+
+def test_resume_resets_new_block_ids_empty_while_continuation_keeps_none() -> None:
+    scheduler = _make_scheduler(max_num_scheduled_tokens=8)
+    request = _request("req-0")
+    scheduler.add_request(request)
+    _admit(scheduler, request, grant=8)
+
+    # Ordinary decode continuation: None (no new blocks to append).
+    request.append_output_token_ids([42])
+    out_ext = scheduler.schedule()
+    (extend,) = out_ext.owner_commands
+    assert extend.kind is OwnerCommandKind.EXTEND
+    _apply_receipts(
+        scheduler,
+        out_ext,
+        {0: [_receipt(extend.key, 0, extend.command_seq, runnable=16)]},
+    )
+    out = scheduler.schedule()
+    assert out.scheduled_cached_reqs.req_ids == ["req-0"]
+    assert out.scheduled_cached_reqs.resumed_req_ids == set()
+    assert out.scheduled_cached_reqs.new_block_ids == [None]
+
+    # PREEMPTED resume: non-None empty reset () so the MRV1 runner can
+    # replace the cached block ids with an ID-free empty set.
+    scheduler.reset_prefix_cache(reset_running_requests=True)
+    out_preempt = scheduler.schedule()
+    (preempt,) = out_preempt.owner_commands
+    _apply_receipts(
+        scheduler,
+        out_preempt,
+        {0: [_receipt(preempt.key, 0, preempt.command_seq, runnable=16)]},
+    )
+    out_resume = scheduler.schedule()
+    (resume,) = out_resume.owner_commands
+    _apply_receipts(
+        scheduler,
+        out_resume,
+        {0: [_receipt(resume.key, 0, resume.command_seq, runnable=16)]},
+    )
+    out_restart = scheduler.schedule()
+    assert out_restart.scheduled_cached_reqs.req_ids == ["req-0"]
+    assert "req-0" in out_restart.scheduled_cached_reqs.resumed_req_ids
+    assert out_restart.scheduled_cached_reqs.new_block_ids == [()]

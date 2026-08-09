@@ -2248,6 +2248,16 @@ class Scheduler(SchedulerInterface):
                 new_token_ids.append(token_ids)
             if idx >= num_running_reqs:
                 resumed_req_ids.add(req_id)
+                # MRV1 GPUModelRunner._update_states asserts a non-None
+                # ``new_block_ids`` entry for every resumed request and
+                # replaces the cached block ids with it; emit the ID-free
+                # empty reset ``()`` so the worker resets to zero scheduler
+                # blocks.
+                new_block_ids.append(())
+            else:
+                # Ordinary continuation: no new scheduler KV blocks exist in
+                # request-owned mode, so there is nothing to append.
+                new_block_ids.append(None)
             # MRV1-only: propagate full token ids for requests not scheduled
             # in the prior step.
             if (
@@ -2255,9 +2265,6 @@ class Scheduler(SchedulerInterface):
                 and req_id not in self.prev_step_scheduled_req_ids
             ):
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            # No scheduler KV blocks exist in request-owned mode: never a
-            # new block ID to append (continuation) or replace (resume).
-            new_block_ids.append(None)
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
