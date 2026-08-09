@@ -13,7 +13,13 @@ from functools import partial
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
-from vllm.v1.core.sched.ownership import OwnerLeaseKey, OwnerReceipt, OwnerReceiptBatch
+from vllm.v1.core.sched.ownership import (
+    OwnerCacheGroupSnapshot,
+    OwnerCachePoolSnapshot,
+    OwnerLeaseKey,
+    OwnerReceipt,
+    OwnerReceiptBatch,
+)
 from vllm.v1.executor.output_aggregator import ModelRunnerOutputAggregator
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -113,6 +119,53 @@ def test_all_rank_empty_events_survives():
     result = _aggregator(0, 1, 2).aggregate(outputs)
     assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
     assert all(b.events == () for b in result.owner_receipt_batches)
+
+
+def test_cache_pool_survives_aggregation_round_trip():
+    """G2 cache_pool snapshots ride through aggregation unchanged when no
+    dedup rewrite occurs, and ranks without one keep cache_pool=None."""
+    pool = OwnerCachePoolSnapshot(
+        owner_rank=1,
+        total_blocks=4096,
+        free_blocks=1234,
+        bytes_per_block=65536,
+        groups=(
+            OwnerCacheGroupSnapshot(
+                group_index=0,
+                spec_kind="layer-block",
+                effective_tokens_per_block=16,
+                allocated_blocks=2000,
+                resident_blocks=1800,
+            ),
+            OwnerCacheGroupSnapshot(
+                group_index=1,
+                spec_kind="layer-block",
+                effective_tokens_per_block=32,
+                allocated_blocks=800,
+                resident_blocks=700,
+            ),
+        ),
+    )
+    outputs = [
+        _output(0, [_batch(0)], empty=True),
+        _output(
+            1,
+            [_batch(1, events=(_receipt(1, request_id="req-a"),), cache_pool=pool)],
+            empty=True,
+        ),
+        _output(2, [_batch(2, events=(_receipt(2, request_id="req-b"),))], empty=True),
+    ]
+    result = _aggregator(0, 1, 2).aggregate(outputs)
+    assert result.owner_receipt_batches[1].cache_pool == pool
+    assert (
+        result.owner_receipt_batches[1].cache_pool.groups[1].effective_tokens_per_block
+        == 32
+    )
+    assert result.owner_receipt_batches[0].cache_pool is None
+    assert result.owner_receipt_batches[2].cache_pool is None
+    # Pickle round-trip of the aggregated output keeps the snapshot.
+    restored = pickle.loads(pickle.dumps(result))
+    assert restored.owner_receipt_batches[1].cache_pool == pool
 
 
 def test_authenticated_transport_slots_preserve_event_order():

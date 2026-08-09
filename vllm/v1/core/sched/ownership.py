@@ -33,6 +33,13 @@ Commands to a given owner are delivered reliably and in order: the per-owner
 the worker consumes that stream without reordering or buffering.
 Nothing here is wired into the scheduler; consumers (G1+) integrate through
 the public types below.
+
+G2 physical capacity vocabulary: :class:`OwnerCacheGroupSnapshot` and
+:class:`OwnerCachePoolSnapshot` describe the single unified per-rank KV block
+pool of Ascend DSV4 in exact block-ID-free terms (pool-wide block counts plus
+per-group table facts).  The legacy logical ``free_capacity`` /
+``resident_pages`` fields on receipts and batches are reference-token facts of
+the G1 protocol only; they must not be used as G2 physical admission.
 """
 
 import enum
@@ -220,6 +227,9 @@ class OwnerReceipt:
     #: True when a RELEASE fully completed; set exactly once per lease.
     released: bool = False
     pending_dma: int | None = None
+    #: G1 logical reference-token fact (unused tokens of the reference
+    #: manager's token budget).  NOT G2 physical capacity: must not be used
+    #: as physical admission; see :class:`OwnerCachePoolSnapshot`.
     free_capacity: int | None = None
     error: str | None = None
 
@@ -244,16 +254,154 @@ class OwnerLeaseToken:
 
 
 @dataclass(frozen=True)
+class OwnerCacheGroupSnapshot:
+    """Block-ID-free physical-capacity fact for one KV group of a per-rank
+    block pool.
+
+    Ascend DSV4 exposes one shared block pool (``KVCacheConfig.num_blocks``)
+    and one shared block-ID space per rank, while each KV group keeps its own
+    lookup table and its own effective tokens per block.  This snapshot is
+    block-ID-free by contract: it carries only counts and table metadata,
+    never local block/page/slot IDs, and it never models an independent
+    per-group capacity pool.
+
+    ``allocated_blocks`` counts the blocks the pool has handed out for this
+    group (including prefix/shared references and NULL blocks); it is not
+    required to sum across groups to the pool's used total.
+    """
+
+    group_index: int
+    #: Stable identifier of the group's table/layout spec kind (opaque to
+    #: the protocol); must be a nonempty string.
+    spec_kind: str
+    #: Effective number of tokens this group's table stores per block;
+    #: heterogeneous across groups by design.
+    effective_tokens_per_block: int
+    #: Blocks of the unified pool allocated for this group (may exceed the
+    #: resident set while blocks are paged in or shared).
+    allocated_blocks: int
+    #: Blocks of this group currently resident in the pool.
+    resident_blocks: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "group_index",
+            "effective_tokens_per_block",
+            "allocated_blocks",
+            "resident_blocks",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(
+                    f"{name} must be a nonnegative non-bool int, got {value!r}."
+                )
+        if not isinstance(self.spec_kind, str) or not self.spec_kind:
+            raise TypeError(
+                f"spec_kind must be a nonempty string, got {self.spec_kind!r}."
+            )
+        if self.resident_blocks > self.allocated_blocks:
+            raise ValueError(
+                "resident_blocks must not exceed allocated_blocks, got "
+                f"{self.resident_blocks} > {self.allocated_blocks}."
+            )
+
+
+@dataclass(frozen=True)
+class OwnerCachePoolSnapshot:
+    """Block-ID-free physical capacity of one unified per-rank KV block pool.
+
+    Ascend DSV4 has exactly one shared block pool and one shared block-ID
+    space per rank; each KV group has its own table and effective
+    tokens-per-block.  This snapshot carries pool-wide counts plus the
+    per-group table facts and never exposes local block/page/slot IDs, so
+    consumers cannot assume any per-family pool splitting or ID namespace.
+
+    ``groups`` must be sorted by strictly increasing ``group_index`` (unique
+    and sorted).  The sum of group ``allocated_blocks`` is NOT required to
+    equal ``total_blocks - free_blocks``: prefix, NULL, and shared references
+    may break that equality.
+    """
+
+    owner_rank: int
+    total_blocks: int
+    free_blocks: int
+    #: Physical bytes per block, or ``None`` when unknown to the emitter.
+    bytes_per_block: int | None = None
+    #: Per-group table snapshots, sorted by ascending unique ``group_index``.
+    groups: tuple[OwnerCacheGroupSnapshot, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("owner_rank", "total_blocks", "free_blocks"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(
+                    f"{name} must be a nonnegative non-bool int, got {value!r}."
+                )
+        if self.bytes_per_block is not None and (
+            isinstance(self.bytes_per_block, bool)
+            or not isinstance(self.bytes_per_block, int)
+            or self.bytes_per_block < 0
+        ):
+            raise TypeError(
+                "bytes_per_block must be a nonnegative non-bool int or None, "
+                f"got {self.bytes_per_block!r}."
+            )
+        if self.free_blocks > self.total_blocks:
+            raise ValueError(
+                "free_blocks must not exceed total_blocks, got "
+                f"{self.free_blocks} > {self.total_blocks}."
+            )
+        if not isinstance(self.groups, tuple):
+            raise TypeError(f"groups must be a tuple, got {self.groups!r}.")
+        for group in self.groups:
+            if not isinstance(group, OwnerCacheGroupSnapshot):
+                raise TypeError(
+                    "groups must contain only OwnerCacheGroupSnapshot "
+                    f"instances, got {group!r}."
+                )
+        indices = [group.group_index for group in self.groups]
+        if any(a >= b for a, b in zip(indices, indices[1:])):
+            raise ValueError(
+                "group_index values must be unique and sorted ascending, "
+                f"got {indices!r}."
+            )
+
+
+@dataclass(frozen=True)
 class OwnerReceiptBatch:
     """One envelope a worker emits per step; empty events differ from a
-    missing response, so an enabled worker always emits exactly one batch."""
+    missing response, so an enabled worker always emits exactly one batch.
+
+    The legacy logical ``free_capacity`` / ``resident_pages`` fields are
+    reference-token facts of the G1 protocol only; they must not be used as
+    G2 physical admission.  Physical capacity travels block-ID-free in the
+    optional :attr:`cache_pool` snapshot.
+    """
 
     owner_rank: int
     emitted_step_seq: int
     events: tuple[OwnerReceipt, ...]
+    #: G1 logical reference-token fact; NOT G2 physical capacity (see
+    #: :class:`OwnerCachePoolSnapshot`).
     free_capacity: int | None = None
+    #: G1 logical resident-page bookkeeping fact; NOT G2 physical capacity
+    #: (see :class:`OwnerCachePoolSnapshot`).
     resident_pages: int | None = None
     pending_dma: int | None = None
+    #: Optional G2 physical-capacity snapshot of this owner's unified
+    #: per-rank KV block pool.  ``None`` when the emitter does not
+    #: participate in G2 capacity publication (the G1 reference manager
+    #: always emits ``None``).
+    cache_pool: OwnerCachePoolSnapshot | None = None
+
+    def __post_init__(self) -> None:
+        if self.cache_pool is not None and not isinstance(
+            self.cache_pool, OwnerCachePoolSnapshot
+        ):
+            raise TypeError(
+                "cache_pool must be an OwnerCachePoolSnapshot or None, "
+                f"got {self.cache_pool!r}."
+            )
 
 
 class OwnershipError(Exception):

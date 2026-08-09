@@ -8,6 +8,8 @@ the backward-compatible owner/epoch carriers on Request, NewRequestData, and
 SchedulerOutput.  No GPU model runner is constructed.
 """
 
+import dataclasses
+
 import pytest
 
 from vllm.sampling_params import SamplingParams
@@ -20,10 +22,13 @@ from vllm.v1.core.sched.ownership import (
     AttentionLeaseManager,
     EpochFenceError,
     OwnerAssignmentObservation,
+    OwnerCacheGroupSnapshot,
+    OwnerCachePoolSnapshot,
     OwnerCommandKind,
     OwnerLeaseCoordinator,
     OwnerLeaseKey,
     OwnerReceipt,
+    OwnerReceiptBatch,
     OwnershipError,
     PublicationViolationError,
 )
@@ -680,11 +685,162 @@ def test_worker_emits_exactly_one_batch_per_step() -> None:
     assert batch.free_capacity == 1000 - 50
     assert batch.resident_pages == 0
     assert batch.pending_dma == 0
+    # G1 reference manager does not participate in G2 capacity publication.
+    assert batch.cache_pool is None
 
     # Empty work still yields a batch: differs from a missing response.
     idle = manager.emit_batch(emitted_step_seq=8)
     assert idle.events == ()
     assert idle.owner_rank == 1
+    assert idle.cache_pool is None
+
+
+# -- G2 physical capacity snapshots ---------------------------------------------------
+
+
+def _group(
+    group_index: int = 0,
+    spec_kind: str = "layer-block",
+    effective_tokens_per_block: int = 16,
+    allocated_blocks: int = 100,
+    resident_blocks: int = 80,
+) -> OwnerCacheGroupSnapshot:
+    return OwnerCacheGroupSnapshot(
+        group_index=group_index,
+        spec_kind=spec_kind,
+        effective_tokens_per_block=effective_tokens_per_block,
+        allocated_blocks=allocated_blocks,
+        resident_blocks=resident_blocks,
+    )
+
+
+def _pool(
+    owner_rank: int = 0,
+    total_blocks: int = 1000,
+    free_blocks: int = 300,
+    bytes_per_block: int | None = 65536,
+    groups: tuple[OwnerCacheGroupSnapshot, ...] = (_group(0), _group(1)),
+) -> OwnerCachePoolSnapshot:
+    return OwnerCachePoolSnapshot(
+        owner_rank=owner_rank,
+        total_blocks=total_blocks,
+        free_blocks=free_blocks,
+        bytes_per_block=bytes_per_block,
+        groups=groups,
+    )
+
+
+def test_cache_group_snapshot_validation() -> None:
+    """Group snapshots validate non-bool int ranges, a nonempty spec kind,
+    and resident_blocks <= allocated_blocks."""
+    for name in (
+        "group_index",
+        "effective_tokens_per_block",
+        "allocated_blocks",
+        "resident_blocks",
+    ):
+        for bad in (True, False, -1, 1.0, "1", None):
+            kwargs = dict(
+                group_index=0,
+                spec_kind="layer-block",
+                effective_tokens_per_block=16,
+                allocated_blocks=100,
+                resident_blocks=80,
+            )
+            kwargs[name] = bad
+            with pytest.raises(TypeError, match=name):
+                OwnerCacheGroupSnapshot(**kwargs)
+    for bad_spec in ("", 0, None):
+        with pytest.raises(TypeError, match="spec_kind"):
+            _group(spec_kind=bad_spec)
+    with pytest.raises(ValueError, match="resident_blocks"):
+        _group(allocated_blocks=10, resident_blocks=11)
+    # Boundary is legal: resident == allocated.
+    assert _group(allocated_blocks=10, resident_blocks=10).resident_blocks == 10
+
+
+def test_cache_pool_snapshot_validation() -> None:
+    """Pool snapshots validate non-bool int ranges, bytes_per_block, the
+    free <= total invariant, and unique/sorted group indices."""
+    for name in ("owner_rank", "total_blocks", "free_blocks"):
+        for bad in (True, False, -1, 1.0, "1", None):
+            kwargs = dict(owner_rank=0, total_blocks=1000, free_blocks=300, groups=())
+            kwargs[name] = bad
+            with pytest.raises(TypeError, match=name):
+                OwnerCachePoolSnapshot(**kwargs)
+    for bad_bytes in (True, False, -1, 1.0, "65536"):
+        with pytest.raises(TypeError, match="bytes_per_block"):
+            _pool(bytes_per_block=bad_bytes)
+    assert _pool(bytes_per_block=None).bytes_per_block is None
+    with pytest.raises(ValueError, match="free_blocks"):
+        _pool(total_blocks=10, free_blocks=11)
+    # Legal boundary: fully free pool.
+    assert _pool(total_blocks=10, free_blocks=10).free_blocks == 10
+    # groups must be a tuple of group snapshots.
+    with pytest.raises(TypeError, match="groups"):
+        _pool(groups=[_group(0)])  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="groups"):
+        _pool(groups=(0,))  # type: ignore[arg-type]
+    # Unique and sorted ascending group indices are required.
+    with pytest.raises(ValueError, match="unique and sorted"):
+        _pool(groups=(_group(1), _group(0)))
+    with pytest.raises(ValueError, match="unique and sorted"):
+        _pool(groups=(_group(0), _group(0)))
+    assert _pool(groups=(_group(2), _group(5))).groups[1].group_index == 5
+
+
+def test_cache_pool_does_not_require_group_sum_consistency() -> None:
+    """The sum of group allocated_blocks is not required to match the pool's
+    used total: prefix/NULL/shared references may break that equality."""
+    groups = (
+        _group(0, allocated_blocks=100),
+        _group(1, allocated_blocks=200),
+    )
+    pool = _pool(total_blocks=1000, free_blocks=300, groups=groups)
+    assert sum(g.allocated_blocks for g in pool.groups) != (
+        pool.total_blocks - pool.free_blocks
+    )
+
+
+def test_cache_snapshots_carry_no_block_page_or_slot_ids() -> None:
+    """Structural guard: G2 capacity snapshots are block-ID-free by contract.
+    No dataclass field may expose a block_id/page_id/slot_id, because Ascend
+    DSV4 block IDs live in one shared per-rank space owned by the worker."""
+    for cls in (OwnerCacheGroupSnapshot, OwnerCachePoolSnapshot):
+        field_names = {f.name for f in dataclasses.fields(cls)}
+        for banned in ("block_id", "page_id", "slot_id"):
+            assert not any(banned in name for name in field_names), (
+                f"{cls.__name__} must not carry a {banned} field"
+            )
+        assert not any("block_id" in name for name in vars(cls)), (
+            f"{cls.__name__} must not carry a block_id attribute"
+        )
+    assert not hasattr(OwnerCacheGroupSnapshot, "block_id")
+    assert not hasattr(OwnerCachePoolSnapshot, "block_id")
+
+
+def test_receipt_batch_accepts_and_validates_cache_pool() -> None:
+    """OwnerReceiptBatch carries an optional G2 cache_pool snapshot and
+    rejects anything that is not a snapshot."""
+    pool = _pool()
+    batch = OwnerReceiptBatch(
+        owner_rank=0,
+        emitted_step_seq=1,
+        events=(),
+        cache_pool=pool,
+    )
+    assert batch.cache_pool == pool
+    assert (
+        OwnerReceiptBatch(owner_rank=0, emitted_step_seq=1, events=()).cache_pool
+        is None
+    )
+    with pytest.raises(TypeError, match="cache_pool"):
+        OwnerReceiptBatch(
+            owner_rank=0,
+            emitted_step_seq=1,
+            events=(),
+            cache_pool="not-a-pool",  # type: ignore[arg-type]
+        )
 
 
 # -- carriers ------------------------------------------------------------------------

@@ -3,7 +3,13 @@
 import pickle
 from unittest import TestCase
 
-from vllm.v1.core.sched.ownership import OwnerLeaseKey, OwnerReceipt, OwnerReceiptBatch
+from vllm.v1.core.sched.ownership import (
+    OwnerCacheGroupSnapshot,
+    OwnerCachePoolSnapshot,
+    OwnerLeaseKey,
+    OwnerReceipt,
+    OwnerReceiptBatch,
+)
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists, ModelRunnerOutput
 
 
@@ -111,7 +117,7 @@ class TestModelRunnerOutputOwnerReceiptBatches(TestCase):
 
     def test_pickle_roundtrip(self):
         """Owner receipt batches survive the pickle wire format used by the
-        multiproc message queues."""
+        multiproc message queues, including the G2 cache_pool snapshot."""
         receipt = OwnerReceipt(
             key=OwnerLeaseKey(request_id="req-0", owner_epoch=1),
             owner_id=1,
@@ -119,11 +125,34 @@ class TestModelRunnerOutputOwnerReceiptBatches(TestCase):
             accepted=True,
             runnable_num_tokens=10,
         )
+        pool = OwnerCachePoolSnapshot(
+            owner_rank=1,
+            total_blocks=4096,
+            free_blocks=1234,
+            bytes_per_block=65536,
+            groups=(
+                OwnerCacheGroupSnapshot(
+                    group_index=0,
+                    spec_kind="layer-block",
+                    effective_tokens_per_block=16,
+                    allocated_blocks=2000,
+                    resident_blocks=1800,
+                ),
+                OwnerCacheGroupSnapshot(
+                    group_index=1,
+                    spec_kind="layer-block",
+                    effective_tokens_per_block=32,
+                    allocated_blocks=800,
+                    resident_blocks=700,
+                ),
+            ),
+        )
         batch = OwnerReceiptBatch(
             owner_rank=1,
             emitted_step_seq=7,
             events=(receipt,),
             free_capacity=42,
+            cache_pool=pool,
         )
         output = ModelRunnerOutput(
             req_ids=["req-0"],
@@ -133,3 +162,32 @@ class TestModelRunnerOutputOwnerReceiptBatches(TestCase):
         restored = pickle.loads(pickle.dumps(output))
         assert restored.owner_receipt_batches == [batch]
         assert restored.owner_receipt_batches[0].events == (receipt,)
+        assert restored.owner_receipt_batches[0].cache_pool == pool
+        assert (
+            restored.owner_receipt_batches[0]
+            .cache_pool.groups[1]
+            .effective_tokens_per_block
+            == 32
+        )
+
+    def test_pickle_roundtrip_cache_pool_default_is_none(self):
+        """Batches without a G2 snapshot keep cache_pool=None on the wire."""
+        batch = OwnerReceiptBatch(
+            owner_rank=1,
+            emitted_step_seq=7,
+            events=(),
+            free_capacity=42,
+            resident_pages=3,
+        )
+        assert batch.cache_pool is None
+        restored = pickle.loads(
+            pickle.dumps(
+                ModelRunnerOutput(
+                    req_ids=[],
+                    req_id_to_index={},
+                    owner_receipt_batches=[batch],
+                )
+            )
+        )
+        assert restored.owner_receipt_batches == [batch]
+        assert restored.owner_receipt_batches[0].cache_pool is None
