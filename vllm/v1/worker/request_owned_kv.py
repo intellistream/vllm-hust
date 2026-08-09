@@ -501,26 +501,31 @@ class RequestOwnedKVStore:
         self,
         step_seq: int,
         tokens: Sequence[OwnerLeaseToken],
-        scheduled_counts: Mapping[OwnerLeaseKey, int],
+        request_token_counts: Mapping[str, int],
     ) -> RequestOwnedStepMetadataResult:
         """Freeze the immutable worker-local G3 execution metadata for one
-        step from the exact scheduled own-rank lease tokens and the exact
-        per-key scheduled token counts.
+        step from the exact own-rank lease tokens and the GLOBAL per-request
+        scheduled counts of the step (``SchedulerOutput.num_scheduled_tokens``).
 
-        The batch is one-step fenced (``step_seq`` must be strictly newer
-        than the last successful build).  ``tokens`` is the exact own-rank
-        authorization set and ``scheduled_counts`` the exact per-key
-        scheduled counts: for a token-bearing step the two key sets must
-        match exactly, counts must be positive non-bool ints, and the
-        post-step target ``record.num_computed_tokens + count`` must not
-        exceed the lease horizon (``OwnerLeaseToken.runnable_num_tokens``,
-        a cumulative horizon, not this step's target) nor the reserved
-        chunk horizon; a target strictly below the lease horizon is legal
-        (partial chunk).  A zero-count heartbeat (empty ``scheduled_counts``)
-        may carry newly published grants but always builds empty execution
-        metadata and retains every pending delta for the later token-bearing
-        step.  A token-bearing build also rejects a key with an unconsumed
-        pending mark from an earlier handoff unless the record was recycled
+        Local scheduled keys are derived inside the store by matching each
+        positive global count against the active records' ``request_id``
+        (the full exact :class:`OwnerLeaseKey` is retained); multiple active
+        records for one request id are ambiguous and rejected, and requests
+        with no local active record are foreign to this rank and ignored.
+        On a token-bearing step (any positive global count) the derived
+        local positive-count key set must match the own-rank authorization
+        tokens exactly: a local active request with a positive count but a
+        missing token fails, and an own token without a positive local count
+        is extra.  The post-step target is ``record.num_computed_tokens +
+        count`` and must not exceed the lease horizon
+        (``OwnerLeaseToken.runnable_num_tokens``, a cumulative horizon, not
+        this step's target) nor the reserved chunk horizon; a target
+        strictly below the lease horizon is legal (partial chunk).  A
+        zero-global-token heartbeat (no positive counts anywhere) may carry
+        newly published grants but always builds empty execution metadata
+        and retains every pending delta for the later token-bearing step.
+        A token-bearing build also rejects a key with an unconsumed pending
+        mark from an earlier handoff unless the record was recycled
         (generation changed).  On success the pending deltas of the batch
         keys are handed into the step and mark expectations are armed; on
         any rejection nothing changes, so pending deltas are never silently
@@ -542,19 +547,19 @@ class RequestOwnedKVStore:
                 error=f"stale step_seq {step_seq}: already built through "
                 f"{self._last_built_step_seq}.",
             )
-        if tokens is None or scheduled_counts is None:
+        if tokens is None or request_token_counts is None:
             return RequestOwnedStepMetadataResult(
                 accepted=False,
                 step_seq=step_seq,
-                error="tokens and scheduled_counts must be the exact "
-                "scheduled own-rank lease tokens and per-key counts.",
+                error="tokens and request_token_counts must be the exact "
+                "own-rank lease tokens and the global per-request counts.",
             )
-        if not isinstance(scheduled_counts, Mapping):
+        if not isinstance(request_token_counts, Mapping):
             return RequestOwnedStepMetadataResult(
                 accepted=False,
                 step_seq=step_seq,
-                error="scheduled_counts must be a mapping keyed by "
-                f"OwnerLeaseKey, got {scheduled_counts!r}.",
+                error="request_token_counts must be a mapping keyed by "
+                f"request_id, got {request_token_counts!r}.",
             )
         lease_tokens = tuple(tokens)
         seen: set[OwnerLeaseKey] = set()
@@ -595,30 +600,31 @@ class RequestOwnedKVStore:
                 )
             seen.add(token.key)
 
-        count_items = tuple(scheduled_counts.items())
-        for key, count in count_items:
-            if not isinstance(key, OwnerLeaseKey):
+        positive_requests: list[str] = []
+        for request_id, count in request_token_counts.items():
+            if not isinstance(request_id, str):
                 return RequestOwnedStepMetadataResult(
                     accepted=False,
                     step_seq=step_seq,
-                    error=f"scheduled count key must be an OwnerLeaseKey, got {key!r}.",
+                    error=f"scheduled count key must be a request_id string, "
+                    f"got {request_id!r}.",
                 )
-            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
                 return RequestOwnedStepMetadataResult(
                     accepted=False,
                     step_seq=step_seq,
-                    error=f"scheduled count must be a positive non-bool int, "
-                    f"got {count!r} for {key!r}.",
+                    error=f"scheduled count must be a nonnegative non-bool "
+                    f"int, got {count!r} for {request_id!r}.",
                 )
+            if count > 0:
+                positive_requests.append(request_id)
 
-        token_keys = {token.key for token in lease_tokens}
-        count_keys = {key for key, _ in count_items}
-        if not count_keys:
-            # Zero-token heartbeat: grants may be newly published but nothing
-            # executes this step.  Build empty execution metadata, retain
-            # every pending delta for the later token-bearing step, and still
-            # close this step's fence (which clears the same-step allocation
-            # marker so the later authorization step is legal).
+        if not positive_requests:
+            # Zero-global-token heartbeat: grants may be newly published but
+            # nothing executes this step.  Build empty execution metadata,
+            # retain every pending delta for the later token-bearing step,
+            # and still close this step's fence (which clears the same-step
+            # allocation marker so the later authorization step is legal).
             metadata = RequestOwnedStepMetadata(
                 step_seq=step_seq, owner_rank=self._owner_rank, entries=()
             )
@@ -630,22 +636,47 @@ class RequestOwnedKVStore:
                 accepted=True, step_seq=step_seq, metadata=metadata
             )
 
-        def _first_key(keys: set[OwnerLeaseKey]) -> OwnerLeaseKey:
-            return sorted(keys, key=lambda k: (k.request_id, k.owner_epoch))[0]
+        # Derive the local scheduled keys from the positive global counts by
+        # matching active records on request_id (full exact key retained).
+        # Requests without a local active record are foreign on this rank.
+        local_counts: dict[OwnerLeaseKey, int] = {}
+        for request_id in positive_requests:
+            matches = [key for key in self._records if key.request_id == request_id]
+            if not matches:
+                continue
+            if len(matches) > 1:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=(
+                        "ambiguous same-request active records for "
+                        f"{request_id!r}: "
+                        f"{sorted(matches, key=lambda k: k.owner_epoch)!r}."
+                    ),
+                )
+            local_counts[matches[0]] = request_token_counts[request_id]
 
-        missing_counts = token_keys - count_keys
-        if missing_counts:
+        token_keys = {token.key for token in lease_tokens}
+        count_keys = set(local_counts)
+        missing_tokens = count_keys - token_keys
+        if missing_tokens:
+            missing_key = sorted(
+                missing_tokens, key=lambda k: (k.request_id, k.owner_epoch)
+            )[0]
             return RequestOwnedStepMetadataResult(
                 accepted=False,
                 step_seq=step_seq,
-                error=f"missing scheduled count for {_first_key(missing_counts)!r}.",
+                error=f"missing authorization token for {missing_key!r}.",
             )
-        extra_counts = count_keys - token_keys
-        if extra_counts:
+        extra_tokens = token_keys - count_keys
+        if extra_tokens:
+            extra_key = sorted(
+                extra_tokens, key=lambda k: (k.request_id, k.owner_epoch)
+            )[0]
             return RequestOwnedStepMetadataResult(
                 accepted=False,
                 step_seq=step_seq,
-                error=f"extra scheduled count for {_first_key(extra_counts)!r}.",
+                error=f"extra lease token without a scheduled count for {extra_key!r}.",
             )
 
         for token in lease_tokens:
@@ -681,7 +712,7 @@ class RequestOwnedKVStore:
                     error=f"unconsumed pending mark for {key!r} from step "
                     f"{expectation.step_seq}.",
                 )
-            target = record.num_computed_tokens + scheduled_counts[key]
+            target = record.num_computed_tokens + local_counts[key]
             if target > token.runnable_num_tokens:
                 return RequestOwnedStepMetadataResult(
                     accepted=False,
@@ -707,7 +738,7 @@ class RequestOwnedKVStore:
                 ),
                 post_step_num_tokens=(
                     self._records[token.key].num_computed_tokens
-                    + scheduled_counts[token.key]
+                    + local_counts[token.key]
                 ),
                 tables=self._tables(self._records[token.key]),
                 delta=(
@@ -735,7 +766,7 @@ class RequestOwnedKVStore:
                 step_seq=step_seq,
                 allocation_generation=record.generation,
                 post_step_num_tokens=(
-                    record.num_computed_tokens + scheduled_counts[token.key]
+                    record.num_computed_tokens + local_counts[token.key]
                 ),
             )
         for record in self._records.values():

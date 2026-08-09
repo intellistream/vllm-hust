@@ -23,7 +23,6 @@ from vllm.v1.core.sched.ownership import (
     AttentionLeaseManager,
     OwnerCommand,
     OwnerCommandKind,
-    OwnerLeaseKey,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.request_owned_kv import (
@@ -618,17 +617,9 @@ class WorkerWrapperBase:
             for token in scheduler_output.scheduled_owner_leases
             if token.owner_id == self.global_rank
         ]
-        scheduled_counts: dict[OwnerLeaseKey, int] = {}
-        for token in own_rank_tokens:
-            count = scheduler_output.num_scheduled_tokens.get(token.key.request_id, 0)
-            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-                raise RuntimeError(
-                    "request-owned num_scheduled_tokens must be nonnegative "
-                    f"non-bool ints, got {count!r} for {token.key.request_id!r}."
-                )
-            if count > 0:
-                scheduled_counts[token.key] = count
-        build = store.build_step_metadata(step_seq, own_rank_tokens, scheduled_counts)
+        build = store.build_step_metadata(
+            step_seq, own_rank_tokens, scheduler_output.num_scheduled_tokens
+        )
         if not build.accepted:
             raise RuntimeError(
                 "request-owned step metadata build failed: "
