@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -48,6 +48,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.owner_layout import GlobalRowId
 from vllm.v1.core.sched.ownership import (
     EpochFenceError,
     OwnerAdmissionStatus,
@@ -75,7 +76,12 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+    OwnerSamplingBatch,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -1614,6 +1620,15 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # G3: fail-closed semantic validation of the aggregated
+        # owner-sampling envelope before ANY request/output mutation below
+        # (receipt application, sampled-token application, computed-token
+        # adjustments).  See _validate_request_owned_sampling_envelope for
+        # the exact contract and the runner-unlock call seam.
+        self._validate_request_owned_sampling_envelope(
+            scheduler_output, model_runner_output
+        )
+
         if self.scheduler_config.enable_request_owned_attention:
             # G2: apply structurally valid receipts before any ordinary
             # output or request mutation below.
@@ -2032,6 +2047,348 @@ class Scheduler(SchedulerInterface):
                 "events without the G2 owner-local allocator/coordinator; "
                 "refusing to ignore them."
             )
+
+    def _validate_request_owned_sampling_envelope(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        """G3: fail-closed scheduler-side validation of the aggregated
+        owner-sampling envelope, before any request state mutation.
+
+        Runs from :meth:`update_from_output` ahead of receipt application,
+        sampled-token application, and computed-token adjustments.  The
+        envelope aggregates every owner's :class:`OwnerSamplingBatch`
+        (all-worker envelope cardinality/slot checks remain the executor
+        aggregator's authority); this boundary validates the
+        scheduler-facing semantics:
+
+        * the envelope request set is exactly the set of positive-count
+          scheduled requests, each appearing exactly once (no unknown,
+          finished, or duplicate requests),
+        * every batch's ``owner_rank`` and ``emitted_step_seq`` match the
+          scheduler step and the request's authoritative current
+          owner/lease epoch,
+        * every row is the terminal logits-producing
+          :class:`GlobalRowId` for that request (``pre-step
+          num_computed_tokens + scheduled_count - 1``, lane 0), not one
+          row per scheduled token,
+        * the merged output has a bijective req map aligned to the same
+          request set, with at most one sampled token per request (the G3
+          no-spec envelope), and
+        * zero-token heartbeat steps reject nonempty sampling identities
+          and never mutate sampling state (this boundary keeps no sampling
+          state at all; it only validates).
+
+        ``owner_sampling_batches is None`` is the default-off output and is
+        accepted unchanged so existing control-only tests keep passing.  The
+        absence is NOT yet authoritative: when the runner unlock wires
+        ``expected_sampling_owner_ranks`` into the executor aggregator, a
+        missing envelope on a token-bearing request-owned step must fail
+        closed at this exact call seam.
+        """
+        batches = model_runner_output.owner_sampling_batches
+        if batches is None:
+            return
+
+        if not self.scheduler_config.enable_request_owned_attention:
+            raise RuntimeError(
+                "owner-sampling envelope ingress requires "
+                "enable_request_owned_attention; the scheduler is not "
+                "participating in the request-owned protocol."
+            )
+        coordinator = getattr(self, "owner_coordinator", None)
+        owner_keys = getattr(self, "_owner_key", None)
+        if coordinator is None or owner_keys is None:
+            raise RuntimeError(
+                "owner-sampling envelope ingress requires the G2 owner "
+                "coordinator; the scheduler was not initialized for it."
+            )
+
+        step_seq = scheduler_output.step_seq
+        if (
+            isinstance(step_seq, bool)
+            or not isinstance(step_seq, int)
+            or step_seq <= 0
+        ):
+            raise RuntimeError(
+                "owner-sampling envelope ingress requires a positive "
+                f"non-bool step_seq, got {step_seq!r}."
+            )
+
+        # Authoritative per-request owner/lease epoch for every
+        # positive-count scheduled request.  A scheduled request that is
+        # unknown/finished or lacks a live lease cannot be validated and
+        # fails closed here.
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        authoritative_owner: dict[str, int] = {}
+        authoritative_epoch: dict[str, int] = {}
+        for req_id, count in num_scheduled_tokens.items():
+            if count <= 0:
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                raise RuntimeError(
+                    "owner-sampling envelope: scheduled request "
+                    f"{req_id!r} is unknown or finished; refusing to "
+                    "validate a sampling identity for it."
+                )
+            key = owner_keys.get(req_id)
+            if key is None:
+                raise RuntimeError(
+                    "owner-sampling envelope: scheduled request "
+                    f"{req_id!r} has no live owner lease key."
+                )
+            owner_rank = coordinator.owner_of(key)
+            if owner_rank is None:
+                raise RuntimeError(
+                    "owner-sampling envelope: scheduled request "
+                    f"{req_id!r} has no assigned owner rank."
+                )
+            authoritative_owner[req_id] = owner_rank
+            authoritative_epoch[req_id] = key.owner_epoch
+
+        # Pre-step computed-token counts: request.num_computed_tokens is
+        # already advanced by _update_after_schedule at this seam, so the
+        # authoritative pre-step snapshot rides the scheduler_output
+        # payload; scheduled_new_reqs + scheduled_cached_reqs cover exactly
+        # the positive-count scheduled requests on the request-owned path,
+        # so any coverage gap here is evidence the flow changed and fails
+        # closed instead of inferring post-mutation request state.
+        pre_step_num_computed_tokens = self._owner_sampling_pre_step_counts(
+            scheduler_output
+        )
+
+        self._validate_owner_sampling_envelope(
+            scheduler_step_seq=step_seq,
+            num_scheduled_tokens=num_scheduled_tokens,
+            pre_step_num_computed_tokens=pre_step_num_computed_tokens,
+            authoritative_owner_by_request_id=authoritative_owner,
+            authoritative_epoch_by_request_id=authoritative_epoch,
+            owner_sampling_batches=batches,
+            model_runner_output=model_runner_output,
+        )
+
+    @staticmethod
+    def _owner_sampling_pre_step_counts(
+        scheduler_output: SchedulerOutput,
+    ) -> dict[str, int]:
+        """Snapshot per-request pre-step ``num_computed_tokens`` from the
+        scheduler output payload (never from mutated request state).
+
+        Conflicting snapshots for one request id fail closed: the same
+        incarnation cannot carry two different pre-step counts in one step.
+        """
+        pre_step: dict[str, int] = {}
+        for new_req in scheduler_output.scheduled_new_reqs:
+            prev = pre_step.get(new_req.req_id)
+            if prev is not None and prev != new_req.num_computed_tokens:
+                raise RuntimeError(
+                    "owner-sampling envelope: conflicting pre-step "
+                    "num_computed_tokens snapshots for "
+                    f"{new_req.req_id!r}."
+                )
+            pre_step[new_req.req_id] = new_req.num_computed_tokens
+        cached = scheduler_output.scheduled_cached_reqs
+        if len(cached.req_ids) != len(cached.num_computed_tokens):
+            raise RuntimeError(
+                "owner-sampling envelope: scheduled_cached_reqs "
+                "num_computed_tokens must be aligned 1:1 with req_ids "
+                f"({len(cached.num_computed_tokens)} counts vs "
+                f"{len(cached.req_ids)} ids)."
+            )
+        for req_id, num_computed in zip(
+            cached.req_ids, cached.num_computed_tokens
+        ):
+            prev = pre_step.get(req_id)
+            if prev is not None and prev != num_computed:
+                raise RuntimeError(
+                    "owner-sampling envelope: conflicting pre-step "
+                    f"num_computed_tokens snapshots for {req_id!r}."
+                )
+            pre_step[req_id] = num_computed
+        return pre_step
+
+    @staticmethod
+    def _validate_owner_sampling_envelope(
+        *,
+        scheduler_step_seq: int,
+        num_scheduled_tokens: Mapping[str, int],
+        pre_step_num_computed_tokens: Mapping[str, int],
+        authoritative_owner_by_request_id: Mapping[str, int],
+        authoritative_epoch_by_request_id: Mapping[str, int],
+        owner_sampling_batches: Sequence[OwnerSamplingBatch],
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Pure G3 owner-sampling envelope validation (see the seam method).
+
+        Raises :class:`RuntimeError` on the first contract violation;
+        performs no state mutation and keeps no state, so a rejection can
+        never leave partial sampling or request state behind.  Rows carry
+        ``GlobalRowId`` identities by :class:`OwnerSamplingBatch`
+        construction; the executor aggregator is the authority for
+        all-worker envelope cardinality and transport-slot checks.
+        """
+        scheduled_req_ids = {
+            req_id
+            for req_id, count in num_scheduled_tokens.items()
+            if count > 0
+        }
+
+        rows: list[tuple[OwnerSamplingBatch, GlobalRowId]] = []
+        seen_req_ids: set[str] = set()
+        for batch in owner_sampling_batches:
+            if (
+                isinstance(batch.owner_rank, bool)
+                or not isinstance(batch.owner_rank, int)
+                or batch.owner_rank < 0
+            ):
+                raise RuntimeError(
+                    "owner-sampling envelope: owner_rank must be a "
+                    f"nonnegative non-bool int, got {batch.owner_rank!r}."
+                )
+            if batch.emitted_step_seq != scheduler_step_seq:
+                raise RuntimeError(
+                    "owner-sampling envelope: batch emitted_step_seq "
+                    f"{batch.emitted_step_seq} from owner "
+                    f"{batch.owner_rank} does not match the scheduler "
+                    f"step {scheduler_step_seq}."
+                )
+            for row in batch.row_ids:
+                req_id = row.request_uid.request_id
+                if req_id in seen_req_ids:
+                    raise RuntimeError(
+                        "owner-sampling envelope: duplicate request "
+                        f"{req_id!r} across owner batches."
+                    )
+                seen_req_ids.add(req_id)
+                rows.append((batch, row))
+
+        if not scheduled_req_ids and rows:
+            # Zero-token heartbeat/control steps must not carry sampling
+            # identities and must not mutate sampling state.
+            raise RuntimeError(
+                "owner-sampling envelope: zero-token heartbeat step "
+                f"carries nonempty sampling identities "
+                f"{[row.request_uid.request_id for _, row in rows]!r}; "
+                "refusing to mutate sampling state."
+            )
+
+        envelope_req_ids = [row.request_uid.request_id for _, row in rows]
+        envelope_set = set(envelope_req_ids)
+        missing = sorted(scheduled_req_ids - envelope_set)
+        if missing:
+            raise RuntimeError(
+                "owner-sampling envelope: missing sampling identity for "
+                f"scheduled request(s) {missing}."
+            )
+        extra = sorted(envelope_set - scheduled_req_ids)
+        if extra:
+            raise RuntimeError(
+                "owner-sampling envelope: sampling identity for "
+                f"unscheduled/unknown request(s) {extra}."
+            )
+
+        for batch, row in rows:
+            req_id = row.request_uid.request_id
+            if (
+                req_id not in authoritative_owner_by_request_id
+                or req_id not in authoritative_epoch_by_request_id
+            ):
+                raise RuntimeError(
+                    "owner-sampling envelope: request "
+                    f"{req_id!r} is unknown or finished."
+                )
+            expected_owner = authoritative_owner_by_request_id[req_id]
+            if batch.owner_rank != expected_owner:
+                raise RuntimeError(
+                    "owner-sampling envelope: request "
+                    f"{req_id!r} is scheduled on owner {expected_owner}, "
+                    f"but appears in owner {batch.owner_rank}'s batch."
+                )
+            expected_epoch = authoritative_epoch_by_request_id[req_id]
+            if row.request_uid.owner_epoch != expected_epoch:
+                raise RuntimeError(
+                    "owner-sampling envelope: request "
+                    f"{req_id!r} sampling row carries lease epoch "
+                    f"{row.request_uid.owner_epoch}, expected "
+                    f"{expected_epoch}."
+                )
+            count = num_scheduled_tokens[req_id]
+            pre_step = pre_step_num_computed_tokens.get(req_id)
+            if pre_step is None:
+                raise RuntimeError(
+                    "owner-sampling envelope: no pre-step "
+                    "num_computed_tokens snapshot for scheduled request "
+                    f"{req_id!r}; cannot establish its terminal row "
+                    "(flow seam gap)."
+                )
+            expected_position = pre_step + count - 1
+            if row.logical_token_position != expected_position:
+                raise RuntimeError(
+                    "owner-sampling envelope: request "
+                    f"{req_id!r} terminal row position "
+                    f"{row.logical_token_position} does not match pre-step "
+                    f"computed {pre_step} + scheduled {count} - 1 = "
+                    f"{expected_position} (one terminal row per request, "
+                    "not one per scheduled token)."
+                )
+            if row.logical_lane != 0:
+                raise RuntimeError(
+                    "owner-sampling envelope: request "
+                    f"{req_id!r} sampling row lane {row.logical_lane} "
+                    "must be 0."
+                )
+
+        # Merged output req map: bijective and aligned to the same request
+        # set as the envelope, with at most one sampled token per request.
+        req_ids = model_runner_output.req_ids
+        req_id_to_index = model_runner_output.req_id_to_index
+        if not isinstance(req_id_to_index, dict):
+            raise RuntimeError(
+                "owner-sampling envelope: merged output req_id_to_index "
+                f"must be a dict, got {type(req_id_to_index).__name__}."
+            )
+        if len(req_id_to_index) != len(req_ids):
+            raise RuntimeError(
+                "owner-sampling envelope: merged output req map is not "
+                f"bijective ({len(req_ids)} req_ids vs "
+                f"{len(req_id_to_index)} index entries)."
+            )
+        for index, req_id in enumerate(req_ids):
+            if req_id_to_index.get(req_id) != index:
+                raise RuntimeError(
+                    "owner-sampling envelope: merged output req map is "
+                    f"not bijective (req_ids[{index}]={req_id!r})."
+                )
+        merged_set = set(req_ids)
+        if merged_set != envelope_set:
+            raise RuntimeError(
+                "owner-sampling envelope: merged output request set "
+                f"{sorted(merged_set)} does not match the envelope "
+                f"request set {sorted(envelope_set)}."
+            )
+        sampled_token_ids = model_runner_output.sampled_token_ids
+        if len(sampled_token_ids) != len(req_ids):
+            raise RuntimeError(
+                "owner-sampling envelope: merged output sampled_token_ids "
+                f"({len(sampled_token_ids)} entries) must be aligned 1:1 "
+                f"with req_ids ({len(req_ids)})."
+            )
+        for index, tokens in enumerate(sampled_token_ids):
+            if not isinstance(tokens, list):
+                raise RuntimeError(
+                    "owner-sampling envelope: merged output "
+                    f"sampled_token_ids[{index}] must be a list, got "
+                    f"{type(tokens).__name__}."
+                )
+            if len(tokens) > 1:
+                raise RuntimeError(
+                    "owner-sampling envelope: spec-shaped multi-token "
+                    f"sampling is unsupported (sampled_token_ids[{index}]"
+                    f"={tokens!r}); the G3 no-spec envelope carries at "
+                    "most one sampled token per request."
+                )
 
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
