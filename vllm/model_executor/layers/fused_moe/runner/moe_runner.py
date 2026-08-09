@@ -117,13 +117,18 @@ def _resolve_layer_name(layer_name: str | LayerName) -> str:
 # include all the functionality of the MoE layer.
 def _moe_forward(
     hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    shared_experts_input: torch.Tensor | None,
-    input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    router_logits: torch.Tensor | None = None,
+    shared_experts_input: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    if router_logits is None:
+        if layer.is_internal_router and layer.gate is not None:
+            router_logits, _ = layer.gate(hidden_states.float())
+        else:
+            router_logits = hidden_states
     return layer._forward_impl(
         hidden_states,
         router_logits,
@@ -134,11 +139,11 @@ def _moe_forward(
 
 def _moe_forward_fake(
     hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    shared_experts_input: torch.Tensor | None,
-    input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    router_logits: torch.Tensor | None = None,
+    shared_experts_input: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # `hidden_dim_unpadded > 0` only on the TRT-LLM MXFP4 path, where the
     # real kernel writes narrower than `hidden_states.shape[-1]`. Plumbed
@@ -151,13 +156,18 @@ def _moe_forward_fake(
 
 def _moe_forward_shared(
     hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    shared_experts_input: torch.Tensor | None,
-    input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    router_logits: torch.Tensor | None = None,
+    shared_experts_input: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    if router_logits is None:
+        if layer.is_internal_router and layer.gate is not None:
+            router_logits, _ = layer.gate(hidden_states.float())
+        else:
+            router_logits = hidden_states
     return layer._forward_impl(
         hidden_states,
         router_logits,
@@ -168,11 +178,11 @@ def _moe_forward_shared(
 
 def _moe_forward_shared_fake(
     hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    shared_experts_input: torch.Tensor | None,
-    input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    router_logits: torch.Tensor | None = None,
+    shared_experts_input: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # `fused_out`: see `_moe_forward_fake` for hidden_dim_unpadded semantics.
     # `shared_out`: matches `shared_experts_input` if provided (latent MoE),
@@ -684,13 +694,13 @@ class MoERunner(MoERunnerInterface):
 
         result = self._forward_entry(
             hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
             self._encode_layer_name(),
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
+            router_logits,
+            shared_experts_input,
+            input_ids,
         )
 
         #
@@ -792,8 +802,8 @@ class MoERunner(MoERunnerInterface):
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        shared_experts_input: torch.Tensor | None,
+        router_logits: torch.Tensor | None = None,
+        shared_experts_input: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Entry point called by the custom op to run the MoE computation.
@@ -823,6 +833,8 @@ class MoERunner(MoERunnerInterface):
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
                 router_logits, _ = self.gate(hidden_states)
+        elif router_logits is None:
+            router_logits = hidden_states
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
