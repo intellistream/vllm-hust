@@ -462,7 +462,18 @@ class RayDistributedExecutor(Executor):
         # request-owned attention is enabled (owner receipts from every rank
         # must be aggregated or they would be dropped).
         if self.scheduler_config.enable_request_owned_attention:
-            aggregator = self.model_runner_output_aggregator
+            assert self.model_runner_output_aggregator is not None, (
+                "request-owned attention is enabled but the model runner "
+                "output aggregator was not constructed."
+            )
+            # Bind the shared aggregator to this scheduler's exact step_seq:
+            # the immutable per-step adapter delegates with
+            # expected_step_seq set to that step, so stale/future receipts
+            # fail closed on both the sync and FutureWrapper paths without
+            # storing any mutable step state on the shared aggregator.
+            aggregator = self.model_runner_output_aggregator.for_step(
+                scheduler_output.step_seq
+            )
         else:
             aggregator = self.kv_output_aggregator
         assert aggregator is not None

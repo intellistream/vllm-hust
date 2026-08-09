@@ -60,7 +60,10 @@ from vllm.utils.system_utils import (
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
-from vllm.v1.executor.output_aggregator import ModelRunnerOutputAggregator
+from vllm.v1.executor.output_aggregator import (
+    ModelRunnerOutputAggregator,
+    ModelRunnerOutputAggregatorStepAdapter,
+)
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -318,13 +321,20 @@ class MultiprocExecutor(Executor):
                 "request-owned attention is enabled but the model runner "
                 "output aggregator was not constructed."
             )
-            aggregator = self.model_runner_output_aggregator
+            # Bind this call to the scheduler's exact step_seq: the immutable
+            # per-step adapter delegates with expected_step_seq set to that
+            # step, so stale/future receipts fail closed without storing any
+            # mutable step state on the shared aggregator.
+            aggregator = self.model_runner_output_aggregator.for_step(
+                scheduler_output.step_seq
+            )
         else:
             aggregator = self.kv_output_aggregator
-        # The generic aggregator is passed through the legacy
-        # ``kv_output_aggregator`` slot (both expose ``aggregate(outputs,
-        # output_rank=...)``) so custom ``collective_rpc`` overrides that keep
-        # the historical signature keep working without a new keyword.
+        # The generic aggregator (or its per-step adapter) is passed through
+        # the legacy ``kv_output_aggregator`` slot (all expose ``aggregate(
+        # outputs, output_rank=...)``) so custom ``collective_rpc`` overrides
+        # that keep the historical signature keep working without a new
+        # keyword.
         return self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
@@ -364,16 +374,20 @@ class MultiprocExecutor(Executor):
         non_block: bool = False,
         unique_reply_rank: int | None = None,
         kv_output_aggregator: (
-            KVOutputAggregator | ModelRunnerOutputAggregator | None
+            KVOutputAggregator
+            | ModelRunnerOutputAggregator
+            | ModelRunnerOutputAggregatorStepAdapter
+            | None
         ) = None,
     ) -> Any:
         """Returns single result if unique_reply_rank and/or kv_output_aggregator
         is provided, otherwise list.
 
-        ``kv_output_aggregator`` accepts either :class:`KVOutputAggregator` or
-        the generic :class:`ModelRunnerOutputAggregator` (both expose
+        ``kv_output_aggregator`` accepts :class:`KVOutputAggregator`, the
+        generic :class:`ModelRunnerOutputAggregator`, or its immutable
+        per-step :class:`ModelRunnerOutputAggregatorStepAdapter` (all expose
         ``aggregate(outputs, output_rank=...)``); request-owned attention
-        passes the generic aggregator through this legacy slot so custom
+        passes the per-step adapter through this legacy slot so custom
         overrides that keep the historical signature keep working.  Any
         aggregator forces ``output_rank=None`` so the broadcast reaches every
         worker and every response MQ is drained.

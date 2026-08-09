@@ -21,7 +21,10 @@ from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.executor import multiproc_executor as multiproc_executor_module
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
-from vllm.v1.executor.output_aggregator import ModelRunnerOutputAggregator
+from vllm.v1.executor.output_aggregator import (
+    ModelRunnerOutputAggregator,
+    ModelRunnerOutputAggregatorStepAdapter,
+)
 from vllm.v1.executor.uniproc_executor import (
     ExecutorWithExternalLauncher,
     UniProcExecutor,
@@ -258,6 +261,13 @@ def _g0_fake_executor(
     return executor
 
 
+def _g0_scheduler_output(step_seq: int = 7) -> SchedulerOutput:
+    """Scheduler output carrying the step_seq the G0 fakes emit (default 7)."""
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.step_seq = step_seq
+    return scheduler_output
+
+
 def _three_worker_responses():
     return [
         (
@@ -274,12 +284,13 @@ def _three_worker_responses():
 
 def test_multiproc_executor_owner_aggregation_sync():
     """G0 owner aggregation broadcasts output_rank=None (every worker
-    executes) and drains every response MQ on the sync path."""
+    executes), drains every response MQ on the sync path, and binds the
+    aggregation to scheduler_output.step_seq (worker emissions match)."""
     responses = _three_worker_responses()
     response_mqs = [_FakeMq([response]) for response in responses]
     executor = _g0_fake_executor(response_mqs)
 
-    result = executor.execute_model(SchedulerOutput.make_empty(), non_block=False)
+    result = executor.execute_model(_g0_scheduler_output(7), non_block=False)
 
     method, _, _, output_rank = executor.rpc_broadcast_mq.enqueued[0]
     assert method == "execute_model"
@@ -289,12 +300,13 @@ def test_multiproc_executor_owner_aggregation_sync():
 
 
 def test_multiproc_executor_owner_aggregation_future():
-    """G0 owner aggregation drains every worker MQ on the Future path too."""
+    """G0 owner aggregation drains every worker MQ on the Future path too,
+    with the same step binding as the sync path."""
     responses = _three_worker_responses()
     response_mqs = [_FakeMq([response]) for response in responses]
     executor = _g0_fake_executor(response_mqs)
 
-    future = executor.execute_model(SchedulerOutput.make_empty(), non_block=True)
+    future = executor.execute_model(_g0_scheduler_output(7), non_block=True)
     result = future.result()
 
     method, _, _, output_rank = executor.rpc_broadcast_mq.enqueued[0]
@@ -302,6 +314,30 @@ def test_multiproc_executor_owner_aggregation_future():
     assert output_rank is None
     assert all(len(mq._responses) == 0 for mq in response_mqs)
     assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+
+
+def test_multiproc_executor_owner_aggregation_step_mismatch_fails_closed():
+    """Call-site binding: worker emissions from a different step than
+    scheduler_output.step_seq fail closed on the sync path instead of
+    aggregating stale/future receipts."""
+    responses = _three_worker_responses()  # workers emit step_seq=7
+    response_mqs = [_FakeMq([response]) for response in responses]
+    executor = _g0_fake_executor(response_mqs)
+
+    with pytest.raises(RuntimeError, match="expected_step_seq"):
+        executor.execute_model(_g0_scheduler_output(8), non_block=False)
+
+
+def test_multiproc_executor_owner_aggregation_step_mismatch_future_fails():
+    """The same step mismatch surfaces on the Future path when the wrapper
+    result is requested."""
+    responses = _three_worker_responses()  # workers emit step_seq=7
+    response_mqs = [_FakeMq([response]) for response in responses]
+    executor = _g0_fake_executor(response_mqs)
+
+    future = executor.execute_model(_g0_scheduler_output(6), non_block=True)
+    with pytest.raises(RuntimeError, match="expected_step_seq"):
+        future.result()
 
 
 class _LegacyCollectiveRpcExecutor(MultiprocExecutor):
@@ -338,9 +374,12 @@ def test_multiproc_executor_legacy_collective_rpc_override_compatible():
     response_mqs = [_FakeMq([response]) for response in responses]
     executor = _g0_fake_executor(response_mqs, cls=_LegacyCollectiveRpcExecutor)
 
-    result = executor.execute_model(SchedulerOutput.make_empty(), non_block=False)
+    result = executor.execute_model(_g0_scheduler_output(7), non_block=False)
 
-    assert isinstance(executor.received_aggregator, ModelRunnerOutputAggregator)
+    assert isinstance(
+        executor.received_aggregator, ModelRunnerOutputAggregatorStepAdapter
+    )
+    assert executor.received_aggregator.step_seq == 7
     method, _, _, output_rank = executor.rpc_broadcast_mq.enqueued[0]
     assert method == "execute_model"
     assert output_rank is None

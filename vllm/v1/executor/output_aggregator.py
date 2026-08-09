@@ -35,6 +35,15 @@ The request-owner enabled contract is fail-closed:
 
 Stale/future lifecycle semantics are deliberately not interpreted here; the
 scheduler-side reference coordinator owns receipt validation.
+
+Call sites bind the shared aggregator to one exact scheduler step through
+:meth:`ModelRunnerOutputAggregator.for_step`, which returns an immutable
+per-step adapter delegating :meth:`~ModelRunnerOutputAggregatorStepAdapter.aggregate`
+with ``expected_step_seq`` set to that step.  The shared aggregator itself
+stores no per-step state, so concurrent steps cannot re-bind or corrupt each
+other; adapters reuse the existing executor transport aggregator slots
+(multiproc ``collective_rpc`` ``kv_output_aggregator``, Ray
+``FutureWrapper``) by duck typing.
 """
 
 from copy import copy
@@ -67,6 +76,17 @@ class ModelRunnerOutputAggregator:
     ) -> None:
         self._expected_owner_ranks: list[int] = sorted(set(expected_owner_ranks))
         self._kv_aggregator = kv_aggregator
+
+    def for_step(self, step_seq: int) -> "ModelRunnerOutputAggregatorStepAdapter":
+        """Return an immutable, stateless per-step adapter bound to ``step_seq``.
+
+        The adapter delegates every :meth:`aggregate` call with
+        ``expected_step_seq=step_seq`` so stale or future worker receipts fail
+        closed at this exact call site.  The shared aggregator itself stores
+        no mutable per-step state, so one aggregator can serve any number of
+        concurrently bound adapters without cross-step interference.
+        """
+        return ModelRunnerOutputAggregatorStepAdapter(self, step_seq)
 
     def aggregate(
         self,
@@ -221,3 +241,46 @@ class ModelRunnerOutputAggregator:
                     )
                 )
         return aggregated
+
+
+class ModelRunnerOutputAggregatorStepAdapter:
+    """Immutable per-step view of a shared :class:`ModelRunnerOutputAggregator`.
+
+    Binds one exact ``step_seq``: every :meth:`aggregate` call delegates to
+    the shared aggregator with ``expected_step_seq`` set to that step, so a
+    stale or future worker emission fails closed.  The adapter is immutable
+    and stores no mutable state beyond its bound step; creating or using it
+    never mutates the shared aggregator or any other adapter.
+
+    It exposes the same duck-typed ``aggregate(outputs, output_rank=...)``
+    surface as :class:`KVOutputAggregator`, so executors can pass it through
+    existing aggregator slots (the multiproc ``collective_rpc``
+    ``kv_output_aggregator`` argument and the Ray ``FutureWrapper``
+    aggregator) without new keywords.
+    """
+
+    def __init__(self, aggregator: ModelRunnerOutputAggregator, step_seq: int) -> None:
+        self._aggregator = aggregator
+        self._step_seq = step_seq
+
+    @property
+    def step_seq(self) -> int:
+        """The exact scheduler step sequence this adapter is bound to."""
+        return self._step_seq
+
+    def aggregate(
+        self,
+        outputs: list[ModelRunnerOutput | None],
+        output_rank: int = 0,
+    ) -> ModelRunnerOutput | None:
+        """Aggregate one step's worker outputs against the bound step.
+
+        Delegates to the shared aggregator with
+        ``expected_step_seq=self.step_seq``; ``output_rank`` selects the
+        output carrier exactly as on the shared aggregator.
+        """
+        return self._aggregator.aggregate(
+            outputs,
+            output_rank=output_rank,
+            expected_step_seq=self._step_seq,
+        )

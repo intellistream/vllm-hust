@@ -8,6 +8,7 @@ and no NPU are constructed.
 """
 
 import pickle
+from functools import partial
 
 import pytest
 
@@ -210,6 +211,138 @@ def test_expected_step_seq_mismatch_fails_closed():
         aggregator.aggregate(outputs, expected_step_seq=8)
     result = aggregator.aggregate(outputs, expected_step_seq=7)
     assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+
+
+def test_for_step_correct_step_aggregates():
+    """for_step(step_seq) binds the exact step: matching worker emissions
+    aggregate normally through the per-step adapter."""
+    outputs = _three_worker_outputs(step_seq=7)
+    adapter = _aggregator(0, 1, 2).for_step(7)
+    result = adapter.aggregate(outputs)
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+    assert all(b.emitted_step_seq == 7 for b in result.owner_receipt_batches)
+
+
+def test_for_step_stale_and_future_mismatch_fails_closed():
+    """Stale (older) and future (newer) worker emissions than the bound step
+    both fail closed with the expected_step_seq error."""
+    outputs = _three_worker_outputs(step_seq=7)
+    stale = _aggregator(0, 1, 2).for_step(6)
+    future = _aggregator(0, 1, 2).for_step(8)
+    with pytest.raises(RuntimeError, match="expected_step_seq"):
+        stale.aggregate(outputs)
+    with pytest.raises(RuntimeError, match="expected_step_seq"):
+        future.aggregate(outputs)
+
+
+def test_for_step_wrappers_independent_and_shared_aggregator_stateless():
+    """Adapters for different steps are independent and the shared
+    aggregator stores no per-step state: creating or using one adapter never
+    re-binds another adapter or the shared aggregator's default unbound
+    behavior."""
+    shared = _aggregator(0, 1, 2)
+    step7 = shared.for_step(7)
+    step8 = shared.for_step(8)
+    assert step7.step_seq == 7
+    assert step8.step_seq == 8
+
+    outputs7 = _three_worker_outputs(step_seq=7)
+    outputs8 = _three_worker_outputs(step_seq=8)
+    assert [b.owner_rank for b in step7.aggregate(outputs7).owner_receipt_batches] == [
+        0,
+        1,
+        2,
+    ]
+    assert [b.owner_rank for b in step8.aggregate(outputs8).owner_receipt_batches] == [
+        0,
+        1,
+        2,
+    ]
+    # Using step8 did not re-bind step7...
+    with pytest.raises(RuntimeError, match="expected_step_seq"):
+        step8.aggregate(outputs7)
+    assert [b.owner_rank for b in step7.aggregate(outputs7).owner_receipt_batches] == [
+        0,
+        1,
+        2,
+    ]
+    # ...nor the shared aggregator: unbound aggregation still accepts any
+    # single consistent emission step.
+    assert [b.owner_rank for b in shared.aggregate(outputs7).owner_receipt_batches] == [
+        0,
+        1,
+        2,
+    ]
+    assert [b.owner_rank for b in shared.aggregate(outputs8).owner_receipt_batches] == [
+        0,
+        1,
+        2,
+    ]
+
+
+def test_shared_aggregator_holds_no_step_state():
+    """The shared aggregator never carries the per-step binding; only the
+    immutable adapter does."""
+    shared = _aggregator(0, 1, 2)
+    adapter = shared.for_step(7)
+    assert not hasattr(shared, "expected_step_seq")
+    assert adapter.step_seq == 7
+    # The adapter is stateless beyond its bound step: repeated and interleaved
+    # calls keep the same binding.
+    outputs = _three_worker_outputs(step_seq=7)
+    assert [b.owner_rank for b in adapter.aggregate(outputs).owner_receipt_batches] == [
+        0,
+        1,
+        2,
+    ]
+
+
+def test_for_step_adapter_sync_and_future_duck_typing():
+    """The adapter matches the KVOutputAggregator duck-typed surface used by
+    sync and FutureWrapper paths: direct ``aggregate(outputs,
+    output_rank=...)`` and an output_rank-pre-bound partial."""
+    outputs = _three_worker_outputs(
+        step_seq=7,
+        events_by_rank={0: (_receipt(0, request_id="req-0"),)},
+    )
+    adapter = _aggregator(0, 1, 2).for_step(7)
+
+    # Sync path: direct call; output_rank selects the output carrier.
+    result = adapter.aggregate(outputs, output_rank=2)
+    assert result.req_ids == []
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+
+    # FutureWrapper path: aggregate pre-bound to output_rank the same way
+    # multiproc collective_rpc builds its partial.
+    bound = partial(adapter.aggregate, output_rank=0)
+    assert [b.owner_rank for b in bound(outputs).owner_receipt_batches] == [0, 1, 2]
+
+
+def test_for_step_adapter_kv_composition_unchanged():
+    """Existing KV connector composition stays identical through the per-step
+    adapter."""
+    kv_aggregator = KVOutputAggregator(expected_finished_count=3)
+    outputs = [
+        _output(0, [_batch(0)], empty=True),
+        _output(1, [_batch(1, events=(_receipt(1, request_id="req-a"),))], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    for i, output in enumerate(outputs):
+        output.kv_connector_output = KVConnectorOutput(
+            finished_sending={"req_send"},
+            invalid_block_ids={i},
+        )
+
+    adapter = _aggregator(0, 1, 2, kv_aggregator=kv_aggregator).for_step(7)
+    result = adapter.aggregate(outputs)
+
+    assert result.kv_connector_output.finished_sending == {"req_send"}
+    assert result.kv_connector_output.invalid_block_ids == {0, 1, 2}
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+    for i, output in enumerate(outputs):
+        assert output.kv_connector_output.finished_sending == {"req_send"}
+        assert output.kv_connector_output.invalid_block_ids == {i}
+    assert EMPTY_MODEL_RUNNER_OUTPUT.kv_connector_output is None
 
 
 def test_exact_duplicate_event_deduped():
