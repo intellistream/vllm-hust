@@ -167,11 +167,12 @@ class SchedulerConfig:
     by batching multiple tokens before sending."""
 
     enable_request_owned_attention: bool = False
-    """EXPERIMENTAL: run attention with per-request owned state.
+    """RESERVED EXPERIMENTAL GATE: run attention with per-request owned state.
 
-    Defaults to False. When enabled, ``VllmConfig`` fails closed unless the
-    configuration matches the supported G0 envelope (pipeline_parallel_size=1,
-    eager execution, no speculative decoding, no KV cache CPU offload)."""
+    Defaults to False. This flag is a reserved experimental control/layout
+    contract (G1): enabling it currently always fails closed at ``VllmConfig``
+    validation until physical owner-local KV allocation/routing (G2) exists.
+    No execution path accepts an enabled configuration today."""
 
     @staticmethod
     def default_factory(**kwargs):

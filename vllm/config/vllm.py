@@ -2147,14 +2147,15 @@ class VllmConfig:
             )
 
     def _validate_request_owned_attention(self) -> None:
-        """Fail closed for the experimental request-owned attention (G0).
+        """Fail closed for the experimental request-owned attention (G0/G1).
 
-        Request-owned attention is only supported inside a narrow envelope:
-        no pipeline parallelism, eager execution without CUDA graphs, no
-        speculative decoding (including MTP), and no KV cache CPU
-        offload/tiering or KV transfer (PD disaggregation / connectors).
-        Each unsupported mode raises a specific ValueError so the feature
-        can never silently run in an unsupported configuration.
+        The specific envelope rejections below stay first and unchanged
+        (pipeline parallelism, speculative decoding including MTP, non-eager
+        execution / CUDA graphs, KV cache CPU offload/tiering, and KV
+        transfer / PD disaggregation). Any otherwise-valid enabled
+        configuration is still refused: only the G1 control/layout contract
+        exists today, physical owner-local KV allocation/routing is a G2
+        prerequisite, and replicated-KV execution is refused until it lands.
         """
         if not self.scheduler_config.enable_request_owned_attention:
             return
@@ -2209,6 +2210,18 @@ class VllmConfig:
                 f"{self.kv_transfer_config.kv_connector!r} with "
                 f"kv_role={self.kv_transfer_config.kv_role!r}."
             )
+
+        # Terminal gate: the envelope checks above cannot pass today. Only
+        # the G1 control/layout contract exists; physical owner-local KV
+        # allocation and routing are a G2 prerequisite, and replicated-KV
+        # execution is refused until that prerequisite exists.
+        raise ValueError(
+            "Request-owned attention cannot be enabled: only the G1 "
+            "control/layout contract exists, while physical owner-local KV "
+            "allocation and routing are a G2 prerequisite. Replicated-KV "
+            "execution is refused until owner-local KV allocation/routing "
+            "is implemented."
+        )
 
     def validate_block_size(self) -> None:
         """Validate block_size against DCP and mamba constraints.

@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Tests for the experimental request-owned attention (G0) config gate.
+"""Tests for the experimental request-owned attention (G0/G1) config gate.
 
 The feature flag lives on SchedulerConfig and defaults to False. When enabled,
 VllmConfig must fail closed on unsupported modes (pipeline parallelism,
-speculative decoding, non-eager/CUDA-graph execution, KV cache CPU offload).
+speculative decoding, non-eager/CUDA-graph execution, KV cache CPU offload)
+with their specific diagnostics, and the formerly supported envelope is now
+refused as well: only the G1 control/layout contract exists, physical
+owner-local KV allocation/routing is a G2 prerequisite, and replicated-KV
+execution is refused.
 """
 
 import pytest
@@ -52,8 +56,10 @@ def _vllm_config(
 ) -> VllmConfig:
     """Build a VllmConfig around the request-owned attention envelope.
 
-    By default the supported G0 envelope is used: eager execution, PP=1,
-    no speculative decoding, no KV cache CPU offload/tiering or KV transfer.
+    By default the formerly supported G0 envelope is used: eager execution,
+    PP=1, no speculative decoding, no KV cache CPU offload/tiering or KV
+    transfer. Enabling the flag now always fails closed at the terminal
+    G2/replicated-KV gate even inside this envelope.
     """
     return VllmConfig(
         scheduler_config=SchedulerConfig.default_factory(
@@ -86,21 +92,22 @@ def test_disabled_leaves_existing_validation_unchanged():
     assert vllm_config.scheduler_config.enable_request_owned_attention is False
 
 
-def test_enabled_accepts_supported_envelope():
-    # Chunked prefill (default), async scheduling (default resolution),
-    # TP>1 and prefix caching are all allowed inside the G0 envelope; the
-    # gate must not reject them.
-    vllm_config = _vllm_config(
-        enable_request_owned_attention=True,
-        compilation_config=_eager_compilation_config(),
-        parallel_config=ParallelConfig(
-            pipeline_parallel_size=1,
-            tensor_parallel_size=2,
-        ),
-        cache_config=CacheConfig(enable_prefix_caching=True),
-    )
-    assert vllm_config.scheduler_config.enable_request_owned_attention is True
-    assert vllm_config.scheduler_config.enable_chunked_prefill is True
+def test_enabled_supported_envelope_fails_closed_g2():
+    # The formerly supported G0 envelope (eager, PP=1, no spec decoding, no
+    # KV offload/transfer; chunked prefill, TP>1 and prefix caching allowed)
+    # now hits the terminal gate: only the G1 control/layout contract exists,
+    # physical owner-local KV allocation/routing is a G2 prerequisite, and
+    # replicated-KV execution is refused.
+    with pytest.raises(ValueError, match="G2 prerequisite"):
+        _vllm_config(
+            enable_request_owned_attention=True,
+            compilation_config=_eager_compilation_config(),
+            parallel_config=ParallelConfig(
+                pipeline_parallel_size=1,
+                tensor_parallel_size=2,
+            ),
+            cache_config=CacheConfig(enable_prefix_caching=True),
+        )
 
 
 def test_enabled_rejects_pipeline_parallelism():
@@ -178,21 +185,13 @@ def test_enabled_rejects_kv_transfer():
 
 def test_hash_differs_when_enabled():
     # Request-owned attention changes the computation graph (per-request
-    # attention kernel selection), so the config hash must distinguish it,
-    # both at the SchedulerConfig level and through VllmConfig.compute_hash().
+    # attention kernel selection), so the scheduler config hash must
+    # distinguish it. VllmConfig.compute_hash() folds in
+    # scheduler_config.compute_hash(), but an enabled VllmConfig can no
+    # longer be constructed (the gate fails closed), so the distinction is
+    # covered at the SchedulerConfig level.
     disabled = SchedulerConfig.default_factory()
     enabled = SchedulerConfig.default_factory(
         enable_request_owned_attention=True,
     )
     assert disabled.compute_hash() != enabled.compute_hash()
-
-    compilation_config = _eager_compilation_config()
-    disabled_vllm = _vllm_config(
-        enable_request_owned_attention=False,
-        compilation_config=compilation_config,
-    )
-    enabled_vllm = _vllm_config(
-        enable_request_owned_attention=True,
-        compilation_config=compilation_config,
-    )
-    assert disabled_vllm.compute_hash() != enabled_vllm.compute_hash()
