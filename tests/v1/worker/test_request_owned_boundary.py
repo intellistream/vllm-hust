@@ -54,6 +54,7 @@ class _FakeWorker:
         self.before_return = before_return
         self.calls = 0
         self.initialized_config = None
+        self.metadata_handoffs: list[RequestOwnedStepMetadata] = []
 
     def initialize_from_config(self, kv_cache_config):
         self.initialized_config = kv_cache_config
@@ -62,6 +63,21 @@ class _FakeWorker:
         self.calls += 1
         if self.before_return is not None:
             self.before_return(scheduler_output)
+        return self.output
+
+    def set_request_owned_step_metadata(self, metadata):
+        self.metadata_handoffs.append(metadata)
+
+
+class _NoHookWorker:
+    """A worker that does not implement the G3 handoff hook."""
+
+    def __init__(self, output=EMPTY_MODEL_RUNNER_OUTPUT) -> None:
+        self.output = output
+        self.calls = 0
+
+    def execute_model(self, scheduler_output):
+        self.calls += 1
         return self.output
 
 
@@ -755,6 +771,10 @@ def test_g3_seam_builds_step_metadata_after_command_publication_validation() -> 
     assert metadata.step_seq == 1
     assert metadata.owner_rank == 0
     assert metadata.entries == ()
+    # The wrapper first actively cleared stale runner state with a None
+    # handoff, then delivered the immutable metadata through the private
+    # hook, and the wire objects were untouched.
+    assert worker.metadata_handoffs == [None, metadata]
 
 
 def test_g3_seam_fails_closed_when_build_rejected() -> None:
@@ -809,3 +829,83 @@ def test_no_local_id_on_scheduler_wires_while_metadata_is_worker_local() -> None
     assert built.accepted
     assert built.metadata.step_seq == 3
     assert built.metadata.entries == ()
+
+
+def test_g3_handoff_delivers_empty_heartbeat_metadata() -> None:
+    """The hook receives the empty heartbeat metadata after a successful
+    build, and no wire object carries or is mutated by the handoff."""
+    step = _output(step_seq=1)
+    command = _reserve(owner_id=0, command_seq=1)
+    step.owner_commands = [command]
+    worker = _FakeWorker()
+    store = _FakeStore(0)
+    wrapper = _wrapper(0, worker, store)
+
+    result = wrapper.execute_model(step)
+    metadata = wrapper._request_owned_step_metadata
+
+    # The zero-token terminal gate still runs the underlying worker, and the
+    # delivered metadata is exactly the built empty heartbeat batch, after
+    # the start-of-call None clear.
+    assert worker.calls == 1
+    assert worker.metadata_handoffs == [None, metadata]
+    assert metadata is wrapper._request_owned_step_metadata
+    assert metadata.step_seq == 1
+    assert metadata.owner_rank == 0
+    assert metadata.entries == ()
+    assert store.last_build_counts == {}
+
+    # No wire attachment or mutation: the command object is untouched and no
+    # scheduler-facing object carries the metadata.
+    assert step.owner_commands[0] is command
+    assert not hasattr(step, "request_owned_step_metadata")
+    assert not hasattr(result, "request_owned_step_metadata")
+
+
+def test_g3_handoff_fails_closed_for_unsupported_worker() -> None:
+    """A worker without the private hook fails closed on the start-of-call
+    None clear, before any command processing or underlying worker run."""
+    step = _output(step_seq=1)
+    step.owner_commands = [_reserve(owner_id=0, command_seq=1)]
+    worker = _NoHookWorker()
+    store = _FakeStore(0)
+    wrapper = _wrapper(0, worker, store)
+
+    with pytest.raises(RuntimeError, match="does not support the request-owned"):
+        wrapper.execute_model(step)
+    assert worker.calls == 0
+    # The fail-closed None delivery happens before any command processing,
+    # so the store was never touched.
+    assert store.calls == []
+    assert wrapper._request_owned_step_metadata is None
+
+
+def test_g3_stale_metadata_cleared_at_start_of_request_owned_call() -> None:
+    """Stale metadata from a previous step is cleared at the start of the
+    next request-owned call, so a failure before the next successful build
+    never exposes it."""
+    step = _output(step_seq=1)
+    step.owner_commands = [_reserve(owner_id=0, command_seq=1)]
+    worker = _FakeWorker()
+    store = _FakeStore(0)
+    wrapper = _wrapper(0, worker, store)
+
+    wrapper.execute_model(step)
+    metadata1 = wrapper._request_owned_step_metadata
+    assert metadata1 is not None
+    assert worker.metadata_handoffs == [None, metadata1]
+
+    # A token-bearing schedule is refused by the existing zero-token gate;
+    # the stale metadata was already cleared at the start of the call.
+    token_step = _output(step_seq=2)
+    token_step.owner_commands = [_reserve(owner_id=0, command_seq=2)]
+    token_step.total_num_scheduled_tokens = 8
+    token_step.num_scheduled_tokens = {"req": 8}
+    with pytest.raises(RuntimeError, match="control-only"):
+        wrapper.execute_model(token_step)
+    assert wrapper._request_owned_step_metadata is None
+    # The concrete worker's runner state was actively cleared with a None
+    # handoff at the start of the second call, before the gate refusal.
+    assert worker.metadata_handoffs == [None, metadata1, None]
+    # The gate refusal never reached the worker's execute_model.
+    assert worker.calls == 1

@@ -9,7 +9,7 @@ sliding window, both block_size 4, prefix caching disabled) so the manager
 stays the authority on block counts and pool accounting.
 """
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 import torch
@@ -1143,3 +1143,299 @@ def test_step_metadata_exposes_local_ids_but_never_wire_fields():
     pool_fields = {field.name for field in fields(OwnerCachePoolSnapshot)}
     assert "tables" not in pool_fields
     assert "block_ids" not in pool_fields
+
+
+# -- G3 atomic batch mark ----------------------------------------------------
+
+
+def test_mark_computed_batch_atomic_advance():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key_a = _key("a")
+    key_b = _key("b")
+    assert store.reserve(
+        _command(key_a, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.reserve(
+        _command(key_b, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+
+    built = store.build_step_metadata(
+        2,
+        [_token(key_a, 8, step_seq=2), _token(key_b, 8, step_seq=2)],
+        {"a": 8, "b": 8},
+    )
+    assert built.accepted
+    mark = store.mark_computed_batch(built.metadata)
+    assert mark.accepted
+    assert mark.error is None
+    assert mark.step_seq == 2
+
+    # Every record advanced to its exact post-step target and every mark
+    # expectation was consumed in the same all-or-nothing commit.
+    assert store._records[key_a].num_computed_tokens == 8
+    assert store._records[key_b].num_computed_tokens == 8
+    assert store._pending_marks == {}
+
+    # The consumed handoffs free the keys for the next token-bearing build
+    # (the reserved horizons are first extended past the marked progress).
+    assert store.build_step_metadata(3, [], {}).accepted
+    assert store.extend(
+        _command(key_a, OwnerCommandKind.EXTEND, required=16, seq=2)
+    ).accepted
+    assert store.extend(
+        _command(key_b, OwnerCommandKind.EXTEND, required=16, seq=2)
+    ).accepted
+    assert store.build_step_metadata(4, [], {}).accepted
+    again = store.build_step_metadata(
+        5,
+        [_token(key_a, 16, step_seq=5), _token(key_b, 16, step_seq=5)],
+        {"a": 8, "b": 8},
+    )
+    assert again.accepted
+    assert again.metadata.entries[0].pre_step_num_computed_tokens == 8
+    assert again.metadata.entries[0].post_step_num_tokens == 16
+
+
+def test_mark_computed_batch_partial_rejected_without_changes():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key_a = _key("a")
+    key_b = _key("b")
+    assert store.reserve(
+        _command(key_a, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.reserve(
+        _command(key_b, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(
+        2,
+        [_token(key_a, 8, step_seq=2), _token(key_b, 8, step_seq=2)],
+        {"a": 8, "b": 8},
+    )
+    assert built.accepted
+    metadata = built.metadata
+    entry_a, entry_b = metadata.entries
+
+    # One bad entry (wrong post-step target) rejects the whole batch before
+    # any record advances or any expectation is consumed.
+    bad = replace(
+        metadata, entries=(replace(entry_a, post_step_num_tokens=99), entry_b)
+    )
+    rejected = store.mark_computed_batch(bad)
+    assert not rejected.accepted
+    assert "target mismatch" in rejected.error
+    assert store._records[key_a].num_computed_tokens == 0
+    assert store._records[key_b].num_computed_tokens == 0
+    assert set(store._pending_marks) == {key_a, key_b}
+
+    # A duplicate batch entry is also rejected without changes.
+    dup = replace(metadata, entries=(entry_a, entry_a))
+    assert not store.mark_computed_batch(dup).accepted
+
+    # The untouched expectations still accept the exact original batch.
+    assert store.mark_computed_batch(metadata).accepted
+    assert store._records[key_a].num_computed_tokens == 8
+    assert store._records[key_b].num_computed_tokens == 8
+
+
+def test_mark_computed_batch_stale_duplicate_wrong_owner_foreign():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("f")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {"f": 8})
+    assert built.accepted
+    metadata = built.metadata
+    entry = metadata.entries[0]
+
+    # Wrong-owner metadata never touches this store.
+    wrong_owner = replace(metadata, owner_rank=1)
+    assert not store.mark_computed_batch(wrong_owner).accepted
+    assert "wrong-owner" in store.mark_computed_batch(wrong_owner).error
+
+    # Foreign key: no active record for the snapshot's key.
+    foreign = replace(metadata, entries=(replace(entry, key=_key("ghost")),))
+    rejected = store.mark_computed_batch(foreign)
+    assert not rejected.accepted
+    assert "foreign" in rejected.error
+
+    # A batch for a step that was never built (or an older one) is stale.
+    future = replace(metadata, step_seq=99)
+    assert not store.mark_computed_batch(future).accepted
+    assert "stale" in store.mark_computed_batch(future).error
+
+    # The exact batch succeeds once...
+    assert store.mark_computed_batch(metadata).accepted
+    assert store._records[key].num_computed_tokens == 8
+    # ...and a second mark of the same step is a duplicate.
+    duplicate = store.mark_computed_batch(metadata)
+    assert not duplicate.accepted
+    assert "duplicate" in duplicate.error
+
+    # A newer build makes the old step stale as well.
+    assert store.build_step_metadata(3, [], {}).accepted
+    stale = store.mark_computed_batch(metadata)
+    assert not stale.accepted
+    assert "stale" in stale.error
+
+
+def test_mark_computed_batch_empty_heartbeat_metadata():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("h")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+
+    heartbeat = store.build_step_metadata(1, [], {})
+    assert heartbeat.accepted
+    assert heartbeat.metadata.entries == ()
+    # An empty batch is a valid no-op mark: nothing to advance, step fenced.
+    assert store.mark_computed_batch(heartbeat.metadata).accepted
+    assert store._records[key].num_computed_tokens == 0
+    # Marking the same heartbeat again is a duplicate.
+    assert not store.mark_computed_batch(heartbeat.metadata).accepted
+
+
+def test_build_rejects_any_live_pending_mark_across_disjoint_keys():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key_a = _key("a")
+    key_b = _key("b")
+    assert store.reserve(
+        _command(key_a, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.reserve(
+        _command(key_b, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+    first = store.build_step_metadata(2, [_token(key_a, 8, step_seq=2)], {"a": 8})
+    assert first.accepted
+
+    # Key A's execution is pending and unmarked.  A token-bearing build for
+    # the disjoint key B must not advance the fence and strand A...
+    disjoint = store.build_step_metadata(3, [_token(key_b, 8, step_seq=3)], {"b": 8})
+    assert not disjoint.accepted
+    assert "unconsumed pending mark" in disjoint.error
+    assert "request_id='a'" in disjoint.error
+    # ...and a heartbeat must not advance the fence over it either.
+    heartbeat = store.build_step_metadata(3, [], {})
+    assert not heartbeat.accepted
+    assert "unconsumed pending mark" in heartbeat.error
+
+    # Atomicity: the rejected builds changed nothing; A's expectation is
+    # still pending and the exact batch can still be marked.
+    assert store._records[key_a].num_computed_tokens == 0
+    assert store._records[key_b].num_computed_tokens == 0
+    assert set(store._pending_marks) == {key_a}
+    assert store.mark_computed_batch(first.metadata).accepted
+    assert store._records[key_a].num_computed_tokens == 8
+
+    # With the pending execution consumed, the next build for B proceeds.
+    next_step = store.build_step_metadata(3, [_token(key_b, 8, step_seq=3)], {"b": 8})
+    assert next_step.accepted
+    assert [entry.key for entry in next_step.metadata.entries] == [key_b]
+
+
+def test_mark_computed_batch_missing_entry_rejected_atomically():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key_a = _key("a")
+    key_b = _key("b")
+    assert store.reserve(
+        _command(key_a, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.reserve(
+        _command(key_b, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(
+        2,
+        [_token(key_a, 8, step_seq=2), _token(key_b, 8, step_seq=2)],
+        {"a": 8, "b": 8},
+    )
+    assert built.accepted
+    metadata = built.metadata
+    entry_a = metadata.entries[0]
+
+    # A metadata object missing one expected entry must not mark the subset
+    # and strand the remainder: the whole batch is rejected with no changes.
+    partial = replace(metadata, entries=(entry_a,))
+    rejected = store.mark_computed_batch(partial)
+    assert not rejected.accepted
+    assert "missing" in rejected.error
+    assert store._records[key_a].num_computed_tokens == 0
+    assert store._records[key_b].num_computed_tokens == 0
+    assert set(store._pending_marks) == {key_a, key_b}
+
+    # The untouched expectations still accept the exact full batch.
+    assert store.mark_computed_batch(metadata).accepted
+    assert store._records[key_a].num_computed_tokens == 8
+    assert store._records[key_b].num_computed_tokens == 8
+
+
+def test_mark_computed_batch_generation_fence():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("g")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {"g": 8})
+    assert built.accepted
+    first_metadata = built.metadata
+
+    # Same-key ABA: preempt, flush, and re-reserve the exact key before the
+    # handed-in step is marked.  The stale batch can never advance the
+    # recycled record because its allocation generation changed.
+    assert store.preempt(
+        _command(key, OwnerCommandKind.PREEMPT, required=8, seq=3)
+    ).accepted
+    store.flush()
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=12, seq=4)
+    ).accepted
+    rejected = store.mark_computed_batch(first_metadata)
+    assert not rejected.accepted
+    assert "generation" in rejected.error
+    assert store._records[key].num_computed_tokens == 0
+
+    # The recycled record builds and marks normally with its own snapshot.
+    assert store.build_step_metadata(3, [], {}).accepted
+    second = store.build_step_metadata(4, [_token(key, 12, step_seq=4)], {"g": 12})
+    assert second.accepted
+    assert store.mark_computed_batch(second.metadata).accepted
+    assert store._records[key].num_computed_tokens == 12
+
+
+def test_mark_computed_batch_expectation_generation_mismatch():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("x")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {"x": 8})
+    assert built.accepted
+    metadata = built.metadata
+
+    # Corrupt the armed expectation's generation (as if the record had been
+    # recycled out from under the expectation without a new build).  The
+    # batch must fail without advancing anything even though the snapshot
+    # entry still matches the record.
+    store._pending_marks[key] = replace(
+        store._pending_marks[key], allocation_generation=999
+    )
+    rejected = store.mark_computed_batch(metadata)
+    assert not rejected.accepted
+    assert "expectation generation" in rejected.error
+    assert store._records[key].num_computed_tokens == 0
+    assert key in store._pending_marks

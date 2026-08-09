@@ -55,6 +55,12 @@ newly allocated deltas into a step only when the build succeeds: a failed
 build retains every pending delta.  A handed-in mark expectation is fenced
 by the record's physical allocation generation, so a stale snapshot can
 never advance computed progress on a recycled same-key record.
+  The atomic batch mark
+(:meth:`RequestOwnedKVStore.mark_computed_batch`) validates every entry
+(exact key, generation, pending expectation, pre-step base, post-step
+target) before advancing any record, and each step may be marked at
+most once: stale, duplicate, wrong-owner, foreign, or partial batches
+fail without changes.
 """
 
 from __future__ import annotations
@@ -263,6 +269,15 @@ class RequestOwnedStepMetadataResult:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RequestOwnedStepMarkResult:
+    """Outcome of :meth:`RequestOwnedKVStore.mark_computed_batch`."""
+
+    accepted: bool
+    step_seq: int
+    error: str | None = None
+
+
 def _reject_allocation(command: OwnerCommand, error: str) -> AllocationResult:
     return AllocationResult(accepted=False, key=command.key, error=error)
 
@@ -329,6 +344,9 @@ class RequestOwnedKVStore:
         #: ``mark_computed``.  Deliberately survives record flush so a stale
         #: snapshot cannot advance a recycled same-key record.
         self._pending_marks: dict[OwnerLeaseKey, _MarkExpectation] = {}
+        #: Step fence of the last successfully marked batch (each step may
+        #: be marked at most once; a duplicate mark attempt is rejected).
+        self._marked_step_seq: int | None = None
 
     def reserve(self, command: OwnerCommand) -> AllocationResult:
         """Physically reserve the chunk of a RESERVE command; request
@@ -497,6 +515,155 @@ class RequestOwnedKVStore:
         record.num_computed_tokens = num_tokens
         return True
 
+    def mark_computed_batch(
+        self, metadata: RequestOwnedStepMetadata
+    ) -> RequestOwnedStepMarkResult:
+        """Atomically advance every entry of a handed-in G3 step metadata
+        batch to its exact post-step target.
+
+        All-or-nothing: every entry is validated (exact lease key, physical
+        allocation generation, an armed pending mark expectation from the
+        matching step build fenced by the same generation, the exact
+        post-step target, and the pre-step computed base) and the batch
+        must cover exactly every expectation armed by the step, before any
+        record advances; a stale (non-current or already-marked step),
+        duplicate, wrong-owner, foreign, missing-entry, or partial batch
+        fails with no changes.  Success consumes every expectation and
+        sets the records' computed progress to the exact post-step
+        targets."""
+        if not isinstance(metadata, RequestOwnedStepMetadata):
+            return RequestOwnedStepMarkResult(
+                accepted=False,
+                step_seq=getattr(metadata, "step_seq", 0),
+                error=f"metadata must be a RequestOwnedStepMetadata, got {metadata!r}.",
+            )
+        step_seq = metadata.step_seq
+        if metadata.owner_rank != self._owner_rank:
+            return RequestOwnedStepMarkResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=f"wrong-owner metadata: owner {metadata.owner_rank} != "
+                f"store rank {self._owner_rank}.",
+            )
+        if self._last_built_step_seq is None or step_seq != self._last_built_step_seq:
+            return RequestOwnedStepMarkResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=f"stale metadata: step_seq {step_seq} is not the last "
+                f"built step {self._last_built_step_seq}.",
+            )
+        if self._marked_step_seq is not None and step_seq == self._marked_step_seq:
+            return RequestOwnedStepMarkResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=f"duplicate mark: step {step_seq} was already marked.",
+            )
+        seen: set[OwnerLeaseKey] = set()
+        for entry in metadata.entries:
+            if not isinstance(entry, RequestOwnedStepEntry):
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"batch entry must be a RequestOwnedStepEntry, "
+                    f"got {entry!r}.",
+                )
+            if entry.key in seen:
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"duplicate batch entry for {entry.key!r}.",
+                )
+            seen.add(entry.key)
+            record = self._records.get(entry.key)
+            if record is None:
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"foreign batch entry: no active record for {entry.key!r}.",
+                )
+            if record.pending_free:
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"lease {entry.key!r} is held pending free until "
+                    f"the flush fence.",
+                )
+            if record.generation != entry.allocation_generation:
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"stale batch entry for {entry.key!r}: record "
+                    f"generation {record.generation} != snapshot "
+                    f"{entry.allocation_generation}.",
+                )
+            expectation = self._pending_marks.get(entry.key)
+            if expectation is None:
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"no pending mark expectation for {entry.key!r}.",
+                )
+            if expectation.allocation_generation != record.generation:
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"stale mark expectation for {entry.key!r}: "
+                    f"expectation generation "
+                    f"{expectation.allocation_generation} != record "
+                    f"generation {record.generation}.",
+                )
+            if expectation.step_seq != step_seq:
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"mark expectation for {entry.key!r} is from step "
+                    f"{expectation.step_seq}, not {step_seq}.",
+                )
+            if expectation.post_step_num_tokens != entry.post_step_num_tokens:
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"post-step target mismatch for {entry.key!r}: "
+                    f"expected {expectation.post_step_num_tokens}, got "
+                    f"{entry.post_step_num_tokens}.",
+                )
+            if record.num_computed_tokens != entry.pre_step_num_computed_tokens:
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"pre-step computed mismatch for {entry.key!r}: "
+                    f"record {record.num_computed_tokens} != snapshot "
+                    f"{entry.pre_step_num_computed_tokens}.",
+                )
+        # Batch completeness: the batch must cover exactly the expectations
+        # armed by this step, so a metadata object missing an entry can
+        # never mark a subset and strand the remainder.
+        expected_keys = {
+            key
+            for key, expectation in self._pending_marks.items()
+            if expectation.step_seq == step_seq
+        }
+        batch_keys = {entry.key for entry in metadata.entries}
+        if batch_keys != expected_keys:
+            missing = expected_keys - batch_keys
+            extra = batch_keys - expected_keys
+            return RequestOwnedStepMarkResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=(
+                    f"incomplete batch for step {step_seq}: missing "
+                    f"{sorted(missing, key=lambda k: (k.request_id, k.owner_epoch))}, "
+                    f"extra "
+                    f"{sorted(extra, key=lambda k: (k.request_id, k.owner_epoch))}."
+                ),
+            )
+        for entry in metadata.entries:
+            record = self._records[entry.key]
+            record.num_computed_tokens = entry.post_step_num_tokens
+            del self._pending_marks[entry.key]
+        self._marked_step_seq = step_seq
+        return RequestOwnedStepMarkResult(accepted=True, step_seq=step_seq)
+
     def build_step_metadata(
         self,
         step_seq: int,
@@ -524,9 +691,11 @@ class RequestOwnedKVStore:
         zero-global-token heartbeat (no positive counts anywhere) may carry
         newly published grants but always builds empty execution metadata
         and retains every pending delta for the later token-bearing step.
-        A token-bearing build also rejects a key with an unconsumed pending
-        mark from an earlier handoff unless the record was recycled
-        (generation changed).  On success the pending deltas of the batch
+        Any build (token-bearing or heartbeat) also rejects while any live
+        unconsumed pending mark exists -- even for a disjoint key -- so the
+        build fence never advances over pending execution; a stale recycled
+        expectation (record missing or generation changed) is ignored under
+        the existing ABA policy.  On success the pending deltas of the batch
         keys are handed into the step and mark expectations are armed; on
         any rejection nothing changes, so pending deltas are never silently
         lost and the same step can be retried.  No scheduler wire object is
@@ -618,6 +787,37 @@ class RequestOwnedKVStore:
                 )
             if count > 0:
                 positive_requests.append(request_id)
+
+        # Pre-build global live-pending fence: no new build (token-bearing
+        # or heartbeat) may advance the build fence over an unconsumed
+        # execution from an earlier handoff, even for a disjoint key --
+        # otherwise step N for key A could stay pending while step N+1 for
+        # key B advances the fence and A becomes permanently unmarkable.
+        # A live pending mark is one whose record still exists with the
+        # same allocation generation; stale recycled expectations (record
+        # missing or generation changed) are ignored under the existing ABA
+        # policy.  The executed batch must be marked before the next build,
+        # so the atomic mark is always reachable.
+        live_pending = [
+            key
+            for key, expectation in self._pending_marks.items()
+            if (record := self._records.get(key)) is not None
+            and expectation.allocation_generation == record.generation
+        ]
+        if live_pending:
+            pending_key = sorted(
+                live_pending, key=lambda k: (k.request_id, k.owner_epoch)
+            )[0]
+            return RequestOwnedStepMetadataResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=(
+                    "unconsumed pending mark for "
+                    f"{pending_key!r} from step "
+                    f"{self._pending_marks[pending_key].step_seq}: the "
+                    "executed batch must be marked before the next build."
+                ),
+            )
 
         if not positive_requests:
             # Zero-global-token heartbeat: grants may be newly published but

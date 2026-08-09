@@ -171,6 +171,27 @@ class WorkerBase:
         """Should be called immediately after execute_model iff it returned None."""
         raise NotImplementedError
 
+    def set_request_owned_step_metadata(
+        self, metadata: RequestOwnedStepMetadata | None
+    ) -> None:
+        """Worker-private handoff of the G3 step metadata.
+
+        Called by the wrapper with ``None`` at the start of every
+        request-owned call to actively clear stale runner state, and with
+        the immutable batch immediately after a successful
+        ``build_step_metadata`` for this rank's step.  The metadata is
+        fully detached and is delivered as a plain method call: it is never
+        attached to a SchedulerOutput or any other wire object, and no wire
+        object is mutated.  Unsupported workers fail closed: the default
+        raises instead of silently dropping the handoff.  No computed
+        progress is marked from this hook; completion is declared later,
+        after token sampling."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support the request-owned G3 "
+            "step metadata handoff; request-owned attention requires a "
+            "worker that implements set_request_owned_step_metadata."
+        )
+
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in
         speculative decoding.
@@ -232,9 +253,11 @@ class WorkerWrapperBase:
         self._request_owned_control_manager: AttentionLeaseManager | None = None
         self._request_owned_kv_store: RequestOwnedKVStore | None = None
         #: Immutable worker-local G3 execution metadata of the last step
-        #: whose command+publication validation succeeded.  Never attached
-        #: to a scheduler wire; the model-runner handoff is a later
-        #: milestone.
+        #: whose command+publication validation succeeded.  Cleared at the
+        #: start of every request-owned call (the concrete worker is
+        #: actively cleared with a ``None`` handoff) and handed to the
+        #: worker through its private hook; never attached to a scheduler
+        #: wire.
         self._request_owned_step_metadata: RequestOwnedStepMetadata | None = None
 
     def shutdown(self) -> None:
@@ -450,6 +473,14 @@ class WorkerWrapperBase:
         at this milestone, so every token-bearing schedule is refused before
         the underlying worker runs.
         """
+        # G3 lifecycle: actively clear stale worker-private metadata at the
+        # start of every request-owned call, before any validation.  The
+        # ``None`` handoff clears the concrete worker's runner state too,
+        # so a failure before the next successful build can never expose
+        # the previous step's metadata.
+        self._request_owned_step_metadata = None
+        self._deliver_request_owned_step_metadata(None)
+
         step_seq = scheduler_output.step_seq
         if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
             raise RuntimeError(
@@ -529,12 +560,16 @@ class WorkerWrapperBase:
         # G3 seam: after command+publication validation, freeze the
         # immutable worker-local execution metadata for this step.  The
         # zero-token terminal gate above still refuses every token-bearing
-        # schedule before the model runner, so this metadata is not yet
-        # handed to any runner; it is kept worker-locally for the milestone
-        # that connects it.
+        # schedule before the model runner, so the handed metadata is
+        # always the empty heartbeat batch at this milestone; no computed
+        # progress is marked here.
         self._request_owned_step_metadata = self._build_request_owned_step_metadata(
             store, step_seq, scheduler_output
         )
+        # G3 handoff: deliver the immutable metadata to the concrete worker
+        # through its private hook, without attaching it to or mutating any
+        # scheduler wire object; unsupported workers fail closed.
+        self._deliver_request_owned_step_metadata(self._request_owned_step_metadata)
 
         self._apply_mm_cache(scheduler_output)
         output = self.worker.execute_model(scheduler_output)
@@ -630,6 +665,27 @@ class WorkerWrapperBase:
                 "request-owned step metadata build accepted without metadata"
             )
         return build.metadata
+
+    def _deliver_request_owned_step_metadata(
+        self, metadata: RequestOwnedStepMetadata | None
+    ) -> None:
+        """Hand the G3 step metadata to the concrete worker.
+
+        ``None`` clears the worker's stale runner state at the start of a
+        request-owned call; the immutable batch is delivered after a
+        successful build.  The hook is a worker-private method call: the
+        metadata is never attached to a SchedulerOutput or any other wire
+        object, and no wire object is mutated.  Workers that do not
+        implement the hook fail closed with an explicit error rather than
+        silently dropping the handoff."""
+        handoff = getattr(self.worker, "set_request_owned_step_metadata", None)
+        if not callable(handoff):
+            raise RuntimeError(
+                f"worker {type(self.worker).__name__} does not support the "
+                "request-owned G3 step metadata handoff; unsupported "
+                "workers fail closed."
+            )
+        handoff(metadata)
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
