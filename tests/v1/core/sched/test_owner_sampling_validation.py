@@ -138,9 +138,13 @@ def _make_scheduler(
     world_size: int = 2,
     max_num_scheduled_tokens: int = 64,
     max_num_running_reqs: int = 16,
+    sampling_enabled: bool = False,
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.scheduler_config = SimpleNamespace(enable_request_owned_attention=True)
+    scheduler.scheduler_config = SimpleNamespace(
+        enable_request_owned_attention=True,
+        enable_request_owned_sampling=sampling_enabled,
+    )
     scheduler.parallel_config = SimpleNamespace(world_size=world_size)
     scheduler.current_step = 0
     scheduler.max_num_scheduled_tokens = max_num_scheduled_tokens
@@ -218,10 +222,22 @@ def _apply_receipts(scheduler, scheduler_output, events_by_rank) -> None:
         )
         for rank in range(scheduler.parallel_config.world_size)
     ]
+    sampling_batches = None
+    if scheduler.scheduler_config.enable_request_owned_sampling:
+        sampling_batches = [
+            OwnerSamplingBatch(
+                owner_rank=rank,
+                emitted_step_seq=scheduler_output.step_seq,
+            )
+            for rank in range(scheduler.parallel_config.world_size)
+        ]
     scheduler.update_from_output(
         scheduler_output,
         ModelRunnerOutput(
-            req_ids=[], req_id_to_index={}, owner_receipt_batches=batches
+            req_ids=[],
+            req_id_to_index={},
+            owner_receipt_batches=batches,
+            owner_sampling_batches=sampling_batches,
         ),
     )
 
@@ -479,7 +495,9 @@ def test_seam_default_off_output_preserves_control_only_step() -> None:
 
 
 def test_seam_accepts_token_bearing_envelope_without_mutation() -> None:
-    scheduler = _make_scheduler(max_num_scheduled_tokens=64)
+    scheduler = _make_scheduler(
+        max_num_scheduled_tokens=64, sampling_enabled=True
+    )
     request = _request("req-0")
     scheduler.add_request(request)
     out = _admit(scheduler, request, grant=8)
@@ -518,7 +536,9 @@ def test_seam_accepts_token_bearing_envelope_without_mutation() -> None:
 
 
 def test_seam_rejects_invalid_envelope_before_any_mutation() -> None:
-    scheduler = _make_scheduler(max_num_scheduled_tokens=64)
+    scheduler = _make_scheduler(
+        max_num_scheduled_tokens=64, sampling_enabled=True
+    )
     request = _request("req-0")
     scheduler.add_request(request)
     out = _admit(scheduler, request, grant=8)
@@ -567,7 +587,9 @@ def test_seam_rejects_invalid_envelope_before_any_mutation() -> None:
 
 
 def test_seam_rejects_unknown_finished_scheduled_request() -> None:
-    scheduler = _make_scheduler(max_num_scheduled_tokens=64)
+    scheduler = _make_scheduler(
+        max_num_scheduled_tokens=64, sampling_enabled=True
+    )
     request = _request("req-0")
     scheduler.add_request(request)
     out = _admit(scheduler, request, grant=8)
@@ -597,7 +619,9 @@ def test_seam_rejects_unknown_finished_scheduled_request() -> None:
 
 
 def test_seam_rejects_missing_lease_key() -> None:
-    scheduler = _make_scheduler(max_num_scheduled_tokens=64)
+    scheduler = _make_scheduler(
+        max_num_scheduled_tokens=64, sampling_enabled=True
+    )
     request = _request("req-0")
     scheduler.add_request(request)
     out = _admit(scheduler, request, grant=8)
@@ -624,7 +648,8 @@ def test_seam_rejects_missing_lease_key() -> None:
 def test_seam_rejects_envelope_when_scheduler_not_owner_enabled() -> None:
     scheduler = _make_scheduler()
     scheduler.scheduler_config = SimpleNamespace(
-        enable_request_owned_attention=False
+        enable_request_owned_attention=False,
+        enable_request_owned_sampling=True,
     )
     with pytest.raises(RuntimeError, match="enable_request_owned_attention"):
         scheduler._validate_request_owned_sampling_envelope(
@@ -636,6 +661,47 @@ def test_seam_rejects_envelope_when_scheduler_not_owner_enabled() -> None:
                     OwnerSamplingBatch(owner_rank=0, emitted_step_seq=1),
                 ],
             ),
+        )
+
+
+def test_seam_sampling_enabled_requires_explicit_batches_even_on_heartbeat() -> None:
+    scheduler = _make_scheduler(sampling_enabled=True)
+    out = scheduler.schedule()
+    assert out.total_num_scheduled_tokens == 0
+
+    with pytest.raises(RuntimeError, match="carries no owner_sampling_batches"):
+        scheduler._validate_request_owned_sampling_envelope(
+            out,
+            ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+        )
+
+
+def test_seam_sampling_disabled_rejects_unexpected_batches() -> None:
+    scheduler = _make_scheduler(sampling_enabled=False)
+    out = scheduler.schedule()
+
+    with pytest.raises(RuntimeError, match="sampling is disabled"):
+        scheduler._validate_request_owned_sampling_envelope(
+            out,
+            ModelRunnerOutput(
+                req_ids=[],
+                req_id_to_index={},
+                owner_sampling_batches=[
+                    OwnerSamplingBatch(owner_rank=0, emitted_step_seq=out.step_seq),
+                    OwnerSamplingBatch(owner_rank=1, emitted_step_seq=out.step_seq),
+                ],
+            ),
+        )
+
+
+def test_seam_rejects_mutated_non_bool_sampling_gate() -> None:
+    scheduler = _make_scheduler()
+    scheduler.scheduler_config.enable_request_owned_sampling = 1
+
+    with pytest.raises(RuntimeError, match="must remain a bool"):
+        scheduler._validate_request_owned_sampling_envelope(
+            scheduler.schedule(),
+            ModelRunnerOutput(req_ids=[], req_id_to_index={}),
         )
 
 

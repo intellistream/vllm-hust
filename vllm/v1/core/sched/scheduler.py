@@ -2080,16 +2080,38 @@ class Scheduler(SchedulerInterface):
           and never mutate sampling state (this boundary keeps no sampling
           state at all; it only validates).
 
-        ``owner_sampling_batches is None`` is the default-off output and is
-        accepted unchanged so existing control-only tests keep passing.  The
-        absence is NOT yet authoritative: when the runner unlock wires
-        ``expected_sampling_owner_ranks`` into the executor aggregator, a
-        missing envelope on a token-bearing request-owned step must fail
-        closed at this exact call seam.
+        ``owner_sampling_batches is None`` remains the default-off output and
+        is accepted only while ``enable_request_owned_sampling`` is false.
+        Once that experimental transport gate is enabled, absence is
+        authoritative failure even for a zero-work heartbeat: every worker
+        slot must emit an explicit (possibly empty) batch.  Conversely, an
+        envelope arriving while the sampling gate is disabled is rejected.
         """
         batches = model_runner_output.owner_sampling_batches
+        sampling_enabled = getattr(
+            self.scheduler_config, "enable_request_owned_sampling", False
+        )
+        if not isinstance(sampling_enabled, bool):
+            raise RuntimeError(
+                "enable_request_owned_sampling must remain a bool at the "
+                f"scheduler boundary, got {sampling_enabled!r}."
+            )
         if batches is None:
+            if sampling_enabled:
+                raise RuntimeError(
+                    "request-owned sampling is enabled but the terminal "
+                    "model output carries no owner_sampling_batches; every "
+                    "worker slot must emit an explicit batch, including an "
+                    "empty batch on zero-work steps."
+                )
             return
+
+        if not sampling_enabled:
+            raise RuntimeError(
+                "model output carries owner_sampling_batches while "
+                "enable_request_owned_sampling is disabled; refusing an "
+                "unexpected sampling authority path."
+            )
 
         if not self.scheduler_config.enable_request_owned_attention:
             raise RuntimeError(
