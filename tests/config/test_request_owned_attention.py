@@ -130,10 +130,11 @@ def test_enabled_supported_envelope_constructs():
     )
     assert vllm_config.scheduler_config.enable_request_owned_attention is True
     assert vllm_config.scheduler_config.async_scheduling is False
-    # The allowed envelope is Multiproc / eager / V1 / no-DBO.
+    # The allowed envelope is Multiproc / eager / V1 / no-DBO / DP=1.
     assert vllm_config.parallel_config.distributed_executor_backend == "mp"
     assert vllm_config.use_v2_model_runner is False
     assert vllm_config.parallel_config.use_ubatching is False
+    assert vllm_config.parallel_config.data_parallel_size == 1
 
 
 def test_enabled_rejects_pipeline_parallelism():
@@ -411,6 +412,32 @@ def test_enabled_rejects_sequence_parallelism_enable_sp():
     vllm_config.compilation_config.pass_config.enable_sp = True
     with pytest.raises(ValueError, match="sequence parallelism"):
         vllm_config._validate_request_owned_attention()
+
+
+def test_enabled_rejects_data_parallelism():
+    # Request-owned owner IDs/output slots/TP ranks are not yet proven under
+    # DP (including external DP), so DP > 1 must fail closed at construction.
+    with pytest.raises(ValueError, match="data_parallel_size"):
+        _vllm_config(parallel_config=ParallelConfig(data_parallel_size=2))
+
+
+def test_enabled_rejects_nested_mutation_data_parallelism():
+    # Post-init nested mutation of data_parallel_size must be caught by
+    # explicit re-validation on the same VllmConfig instance.
+    vllm_config = _vllm_config(enable_request_owned_attention=False)
+    vllm_config.scheduler_config.enable_request_owned_attention = True
+    vllm_config.parallel_config.data_parallel_size = 2
+    with pytest.raises(ValueError, match="data_parallel_size"):
+        vllm_config._validate_request_owned_attention()
+
+
+def test_enabled_does_not_gate_expert_parallelism():
+    # Expert parallelism runs inside the single TP/HCCL world and must not
+    # be conflated with data parallelism: the request-owned gate keys only
+    # on data_parallel_size and leaves EP knobs untouched.
+    vllm_config = _vllm_config()
+    vllm_config.parallel_config.enable_elastic_ep = True
+    vllm_config._validate_request_owned_attention()  # must not raise
 
 
 def test_hash_differs_when_enabled():

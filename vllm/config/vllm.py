@@ -2164,9 +2164,12 @@ class VllmConfig:
         yet: the V2 model runner, dynamic batch overlap / micro-batching
         (DBO), distributed EC cache transfer, KV-sharing fast prefill, any
         executor other than Multiproc (UniProc is tolerated only for
-        single-process host/control tests), non-generative (pooling/draft)
-        runner types, and sequence parallelism / async TP
-        (``pass_config.enable_sp`` / ``pass_config.fuse_gemm_comms``).
+        single-process host/control tests), data parallelism (DP > 1 is not
+        yet proven for request-owned owner IDs/output slots/TP ranks;
+        expert parallelism stays within the single TP/HCCL world and is not
+        gated), non-generative (pooling/draft) runner types, and sequence
+        parallelism / async TP (``pass_config.enable_sp`` /
+        ``pass_config.fuse_gemm_comms``).
 
         Residual: FlashComm and the optional O-projection TP split are only
         exposed through platform-plugin environment / ``additional_config``
@@ -2186,6 +2189,16 @@ class VllmConfig:
                 "Request-owned attention is experimental and requires "
                 "pipeline_parallel_size=1, but got pipeline_parallel_size="
                 f"{parallel_config.pipeline_parallel_size}."
+            )
+
+        if parallel_config.data_parallel_size != 1:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "data_parallel_size=1, but got data_parallel_size="
+                f"{parallel_config.data_parallel_size}. Data parallelism is "
+                "not yet proven for request-owned owner IDs/output "
+                "slots/TP ranks; expert parallelism is unaffected and stays "
+                "within the single TP/HCCL world."
             )
 
         if parallel_config.use_ray:
