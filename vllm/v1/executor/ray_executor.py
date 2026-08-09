@@ -438,6 +438,12 @@ class RayDistributedExecutor(Executor):
         grammar_output: "GrammarOutput | None",
         non_block: bool = False,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        # execute_model() can defer token work until sample_tokens(). Recheck
+        # the mutable experimental gate at the actual dispatch boundary so a
+        # disabled -> enabled transition cannot send token work to Ray workers
+        # whose configuration still permits replicated KV execution.
+        self._validate_request_owned_control_only_step(scheduler_output)
+
         # Build the compiled DAG for the first time.
         if self.forward_dag is None:  # type: ignore
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)

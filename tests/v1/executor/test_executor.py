@@ -25,6 +25,7 @@ from vllm.v1.executor.output_aggregator import (
     ModelRunnerOutputAggregator,
     ModelRunnerOutputAggregatorStepAdapter,
 )
+from vllm.v1.executor.ray_executor import RayDistributedExecutor
 from vllm.v1.executor.uniproc_executor import (
     ExecutorWithExternalLauncher,
     UniProcExecutor,
@@ -318,6 +319,20 @@ def test_multiproc_control_only_guard_precedes_transport(total, per_request):
     with pytest.raises(RuntimeError, match="control-only"):
         executor.execute_model(scheduler_output)
     assert executor.rpc_broadcast_mq.enqueued == []
+
+
+def test_ray_deferred_dispatch_rechecks_control_only_guard():
+    """A mutable false -> true gate transition between execute_model() and
+    sample_tokens() must fail before constructing or executing the Ray DAG."""
+    executor = RayDistributedExecutor.__new__(RayDistributedExecutor)
+    executor.scheduler_config = SimpleNamespace(enable_request_owned_attention=True)
+    scheduler_output = _g0_scheduler_output()
+    scheduler_output.total_num_scheduled_tokens = 1
+    scheduler_output.num_scheduled_tokens = {"req": 1}
+
+    with pytest.raises(RuntimeError, match="control-only"):
+        executor._execute_dag(scheduler_output, None)
+    assert not hasattr(executor, "forward_dag")
 
 
 def test_multiproc_executor_owner_aggregation_future():
