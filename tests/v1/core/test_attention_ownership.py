@@ -759,6 +759,18 @@ def test_cache_group_snapshot_validation() -> None:
     assert _group(allocated_blocks=10, resident_blocks=10).resident_blocks == 10
 
 
+def test_cache_group_snapshot_requires_positive_effective_tokens_per_block() -> None:
+    """Zero effective tokens per block is not valid physical geometry."""
+    with pytest.raises(TypeError, match="effective_tokens_per_block"):
+        _group(effective_tokens_per_block=0)
+    # Negative/bool still rejected by the same range check.
+    with pytest.raises(TypeError, match="effective_tokens_per_block"):
+        _group(effective_tokens_per_block=-1)
+    with pytest.raises(TypeError, match="effective_tokens_per_block"):
+        _group(effective_tokens_per_block=True)  # type: ignore[arg-type]
+    assert _group(effective_tokens_per_block=1).effective_tokens_per_block == 1
+
+
 def test_cache_pool_snapshot_validation() -> None:
     """Pool snapshots validate non-bool int ranges, bytes_per_block, the
     free <= total invariant, and unique/sorted group indices."""
@@ -840,6 +852,24 @@ def test_receipt_batch_accepts_and_validates_cache_pool() -> None:
             emitted_step_seq=1,
             events=(),
             cache_pool="not-a-pool",  # type: ignore[arg-type]
+        )
+
+
+def test_receipt_batch_cache_pool_owner_rank_must_match_batch() -> None:
+    """A cache_pool snapshot must describe the same owner as its batch."""
+    matching = OwnerReceiptBatch(
+        owner_rank=1,
+        emitted_step_seq=1,
+        events=(),
+        cache_pool=_pool(owner_rank=1),
+    )
+    assert matching.cache_pool.owner_rank == matching.owner_rank
+    with pytest.raises(ValueError, match="owner_rank"):
+        OwnerReceiptBatch(
+            owner_rank=1,
+            emitted_step_seq=1,
+            events=(),
+            cache_pool=_pool(owner_rank=2),
         )
 
 

@@ -275,7 +275,8 @@ class OwnerCacheGroupSnapshot:
     #: the protocol); must be a nonempty string.
     spec_kind: str
     #: Effective number of tokens this group's table stores per block;
-    #: heterogeneous across groups by design.
+    #: heterogeneous across groups by design.  Must be positive: zero is
+    #: not valid physical geometry.
     effective_tokens_per_block: int
     #: Blocks of the unified pool allocated for this group (may exceed the
     #: resident set while blocks are paged in or shared).
@@ -284,17 +285,18 @@ class OwnerCacheGroupSnapshot:
     resident_blocks: int
 
     def __post_init__(self) -> None:
-        for name in (
-            "group_index",
-            "effective_tokens_per_block",
-            "allocated_blocks",
-            "resident_blocks",
-        ):
+        for name in ("group_index", "allocated_blocks", "resident_blocks"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise TypeError(
                     f"{name} must be a nonnegative non-bool int, got {value!r}."
                 )
+        value = self.effective_tokens_per_block
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise TypeError(
+                "effective_tokens_per_block must be a positive non-bool int, "
+                f"got {value!r}."
+            )
         if not isinstance(self.spec_kind, str) or not self.spec_kind:
             raise TypeError(
                 f"spec_kind must be a nonempty string, got {self.spec_kind!r}."
@@ -391,7 +393,8 @@ class OwnerReceiptBatch:
     #: Optional G2 physical-capacity snapshot of this owner's unified
     #: per-rank KV block pool.  ``None`` when the emitter does not
     #: participate in G2 capacity publication (the G1 reference manager
-    #: always emits ``None``).
+    #: always emits ``None``).  When present, its ``owner_rank`` must match
+    #: this batch's ``owner_rank``.
     cache_pool: OwnerCachePoolSnapshot | None = None
 
     def __post_init__(self) -> None:
@@ -401,6 +404,14 @@ class OwnerReceiptBatch:
             raise TypeError(
                 "cache_pool must be an OwnerCachePoolSnapshot or None, "
                 f"got {self.cache_pool!r}."
+            )
+        if (
+            self.cache_pool is not None
+            and self.cache_pool.owner_rank != self.owner_rank
+        ):
+            raise ValueError(
+                "cache_pool.owner_rank must match batch owner_rank, got "
+                f"{self.cache_pool.owner_rank} != {self.owner_rank}."
             )
 
 
