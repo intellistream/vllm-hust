@@ -74,6 +74,42 @@ logger = init_logger(__name__)
 # physical NPU id so that instances on different NPUs stay addressable.
 _MOONCAKE_ASCEND_BASE_PORT = 12001
 
+
+def _derive_ascend_server_name(hostname: str, device_id: int) -> str:
+    """Derive the per-instance "ip:port" server name on Ascend.
+
+    ASCEND_RT_VISIBLE_DEVICES lists the physical NPU ids visible to the
+    process. The P2P handshake endpoint must be unique per instance, so the
+    port is derived from the physical NPU id. Returns the bare hostname on
+    non-Ascend platforms where the env var is unset.
+    """
+    ascend_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+    if not ascend_devices:
+        return hostname
+    phys_ids = [dev.strip() for dev in ascend_devices.split(",")]
+    if not 0 <= device_id < len(phys_ids):
+        raise ValueError(
+            f"device_id {device_id} is out of range for "
+            f"ASCEND_RT_VISIBLE_DEVICES={ascend_devices!r} "
+            f"({len(phys_ids)} devices); TP config does not match the "
+            "visible device list"
+        )
+    try:
+        phys_id = int(phys_ids[device_id])
+    except ValueError as exc:
+        raise ValueError(
+            f"non-integer physical NPU id {phys_ids[device_id]!r} in "
+            f"ASCEND_RT_VISIBLE_DEVICES={ascend_devices!r}"
+        ) from exc
+    port = _MOONCAKE_ASCEND_BASE_PORT + phys_id
+    if port > 65535:
+        raise ValueError(
+            f"derived Mooncake port {port} exceeds 65535 "
+            f"(base {_MOONCAKE_ASCEND_BASE_PORT} + phys_id {phys_id})"
+        )
+    return f"{hostname}:{port}"
+
+
 try:
     from mooncake.engine import TransferEngine
 except ImportError:
@@ -949,14 +985,7 @@ class MooncakeConnectorWorker:
         # connect. Derive a per-instance port from the physical NPU id when
         # running on Ascend. This is a no-op on other platforms because
         # ASCEND_RT_VISIBLE_DEVICES is only set by the Ascend runtime.
-        local_server_name = self.hostname
-        ascend_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
-        if ascend_devices:
-            phys_ids = [dev.strip() for dev in ascend_devices.split(",")]
-            phys_id = phys_ids[self.device_id]
-            local_server_name = (
-                f"{self.hostname}:{_MOONCAKE_ASCEND_BASE_PORT + int(phys_id)}"
-            )
+        local_server_name = _derive_ascend_server_name(self.hostname, self.device_id)
         ret_value = self.engine.initialize(
             local_server_name, "P2PHANDSHAKE", protocol, device_name
         )
