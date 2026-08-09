@@ -8,6 +8,18 @@ request-owned global KV grid (:class:`GlobalRowId`, fenced by
 (:class:`OwnerRowLayout`) that maps canonical execution rows onto
 per-owner row buffers for the request-owned attention collectives.
 
+The companion :class:`OwnerCollectivePlan` binds such a layout to one
+process-global rank of the owning group and derives the exact split
+vectors and row identities of the two unconditional raw
+``all_to_all_single`` exchanges of the request-owned collectives:
+owner_to_all / fanout (every rank sends its local owner rows to every
+rank and receives the full owner-major rows array) and all_to_owner /
+fanin (every rank sends the full owner-major rows array and each owner
+receives its stable rows once per source, source-rank-major).  The plan
+is dependency-neutral: no torch or distributed import, no Q/KV-specific
+API; rank lookup always goes through
+:meth:`OwnerRowLayout.local_rank_of_global`.
+
 The layout is group-local: ``group_ranks`` lists the process-global ranks
 of the owning group (local index -> global rank) and may be noncontiguous
 and unsorted.  ``owner_counts``, ``owner_offsets``, and ``owner_rows`` are
@@ -387,3 +399,188 @@ class OwnerRowLayout:
                 f"tensor leading axis {leading} < logical length {logical_len}"
             )
         return list(permutation) + list(range(logical_len, leading))
+
+
+class OwnerCollectivePlan:
+    """Immutable all_to_all_single plan for one owner of a row layout.
+
+    Binds an :class:`OwnerRowLayout` to one process-global rank of the
+    owning group (the local process) and derives the exact split vectors
+    and expected row identities of the two unconditional raw
+    ``all_to_all_single`` exchanges:
+
+    * owner_to_all / fanout: every rank sends its local owner rows to
+      every rank, so after the exchange every rank holds the full
+      owner-major rows array.  The send buffer is the local owner rows
+      tiled ``world_size`` times (one tile per destination): the input
+      split vector is ``(local_owner_row_count,) * world_size`` and the
+      output split vector is ``layout.owner_counts`` (the segment
+      received from source ``j`` is that source's owner bucket).
+    * all_to_owner / fanin: every rank sends the full owner-major rows
+      array back to the owners and destination ``j`` keeps only its own
+      bucket.  The input split vector is ``layout.owner_counts`` and the
+      output split vector is ``(local_owner_row_count,) * world_size``:
+      the local owner receives its stable rows once per source, in
+      source-rank-major order.
+
+    Everything here is pure Python and group-local.  The process-global
+    rank is resolved through :meth:`OwnerRowLayout.local_rank_of_global`,
+    never by assuming a rank range or ordering, so the group may be
+    noncontiguous and unsorted.
+
+    Args:
+        layout: the owner-major row layout of this execution step.
+        owner_global_rank: process-global rank of the local process; it
+            must be an ``int`` member of ``layout.group_ranks``.
+
+    Raises:
+        OwnerLayoutError: on a non-``OwnerRowLayout`` binding, a
+            bool/non-int rank, or a rank that is not a group member.
+    """
+
+    __slots__ = (
+        "_layout",
+        "_owner_global_rank",
+        "_local_rank",
+        "_local_owner_count",
+        "_local_owner_slice",
+        "_local_owner_rows",
+        "_owner_to_all_input_splits",
+        "_owner_to_all_output_splits",
+        "_all_to_owner_input_splits",
+        "_all_to_owner_output_splits",
+        "_fanout_send_rows",
+        "_fanout_receive_rows",
+        "_fanin_send_rows",
+        "_fanin_receive_rows",
+        "_frozen",
+    )
+
+    def __init__(self, layout: OwnerRowLayout, owner_global_rank: int) -> None:
+        if not isinstance(layout, OwnerRowLayout):
+            raise OwnerLayoutError(f"layout must be an OwnerRowLayout, got {layout!r}")
+        if isinstance(owner_global_rank, bool) or not isinstance(
+            owner_global_rank, int
+        ):
+            raise OwnerLayoutError(
+                f"owner_global_rank must be an int, got {owner_global_rank!r}"
+            )
+        local_rank = layout.local_rank_of_global(owner_global_rank)
+        world_size = layout.world_size
+        count = layout.owner_counts[local_rank]
+        owner_slice = layout.owner_slice_for_local(local_rank)
+        local_owner_rows = tuple(layout.owner_rows[owner_slice])
+        tile = (count,) * world_size
+        owner_counts = tuple(layout.owner_counts)
+        owner_rows = tuple(layout.owner_rows)
+        self._layout = layout
+        self._owner_global_rank = owner_global_rank
+        self._local_rank = local_rank
+        self._local_owner_count = count
+        self._local_owner_slice = owner_slice
+        self._local_owner_rows = local_owner_rows
+        self._owner_to_all_input_splits = tile
+        self._owner_to_all_output_splits = owner_counts
+        self._all_to_owner_input_splits = owner_counts
+        self._all_to_owner_output_splits = tile
+        self._fanout_send_rows = local_owner_rows * world_size
+        self._fanout_receive_rows = owner_rows
+        self._fanin_send_rows = owner_rows
+        self._fanin_receive_rows = local_owner_rows * world_size
+        object.__setattr__(self, "_frozen", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                f"OwnerCollectivePlan is immutable: cannot set {name!r}"
+            )
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(
+            f"OwnerCollectivePlan is immutable: cannot delete {name!r}"
+        )
+
+    # -- binding and rank mapping --------------------------------------------
+
+    @property
+    def layout(self) -> OwnerRowLayout:
+        """The owner-major row layout this plan is bound to."""
+        return self._layout
+
+    @property
+    def owner_global_rank(self) -> int:
+        """Process-global rank of the local process."""
+        return self._owner_global_rank
+
+    @property
+    def local_rank(self) -> int:
+        """Group-local index of the local process."""
+        return self._local_rank
+
+    @property
+    def world_size(self) -> int:
+        """Number of owning ranks (``layout.world_size``)."""
+        return self._layout.world_size
+
+    # -- local owner state ---------------------------------------------------
+
+    @property
+    def local_owner_count(self) -> int:
+        """Number of rows owned by the local process."""
+        return self._local_owner_count
+
+    @property
+    def local_owner_slice(self) -> slice:
+        """Slice of owner-major arrays holding the local owner's rows."""
+        return self._local_owner_slice
+
+    @property
+    def local_owner_rows(self) -> tuple[ExecutionRow, ...]:
+        """The local owner's stable rows in owner-major order."""
+        return self._local_owner_rows
+
+    # -- owner_to_all / fanout -----------------------------------------------
+
+    @property
+    def owner_to_all_input_splits(self) -> tuple[int, ...]:
+        """Fanout input split vector: ``(local_owner_count,) * world_size``."""
+        return self._owner_to_all_input_splits
+
+    @property
+    def owner_to_all_output_splits(self) -> tuple[int, ...]:
+        """Fanout output split vector: ``layout.owner_counts``."""
+        return self._owner_to_all_output_splits
+
+    @property
+    def fanout_send_rows(self) -> tuple[ExecutionRow, ...]:
+        """Fanout send identities: local owner rows tiled once per rank."""
+        return self._fanout_send_rows
+
+    @property
+    def fanout_receive_rows(self) -> tuple[ExecutionRow, ...]:
+        """Fanout receive identities: the full owner-major rows array."""
+        return self._fanout_receive_rows
+
+    # -- all_to_owner / fanin ------------------------------------------------
+
+    @property
+    def all_to_owner_input_splits(self) -> tuple[int, ...]:
+        """Fanin input split vector: ``layout.owner_counts``."""
+        return self._all_to_owner_input_splits
+
+    @property
+    def all_to_owner_output_splits(self) -> tuple[int, ...]:
+        """Fanin output split vector: ``(local_owner_count,) * world_size``."""
+        return self._all_to_owner_output_splits
+
+    @property
+    def fanin_send_rows(self) -> tuple[ExecutionRow, ...]:
+        """Fanin send identities: the full owner-major rows array."""
+        return self._fanin_send_rows
+
+    @property
+    def fanin_receive_rows(self) -> tuple[ExecutionRow, ...]:
+        """Fanin receive identities: the local owner's stable rows repeated
+        once per source rank, in source-rank-major order."""
+        return self._fanin_receive_rows

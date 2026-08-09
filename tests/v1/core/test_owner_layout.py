@@ -15,6 +15,7 @@ import torch
 from vllm.v1.core.sched.owner_layout import (
     ExecutionRow,
     GlobalRowId,
+    OwnerCollectivePlan,
     OwnerLayoutError,
     OwnerRowLayout,
 )
@@ -503,3 +504,267 @@ def test_owner_row_layout_is_immutable_after_construction() -> None:
     assert layout.owner_offsets == (0, 1, 3, 3)
     assert layout.group_ranks == (7, 2, 11)
     assert layout.global_to_local == {7: 0, 2: 1, 11: 2}
+
+
+# -- OwnerCollectivePlan ------------------------------------------------------
+
+
+def _plan_group(layout: OwnerRowLayout) -> list[OwnerCollectivePlan]:
+    """One plan per group member, built from its process-global rank."""
+    return [
+        OwnerCollectivePlan(layout, layout.group_ranks[local])
+        for local in range(layout.world_size)
+    ]
+
+
+def _simulate_fanout(
+    layout: OwnerRowLayout, plans: list[OwnerCollectivePlan]
+) -> list[tuple[ExecutionRow, ...]]:
+    """Deterministic whole-group all_to_all_single simulation for fanout.
+
+    Every rank's send buffer is its local owner rows tiled once per
+    destination; only the plan's split vectors and the layout are used to
+    route rows.  Returns each rank's receive buffer in source-major order.
+    """
+    world_size = layout.world_size
+    sends: list[tuple[ExecutionRow, ...]] = []
+    for local, plan in enumerate(plans):
+        send = (
+            tuple(layout.owner_rows[layout.owner_slice_for_local(local)]) * world_size
+        )
+        assert (
+            plan.owner_to_all_input_splits == (layout.owner_counts[local],) * world_size
+        )
+        assert sum(plan.owner_to_all_input_splits) == len(send)
+        assert plan.fanout_send_rows == send
+        sends.append(send)
+    receives: list[tuple[ExecutionRow, ...]] = []
+    for local, plan in enumerate(plans):
+        parts: list[ExecutionRow] = []
+        for src in range(world_size):
+            input_splits = plans[src].owner_to_all_input_splits
+            start = sum(input_splits[:local])
+            part = sends[src][start : start + input_splits[local]]
+            assert part == tuple(layout.owner_rows[layout.owner_slice_for_local(src)])
+            assert len(part) == plan.owner_to_all_output_splits[src]
+            parts.extend(part)
+        receive = tuple(parts)
+        assert sum(plan.owner_to_all_output_splits) == len(receive)
+        receives.append(receive)
+    return receives
+
+
+def _simulate_fanin(
+    layout: OwnerRowLayout, plans: list[OwnerCollectivePlan]
+) -> list[tuple[ExecutionRow, ...]]:
+    """Deterministic whole-group all_to_all_single simulation for fanin.
+
+    Every rank's send buffer is the full owner-major rows array; only the
+    plan's split vectors and the layout are used to route rows.  Returns
+    each rank's receive buffer in source-major order.
+    """
+    world_size = layout.world_size
+    sends: list[tuple[ExecutionRow, ...]] = []
+    for plan in plans:
+        send = tuple(layout.owner_rows)
+        assert plan.all_to_owner_input_splits == layout.owner_counts
+        assert sum(plan.all_to_owner_input_splits) == len(send)
+        assert plan.fanin_send_rows == send
+        sends.append(send)
+    receives: list[tuple[ExecutionRow, ...]] = []
+    for local, plan in enumerate(plans):
+        parts: list[ExecutionRow] = []
+        for src in range(world_size):
+            input_splits = plans[src].all_to_owner_input_splits
+            start = sum(input_splits[:local])
+            part = sends[src][start : start + input_splits[local]]
+            assert part == tuple(layout.owner_rows[layout.owner_slice_for_local(local)])
+            assert len(part) == plan.all_to_owner_output_splits[src]
+            parts.extend(part)
+        receive = tuple(parts)
+        assert sum(plan.all_to_owner_output_splits) == len(receive)
+        receives.append(receive)
+    return receives
+
+
+def _ragged_zero_owner_layout() -> OwnerRowLayout:
+    # Noncontiguous, unsorted group (7, 2, 11, 5); rank 7 owns zero rows,
+    # ranks 2/11/5 own 3/2/1 rows respectively.
+    rows = _rows(["b", "b", "b", "c", "c", "d"], [0, 1, 2, 0, 1, 0])
+    owner = _owners(["b", "c", "d"], {"b": 2, "c": 11, "d": 5})
+    layout = OwnerRowLayout.build(3, rows, owner, (7, 2, 11, 5))
+    assert layout.owner_counts == (0, 3, 2, 1)
+    assert layout.owner_offsets == (0, 0, 3, 5, 6)
+    return layout
+
+
+def test_plan_binding_exact_splits_and_rank_mapping() -> None:
+    layout = _ragged_zero_owner_layout()
+    plans = _plan_group(layout)
+    for local, plan in enumerate(plans):
+        global_rank = layout.group_ranks[local]
+        assert plan.layout is layout
+        assert plan.owner_global_rank == global_rank
+        assert plan.local_rank == local
+        assert plan.local_rank == layout.local_rank_of_global(global_rank)
+        assert plan.world_size == layout.world_size == 4
+        count = layout.owner_counts[local]
+        assert plan.local_owner_count == count
+        assert plan.local_owner_slice == layout.owner_slice_for_local(local)
+        assert plan.local_owner_rows == tuple(
+            layout.owner_rows[layout.owner_slice_for_local(local)]
+        )
+        # Fanout: input splits tile the local owner count, output splits
+        # are the owner counts; fanin is the exact mirror.
+        assert plan.owner_to_all_input_splits == (count,) * 4
+        assert plan.owner_to_all_output_splits == layout.owner_counts
+        assert plan.all_to_owner_input_splits == layout.owner_counts
+        assert plan.all_to_owner_output_splits == (count,) * 4
+        # Expected identities.
+        assert plan.fanout_receive_rows == tuple(layout.owner_rows)
+        assert plan.fanin_send_rows == tuple(layout.owner_rows)
+        assert plan.fanin_receive_rows == plan.local_owner_rows * 4
+        assert plan.fanout_send_rows == plan.local_owner_rows * 4
+        # Split sums match the simulated buffers.
+        assert sum(plan.owner_to_all_input_splits) == len(plan.fanout_send_rows)
+        assert sum(plan.owner_to_all_output_splits) == len(plan.fanout_receive_rows)
+        assert sum(plan.all_to_owner_input_splits) == len(plan.fanin_send_rows)
+        assert sum(plan.all_to_owner_output_splits) == len(plan.fanin_receive_rows)
+
+
+def test_fanout_simulation_every_rank_receives_owner_rows() -> None:
+    layout = _ragged_zero_owner_layout()
+    plans = _plan_group(layout)
+    fanout_receives = _simulate_fanout(layout, plans)
+    for local, plan in enumerate(plans):
+        assert fanout_receives[local] == tuple(layout.owner_rows)
+        assert fanout_receives[local] == plan.fanout_receive_rows
+    # The zero owner participates: it sends empty tiles and receives the
+    # same full owner-major array as everyone else.
+    assert plans[0].local_owner_count == 0
+    assert plans[0].local_owner_rows == ()
+    assert fanout_receives[0] == tuple(layout.owner_rows)
+
+
+def test_fanin_simulation_every_owner_receives_source_major_rows() -> None:
+    layout = _ragged_zero_owner_layout()
+    plans = _plan_group(layout)
+    fanin_receives = _simulate_fanin(layout, plans)
+    for local, plan in enumerate(plans):
+        expected = (
+            tuple(layout.owner_rows[layout.owner_slice_for_local(local)])
+            * layout.world_size
+        )
+        assert fanin_receives[local] == expected
+        assert fanin_receives[local] == plan.fanin_receive_rows
+    # The zero owner receives nothing.
+    assert plans[0].fanin_receive_rows == ()
+
+
+def test_q_fragment_transpose_and_o_partial_exact_sums() -> None:
+    layout = _ragged_zero_owner_layout()
+    world_size = layout.world_size
+    # Q fanin arrives source-major: (source, row).  Transpose it to
+    # row-major source shards, i.e. every source's copy of one row.
+    plan = OwnerCollectivePlan(layout, 11)  # local rank 2, count 2
+    count = plan.local_owner_count
+    assert count == 2
+    fragment = plan.fanin_receive_rows
+    assert fragment == (plan.local_owner_rows * world_size)
+    for index in range(count):
+        row = plan.local_owner_rows[index]
+        shard = fragment[index::count]
+        assert shard == (row,) * world_size
+    # O partials: every source contributes (src + 1) * position per row;
+    # summing the source-major buffer per row must be exact.
+    partials = tuple(
+        (src + 1) * row.row_id.logical_token_position
+        for src in range(world_size)
+        for row in plan.local_owner_rows
+    )
+    assert len(partials) == count * world_size
+    for index in range(count):
+        position = plan.local_owner_rows[index].row_id.logical_token_position
+        assert sum(partials[index::count]) == (
+            sum(src + 1 for src in range(world_size)) * position
+        )
+    # The zero owner's fragment and partials are both empty.
+    zero_plan = OwnerCollectivePlan(layout, 7)
+    assert zero_plan.fanin_receive_rows == ()
+    assert (
+        tuple(
+            (src + 1) * row.row_id.logical_token_position
+            for src in range(world_size)
+            for row in zero_plan.local_owner_rows
+        )
+        == ()
+    )
+
+
+def test_all_zero_rows_collective_plan_on_every_rank() -> None:
+    group = (7, 2, 11)
+    layout = OwnerRowLayout.build(0, [], {}, group)
+    zero = (0, 0, 0)
+    for global_rank in group:
+        plan = OwnerCollectivePlan(layout, global_rank)
+        assert plan.local_owner_count == 0
+        assert plan.local_owner_rows == ()
+        assert plan.owner_to_all_input_splits == zero
+        assert plan.owner_to_all_output_splits == zero
+        assert plan.all_to_owner_input_splits == zero
+        assert plan.all_to_owner_output_splits == zero
+        assert plan.fanout_send_rows == ()
+        assert plan.fanout_receive_rows == ()
+        assert plan.fanin_send_rows == ()
+        assert plan.fanin_receive_rows == ()
+
+
+def test_plan_rejects_bool_nonint_and_unknown_ranks() -> None:
+    layout = OwnerRowLayout.build(0, [], {}, (7, 2, 11))
+    with pytest.raises(OwnerLayoutError):
+        OwnerCollectivePlan(layout, True)
+    with pytest.raises(OwnerLayoutError):
+        OwnerCollectivePlan(layout, False)
+    with pytest.raises(OwnerLayoutError):
+        OwnerCollectivePlan(layout, "11")  # type: ignore[arg-type]
+    with pytest.raises(OwnerLayoutError):
+        OwnerCollectivePlan(layout, 2.0)  # type: ignore[arg-type]
+    with pytest.raises(OwnerLayoutError):
+        OwnerCollectivePlan(layout, -1)
+    with pytest.raises(OwnerLayoutError):
+        OwnerCollectivePlan(layout, 999)
+    with pytest.raises(OwnerLayoutError):
+        OwnerCollectivePlan(layout, 5)  # not a group member
+    with pytest.raises(OwnerLayoutError):
+        OwnerCollectivePlan("layout", 7)  # type: ignore[arg-type]
+    # A valid group member is accepted.
+    plan = OwnerCollectivePlan(layout, 2)
+    assert plan.local_rank == 1
+    assert plan.owner_global_rank == 2
+
+
+def test_owner_collective_plan_is_immutable_after_construction() -> None:
+    layout = _ragged_zero_owner_layout()
+    plan = OwnerCollectivePlan(layout, 11)
+    with pytest.raises(AttributeError):
+        plan._local_owner_count = 7
+    with pytest.raises(AttributeError):
+        plan._layout = layout
+    with pytest.raises(AttributeError):
+        plan._owner_to_all_input_splits = (1, 1, 1, 1)
+    with pytest.raises(AttributeError):
+        plan._fanin_receive_rows = ()
+    with pytest.raises(AttributeError):
+        del plan._fanout_receive_rows
+    # Public state-corrupting assignments and deletions fail as well.
+    with pytest.raises(AttributeError):
+        plan.local_owner_count = 0
+    with pytest.raises(AttributeError):
+        plan.owner_to_all_input_splits = (1, 1, 1, 1)
+    with pytest.raises(AttributeError):
+        del plan.fanin_receive_rows
+    # Failed mutations leave the plan unchanged.
+    assert plan.local_owner_count == 2
+    assert plan.local_rank == 2
+    assert plan.owner_to_all_input_splits == (2, 2, 2, 2)
+    assert plan.fanin_receive_rows == plan.local_owner_rows * 4
