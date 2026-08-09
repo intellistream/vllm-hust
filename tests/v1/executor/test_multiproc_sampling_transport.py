@@ -114,6 +114,7 @@ def _fake_executor(
         enable_request_owned_attention=True,
         enable_request_owned_sampling=enable_request_owned_sampling,
     )
+    executor.parallel_config = SimpleNamespace(world_size=3)
     executor.kv_output_aggregator = None
     executor.model_runner_output_aggregator = ModelRunnerOutputAggregator(
         [0, 1, 2],
@@ -425,3 +426,256 @@ def test_abstract_executor_builds_sampling_aggregator():
     assert (
         executor.model_runner_output_aggregator._expected_sampling_owner_ranks is None
     )
+
+
+# ---------------------------------------------------------------------------
+# Live contract fence: post-init mutations and contract disagreement
+# ---------------------------------------------------------------------------
+
+
+def test_sampling_mutated_false_to_true_fails_before_dispatch():
+    """Post-init False->True mutation: the aggregator was built without the
+    owner-sampling contract, so the live G3 path must fail before any
+    collective RPC/worker dispatch and without touching pending state."""
+    executor = _fake_executor(
+        [_FakeMq() for _ in range(3)], enable_request_owned_sampling=False
+    )
+    executor.scheduler_config.enable_request_owned_sampling = True
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        executor.execute_model(_scheduler_output(7), non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+    assert executor._pending_sampling_adapter is None
+    assert executor._sampling_transport_failed is False
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        executor.sample_tokens(None, non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+
+
+def test_sampling_mutated_true_to_false_fails_before_dispatch():
+    """Post-init True->False mutation: the aggregator still carries the
+    owner-sampling contract, so a legacy dispatch must fail before any
+    collective RPC/worker call."""
+    executor = _fake_executor([_FakeMq() for _ in range(3)])
+    executor.scheduler_config.enable_request_owned_sampling = False
+
+    with pytest.raises(RuntimeError, match="mutated False"):
+        executor.execute_model(_scheduler_output(7), non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+    assert executor._pending_sampling_adapter is None
+    assert executor._sampling_transport_failed is False
+
+    with pytest.raises(RuntimeError, match="mutated False"):
+        executor.sample_tokens(None, non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+
+
+@pytest.mark.parametrize("bad", [1, 0, "true", None])
+def test_sampling_non_bool_mutation_fails_closed_before_dispatch(bad):
+    """Any non-bool replacement of the gate fails closed before dispatch:
+    sample_tokens consults only the live fence; with the attention envelope
+    off, a truthy non-bool would otherwise select the G3 path via getattr,
+    so the fence must reject it before any RPC."""
+    executor = _fake_executor([_FakeMq() for _ in range(3)])
+    executor.scheduler_config.enable_request_owned_sampling = bad
+    with pytest.raises(RuntimeError, match="strict bool"):
+        executor.sample_tokens(None, non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+
+    executor.scheduler_config.enable_request_owned_attention = False
+    with pytest.raises(RuntimeError, match="strict bool"):
+        executor.execute_model(_scheduler_output(7), non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+
+    # Attention on: the existing control-only gate also fails closed, still
+    # before any dispatch.
+    executor.scheduler_config.enable_request_owned_attention = True
+    with pytest.raises(RuntimeError, match="must remain a bool"):
+        executor.execute_model(_scheduler_output(7), non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+
+
+@pytest.mark.parametrize("bad_attention", [1, "yes", None])
+def test_sampling_with_mutated_non_bool_attention_fails_closed_before_dispatch(
+    bad_attention,
+):
+    """A post-init non-bool mutation of the attention envelope cannot be
+    truthiness-coerced into the sampling contract: with sampling enabled the
+    live fence requires attention to be exactly the strict bool True."""
+    executor = _fake_executor([_FakeMq() for _ in range(3)])
+    executor.scheduler_config.enable_request_owned_attention = bad_attention
+
+    with pytest.raises(RuntimeError, match="strict bool"):
+        executor.execute_model(_scheduler_output(7), non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+    assert executor._pending_sampling_adapter is None
+    assert executor._sampling_transport_failed is False
+
+    with pytest.raises(RuntimeError, match="strict bool"):
+        executor.sample_tokens(None, non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+
+
+def test_sampling_enabled_without_attention_envelope_fails_before_dispatch():
+    """Sampling on but the attention envelope disabled (so no sampling
+    aggregator can exist) fails closed before dispatch."""
+    executor = _fake_executor([_FakeMq() for _ in range(3)])
+    executor.scheduler_config.enable_request_owned_attention = False
+    with pytest.raises(RuntimeError, match="attention envelope"):
+        executor.execute_model(_scheduler_output(7), non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+    assert executor._pending_sampling_adapter is None
+    assert executor._sampling_transport_failed is False
+
+
+def test_sampling_enabled_with_missing_aggregator_fails_before_dispatch():
+    """Sampling on but the aggregator missing (as if it was never built with
+    the contract) fails closed before dispatch."""
+    executor = _fake_executor([_FakeMq() for _ in range(3)])
+    executor.model_runner_output_aggregator = None
+    with pytest.raises(RuntimeError, match="aggregator was not constructed"):
+        executor.execute_model(_scheduler_output(7), non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+    assert executor._pending_sampling_adapter is None
+    assert executor._sampling_transport_failed is False
+
+
+def test_sampling_enabled_with_mismatched_expected_ranks_fails_before_dispatch():
+    """An aggregator whose expected-owner contract (sampling or receipt
+    ranks) does not match the executor's current ranks fails closed before
+    dispatch."""
+    executor = _fake_executor([_FakeMq() for _ in range(3)])
+    # Missing sampling owner rank 2 in an otherwise enabled contract.
+    executor.model_runner_output_aggregator = ModelRunnerOutputAggregator(
+        [0, 1, 2],
+        expected_sampling_owner_ranks=[0, 1],
+    )
+    with pytest.raises(RuntimeError, match="does not match"):
+        executor.execute_model(_scheduler_output(7), non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+
+    # Receipt contract itself mismatched against the current world.
+    executor.model_runner_output_aggregator = ModelRunnerOutputAggregator(
+        [0, 1],
+        expected_sampling_owner_ranks=[0, 1],
+    )
+    with pytest.raises(RuntimeError, match="does not match"):
+        executor.execute_model(_scheduler_output(7), non_block=False)
+    assert executor.rpc_calls == []
+    assert executor.rpc_broadcast_mq.enqueued == []
+
+
+def test_sample_tokens_pending_adapter_with_flag_flipped_off_fails_closed():
+    """A pending deferred round whose gate was flipped False after the
+    execute round is refused before dispatch (the aggregator still carries
+    the owner-sampling contract); the pending adapter is left untouched (no
+    pending state mutation) and no additional worker dispatch happens."""
+    executor = _fake_executor(_deferred_then_terminal_mqs())
+    assert executor.execute_model(_scheduler_output(7), non_block=False) is None
+    pending = executor._pending_sampling_adapter
+    assert pending is not None
+    executor.scheduler_config.enable_request_owned_sampling = False
+
+    with pytest.raises(RuntimeError, match="mutated False"):
+        executor.sample_tokens(None, non_block=False)
+    assert len(executor.rpc_calls) == 1  # only the deferred execute round
+    assert len(executor.rpc_broadcast_mq.enqueued) == 1
+    assert executor._pending_sampling_adapter is pending
+    assert executor._sampling_transport_failed is False
+
+
+def test_sample_tokens_pending_adapter_fully_torn_down_fails_closed():
+    """A pending deferred round whose gate was flipped False and whose
+    aggregator was torn down (attention envelope off) is refused by the
+    pending/config-agreement branch before dispatch."""
+    executor = _fake_executor(_deferred_then_terminal_mqs())
+    assert executor.execute_model(_scheduler_output(7), non_block=False) is None
+    pending = executor._pending_sampling_adapter
+    executor.scheduler_config.enable_request_owned_sampling = False
+    executor.model_runner_output_aggregator = None
+
+    with pytest.raises(RuntimeError, match="now disabled"):
+        executor.sample_tokens(None, non_block=False)
+    assert len(executor.rpc_calls) == 1  # only the deferred execute round
+    assert len(executor.rpc_broadcast_mq.enqueued) == 1
+    assert executor._pending_sampling_adapter is pending
+    assert executor._sampling_transport_failed is False
+
+
+def test_sample_tokens_pending_adapter_with_replaced_aggregator_fails_closed():
+    """A pending adapter bound to an aggregator that was replaced (rebuilt)
+    since the deferred round is refused before dispatch."""
+    executor = _fake_executor(_deferred_then_terminal_mqs())
+    assert executor.execute_model(_scheduler_output(7), non_block=False) is None
+    pending = executor._pending_sampling_adapter
+    executor.model_runner_output_aggregator = ModelRunnerOutputAggregator(
+        [0, 1, 2],
+        expected_sampling_owner_ranks=[0, 1, 2],
+    )
+    with pytest.raises(RuntimeError, match="no longer the live"):
+        executor.sample_tokens(None, non_block=False)
+    assert len(executor.rpc_calls) == 1  # only the deferred execute round
+    assert len(executor.rpc_broadcast_mq.enqueued) == 1
+    assert executor._pending_sampling_adapter is pending
+    assert executor._sampling_transport_failed is False
+
+
+def test_live_fence_passes_normal_enabled_flow():
+    """The fence is a no-op on the normal enabled path: the deferred execute
+    round binds the pending adapter and the terminal sample round consumes
+    it exactly as before."""
+    executor = _fake_executor(_deferred_then_terminal_mqs())
+    executor._validate_request_owned_sampling_live()  # no raise
+    assert executor.execute_model(_scheduler_output(7), non_block=False) is None
+    executor._validate_request_owned_sampling_live()  # pending agrees
+    result = executor.sample_tokens(None, non_block=False)
+    assert result is not None
+    assert [b.owner_rank for b in result.owner_sampling_batches] == [0, 1, 2]
+    assert executor._pending_sampling_adapter is None
+
+
+def test_live_fence_passes_normal_disabled_flow():
+    """The fence is a no-op on the default disabled paths: attention on +
+    sampling off (G0 receipt aggregation) and attention off (legacy) both
+    dispatch exactly as before."""
+    responses = [
+        (
+            WorkerProc.ResponseStatus.SUCCESS,
+            ModelRunnerOutput(
+                req_ids=[],
+                req_id_to_index={},
+                owner_receipt_batches=[_owner_batch(rank)],
+            ),
+        )
+        for rank in (0, 1, 2)
+    ]
+    response_mqs = [_FakeMq([response]) for response in responses]
+    executor = _fake_executor(response_mqs, enable_request_owned_sampling=False)
+    executor._validate_request_owned_sampling_live()  # no raise
+    result = executor.execute_model(_scheduler_output(7), non_block=False)
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+    assert executor.rpc_calls[0][0] == "execute_model"
+
+    # Attention off: fully legacy path, still passes the fence.
+    legacy = _fake_executor(
+        [_FakeMq([(WorkerProc.ResponseStatus.SUCCESS, None)]) for _ in range(3)],
+        enable_request_owned_sampling=False,
+    )
+    legacy.scheduler_config.enable_request_owned_attention = False
+    legacy.model_runner_output_aggregator = None
+    legacy._validate_request_owned_sampling_live()  # no raise
+    assert legacy.execute_model(_scheduler_output(7), non_block=False) is None
+    assert legacy.rpc_calls[0][0] == "execute_model"

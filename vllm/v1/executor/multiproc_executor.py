@@ -321,6 +321,7 @@ class MultiprocExecutor(Executor):
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         self._validate_request_owned_control_only_step(scheduler_output)
+        self._validate_request_owned_sampling_live()
         if getattr(self.scheduler_config, "enable_request_owned_sampling", False):
             return self._execute_model_request_owned_sampling(
                 scheduler_output, non_block
@@ -361,10 +362,9 @@ class MultiprocExecutor(Executor):
     def sample_tokens(  # type: ignore[override]
         self, grammar_output: GrammarOutput | None, non_block: bool = False
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
+        self._validate_request_owned_sampling_live()
         if getattr(self.scheduler_config, "enable_request_owned_sampling", False):
-            return self._sample_tokens_request_owned_sampling(
-                grammar_output, non_block
-            )
+            return self._sample_tokens_request_owned_sampling(grammar_output, non_block)
         return self.collective_rpc(
             "sample_tokens",
             args=(grammar_output,),
@@ -373,6 +373,104 @@ class MultiprocExecutor(Executor):
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,
         )
+
+    def _validate_request_owned_sampling_live(self) -> None:
+        """Strict live contract fence before any sampling dispatch.
+
+        The current scheduler flags, the executor's adapter configuration
+        (the request-owned attention envelope and the constructed model
+        runner output aggregator), and the aggregator's expected-owner
+        contract must agree exactly with the owner ranks fixed at
+        construction.  Both gates must remain strict bools: any post-init
+        mutation of the sampling gate (False->True or True->False), any
+        non-bool replacement of either gate, and any missing or mismatched
+        expected-owner contract fails closed here, before a single
+        collective RPC or worker call and before any pending per-step
+        adapter state can be written.  A pending per-step adapter must also
+        still agree with the live configuration: a pending round is never
+        dispatched through a different transport or a rebuilt aggregator.
+        This method never mutates transport state.
+        """
+        sampling_enabled = getattr(
+            self.scheduler_config, "enable_request_owned_sampling", False
+        )
+        if not isinstance(sampling_enabled, bool):
+            raise RuntimeError(
+                "request-owned sampling gate must remain a strict bool after "
+                f"configuration validation, got {sampling_enabled!r}; "
+                "refusing a live dispatch under a mutated sampling contract."
+            )
+        attention_enabled = getattr(
+            self.scheduler_config, "enable_request_owned_attention", False
+        )
+        if not isinstance(attention_enabled, bool):
+            raise RuntimeError(
+                "request-owned attention gate must remain a strict bool "
+                f"after configuration validation, got {attention_enabled!r}; "
+                "refusing a live dispatch under a mutated attention "
+                "contract."
+            )
+        expected_ranks = sorted(self._expected_owner_ranks())
+        aggregator = self.model_runner_output_aggregator
+        if sampling_enabled:
+            if not attention_enabled:
+                raise RuntimeError(
+                    "request-owned sampling requires the request-owned "
+                    "attention envelope (enable_request_owned_attention="
+                    "True); refusing a live dispatch when the envelope is "
+                    "disabled (the sampling gate must have been mutated "
+                    "True after initialization)."
+                )
+            if aggregator is None:
+                raise RuntimeError(
+                    "request-owned sampling is enabled but the model runner "
+                    "output aggregator was not constructed; refusing a live "
+                    "dispatch (the sampling gate must have been mutated "
+                    "True after initialization)."
+                )
+            if (
+                aggregator._expected_sampling_owner_ranks != expected_ranks
+                or aggregator._expected_owner_ranks != expected_ranks
+            ):
+                raise RuntimeError(
+                    "request-owned sampling: the aggregator expected-owner "
+                    "contract (sampling "
+                    f"{aggregator._expected_sampling_owner_ranks}, receipt "
+                    f"{aggregator._expected_owner_ranks}) does not match the "
+                    f"current expected owner ranks {expected_ranks}; "
+                    "refusing a live dispatch under a mutated or mismatched "
+                    "sampling contract."
+                )
+        elif aggregator is not None and (
+            aggregator._expected_sampling_owner_ranks is not None
+            or aggregator._expected_owner_ranks != expected_ranks
+        ):
+            raise RuntimeError(
+                "request-owned sampling is disabled but the model runner "
+                "output aggregator still carries an enabled owner-sampling "
+                "contract "
+                f"({aggregator._expected_sampling_owner_ranks!r}); refusing "
+                "a live dispatch (the sampling gate must have been mutated "
+                "False after initialization)."
+            )
+        pending = getattr(self, "_pending_sampling_adapter", None)
+        if pending is None:
+            return
+        if not sampling_enabled:
+            raise RuntimeError(
+                "request-owned sampling: a per-step sampling adapter is "
+                "pending but the sampling gate is now disabled; refusing to "
+                "dispatch the pending round through the legacy transport "
+                "(the sampling gate must have been mutated False after the "
+                "deferred execute_model round)."
+            )
+        if aggregator is None or pending._aggregator is not aggregator:
+            raise RuntimeError(
+                "request-owned sampling: the pending per-step adapter is "
+                "bound to an aggregator that is no longer the live model "
+                "runner output aggregator; refusing to dispatch a stale "
+                "pending round."
+            )
 
     def _request_owned_sampling_adapter(
         self, step_seq: int

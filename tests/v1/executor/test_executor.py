@@ -246,8 +246,10 @@ def _g0_fake_executor(
 ) -> MultiprocExecutor:
     executor = cls.__new__(cls)
     executor.scheduler_config = SimpleNamespace(
-        enable_request_owned_attention=enable_request_owned_attention
+        enable_request_owned_attention=enable_request_owned_attention,
+        enable_request_owned_sampling=False,
     )
+    executor.parallel_config = SimpleNamespace(world_size=3)
     executor.kv_output_aggregator = None
     executor.model_runner_output_aggregator = (
         ModelRunnerOutputAggregator([0, 1, 2])
