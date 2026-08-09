@@ -532,16 +532,36 @@ def test_for_step_adapter_kv_composition_unchanged():
 
 def test_exact_duplicate_event_deduped():
     """Exact payload replay is idempotent: equal payloads (even as distinct
-    objects) with the same identity collapse to one event."""
+    objects) with the same identity collapse to one event without dropping
+    the enclosing owner's physical-capacity snapshot."""
     ev = _receipt(1, request_id="req-a", command_seq=3)
     duplicate = _receipt(1, request_id="req-a", command_seq=3)
+    pool = OwnerCachePoolSnapshot(
+        owner_rank=1,
+        total_blocks=32,
+        free_blocks=17,
+        groups=(
+            OwnerCacheGroupSnapshot(
+                group_index=0,
+                spec_kind="full",
+                effective_tokens_per_block=16,
+                allocated_blocks=15,
+                resident_blocks=15,
+            ),
+        ),
+    )
     outputs = [
         _output(0, [_batch(0)], empty=True),
-        _output(1, [_batch(1, events=(ev, duplicate, ev))], empty=True),
+        _output(
+            1,
+            [_batch(1, events=(ev, duplicate, ev), cache_pool=pool)],
+            empty=True,
+        ),
         _output(2, [_batch(2)], empty=True),
     ]
     result = _aggregator(0, 1, 2).aggregate(outputs)
     assert result.owner_receipt_batches[1].events == (ev,)
+    assert result.owner_receipt_batches[1].cache_pool == pool
 
 
 def test_event_owner_id_must_match_batch_owner_rank():

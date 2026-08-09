@@ -321,6 +321,7 @@ class ModelRunnerOutputAggregator:
                         free_capacity=batch.free_capacity,
                         resident_pages=batch.resident_pages,
                         pending_dma=batch.pending_dma,
+                        cache_pool=batch.cache_pool,
                     )
                 )
         return aggregated
