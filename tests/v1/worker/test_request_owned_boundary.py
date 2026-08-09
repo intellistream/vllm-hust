@@ -66,7 +66,7 @@ def _reserve(owner_id: int, command_seq: int = 1) -> OwnerCommand:
         owner_id=owner_id,
         command_seq=command_seq,
         kind=OwnerCommandKind.RESERVE,
-        requested_through=8,
+        required_num_tokens=8,
     )
 
 
@@ -191,7 +191,7 @@ def test_foreign_commands_and_publications_are_ignored() -> None:
             owner_id=1,
             step_seq=4,
             command_seq=1,
-            runnable_through=8,
+            runnable_num_tokens=8,
         )
     ]
     worker = _FakeWorker()
@@ -210,7 +210,7 @@ def test_local_publication_without_physical_grant_fails_before_worker() -> None:
             owner_id=0,
             step_seq=4,
             command_seq=1,
-            runnable_through=8,
+            runnable_num_tokens=8,
         )
     ]
     worker = _FakeWorker()

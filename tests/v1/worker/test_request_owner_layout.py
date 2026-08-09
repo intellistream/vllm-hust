@@ -33,7 +33,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 def _lease(
     request_id: str,
     owner_id: int,
-    runnable_through: int,
+    runnable_num_tokens: int,
     step_seq: int = 3,
 ) -> OwnerLeaseToken:
     return OwnerLeaseToken(
@@ -41,7 +41,7 @@ def _lease(
         owner_id=owner_id,
         step_seq=step_seq,
         command_seq=1,
-        runnable_through=runnable_through,
+        runnable_num_tokens=runnable_num_tokens,
     )
 
 
@@ -50,7 +50,7 @@ def _layout() -> OwnerRowLayout:
         step_seq=3,
         request_ids=["a", "a", "b"],
         token_positions=[0, 1, 0],
-        leases=[_lease("a", 11, 1), _lease("b", 2, 0)],
+        leases=[_lease("a", 11, 2), _lease("b", 2, 1)],
         group_ranks=(7, 2, 11),
     )
 
@@ -125,9 +125,9 @@ def test_runner_helper_enabled_builds_exact_layout(monkeypatch) -> None:
     scheduler_output = SimpleNamespace(
         step_seq=3,
         scheduled_owner_leases=[
-            _lease("c", 7, 2),
-            _lease("a", 11, 2),
-            _lease("b", 2, 2),
+            _lease("c", 7, 3),
+            _lease("a", 11, 3),
+            _lease("b", 2, 3),
         ],
     )
     req_indices = np.array([1, 0, 1, 0, 1, 2, 2], dtype=np.int64)
@@ -164,7 +164,7 @@ def test_runner_helper_enabled_builds_exact_layout(monkeypatch) -> None:
 
 def test_runner_helper_fails_closed_on_bad_leases(monkeypatch) -> None:
     runner = _bare_runner(True, ["a"], monkeypatch)
-    # Position beyond the lease horizon must fail closed, not silently pass.
+    # Position at/beyond the lease's exclusive bound must fail closed.
     scheduler_output = SimpleNamespace(
         step_seq=3,
         scheduled_owner_leases=[_lease("a", 11, 0)],

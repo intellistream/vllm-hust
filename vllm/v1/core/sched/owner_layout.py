@@ -639,7 +639,9 @@ def build_owner_row_layout(
     * ``request_ids`` and ``token_positions`` have exactly equal lengths and
       every request id is a nonempty string.
     * Every token position is a nonnegative non-bool integer and is
-      ``<=`` the matching lease's ``runnable_through``.
+      strictly below the matching lease's ``runnable_num_tokens``
+      (exclusive 0-based upper bound: ``position < runnable_num_tokens``;
+      the boundary itself is never a legal position).
     * There is exactly one lease per distinct scheduled request: no missing,
       extra, or duplicate leases; every lease's ``step_seq`` exactly equals
       ``step_seq``; the lease key's request id matches the row request id and
@@ -715,17 +717,18 @@ def build_owner_row_layout(
                 f"lease owner {owner!r} for request {request_id!r} is not in "
                 f"group_ranks {group!r}"
             )
-        if isinstance(lease.runnable_through, bool) or not isinstance(
-            lease.runnable_through, int
+        if isinstance(lease.runnable_num_tokens, bool) or not isinstance(
+            lease.runnable_num_tokens, int
         ):
             raise OwnerLayoutError(
-                f"lease runnable_through must be an int for request "
-                f"{request_id!r}, got {lease.runnable_through!r}"
+                f"lease runnable_num_tokens must be an int for request "
+                f"{request_id!r}, got {lease.runnable_num_tokens!r}"
             )
-        if position > lease.runnable_through:
+        if position >= lease.runnable_num_tokens:
             raise OwnerLayoutError(
-                f"token position {position} for request {request_id!r} exceeds "
-                f"lease runnable_through {lease.runnable_through}"
+                f"token position {position} for request {request_id!r} is at or "
+                f"beyond the exclusive bound runnable_num_tokens "
+                f"{lease.runnable_num_tokens}"
             )
         key = OwnerLeaseKey(request_id=request_id, owner_epoch=lease.key.owner_epoch)
         row_ids.append(GlobalRowId(request_uid=key, logical_token_position=position))

@@ -21,7 +21,13 @@ preserving the sticky owner/key; a later RESERVE reacquires a lease on the
 same owner.  RESTORE is the separate DMA/cold-residency intent and does not
 reacquire capacity.
 
-All horizons are absolute token positions (never relative step counts).
+All token counts are exact and are exclusive 0-based upper bounds: a lease
+covering ``N`` tokens makes exactly positions ``0 <= position < N``
+runnable, and ``N`` itself is never a legal position.  ``required_num_tokens``
+and ``runnable_num_tokens`` are such counts.  A zero-token RESERVE is a legal
+empty lease: it is accepted, commits zero tokens, and publishes no lease
+token; a nonzero request against zero physical/reference capacity is still
+rejected (``0`` is a real value, never a stand-in for a missing count).
 Commands to a given owner are delivered reliably and in order: the per-owner
 ``command_seq`` fence increases monotonically across all request keys and
 the worker consumes that stream without reordering or buffering.
@@ -68,6 +74,19 @@ class OwnerCommandKind(enum.Enum):
     RESTORE = "RESTORE"
 
 
+class OwnerAdmissionStatus(enum.Enum):
+    """Immutable admission status of a request on its owner.
+
+    Carried by :class:`OwnerAllocationDescriptor`: ``WAITING`` marks a
+    request that is admitted (owner-assigned) but not yet runnable, and
+    ``PREEMPTED`` marks a request whose active runnable capacity was
+    released while the sticky owner/key are preserved.
+    """
+
+    WAITING = "WAITING"
+    PREEMPTED = "PREEMPTED"
+
+
 @dataclass(frozen=True)
 class OwnerAssignmentObservation:
     """Observation used by the coordinator for least-work assignment.
@@ -97,6 +116,47 @@ class OwnerAssignmentObservation:
 
 
 @dataclass(frozen=True)
+class OwnerAllocationDescriptor:
+    """Immutable RESERVE allocation descriptor for one request lease.
+
+    Minimal before-first-publication descriptor: identifies the request
+    (:attr:`key`), its prompt length, how many prompt tokens are already
+    computed on the owner, the total runnable token count being reserved,
+    and the request's admission status.  Counts are exact nonnegative
+    non-bool integers and ``num_computed_tokens <= num_tokens``.
+    """
+
+    key: OwnerLeaseKey
+    num_prompt_tokens: int
+    num_computed_tokens: int
+    num_tokens: int
+    status: OwnerAdmissionStatus
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, OwnerLeaseKey):
+            raise TypeError(f"key must be an OwnerLeaseKey, got {self.key!r}.")
+        for name in (
+            "num_prompt_tokens",
+            "num_computed_tokens",
+            "num_tokens",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(
+                    f"{name} must be a nonnegative non-bool int, got {value!r}."
+                )
+        if self.num_computed_tokens > self.num_tokens:
+            raise ValueError(
+                "num_computed_tokens must not exceed num_tokens, got "
+                f"{self.num_computed_tokens} > {self.num_tokens}."
+            )
+        if not isinstance(self.status, OwnerAdmissionStatus):
+            raise TypeError(
+                f"status must be an OwnerAdmissionStatus, got {self.status!r}."
+            )
+
+
+@dataclass(frozen=True)
 class OwnerCommand:
     """A fenced command from the coordinator to a worker lease manager.
 
@@ -111,8 +171,29 @@ class OwnerCommand:
     #: rejected by the receiver.
     command_seq: int
     kind: OwnerCommandKind
-    #: Absolute requested token horizon (inclusive).
-    requested_through: int
+    #: Exact number of tokens this command requires, as an exclusive
+    #: 0-based upper bound (positions ``0 <= p < required_num_tokens``).
+    #: Zero is a legal empty RESERVE; nonzero against zero capacity is
+    #: rejected by the receiver.
+    required_num_tokens: int
+    #: Optional RESERVE allocation descriptor (key must match; counts are
+    #: validated by the descriptor itself).  ``None`` when the caller does
+    #: not participate in allocation publication.
+    allocation: OwnerAllocationDescriptor | None = None
+
+    def __post_init__(self) -> None:
+        if self.allocation is None:
+            return
+        if not isinstance(self.allocation, OwnerAllocationDescriptor):
+            raise TypeError(
+                "allocation must be an OwnerAllocationDescriptor or None, "
+                f"got {self.allocation!r}."
+            )
+        if self.allocation.key != self.key:
+            raise ValueError(
+                f"allocation key {self.allocation.key!r} must match "
+                f"command key {self.key!r}."
+            )
 
 
 @dataclass(frozen=True)
@@ -123,8 +204,10 @@ class OwnerReceipt:
     owner_id: int
     command_seq: int
     accepted: bool
-    #: Absolute horizon the worker can legally run to.  ``None`` on rejection.
-    runnable_through: int | None = None
+    #: Exact number of tokens the worker can legally run (exclusive 0-based
+    #: upper bound: positions ``0 <= p < runnable_num_tokens``).  ``0`` is
+    #: the legal grant of an accepted empty lease.  ``None`` on rejection.
+    runnable_num_tokens: int | None = None
     #: True when a RELEASE fully completed; set exactly once per lease.
     released: bool = False
     pending_dma: int | None = None
@@ -136,8 +219,9 @@ class OwnerReceipt:
 class OwnerLeaseToken:
     """Immutable token covering a lease published at a scheduler step.
 
-    Published tokens are legally binding: a worker must not refuse tokens at
-    or below ``runnable_through``.  ``step_seq`` increases monotonically per
+    Published tokens are legally binding: a worker must not refuse tokens in
+    the range ``0 <= p < runnable_num_tokens``.  An accepted empty lease
+    (count 0) publishes no token.  ``step_seq`` increases monotonically per
     lease; the worker rejects regressed or duplicate steps.
     """
 
@@ -145,8 +229,9 @@ class OwnerLeaseToken:
     owner_id: int
     step_seq: int
     command_seq: int
-    #: Absolute horizon the worker must honor (<= worker-granted horizon).
-    runnable_through: int
+    #: Exact count of tokens the worker must honor (exclusive 0-based upper
+    #: bound, <= worker-granted count); always positive on a published token.
+    runnable_num_tokens: int
 
 
 @dataclass(frozen=True)
@@ -171,8 +256,8 @@ class EpochFenceError(OwnershipError):
 
 
 class PublicationViolationError(OwnershipError):
-    """A publish/receipt would exceed the granted horizon or refuse published
-    tokens."""
+    """A publish/receipt would exceed the granted token count or refuse
+    published tokens."""
 
 
 # ---------------------------------------------------------------------------
@@ -185,9 +270,9 @@ class _LeaseState:
     """Per-lease bookkeeping kept by the reference coordinator."""
 
     owner_id: int
-    requested_through: int = 0
-    last_requested: int = 0
-    runnable_through: int | None = None
+    required_num_tokens: int = 0
+    last_required_num_tokens: int = 0
+    runnable_num_tokens: int | None = None
     preempted: bool = False
     restored: bool = False
     superseded: bool = False
@@ -215,10 +300,11 @@ class OwnerLeaseCoordinator:
     Other invariants: idempotent same-request assignment; an epoch fence for
     reused request ids that keeps the old-epoch lease as a tombstone until
     its own RELEASE receipt (commitments are never silently freed); reserve/
-    extend requested-vs-receipted horizon gating; accepted receipts fail
-    closed when they exceed the command's requested horizon or regress below
+    extend required-vs-granted token-count gating; accepted receipts fail
+    closed when they exceed the command's required count or regress below
     the published watermark; publication only at or below the granted
-    horizon; preempt preserves the owner and releases active capacity;
+    count (a zero-token empty lease publishes no token); preempt preserves
+    the owner and releases active capacity;
     finish/abort leaves ``release_pending`` until the matching RELEASE
     receipt frees the commitment (and its charge) exactly once.  Owner
     commands are delivered reliably and in order (monotonic ``command_seq``
@@ -248,7 +334,7 @@ class OwnerLeaseCoordinator:
     def assign(
         self,
         key: OwnerLeaseKey,
-        requested_through: int | None = None,
+        required_num_tokens: int | None = None,
         projected_work: int | None = None,
     ) -> int:
         """Assign ``key`` to the least-committed-work owner.
@@ -299,13 +385,17 @@ class OwnerLeaseCoordinator:
 
         owner = min(candidates, key=score).owner_id
         projected = (
-            projected_work if projected_work is not None else (requested_through or 0)
+            projected_work
+            if projected_work is not None
+            else (required_num_tokens if required_num_tokens is not None else 0)
         )
         self._charges[owner] = self._charges.get(owner, 0) + projected
         self._key_charge[key] = projected
         self._leases[key] = _LeaseState(
             owner_id=owner,
-            requested_through=requested_through or 0,
+            required_num_tokens=(
+                required_num_tokens if required_num_tokens is not None else 0
+            ),
         )
         return owner
 
@@ -315,7 +405,7 @@ class OwnerLeaseCoordinator:
         self,
         key: OwnerLeaseKey,
         kind: OwnerCommandKind,
-        requested_through: int,
+        required_num_tokens: int,
     ) -> OwnerCommand:
         lease = self._leases.get(key)
         if lease is None:
@@ -325,17 +415,17 @@ class OwnerLeaseCoordinator:
         )
         lease.command_seq = self._owner_command_seq[lease.owner_id]
         lease.command_kind = kind
-        lease.last_requested = requested_through
-        lease.requested_through = max(lease.requested_through, requested_through)
+        lease.last_required_num_tokens = required_num_tokens
+        lease.required_num_tokens = max(lease.required_num_tokens, required_num_tokens)
         return OwnerCommand(
             key=key,
             owner_id=lease.owner_id,
             command_seq=lease.command_seq,
             kind=kind,
-            requested_through=requested_through,
+            required_num_tokens=required_num_tokens,
         )
 
-    def reserve(self, key: OwnerLeaseKey, requested_through: int) -> OwnerCommand:
+    def reserve(self, key: OwnerLeaseKey, required_num_tokens: int) -> OwnerCommand:
         lease = self._leases[key]
         if lease.released or lease.release_pending:
             raise OwnershipError(f"cannot RESERVE released {key}")
@@ -343,13 +433,14 @@ class OwnerLeaseCoordinator:
             raise OwnershipError(f"cannot RESERVE superseded {key}")
         if lease.command_seq != 0:
             raise OwnershipError(f"cannot RESERVE already-reserved {key}")
-        return self._issue(key, OwnerCommandKind.RESERVE, requested_through)
+        return self._issue(key, OwnerCommandKind.RESERVE, required_num_tokens)
 
-    def resume(self, key: OwnerLeaseKey, requested_through: int) -> OwnerCommand:
+    def resume(self, key: OwnerLeaseKey, required_num_tokens: int) -> OwnerCommand:
         """Reacquire a lease on the same (sticky) owner after a preempt.
 
         Issues a RESERVE-kind command; the worker grants a fresh runnable
-        horizon instead of silently retaining the preempt-released capacity.
+        token count instead of silently retaining the preempt-released
+        capacity.
         """
         lease = self._leases[key]
         if lease.released or lease.release_pending:
@@ -358,9 +449,9 @@ class OwnerLeaseCoordinator:
             raise OwnershipError(f"cannot RESUME superseded {key}")
         if not lease.preempted:
             raise OwnershipError(f"cannot RESUME non-preempted {key}")
-        return self._issue(key, OwnerCommandKind.RESERVE, requested_through)
+        return self._issue(key, OwnerCommandKind.RESERVE, required_num_tokens)
 
-    def extend(self, key: OwnerLeaseKey, requested_through: int) -> OwnerCommand:
+    def extend(self, key: OwnerLeaseKey, required_num_tokens: int) -> OwnerCommand:
         lease = self._leases[key]
         if lease.released or lease.release_pending:
             raise OwnershipError(f"cannot EXTEND released {key}")
@@ -368,7 +459,7 @@ class OwnerLeaseCoordinator:
             raise OwnershipError(f"cannot EXTEND superseded {key}")
         if lease.command_seq == 0:
             raise OwnershipError(f"cannot EXTEND un-reserved {key}")
-        return self._issue(key, OwnerCommandKind.EXTEND, requested_through)
+        return self._issue(key, OwnerCommandKind.EXTEND, required_num_tokens)
 
     def preempt(
         self,
@@ -383,11 +474,15 @@ class OwnerLeaseCoordinator:
         through = (
             preempt_through
             if preempt_through is not None
-            else (lease.runnable_through or lease.requested_through)
+            else (
+                lease.runnable_num_tokens
+                if lease.runnable_num_tokens is not None
+                else lease.required_num_tokens
+            )
         )
         return self._issue(key, OwnerCommandKind.PREEMPT, through)
 
-    def restore(self, key: OwnerLeaseKey, requested_through: int) -> OwnerCommand:
+    def restore(self, key: OwnerLeaseKey, required_num_tokens: int) -> OwnerCommand:
         """Request the separate DMA/cold-residency restore intent.
 
         Does not reacquire runnable capacity; use :meth:`resume` for that.
@@ -399,7 +494,7 @@ class OwnerLeaseCoordinator:
             raise OwnershipError(f"cannot RESTORE superseded {key}")
         if not lease.preempted:
             raise OwnershipError(f"cannot RESTORE non-preempted {key}")
-        return self._issue(key, OwnerCommandKind.RESTORE, requested_through)
+        return self._issue(key, OwnerCommandKind.RESTORE, required_num_tokens)
 
     def finish(self, key: OwnerLeaseKey) -> OwnerCommand:
         """Finish/abort the lease: leave ``release_pending`` until the
@@ -410,13 +505,13 @@ class OwnerLeaseCoordinator:
         ``command_seq``, so a double finish before the first receipt
         converges and the refund happens exactly once.  Raises
         :class:`OwnershipError` when no RESERVE has been accepted yet
-        (``runnable_through`` is None); the caller must :meth:`abandon`
+        (``runnable_num_tokens`` is None); the caller must :meth:`abandon`
         before reservation or after a refused RESERVE.
         """
         lease = self._leases[key]
         if lease.released:
             raise OwnershipError(f"cannot finish already-released {key}")
-        if lease.runnable_through is None:
+        if lease.runnable_num_tokens is None:
             raise OwnershipError(
                 f"cannot finish {key}: no accepted RESERVE (abandon instead)"
             )
@@ -427,7 +522,11 @@ class OwnerLeaseCoordinator:
                 )
             return lease.release_command
         lease.release_pending = True
-        through = lease.runnable_through or lease.requested_through
+        through = (
+            lease.runnable_num_tokens
+            if lease.runnable_num_tokens is not None
+            else lease.required_num_tokens
+        )
         command = self._issue(key, OwnerCommandKind.RELEASE, through)
         lease.release_command = command
         return command
@@ -443,7 +542,7 @@ class OwnerLeaseCoordinator:
         lease = self._leases.get(key)
         if lease is None:
             return False
-        if lease.runnable_through is not None:
+        if lease.runnable_num_tokens is not None:
             raise OwnershipError(f"cannot abandon admitted lease {key}")
         if lease.release_pending or lease.released or lease.preempted:
             raise OwnershipError(f"cannot abandon non-provisional lease {key}")
@@ -463,7 +562,7 @@ class OwnerLeaseCoordinator:
         Receipts are fenced by full key (request id + epoch): stale,
         duplicate, wrong-owner, and unknown-key receipts are ignored and
         never advance or free state.  An accepted receipt that exceeds the
-        command's requested horizon or regresses below the published
+        command's required count or regresses below the published
         watermark fails closed with :class:`PublicationViolationError`
         instead of silently advancing.
         """
@@ -484,26 +583,26 @@ class OwnerLeaseCoordinator:
             # Tombstoned lease: only its own RELEASE receipt may apply.
             return False
 
-        if receipt.runnable_through is not None:
-            if receipt.runnable_through > lease.last_requested:
+        if receipt.runnable_num_tokens is not None:
+            if receipt.runnable_num_tokens > lease.last_required_num_tokens:
                 raise PublicationViolationError(
-                    f"receipt for {receipt.key} grants {receipt.runnable_through} "
-                    f"beyond requested horizon {lease.last_requested}"
+                    f"receipt for {receipt.key} grants {receipt.runnable_num_tokens} "
+                    f"beyond required count {lease.last_required_num_tokens}"
                 )
             watermark = self._publish_watermark.get(receipt.key, 0)
-            if receipt.runnable_through < watermark:
+            if receipt.runnable_num_tokens < watermark:
                 raise PublicationViolationError(
                     f"receipt for {receipt.key} regresses below published "
-                    f"horizon {watermark}"
+                    f"count {watermark}"
                 )
-            lease.runnable_through = receipt.runnable_through
+            lease.runnable_num_tokens = receipt.runnable_num_tokens
         self._processed[receipt.key] = receipt.command_seq
         lease.receipt_seq = receipt.command_seq
 
         if lease.command_kind is OwnerCommandKind.PREEMPT:
             # PREEMPT preserves the owner; the active runnable capacity was
-            # released by the worker, so the receipt horizon is the honored
-            # (published) horizon only.
+            # released by the worker, so the receipt count is the honored
+            # (published) count only.
             lease.preempted = True
         elif lease.command_kind is OwnerCommandKind.RESTORE:
             lease.restored = True
@@ -526,11 +625,12 @@ class OwnerLeaseCoordinator:
     # -- publication ----------------------------------------------------------
 
     def publish(self, step_seq: int) -> list[OwnerLeaseToken]:
-        """Publish lease tokens for the step, only at/below granted horizons.
+        """Publish lease tokens for the step, only at/below granted counts.
 
-        Raises :class:`PublicationViolationError` when a publish would
-        exceed the worker-granted horizon or regress an already-published
-        horizon.
+        A lease with zero runnable tokens (an accepted empty RESERVE)
+        publishes no token.  Raises :class:`PublicationViolationError` when
+        a publish would exceed the worker-granted count or regress an
+        already-published count.
         """
         tokens: list[OwnerLeaseToken] = []
         for key, lease in sorted(
@@ -556,16 +656,18 @@ class OwnerLeaseCoordinator:
                 # PREEMPT, RELEASE, and RESTORE receipts never advance
                 # publication.
                 continue
-            if lease.runnable_through is None:
+            if lease.runnable_num_tokens is None:
                 # Not yet granted: nothing legal to publish.
                 continue
-            horizon = min(lease.runnable_through, lease.requested_through)
+            horizon = min(lease.runnable_num_tokens, lease.required_num_tokens)
             watermark = self._publish_watermark.get(key, 0)
             if horizon < watermark:
                 raise PublicationViolationError(
-                    f"publish horizon {horizon} for {key} regresses "
-                    f"published horizon {watermark}"
+                    f"publish count {horizon} for {key} regresses "
+                    f"published count {watermark}"
                 )
+            # Zero runnable tokens: the empty lease publishes no token, and
+            # the watermark never advances below an already-published count.
             if horizon <= watermark:
                 continue
             self._publish_watermark[key] = horizon
@@ -575,7 +677,7 @@ class OwnerLeaseCoordinator:
                     owner_id=lease.owner_id,
                     step_seq=step_seq,
                     command_seq=lease.command_seq,
-                    runnable_through=horizon,
+                    runnable_num_tokens=horizon,
                 )
             )
         return tokens
@@ -586,11 +688,11 @@ class OwnerLeaseCoordinator:
         lease = self._leases.get(key)
         return lease.owner_id if lease is not None else None
 
-    def requested_through_of(self, key: OwnerLeaseKey) -> int:
-        return self._leases[key].requested_through
+    def required_num_tokens_of(self, key: OwnerLeaseKey) -> int:
+        return self._leases[key].required_num_tokens
 
-    def runnable_through_of(self, key: OwnerLeaseKey) -> int | None:
-        return self._leases[key].runnable_through
+    def runnable_num_tokens_of(self, key: OwnerLeaseKey) -> int | None:
+        return self._leases[key].runnable_num_tokens
 
     def published_through(self, key: OwnerLeaseKey) -> int:
         return self._publish_watermark.get(key, 0)
@@ -624,14 +726,14 @@ class OwnerLeaseCoordinator:
 class _WorkerLease:
     """Per-lease bookkeeping kept by the reference worker manager.
 
-    ``runnable_through``/``published_through`` are the logical horizons the
-    worker is legally bound to honor; ``committed_tokens`` is the separate
-    active physical commitment that occupies capacity.  PREEMPT zeroes the
-    commitment while retaining the logical fence, so a post-step preempt is
-    not a horizon regression.
+    ``runnable_num_tokens`` (exclusive 0-based bound) and ``published_through``
+    are the logical token counts the worker is legally bound to honor;
+    ``committed_tokens`` is the separate active physical commitment that
+    occupies capacity.  PREEMPT zeroes the commitment while retaining the
+    logical fence, so a post-step preempt is not a count regression.
     """
 
-    runnable_through: int
+    runnable_num_tokens: int
     published_through: int = 0
     committed_tokens: int = 0
     #: command_seq of the last accepted grant (RESERVE/EXTEND); published
@@ -651,9 +753,12 @@ class AttentionLeaseManager:
     """Pure-Python reference worker-side lease manager (no GPU).
 
     ``capacity`` models the worker's total request-owned attention budget in
-    tokens; each active lease commits ``min(runnable_through, capacity)``
-    tokens.  ``grant_ceiling`` optionally caps how much absolute horizon a
-    single command may grant, which models chunk-horizon gating.
+    tokens; each active lease commits ``min(required_num_tokens, capacity)``
+    tokens.  ``grant_ceiling`` optionally caps how many tokens a single
+    command may grant, which models chunk-count gating.  A zero-token
+    RESERVE is a legal empty lease: accepted, commits zero tokens, and
+    publishes no token; a nonzero request against zero physical/reference
+    capacity is still rejected.
 
     The manager enforces the protocol invariants locally: monotonically
     fenced command sequences, a per-request-id epoch fence (a stale
@@ -664,7 +769,7 @@ class AttentionLeaseManager:
     intent, and each lease's commitment is released exactly once.
     ``record_published`` enforces the published-token invariant (active
     lease, matching grant command sequence, monotonic step sequence,
-    horizon at or below the grant), and RELEASE clears the DMA/restore/
+    count at or below the grant), and RELEASE clears the DMA/restore/
     residency facts so freed leases never report stale physical state.
     """
 
@@ -741,11 +846,11 @@ class AttentionLeaseManager:
         return self._receipt(command, accepted=False, error="unknown command kind")
 
     def _grant(self, command: OwnerCommand, lease: _WorkerLease) -> int:
-        """Grant an absolute horizon for ``command`` on ``lease``."""
+        """Grant an exclusive token count for ``command`` on ``lease``."""
         cap = max(0, self.capacity - self._committed_others(lease))
         if self.grant_ceiling is not None:
-            cap = min(cap, lease.runnable_through + self.grant_ceiling)
-        return min(command.requested_through, cap)
+            cap = min(cap, lease.runnable_num_tokens + self.grant_ceiling)
+        return min(command.required_num_tokens, cap)
 
     def _committed_others(self, lease: _WorkerLease) -> int:
         return sum(
@@ -768,50 +873,56 @@ class AttentionLeaseManager:
                 return self._receipt(command, accepted=False, error="duplicate reserve")
             # Resume: reacquire capacity on the same owner; the old runnable
             # capacity was released by the PREEMPT receipt.
-            if command.requested_through < lease.published_through:
+            if command.required_num_tokens < lease.published_through:
                 return self._receipt(
                     command,
                     accepted=False,
                     error="refuses published tokens",
                 )
             granted = self._grant(command, lease)
-            if granted < lease.published_through or granted <= 0:
-                # Reacquiring below the honored (published) horizon would
-                # refuse published tokens; reacquiring nothing is a refusal.
+            if granted < lease.published_through or (
+                granted <= 0 and command.required_num_tokens > 0
+            ):
+                # Reacquiring below the honored (published) count would
+                # refuse published tokens; a nonzero reacquisition that
+                # grants nothing is a refusal.  A zero-token resume is a
+                # legal empty lease and commits nothing.
                 return self._receipt(
                     command,
                     accepted=False,
                     error="insufficient capacity to resume",
                 )
-            lease.runnable_through = granted
+            lease.runnable_num_tokens = granted
             lease.committed_tokens = granted
             lease.grant_command_seq = command.command_seq
             lease.preempted = False
             lease.restoring = False
             lease.pending_dma = 0
-            return self._receipt(command, accepted=True, runnable_through=granted)
+            return self._receipt(command, accepted=True, runnable_num_tokens=granted)
         committed = sum(
             active.committed_tokens
             for active in self._leases.values()
             if not active.released
         )
-        granted = min(command.requested_through, max(0, self.capacity - committed))
+        granted = min(command.required_num_tokens, max(0, self.capacity - committed))
         if self.grant_ceiling is not None:
             granted = min(granted, self.grant_ceiling)
-        if granted <= 0:
-            # Real pre-publication refusal: zero/insufficient capacity must
-            # not be reported as an accepted zero-horizon grant.
+        if granted <= 0 and command.required_num_tokens > 0:
+            # Real pre-publication refusal: a nonzero request against zero
+            # physical/reference capacity must not be reported as an
+            # accepted empty lease.  A zero-token request is the one legal
+            # empty lease and commits nothing.
             return self._receipt(
                 command,
                 accepted=False,
                 error="insufficient capacity to reserve",
             )
         self._leases[command.key] = _WorkerLease(
-            runnable_through=granted,
+            runnable_num_tokens=granted,
             committed_tokens=granted,
             grant_command_seq=command.command_seq,
         )
-        return self._receipt(command, accepted=True, runnable_through=granted)
+        return self._receipt(command, accepted=True, runnable_num_tokens=granted)
 
     def _on_extend(
         self, command: OwnerCommand, lease: _WorkerLease | None
@@ -824,24 +935,33 @@ class AttentionLeaseManager:
             return self._receipt(command, accepted=False, error="lease superseded")
         if lease.preempted:
             return self._receipt(command, accepted=False, error="lease is preempted")
-        if command.requested_through < lease.published_through:
+        if command.required_num_tokens < lease.published_through:
             return self._receipt(
                 command,
                 accepted=False,
                 error="refuses published tokens",
             )
         granted = self._grant(command, lease)
-        if granted < lease.runnable_through:
+        if granted < lease.runnable_num_tokens:
             reason = (
                 "insufficient capacity to extend"
-                if command.requested_through >= lease.runnable_through
-                else "extend would shrink the runnable horizon"
+                if command.required_num_tokens >= lease.runnable_num_tokens
+                else "extend would shrink the runnable token count"
             )
             return self._receipt(command, accepted=False, error=reason)
-        lease.committed_tokens += granted - lease.runnable_through
-        lease.runnable_through = granted
+        if granted <= 0 and command.required_num_tokens > 0:
+            # A nonzero extension that grants nothing (e.g. extending an
+            # empty lease with zero capacity available) is a refusal, not
+            # an accepted no-op.
+            return self._receipt(
+                command,
+                accepted=False,
+                error="insufficient capacity to extend",
+            )
+        lease.committed_tokens += granted - lease.runnable_num_tokens
+        lease.runnable_num_tokens = granted
         lease.grant_command_seq = command.command_seq
-        return self._receipt(command, accepted=True, runnable_through=granted)
+        return self._receipt(command, accepted=True, runnable_num_tokens=granted)
 
     def _on_preempt(
         self, command: OwnerCommand, lease: _WorkerLease | None
@@ -852,7 +972,7 @@ class AttentionLeaseManager:
             )
         if lease.superseded:
             return self._receipt(command, accepted=False, error="lease superseded")
-        if command.requested_through < lease.published_through:
+        if command.required_num_tokens < lease.published_through:
             return self._receipt(
                 command,
                 accepted=False,
@@ -861,10 +981,10 @@ class AttentionLeaseManager:
         lease.preempted = True
         # Release the active physical commitment while retaining the
         # logical run/published fence: published tokens stay honored and
-        # the preempt is not a horizon regression.
+        # the preempt is not a count regression.
         lease.committed_tokens = 0
         return self._receipt(
-            command, accepted=True, runnable_through=lease.runnable_through
+            command, accepted=True, runnable_num_tokens=lease.runnable_num_tokens
         )
 
     def _on_restore(
@@ -880,7 +1000,7 @@ class AttentionLeaseManager:
             return self._receipt(
                 command, accepted=False, error="lease is not preempted"
             )
-        if command.requested_through < lease.published_through:
+        if command.required_num_tokens < lease.published_through:
             return self._receipt(
                 command,
                 accepted=False,
@@ -893,7 +1013,7 @@ class AttentionLeaseManager:
         return self._receipt(
             command,
             accepted=True,
-            runnable_through=lease.runnable_through,
+            runnable_num_tokens=lease.runnable_num_tokens,
             pending_dma=1,
         )
 
@@ -906,7 +1026,7 @@ class AttentionLeaseManager:
             return self._receipt(
                 command, accepted=False, error="lease already released"
             )
-        if command.requested_through < lease.published_through:
+        if command.required_num_tokens < lease.published_through:
             return self._receipt(
                 command,
                 accepted=False,
@@ -923,7 +1043,7 @@ class AttentionLeaseManager:
         return self._receipt(
             command,
             accepted=True,
-            runnable_through=lease.runnable_through,
+            runnable_num_tokens=lease.runnable_num_tokens,
             released=True,
         )
 
@@ -932,7 +1052,7 @@ class AttentionLeaseManager:
         command: OwnerCommand,
         *,
         accepted: bool,
-        runnable_through: int | None = None,
+        runnable_num_tokens: int | None = None,
         released: bool = False,
         pending_dma: int | None = None,
         error: str | None = None,
@@ -943,7 +1063,7 @@ class AttentionLeaseManager:
             owner_id=command.owner_id,
             command_seq=command.command_seq,
             accepted=accepted,
-            runnable_through=runnable_through,
+            runnable_num_tokens=runnable_num_tokens,
             released=released,
             pending_dma=(
                 pending_dma
@@ -964,7 +1084,7 @@ class AttentionLeaseManager:
         Tokens for the matching owner must satisfy the full publication
         invariant: an existing, active (not released/superseded/preempted)
         lease, the accepted grant's ``command_seq``, a strictly increasing
-        ``step_seq``, and a horizon at or below the granted horizon.
+        ``step_seq``, and a token count at or below the granted count.
         Anything else raises :class:`PublicationViolationError`.  Tokens
         for other owners are ignored.
         """
@@ -989,12 +1109,14 @@ class AttentionLeaseManager:
                 f"token for {token.key} regresses or duplicates step "
                 f"sequence {token.step_seq} (last {lease.last_step_seq})"
             )
-        if token.runnable_through > lease.runnable_through:
+        if token.runnable_num_tokens > lease.runnable_num_tokens:
             raise PublicationViolationError(
-                f"token for {token.key} exceeds granted horizon "
-                f"{lease.runnable_through}"
+                f"token for {token.key} exceeds granted count "
+                f"{lease.runnable_num_tokens}"
             )
-        lease.published_through = max(lease.published_through, token.runnable_through)
+        lease.published_through = max(
+            lease.published_through, token.runnable_num_tokens
+        )
         lease.last_step_seq = token.step_seq
 
     # -- batch emission --------------------------------------------------------

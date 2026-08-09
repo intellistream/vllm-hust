@@ -153,7 +153,7 @@ def test_assignment_charges_local_commitment_exactly_once() -> None:
     # Admit the lease first (finish requires an accepted RESERVE); the
     # reservation itself carries no extra charge.
     manager = AttentionLeaseManager(owner_rank=1, capacity=1000)
-    _grant(coordinator, manager, coordinator.reserve(key1, requested_through=1))
+    _grant(coordinator, manager, coordinator.reserve(key1, required_num_tokens=1))
     # Release refunds the charge exactly once.
     command = coordinator.finish(key1)
     receipt = manager.apply(command)
@@ -170,7 +170,7 @@ def test_assignment_charges_local_commitment_exactly_once() -> None:
         command_seq=command.command_seq,
         accepted=True,
         released=True,
-        runnable_through=0,
+        runnable_num_tokens=0,
     )
     assert not coordinator.apply_receipt(duplicate)
     assert coordinator.release_count() == 1
@@ -209,13 +209,13 @@ def test_epoch_reuse_does_not_leak_old_lease_horizons() -> None:
     old = _key("req-reused", epoch=0)
     new = _key("req-reused", epoch=1)
     assert coordinator.assign(old) == 1
-    _grant(coordinator, manager, coordinator.reserve(old, requested_through=40))
-    assert coordinator.runnable_through_of(old) == 40
+    _grant(coordinator, manager, coordinator.reserve(old, required_num_tokens=40))
+    assert coordinator.runnable_num_tokens_of(old) == 40
     # Reused id at a new epoch starts from an empty slate; the old horizon
     # is retained by the old key (never silently freed).
     assert coordinator.assign(new) == 1
-    assert coordinator.runnable_through_of(old) == 40
-    assert coordinator.runnable_through_of(new) is None
+    assert coordinator.runnable_num_tokens_of(old) == 40
+    assert coordinator.runnable_num_tokens_of(new) is None
     # The old commitment is freed only by its own RELEASE receipt.
     command = coordinator.finish(old)
     receipt = manager.apply(command)
@@ -233,7 +233,7 @@ def test_old_release_new_epoch_isolation() -> None:
     old = _key("req-iso", epoch=0)
     new = _key("req-iso", epoch=1)
     coordinator.assign(old)
-    _grant(coordinator, manager, coordinator.reserve(old, requested_through=20))
+    _grant(coordinator, manager, coordinator.reserve(old, required_num_tokens=20))
     command = coordinator.finish(old)
     assert coordinator.is_release_pending(old)
     # Epoch reuse must not clear the old release-pending state.
@@ -247,7 +247,7 @@ def test_old_release_new_epoch_isolation() -> None:
     assert not coordinator.is_released(new)
     assert coordinator.release_count() == 1
     # The new-epoch lease is fully independent.
-    command_new = coordinator.reserve(new, requested_through=20)
+    command_new = coordinator.reserve(new, required_num_tokens=20)
     _grant(coordinator, manager, command_new)
     command_new = coordinator.finish(new)
     _grant(coordinator, manager, command_new)
@@ -269,30 +269,30 @@ def test_reserve_extend_chunk_horizon_gating() -> None:
 
     # RESERVE asks for an absolute horizon of 100 tokens; the worker grants a
     # chunk of 40, so publication is gated at 40.
-    command = coordinator.reserve(key, requested_through=100)
+    command = coordinator.reserve(key, required_num_tokens=100)
     receipt = _grant(coordinator, manager, command)
     assert receipt.accepted
-    assert receipt.runnable_through == 40
-    assert coordinator.requested_through_of(key) == 100
-    assert coordinator.runnable_through_of(key) == 40
+    assert receipt.runnable_num_tokens == 40
+    assert coordinator.required_num_tokens_of(key) == 100
+    assert coordinator.runnable_num_tokens_of(key) == 40
     tokens = _publish(coordinator, manager, step_seq=1)
-    assert [t.runnable_through for t in tokens] == [40]
+    assert [t.runnable_num_tokens for t in tokens] == [40]
 
     # EXTEND grows the granted horizon in chunks; publication follows.
-    command = coordinator.extend(key, requested_through=100)
+    command = coordinator.extend(key, required_num_tokens=100)
     receipt = _grant(coordinator, manager, command)
-    assert receipt.runnable_through == 80
+    assert receipt.runnable_num_tokens == 80
     tokens = _publish(coordinator, manager, step_seq=2)
-    assert [t.runnable_through for t in tokens] == [80]
+    assert [t.runnable_num_tokens for t in tokens] == [80]
 
-    command = coordinator.extend(key, requested_through=100)
+    command = coordinator.extend(key, required_num_tokens=100)
     receipt = _grant(coordinator, manager, command)
-    assert receipt.runnable_through == 100
+    assert receipt.runnable_num_tokens == 100
     tokens = _publish(coordinator, manager, step_seq=3)
-    assert [t.runnable_through for t in tokens] == [100]
+    assert [t.runnable_num_tokens for t in tokens] == [100]
 
     # Publication never exceeds the receipted horizon.
-    assert coordinator.published_through(key) <= coordinator.runnable_through_of(key)
+    assert coordinator.published_through(key) <= coordinator.runnable_num_tokens_of(key)
 
 
 def test_accepted_receipts_fail_closed_on_horizon_violations() -> None:
@@ -303,22 +303,22 @@ def test_accepted_receipts_fail_closed_on_horizon_violations() -> None:
     )
     key = _key()
     coordinator.assign(key)
-    _grant(coordinator, manager, coordinator.reserve(key, requested_through=50))
+    _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=50))
     _publish(coordinator, manager, step_seq=1)
     assert coordinator.published_through(key) == 50
 
     # A receipt that regresses below the published horizon fails closed.
-    command = coordinator.extend(key, requested_through=50)
+    command = coordinator.extend(key, required_num_tokens=50)
     regress = OwnerReceipt(
         key=key,
         owner_id=1,
         command_seq=command.command_seq,
         accepted=True,
-        runnable_through=20,
+        runnable_num_tokens=20,
     )
     with pytest.raises(PublicationViolationError):
         coordinator.apply_receipt(regress)
-    assert coordinator.runnable_through_of(key) == 50
+    assert coordinator.runnable_num_tokens_of(key) == 50
     assert coordinator.published_through(key) == 50
 
     # A receipt that exceeds the command's requested horizon fails closed.
@@ -327,11 +327,11 @@ def test_accepted_receipts_fail_closed_on_horizon_violations() -> None:
         owner_id=1,
         command_seq=command.command_seq,
         accepted=True,
-        runnable_through=999,
+        runnable_num_tokens=999,
     )
     with pytest.raises(PublicationViolationError):
         coordinator.apply_receipt(exceed)
-    assert coordinator.runnable_through_of(key) == 50
+    assert coordinator.runnable_num_tokens_of(key) == 50
     assert coordinator.published_through(key) == 50
 
 
@@ -346,9 +346,9 @@ def test_preempt_releases_capacity_and_resume_reacquires_on_same_owner() -> None
     )
     key = _key()
     coordinator.assign(key)
-    _grant(coordinator, manager, coordinator.reserve(key, requested_through=100))
+    _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=100))
     _publish(coordinator, manager, step_seq=1)
-    assert coordinator.runnable_through_of(key) == 40
+    assert coordinator.runnable_num_tokens_of(key) == 40
     assert coordinator.published_through(key) == 40
     # The initial grant commits exactly the granted tokens to capacity.
     assert manager.free_capacity() == 1000 - 40
@@ -360,7 +360,7 @@ def test_preempt_releases_capacity_and_resume_reacquires_on_same_owner() -> None
     assert receipt.accepted
     assert coordinator.is_preempted(key)
     assert coordinator.owner_of(key) == 1
-    assert coordinator.runnable_through_of(key) == 40
+    assert coordinator.runnable_num_tokens_of(key) == 40
     # The physical commitment is released: capacity is fully available
     # again even though the logical horizon fence is retained.
     assert manager.free_capacity() == 1000
@@ -370,25 +370,25 @@ def test_preempt_releases_capacity_and_resume_reacquires_on_same_owner() -> None
 
     # RESTORE is the DMA/cold-residency intent: it does not reacquire
     # runnable capacity.
-    command = coordinator.restore(key, requested_through=100)
+    command = coordinator.restore(key, required_num_tokens=100)
     receipt = _grant(coordinator, manager, command)
     assert receipt.accepted
     assert coordinator.is_restored(key)
     assert coordinator.is_preempted(key)
-    assert coordinator.runnable_through_of(key) == 40
+    assert coordinator.runnable_num_tokens_of(key) == 40
 
     # RESUME reacquires a lease on the same (sticky) owner.
-    command = coordinator.resume(key, requested_through=100)
+    command = coordinator.resume(key, required_num_tokens=100)
     assert command.kind is OwnerCommandKind.RESERVE
     receipt = _grant(coordinator, manager, command)
     assert receipt.accepted
     assert not coordinator.is_preempted(key)
     assert coordinator.owner_of(key) == 1
-    assert coordinator.runnable_through_of(key) == 80
+    assert coordinator.runnable_num_tokens_of(key) == 80
     # RESUME reacquires the physical commitment for the new grant.
     assert manager.free_capacity() == 1000 - 80
     tokens = _publish(coordinator, manager, step_seq=3)
-    assert [t.runnable_through for t in tokens] == [80]
+    assert [t.runnable_num_tokens for t in tokens] == [80]
     assert manager.free_capacity() == 1000 - 80
 
 
@@ -400,7 +400,7 @@ def test_published_tokens_cannot_be_refused() -> None:
     )
     key = _key()
     coordinator.assign(key)
-    _grant(coordinator, manager, coordinator.reserve(key, requested_through=50))
+    _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=50))
     _publish(coordinator, manager, step_seq=1)
     assert manager.published_through(key) == 50
 
@@ -413,7 +413,7 @@ def test_published_tokens_cannot_be_refused() -> None:
     assert not coordinator.apply_receipt(receipt)
     assert not coordinator.is_preempted(key)
     assert coordinator.published_through(key) == 50
-    assert coordinator.runnable_through_of(key) == 50
+    assert coordinator.runnable_num_tokens_of(key) == 50
 
 
 # -- receipts ----------------------------------------------------------------------
@@ -427,9 +427,9 @@ def test_stale_duplicate_wrong_owner_wrong_epoch_receipts_are_ignored() -> None:
     )
     key = _key()
     coordinator.assign(key)
-    command = coordinator.reserve(key, requested_through=50)
+    command = coordinator.reserve(key, required_num_tokens=50)
     _grant(coordinator, manager, command)
-    assert coordinator.runnable_through_of(key) == 50
+    assert coordinator.runnable_num_tokens_of(key) == 50
 
     # Stale: an old command sequence cannot advance state.
     stale = OwnerReceipt(
@@ -437,10 +437,10 @@ def test_stale_duplicate_wrong_owner_wrong_epoch_receipts_are_ignored() -> None:
         owner_id=1,
         command_seq=command.command_seq - 1,
         accepted=True,
-        runnable_through=999,
+        runnable_num_tokens=999,
     )
     assert not coordinator.apply_receipt(stale)
-    assert coordinator.runnable_through_of(key) == 50
+    assert coordinator.runnable_num_tokens_of(key) == 50
 
     # Duplicate: the same sequence applied twice cannot advance state.
     duplicate = OwnerReceipt(
@@ -448,21 +448,21 @@ def test_stale_duplicate_wrong_owner_wrong_epoch_receipts_are_ignored() -> None:
         owner_id=1,
         command_seq=command.command_seq,
         accepted=True,
-        runnable_through=999,
+        runnable_num_tokens=999,
     )
     assert not coordinator.apply_receipt(duplicate)
-    assert coordinator.runnable_through_of(key) == 50
+    assert coordinator.runnable_num_tokens_of(key) == 50
 
     # Wrong owner.
     wrong_owner = OwnerReceipt(
         key=key,
         owner_id=9,
-        command_seq=coordinator.extend(key, requested_through=50).command_seq,
+        command_seq=coordinator.extend(key, required_num_tokens=50).command_seq,
         accepted=True,
-        runnable_through=999,
+        runnable_num_tokens=999,
     )
     assert not coordinator.apply_receipt(wrong_owner)
-    assert coordinator.runnable_through_of(key) == 50
+    assert coordinator.runnable_num_tokens_of(key) == 50
 
     # Wrong epoch: no lease exists for the un-admitted epoch key.
     wrong_epoch = OwnerReceipt(
@@ -470,10 +470,10 @@ def test_stale_duplicate_wrong_owner_wrong_epoch_receipts_are_ignored() -> None:
         owner_id=1,
         command_seq=1,
         accepted=True,
-        runnable_through=999,
+        runnable_num_tokens=999,
     )
     assert not coordinator.apply_receipt(wrong_epoch)
-    assert coordinator.runnable_through_of(key) == 50
+    assert coordinator.runnable_num_tokens_of(key) == 50
 
 
 def test_finish_abort_release_pending_and_exact_once_release() -> None:
@@ -484,7 +484,7 @@ def test_finish_abort_release_pending_and_exact_once_release() -> None:
     )
     key = _key()
     coordinator.assign(key)
-    _grant(coordinator, manager, coordinator.reserve(key, requested_through=50))
+    _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=50))
     _publish(coordinator, manager, step_seq=1)
 
     # Finish/abort leaves the commitment release-pending.
@@ -511,7 +511,7 @@ def test_finish_abort_release_pending_and_exact_once_release() -> None:
         command_seq=command.command_seq,
         accepted=True,
         released=True,
-        runnable_through=50,
+        runnable_num_tokens=50,
     )
     assert not coordinator.apply_receipt(duplicate)
     assert coordinator.release_count() == 1
@@ -519,15 +519,15 @@ def test_finish_abort_release_pending_and_exact_once_release() -> None:
     # A receipt claiming release against a non-RELEASE command cannot free.
     second = _key("req-1")
     coordinator.assign(second)
-    _grant(coordinator, manager, coordinator.reserve(second, requested_through=10))
-    command = coordinator.extend(second, requested_through=20)
+    _grant(coordinator, manager, coordinator.reserve(second, required_num_tokens=10))
+    command = coordinator.extend(second, required_num_tokens=20)
     forged = OwnerReceipt(
         key=second,
         owner_id=1,
         command_seq=command.command_seq,
         accepted=True,
         released=True,
-        runnable_through=20,
+        runnable_num_tokens=20,
     )
     assert coordinator.apply_receipt(forged)
     assert not coordinator.is_released(second)
@@ -543,7 +543,7 @@ def test_release_frees_exactly_once_across_manager_and_coordinator() -> None:
     keys = [_key(f"req-{i}") for i in range(3)]
     for key in keys:
         coordinator.assign(key)
-        _grant(coordinator, manager, coordinator.reserve(key, requested_through=20))
+        _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=20))
         _publish(coordinator, manager, step_seq=1)
         command = coordinator.finish(key)
         _grant(coordinator, manager, command)
@@ -569,15 +569,16 @@ def test_zero_capacity_reserve_refused_and_provisional_retried() -> None:
     key = _key()
     assert coordinator.assign(key, projected_work=10) == 1
 
-    # Zero-capacity RESERVE is a real pre-publication refusal, not an
-    # accepted zero-horizon grant.
-    command = coordinator.reserve(key, requested_through=50)
+    # A nonzero RESERVE against zero capacity is a real pre-publication
+    # refusal, not an accepted empty lease (a zero-token RESERVE is the
+    # one legal empty lease; see the empty-lease test below).
+    command = coordinator.reserve(key, required_num_tokens=50)
     receipt = manager1.apply(command)
     assert not receipt.accepted
     assert "capacity" in receipt.error
-    assert receipt.runnable_through is None
+    assert receipt.runnable_num_tokens is None
     assert not coordinator.apply_receipt(receipt)
-    assert coordinator.runnable_through_of(key) is None
+    assert coordinator.runnable_num_tokens_of(key) is None
     assert coordinator.published_through(key) == 0
 
     # Abandon the provisional assignment and retry another owner.
@@ -587,10 +588,10 @@ def test_zero_capacity_reserve_refused_and_provisional_retried() -> None:
         OwnerAssignmentObservation(owner_id=1, observation_seq=2, work=1000)
     )
     assert coordinator.assign(key, projected_work=10) == 2
-    command = coordinator.reserve(key, requested_through=50)
+    command = coordinator.reserve(key, required_num_tokens=50)
     receipt = manager2.apply(command)
     assert receipt.accepted
-    assert receipt.runnable_through == 50
+    assert receipt.runnable_num_tokens == 50
     assert coordinator.apply_receipt(receipt)
     assert coordinator.owner_of(key) == 2
 
@@ -599,6 +600,51 @@ def test_zero_capacity_reserve_refused_and_provisional_retried() -> None:
     with pytest.raises(OwnershipError):
         coordinator.abandon(key)
     assert coordinator.assign(key, projected_work=10) == 2
+
+
+def test_zero_token_reserve_is_legal_empty_lease_and_extends_later() -> None:
+    """A zero-token RESERVE is a legal empty lease: accepted, commits zero
+    tokens, and publishes no lease token; a later EXTEND acquires real
+    tokens and publication follows."""
+    coordinator = OwnerLeaseCoordinator()
+    manager = AttentionLeaseManager(owner_rank=1, capacity=100)
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=1, observation_seq=1, work=0)
+    )
+    key = _key()
+    assert coordinator.assign(key) == 1
+
+    # Zero-token RESERVE: the one legal empty lease.  It commits nothing,
+    # admits the lease, and publishes no token.
+    command = coordinator.reserve(key, required_num_tokens=0)
+    receipt = _grant(coordinator, manager, command)
+    assert receipt.accepted
+    assert receipt.runnable_num_tokens == 0
+    assert coordinator.runnable_num_tokens_of(key) == 0
+    assert manager.free_capacity() == 100
+    assert _publish(coordinator, manager, step_seq=1) == []
+    # Admission is real: the owner is sticky and finish is allowed.
+    assert coordinator.owner_of(key) == 1
+    with pytest.raises(OwnershipError):
+        coordinator.abandon(key)
+
+    # A later EXTEND acquires real tokens and publication follows.
+    command = coordinator.extend(key, required_num_tokens=5)
+    receipt = _grant(coordinator, manager, command)
+    assert receipt.accepted
+    assert receipt.runnable_num_tokens == 5
+    assert coordinator.runnable_num_tokens_of(key) == 5
+    tokens = _publish(coordinator, manager, step_seq=2)
+    assert [t.runnable_num_tokens for t in tokens] == [5]
+    assert manager.free_capacity() == 95
+
+    # The extended lease releases exactly once through the normal path.
+    command = coordinator.finish(key)
+    receipt = _grant(coordinator, manager, command)
+    assert receipt.accepted
+    assert receipt.released
+    assert coordinator.release_count() == 1
+    assert manager.free_capacity() == 100
 
 
 def test_abandon_refunds_provisional_charge() -> None:
@@ -622,7 +668,7 @@ def test_worker_emits_exactly_one_batch_per_step() -> None:
     )
     key = _key()
     coordinator.assign(key)
-    _grant(coordinator, manager, coordinator.reserve(key, requested_through=50))
+    _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=50))
 
     batch = manager.emit_batch(emitted_step_seq=7)
     assert batch.owner_rank == 1
@@ -743,10 +789,10 @@ def test_owner_command_sequence_is_monotonic_across_keys() -> None:
     coordinator.assign(key_a)
     coordinator.assign(key_b)
     commands = [
-        coordinator.reserve(key_a, requested_through=50),
-        coordinator.reserve(key_b, requested_through=50),
-        coordinator.extend(key_a, requested_through=100),
-        coordinator.extend(key_b, requested_through=100),
+        coordinator.reserve(key_a, required_num_tokens=50),
+        coordinator.reserve(key_b, required_num_tokens=50),
+        coordinator.extend(key_a, required_num_tokens=100),
+        coordinator.extend(key_b, required_num_tokens=100),
     ]
     seqs = [c.command_seq for c in commands]
     assert seqs == sorted(seqs)
@@ -765,7 +811,7 @@ def test_finish_is_idempotent_while_release_pending() -> None:
     )
     key = _key()
     coordinator.assign(key)
-    _grant(coordinator, manager, coordinator.reserve(key, requested_through=50))
+    _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=50))
     _publish(coordinator, manager, step_seq=1)
 
     # A double finish before the first receipt converges: the same
@@ -797,7 +843,7 @@ def test_finish_rejected_before_any_accepted_reserve() -> None:
         coordinator.finish(key)
     # After a refused RESERVE the lease is still provisional: finish is
     # still refused and the caller must abandon instead.
-    command = coordinator.reserve(key, requested_through=50)
+    command = coordinator.reserve(key, required_num_tokens=50)
     refused = OwnerReceipt(
         key=key,
         owner_id=1,
@@ -821,19 +867,19 @@ def test_publish_waits_for_receipted_grants() -> None:
     coordinator.assign(key)
 
     # A RESERVE that has not been receipted publishes nothing.
-    command = coordinator.reserve(key, requested_through=100)
+    command = coordinator.reserve(key, required_num_tokens=100)
     assert _publish(coordinator, manager, step_seq=1) == []
     # Only after its accepted receipt does the grant publish.
     _grant(coordinator, manager, command)
     tokens = _publish(coordinator, manager, step_seq=2)
-    assert [t.runnable_through for t in tokens] == [40]
+    assert [t.runnable_num_tokens for t in tokens] == [40]
 
     # An EXTEND in flight (issued, not receipted) publishes nothing new.
-    command = coordinator.extend(key, requested_through=100)
+    command = coordinator.extend(key, required_num_tokens=100)
     assert _publish(coordinator, manager, step_seq=3) == []
     _grant(coordinator, manager, command)
     tokens = _publish(coordinator, manager, step_seq=4)
-    assert [t.runnable_through for t in tokens] == [80]
+    assert [t.runnable_num_tokens for t in tokens] == [80]
 
 
 def test_publish_only_from_reserve_or_extend_grants() -> None:
@@ -844,14 +890,14 @@ def test_publish_only_from_reserve_or_extend_grants() -> None:
     )
     key = _key()
     coordinator.assign(key)
-    _grant(coordinator, manager, coordinator.reserve(key, requested_through=100))
+    _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=100))
     tokens = _publish(coordinator, manager, step_seq=1)
-    assert [t.runnable_through for t in tokens] == [40]
+    assert [t.runnable_num_tokens for t in tokens] == [40]
 
     # PREEMPT, RESTORE, and RELEASE receipts never advance publication.
     _grant(coordinator, manager, coordinator.preempt(key, preempt_through=40))
     assert _publish(coordinator, manager, step_seq=2) == []
-    _grant(coordinator, manager, coordinator.restore(key, requested_through=40))
+    _grant(coordinator, manager, coordinator.restore(key, required_num_tokens=40))
     assert _publish(coordinator, manager, step_seq=3) == []
     _grant(coordinator, manager, coordinator.finish(key))
     assert _publish(coordinator, manager, step_seq=4) == []

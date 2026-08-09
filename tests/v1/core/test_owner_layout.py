@@ -21,7 +21,13 @@ from vllm.v1.core.sched.owner_layout import (
     OwnerRowLayout,
     build_owner_row_layout,
 )
-from vllm.v1.core.sched.ownership import OwnerLeaseKey, OwnerLeaseToken
+from vllm.v1.core.sched.ownership import (
+    AttentionLeaseManager,
+    OwnerCommand,
+    OwnerCommandKind,
+    OwnerLeaseKey,
+    OwnerLeaseToken,
+)
 
 
 def _key(request_id: str = "req-0", epoch: int = 0) -> OwnerLeaseKey:
@@ -778,7 +784,7 @@ def test_owner_collective_plan_is_immutable_after_construction() -> None:
 def _lease(
     request_id: str,
     owner_id: int,
-    runnable_through: int,
+    runnable_num_tokens: int,
     step_seq: int = 3,
     epoch: int = 0,
 ) -> OwnerLeaseToken:
@@ -787,7 +793,7 @@ def _lease(
         owner_id=owner_id,
         step_seq=step_seq,
         command_seq=1,
-        runnable_through=runnable_through,
+        runnable_num_tokens=runnable_num_tokens,
     )
 
 
@@ -859,9 +865,9 @@ def test_build_layout_chunked_mixed_request_counts_and_epochs() -> None:
     request_ids = ["a", "a", "a", "b", "b", "c"]
     positions = [0, 1, 2, 0, 1, 0]
     leases = [
-        _lease("a", 11, 2, epoch=5),
+        _lease("a", 11, 3, epoch=5),
         _lease("b", 2, 3, epoch=5),
-        _lease("c", 7, 0, epoch=5),
+        _lease("c", 7, 1, epoch=5),
     ]
     layout = _build(request_ids, positions, leases)
     assert layout.owner_counts == (1, 2, 3)
@@ -891,7 +897,7 @@ def test_build_layout_chunked_mixed_request_counts_and_epochs() -> None:
 def test_build_layout_noncontiguous_unsorted_group_ranks() -> None:
     request_ids = ["a", "b", "a"]
     positions = [0, 0, 1]
-    leases = [_lease("b", 2, 1), _lease("a", 11, 1)]
+    leases = [_lease("b", 2, 1), _lease("a", 11, 2)]
     layout = _build(request_ids, positions, leases, group_ranks=(11, 7, 2))
     assert layout.group_ranks == (11, 7, 2)
     assert layout.global_to_local == {11: 0, 7: 1, 2: 2}
@@ -908,7 +914,7 @@ def test_build_layout_noncontiguous_unsorted_group_ranks() -> None:
 def test_build_layout_single_request_many_rows() -> None:
     request_ids = ["a"] * 4
     positions = [0, 1, 2, 3]
-    layout = _build(request_ids, positions, [_lease("a", 2, 3)])
+    layout = _build(request_ids, positions, [_lease("a", 2, 4)])
     assert layout.logical_len == 4
     assert layout.owner_counts == (0, 4, 0)
     assert [row.row_id.logical_token_position for row in layout.owner_rows] == [
@@ -973,9 +979,46 @@ def test_build_layout_rejects_invalid_positions() -> None:
         _build(["a"], ["0"], [lease])  # type: ignore[list-item]
     with pytest.raises(OwnerLayoutError):
         _build(["a"], [6], [lease])
-    # The boundary position is exactly allowed.
-    layout = _build(["a"], [5], [lease])
-    assert layout.global_rows[0].row_id.logical_token_position == 5
+    # The exclusive boundary is not a legal position: 5 < 5 is false.
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [5], [lease])
+    # The last runnable position is exactly runnable_num_tokens - 1.
+    layout = _build(["a"], [4], [lease])
+    assert layout.global_rows[0].row_id.logical_token_position == 4
+
+
+def test_build_layout_exclusive_bound_off_by_one_at_full_capacity() -> None:
+    """A lease granted exactly the full worker capacity makes the capacity
+    value the exclusive upper bound: the boundary position itself is
+    rejected while the last legal position is capacity - 1."""
+    manager = AttentionLeaseManager(owner_rank=7, capacity=4)
+    key = OwnerLeaseKey(request_id="a", owner_epoch=0)
+    receipt = manager.apply(
+        OwnerCommand(
+            key=key,
+            owner_id=7,
+            command_seq=1,
+            kind=OwnerCommandKind.RESERVE,
+            required_num_tokens=4,
+        )
+    )
+    assert receipt.accepted
+    # Full capacity is granted exactly, never truncated by one.
+    assert receipt.runnable_num_tokens == 4
+    assert manager.free_capacity() == 0
+    token = OwnerLeaseToken(
+        key=key,
+        owner_id=7,
+        step_seq=3,
+        command_seq=1,
+        runnable_num_tokens=4,
+    )
+    # The exact capacity value is out of range (0 <= position < 4).
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [4], [token], group_ranks=(7, 2, 11))
+    # The last legal position is capacity - 1.
+    layout = _build(["a"], [3], [token], group_ranks=(7, 2, 11))
+    assert layout.global_rows[0].row_id.logical_token_position == 3
 
 
 def test_build_layout_rejects_step_seq_violations() -> None:
@@ -1030,7 +1073,7 @@ def test_build_layout_rejects_owner_outside_group() -> None:
         _build(["a"], [0], [_lease("a", False, 1)], group_ranks=(0, 2))  # type: ignore[arg-type]
 
 
-def test_build_layout_rejects_nonint_runnable_through() -> None:
+def test_build_layout_rejects_nonint_runnable_num_tokens() -> None:
     with pytest.raises(OwnerLayoutError):
         _build(["a"], [0], [_lease("a", 7, None)])  # type: ignore[arg-type]
     with pytest.raises(OwnerLayoutError):
@@ -1044,7 +1087,7 @@ def test_build_layout_accepts_numpy_like_positions_without_numpy_import() -> Non
         step_seq=3,
         request_ids=["a", "a"],
         token_positions=np.array([0, 1], dtype=np.int64),
-        leases=[_lease("a", 7, 1)],
+        leases=[_lease("a", 7, 2)],
         group_ranks=(7, 2),
     )
     assert layout.logical_len == 2

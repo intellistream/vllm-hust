@@ -117,7 +117,7 @@ class TestModelRunnerOutputOwnerReceiptBatches(TestCase):
             owner_id=1,
             command_seq=2,
             accepted=True,
-            runnable_through=10,
+            runnable_num_tokens=10,
         )
         batch = OwnerReceiptBatch(
             owner_rank=1,

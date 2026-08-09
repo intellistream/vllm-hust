@@ -28,7 +28,7 @@ def _receipt(
     owner_epoch: int = 1,
     command_seq: int = 1,
     accepted: bool = True,
-    runnable_through: int = 10,
+    runnable_num_tokens: int = 10,
     released: bool = False,
     **kwargs,
 ) -> OwnerReceipt:
@@ -37,7 +37,7 @@ def _receipt(
         owner_id=owner_rank,
         command_seq=command_seq,
         accepted=accepted,
-        runnable_through=runnable_through,
+        runnable_num_tokens=runnable_num_tokens,
         released=released,
         **kwargs,
     )
@@ -534,8 +534,8 @@ def test_bool_event_identity_cannot_alias_integer_identity() -> None:
 def test_conflicting_duplicate_event_fatal():
     """Same identity with a conflicting payload raises instead of silently
     dropping or keeping one variant."""
-    ev = _receipt(1, request_id="req-a", command_seq=3, runnable_through=10)
-    conflicting = _receipt(1, request_id="req-a", command_seq=3, runnable_through=99)
+    ev = _receipt(1, request_id="req-a", command_seq=3, runnable_num_tokens=10)
+    conflicting = _receipt(1, request_id="req-a", command_seq=3, runnable_num_tokens=99)
     outputs = [
         _output(0, [_batch(0)], empty=True),
         _output(1, [_batch(1, events=(ev, conflicting))], empty=True),
