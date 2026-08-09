@@ -1214,6 +1214,8 @@ class VllmConfig:
             )
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+        self._validate_request_owned_attention()
+
         # async tp is built on top of sequence parallelism and requires it.
         pass_config = self.compilation_config.pass_config
         if pass_config.fuse_gemm_comms:
@@ -2142,6 +2144,71 @@ class VllmConfig:
             logger.warning_once(
                 "Model Runner V2 does not yet support the thinking_token_budget "
                 "request parameter. Set VLLM_USE_V2_MODEL_RUNNER=0 if this is required."
+            )
+
+    def _validate_request_owned_attention(self) -> None:
+        """Fail closed for the experimental request-owned attention (G0).
+
+        Request-owned attention is only supported inside a narrow envelope:
+        no pipeline parallelism, eager execution without CUDA graphs, no
+        speculative decoding (including MTP), and no KV cache CPU
+        offload/tiering or KV transfer (PD disaggregation / connectors).
+        Each unsupported mode raises a specific ValueError so the feature
+        can never silently run in an unsupported configuration.
+        """
+        if not self.scheduler_config.enable_request_owned_attention:
+            return
+
+        if self.parallel_config.pipeline_parallel_size != 1:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "pipeline_parallel_size=1, but got pipeline_parallel_size="
+                f"{self.parallel_config.pipeline_parallel_size}."
+            )
+
+        if self.speculative_config is not None:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support speculative decoding (including MTP), but got "
+                f"speculative_config.method={self.speculative_config.method!r}."
+            )
+
+        compilation_config = self.compilation_config
+        if compilation_config.mode != CompilationMode.NONE:
+            mode_name = getattr(compilation_config.mode, "name", None)
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "eager execution (CompilationMode.NONE), but got "
+                f"compilation_config.mode={mode_name}."
+            )
+        if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            cudagraph_name = getattr(compilation_config.cudagraph_mode, "name",
+                                     None)
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support CUDA graphs, but got compilation_config."
+                f"cudagraph_mode={cudagraph_name}."
+            )
+
+        if self.cache_config.kv_offloading_size is not None:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support KV cache CPU offloading, but got "
+                f"cache_config.kv_offloading_size="
+                f"{self.cache_config.kv_offloading_size}."
+            )
+
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support KV cache transfer/offload/tiering (PD "
+                "disaggregation or KV connectors), but got "
+                f"kv_transfer_config.kv_connector="
+                f"{self.kv_transfer_config.kv_connector!r} with "
+                f"kv_role={self.kv_transfer_config.kv_role!r}."
             )
 
     def validate_block_size(self) -> None:

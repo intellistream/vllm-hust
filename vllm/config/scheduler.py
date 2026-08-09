@@ -166,6 +166,13 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    enable_request_owned_attention: bool = False
+    """EXPERIMENTAL: run attention with per-request owned state.
+
+    Defaults to False. When enabled, ``VllmConfig`` fails closed unless the
+    configuration matches the supported G0 envelope (pipeline_parallel_size=1,
+    eager execution, no speculative decoding, no KV cache CPU offload)."""
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -224,6 +231,11 @@ class SchedulerConfig:
         #   impact on that. For more details, please check
         #   https://github.com/vllm-project/vllm/issues/29585
         factors.append(self.max_num_batched_tokens)
+
+        # Request-owned attention selects a different attention execution path
+        # (per-request attention) when enabled, which changes the structure of
+        # the computation graph (attention kernel selection and shapes).
+        factors.append(self.enable_request_owned_attention)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
