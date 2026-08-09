@@ -9,6 +9,7 @@ invariants, list and CPU torch round trips, padded-buffer logical-prefix
 handling, and every fail-closed case.  No GPU or model runner is built.
 """
 
+import numpy as np
 import pytest
 import torch
 
@@ -18,8 +19,9 @@ from vllm.v1.core.sched.owner_layout import (
     OwnerCollectivePlan,
     OwnerLayoutError,
     OwnerRowLayout,
+    build_owner_row_layout,
 )
-from vllm.v1.core.sched.ownership import OwnerLeaseKey
+from vllm.v1.core.sched.ownership import OwnerLeaseKey, OwnerLeaseToken
 
 
 def _key(request_id: str = "req-0", epoch: int = 0) -> OwnerLeaseKey:
@@ -768,3 +770,288 @@ def test_owner_collective_plan_is_immutable_after_construction() -> None:
     assert plan.local_rank == 2
     assert plan.owner_to_all_input_splits == (2, 2, 2, 2)
     assert plan.fanin_receive_rows == plan.local_owner_rows * 4
+
+
+# -- build_owner_row_layout: step builder from lease tokens ------------------
+
+
+def _lease(
+    request_id: str,
+    owner_id: int,
+    runnable_through: int,
+    step_seq: int = 3,
+    epoch: int = 0,
+) -> OwnerLeaseToken:
+    return OwnerLeaseToken(
+        key=OwnerLeaseKey(request_id=request_id, owner_epoch=epoch),
+        owner_id=owner_id,
+        step_seq=step_seq,
+        command_seq=1,
+        runnable_through=runnable_through,
+    )
+
+
+def _build(
+    request_ids: list[str],
+    positions: list[int],
+    leases: list[OwnerLeaseToken],
+    group_ranks: tuple[int, ...] = (7, 2, 11),
+    step_seq: int = 3,
+) -> OwnerRowLayout:
+    return build_owner_row_layout(
+        step_seq=step_seq,
+        request_ids=request_ids,
+        token_positions=positions,
+        leases=leases,
+        group_ranks=group_ranks,
+    )
+
+
+def test_build_layout_reordered_rows_vs_lease_order() -> None:
+    # Actual flattened execution order interleaves requests; the scheduler's
+    # lease sequence is in a different (scheduler-side) order.
+    request_ids = ["b", "a", "b", "c", "a"]
+    positions = [0, 1, 1, 0, 0]
+    leases = [
+        _lease("c", 7, 5),
+        _lease("a", 11, 5),
+        _lease("b", 2, 5),
+    ]
+    layout = _build(request_ids, positions, leases)
+    assert layout.step_seq == 3
+    assert layout.logical_len == 5
+    assert layout.group_ranks == (7, 2, 11)
+    # Canonical rows are exactly the flattened execution order.
+    assert [row.row_id.request_uid.request_id for row in layout.global_rows] == [
+        "b",
+        "a",
+        "b",
+        "c",
+        "a",
+    ]
+    assert [row.row_id.logical_token_position for row in layout.global_rows] == [
+        0,
+        1,
+        1,
+        0,
+        0,
+    ]
+    # Owner buckets: rank 7 owns c, rank 2 owns b, rank 11 owns a.
+    assert layout.owner_counts == (1, 2, 2)
+    assert [row.row_id.request_uid.request_id for row in layout.owner_rows] == [
+        "c",
+        "b",
+        "b",
+        "a",
+        "a",
+    ]
+    _assert_permutation_invariants(layout)
+    # Immutable and every row is lane 0 with the shared step fence.
+    with pytest.raises(AttributeError):
+        layout._step_seq = 9
+    for row in layout.owner_rows:
+        assert row.row_id.logical_lane == 0
+        assert row.step_seq == 3
+
+
+def test_build_layout_chunked_mixed_request_counts_and_epochs() -> None:
+    # Unequal chunk sizes: a has 3 rows, b has 2, c has 1.
+    request_ids = ["a", "a", "a", "b", "b", "c"]
+    positions = [0, 1, 2, 0, 1, 0]
+    leases = [
+        _lease("a", 11, 2, epoch=5),
+        _lease("b", 2, 3, epoch=5),
+        _lease("c", 7, 0, epoch=5),
+    ]
+    layout = _build(request_ids, positions, leases)
+    assert layout.owner_counts == (1, 2, 3)
+    assert layout.owner_offsets == (0, 1, 3, 6)
+    # The request epoch rides on the lease key into every row identity.
+    for row in layout.global_rows:
+        assert row.row_id.request_uid.owner_epoch == 5
+    assert [row.row_id.request_uid.request_id for row in layout.owner_rows] == [
+        "c",
+        "b",
+        "b",
+        "a",
+        "a",
+        "a",
+    ]
+    assert [row.row_id.logical_token_position for row in layout.owner_rows] == [
+        0,
+        0,
+        1,
+        0,
+        1,
+        2,
+    ]
+    _assert_permutation_invariants(layout)
+
+
+def test_build_layout_noncontiguous_unsorted_group_ranks() -> None:
+    request_ids = ["a", "b", "a"]
+    positions = [0, 0, 1]
+    leases = [_lease("b", 2, 1), _lease("a", 11, 1)]
+    layout = _build(request_ids, positions, leases, group_ranks=(11, 7, 2))
+    assert layout.group_ranks == (11, 7, 2)
+    assert layout.global_to_local == {11: 0, 7: 1, 2: 2}
+    assert layout.local_rank_of_global(11) == 0
+    assert layout.owner_counts == (2, 0, 1)
+    assert [row.row_id.request_uid.request_id for row in layout.owner_rows] == [
+        "a",
+        "a",
+        "b",
+    ]
+    _assert_permutation_invariants(layout)
+
+
+def test_build_layout_single_request_many_rows() -> None:
+    request_ids = ["a"] * 4
+    positions = [0, 1, 2, 3]
+    layout = _build(request_ids, positions, [_lease("a", 2, 3)])
+    assert layout.logical_len == 4
+    assert layout.owner_counts == (0, 4, 0)
+    assert [row.row_id.logical_token_position for row in layout.owner_rows] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    _assert_permutation_invariants(layout)
+
+
+def test_build_layout_empty_rows_require_empty_leases() -> None:
+    layout = _build([], [], [], group_ranks=(7, 2, 11))
+    assert layout.logical_len == 0
+    assert layout.owner_counts == (0, 0, 0)
+    assert layout.owner_offsets == (0, 0, 0, 0)
+    assert layout.global_rows == ()
+    assert layout.owner_rows == ()
+    _assert_permutation_invariants(layout)
+    # Empty rows with any lease fail closed.
+    with pytest.raises(OwnerLayoutError):
+        _build([], [], [_lease("a", 7, 1)])
+    with pytest.raises(OwnerLayoutError):
+        build_owner_row_layout(
+            step_seq=3,
+            request_ids=[],
+            token_positions=[],
+            leases=[],
+            group_ranks=[],
+        )
+
+
+def test_build_layout_rejects_length_mismatch() -> None:
+    with pytest.raises(OwnerLayoutError):
+        _build(["a", "a"], [0], [_lease("a", 7, 1)])
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0, 1], [_lease("a", 7, 1)])
+    with pytest.raises(OwnerLayoutError):
+        _build([], [0], [_lease("a", 7, 1)])
+
+
+def test_build_layout_rejects_invalid_request_ids() -> None:
+    with pytest.raises(OwnerLayoutError):
+        _build([""], [0], [_lease("", 7, 0)])
+    with pytest.raises(OwnerLayoutError):
+        _build(["a", ""], [0, 0], [_lease("a", 7, 0), _lease("", 2, 0)])
+    with pytest.raises(OwnerLayoutError):
+        _build([5], [0], [_lease("5", 7, 0)])  # type: ignore[list-item]
+    # A non-string lease request id cannot even be constructed: the frozen
+    # OwnerLeaseKey fails closed with TypeError at the type boundary.
+    with pytest.raises(TypeError):
+        _lease(5, 7, 0)  # type: ignore[arg-type]
+
+
+def test_build_layout_rejects_invalid_positions() -> None:
+    lease = _lease("a", 7, 5)
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [-1], [lease])
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [True], [lease])
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], ["0"], [lease])  # type: ignore[list-item]
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [6], [lease])
+    # The boundary position is exactly allowed.
+    layout = _build(["a"], [5], [lease])
+    assert layout.global_rows[0].row_id.logical_token_position == 5
+
+
+def test_build_layout_rejects_step_seq_violations() -> None:
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", 7, 1, step_seq=4)])
+    with pytest.raises(OwnerLayoutError):
+        build_owner_row_layout(
+            step_seq=True,
+            request_ids=["a"],
+            token_positions=[0],
+            leases=[_lease("a", 7, 1, step_seq=True)],
+            group_ranks=(7, 2),
+        )
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", 7, 1)], step_seq=-1)
+
+
+def test_build_layout_rejects_lease_quantity_violations() -> None:
+    # Missing lease for a scheduled request.
+    with pytest.raises(OwnerLayoutError):
+        _build(["a", "b"], [0, 0], [_lease("a", 7, 1)])
+    # Extra lease for an unscheduled request.
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", 7, 1), _lease("b", 2, 1)])
+    # Duplicate leases for one request.
+    with pytest.raises(OwnerLayoutError):
+        _build(
+            ["a", "a"],
+            [0, 1],
+            [_lease("a", 7, 1), _lease("a", 7, 1)],
+        )
+    # A lease that is not an OwnerLeaseToken.
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", 7, 1), ("a", 7)])  # type: ignore[list-item]
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [("a", 7)])  # type: ignore[list-item]
+
+
+def test_build_layout_rejects_owner_outside_group() -> None:
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", 5, 1)], group_ranks=(7, 2, 11))
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", -1, 1)], group_ranks=(7, 2, 11))
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", 2, 1)], group_ranks=(7, 11))
+    # Bool aliases must not match real ranks by hash equality.
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", True, 1)], group_ranks=(1, 2))  # type: ignore[arg-type]
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", False, 1)], group_ranks=(0, 2))  # type: ignore[arg-type]
+
+
+def test_build_layout_rejects_nonint_runnable_through() -> None:
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", 7, None)])  # type: ignore[arg-type]
+    with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", 7, True)])  # type: ignore[arg-type]
+
+
+def test_build_layout_accepts_numpy_like_positions_without_numpy_import() -> None:
+    # operator.index-based coercion keeps the helper dependency-neutral while
+    # tolerating numpy scalars from the runner's flattened position array.
+    layout = build_owner_row_layout(
+        step_seq=3,
+        request_ids=["a", "a"],
+        token_positions=np.array([0, 1], dtype=np.int64),
+        leases=[_lease("a", 7, 1)],
+        group_ranks=(7, 2),
+    )
+    assert layout.logical_len == 2
+    assert [row.row_id.logical_token_position for row in layout.global_rows] == [0, 1]
+    with pytest.raises(OwnerLayoutError):
+        build_owner_row_layout(
+            step_seq=3,
+            request_ids=["a"],
+            token_positions=np.array([2], dtype=np.int64),
+            leases=[_lease("a", 7, 1)],
+            group_ranks=(7, 2),
+        )

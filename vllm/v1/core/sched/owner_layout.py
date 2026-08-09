@@ -43,11 +43,12 @@ for physical padding: the helpers operate on the exact logical prefix and
 fail closed on any mismatch.
 """
 
+import operator
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from vllm.v1.core.sched.ownership import OwnerLeaseKey
+from vllm.v1.core.sched.ownership import OwnerLeaseKey, OwnerLeaseToken
 
 
 class OwnerLayoutError(Exception):
@@ -584,3 +585,144 @@ class OwnerCollectivePlan:
         """Fanin receive identities: the local owner's stable rows repeated
         once per source rank, in source-rank-major order."""
         return self._fanin_receive_rows
+
+
+# ---------------------------------------------------------------------------
+# Step builder from scheduler lease tokens
+# ---------------------------------------------------------------------------
+
+
+def _require_nonempty_string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise OwnerLayoutError(f"{name} must be a nonempty string, got {value!r}")
+    return value
+
+
+def _require_token_position(value: object, name: str) -> int:
+    """Coerce a non-bool integer-like token position to a plain ``int``.
+
+    Accepts anything implementing ``__index__`` (so numpy scalars work without
+    a numpy import) and rejects ``bool`` aliases explicitly.
+    """
+    if isinstance(value, bool):
+        raise OwnerLayoutError(f"{name} must be a nonnegative integer, got {value!r}")
+    try:
+        position = operator.index(value)
+    except TypeError as exc:
+        raise OwnerLayoutError(
+            f"{name} must be a nonnegative integer, got {value!r}"
+        ) from exc
+    if position < 0:
+        raise OwnerLayoutError(f"{name} must be a nonnegative integer, got {value!r}")
+    return position
+
+
+def build_owner_row_layout(
+    step_seq: int,
+    request_ids: Sequence[str],
+    token_positions: Sequence[int],
+    leases: Sequence[OwnerLeaseToken],
+    group_ranks: Sequence[int],
+) -> OwnerRowLayout:
+    """Build the immutable :class:`OwnerRowLayout` for one execution step.
+
+    The worker constructs this only after the flattened execution order is
+    known: ``request_ids`` and ``token_positions`` are the per-row flattened
+    request ids and absolute logical token positions in actual execution-row
+    order (one entry per row, equal lengths).  ``leases`` are the scheduler's
+    published :class:`OwnerLeaseToken` sequence for this step and
+    ``group_ranks`` the process-global ranks of the owning group in
+    group-local index order.
+
+    Contracts (all fail closed via :class:`OwnerLayoutError`):
+
+    * ``request_ids`` and ``token_positions`` have exactly equal lengths and
+      every request id is a nonempty string.
+    * Every token position is a nonnegative non-bool integer and is
+      ``<=`` the matching lease's ``runnable_through``.
+    * There is exactly one lease per distinct scheduled request: no missing,
+      extra, or duplicate leases; every lease's ``step_seq`` exactly equals
+      ``step_seq``; the lease key's request id matches the row request id and
+      supplies the request epoch; the owner is a member of ``group_ranks``.
+    * Every row uses logical lane 0.
+
+    Empty row input requires empty ``leases`` and produces a valid zero-row
+    layout (``group_ranks`` must still be nonempty).  The returned layout is
+    immutable; no tensor or device state is staged here.
+    """
+    step = _require_nonneg_int(step_seq, "step_seq")
+    rows_request_ids = [
+        _require_nonempty_string(request_id, "request_ids[i]")
+        for request_id in request_ids
+    ]
+    positions = [
+        _require_token_position(position, "token_positions[i]")
+        for position in token_positions
+    ]
+    if len(rows_request_ids) != len(positions):
+        raise OwnerLayoutError(
+            "request_ids and token_positions must have exactly equal lengths, "
+            f"got {len(rows_request_ids)} and {len(positions)}"
+        )
+    group = _validate_group_ranks(group_ranks)
+    group_local = {rank: local for local, rank in enumerate(group)}
+
+    lease_by_request_id: dict[str, OwnerLeaseToken] = {}
+    for lease in leases:
+        if not isinstance(lease, OwnerLeaseToken):
+            raise OwnerLayoutError(
+                f"leases must contain OwnerLeaseToken, got {lease!r}"
+            )
+        lease_request_id = _require_nonempty_string(
+            lease.key.request_id, "lease key request_id"
+        )
+        if lease.step_seq != step:
+            raise OwnerLayoutError(
+                "lease step_seq must exactly equal the layout step_seq; got "
+                f"{lease.step_seq} for request {lease_request_id!r}, "
+                f"expected {step}"
+            )
+        if lease_request_id in lease_by_request_id:
+            raise OwnerLayoutError(
+                f"duplicate lease for scheduled request {lease_request_id!r}"
+            )
+        lease_by_request_id[lease_request_id] = lease
+
+    row_request_id_set = set(rows_request_ids)
+    missing = row_request_id_set - lease_by_request_id.keys()
+    if missing:
+        raise OwnerLayoutError(f"no lease for scheduled request {sorted(missing)[0]!r}")
+    extra = lease_by_request_id.keys() - row_request_id_set
+    if extra:
+        raise OwnerLayoutError(f"lease for unscheduled request {sorted(extra)[0]!r}")
+
+    row_ids: list[GlobalRowId] = []
+    owner_by_request_uid: dict[OwnerLeaseKey, int] = {}
+    for request_id, position in zip(rows_request_ids, positions):
+        lease = lease_by_request_id[request_id]
+        owner = lease.owner_id
+        if (
+            isinstance(owner, bool)
+            or not isinstance(owner, int)
+            or owner not in group_local
+        ):
+            raise OwnerLayoutError(
+                f"lease owner {owner!r} for request {request_id!r} is not in "
+                f"group_ranks {group!r}"
+            )
+        if isinstance(lease.runnable_through, bool) or not isinstance(
+            lease.runnable_through, int
+        ):
+            raise OwnerLayoutError(
+                f"lease runnable_through must be an int for request "
+                f"{request_id!r}, got {lease.runnable_through!r}"
+            )
+        if position > lease.runnable_through:
+            raise OwnerLayoutError(
+                f"token position {position} for request {request_id!r} exceeds "
+                f"lease runnable_through {lease.runnable_through}"
+            )
+        key = OwnerLeaseKey(request_id=request_id, owner_epoch=lease.key.owner_epoch)
+        row_ids.append(GlobalRowId(request_uid=key, logical_token_position=position))
+        owner_by_request_uid[key] = owner
+    return OwnerRowLayout(step, row_ids, owner_by_request_uid, group)
