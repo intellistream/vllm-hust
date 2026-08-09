@@ -676,6 +676,11 @@ def build_owner_row_layout(
         lease_request_id = _require_nonempty_string(
             lease.key.request_id, "lease key request_id"
         )
+        if isinstance(lease.step_seq, bool) or not isinstance(lease.step_seq, int):
+            raise OwnerLayoutError(
+                "lease step_seq must be a non-bool int for request "
+                f"{lease_request_id!r}, got {lease.step_seq!r}"
+            )
         if lease.step_seq != step:
             raise OwnerLayoutError(
                 "lease step_seq must exactly equal the layout step_seq; got "

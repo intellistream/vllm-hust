@@ -982,6 +982,8 @@ def test_build_layout_rejects_step_seq_violations() -> None:
     with pytest.raises(OwnerLayoutError):
         _build(["a"], [0], [_lease("a", 7, 1, step_seq=4)])
     with pytest.raises(OwnerLayoutError):
+        _build(["a"], [0], [_lease("a", 7, 1, step_seq=True)])
+    with pytest.raises(OwnerLayoutError):
         build_owner_row_layout(
             step_seq=True,
             request_ids=["a"],
