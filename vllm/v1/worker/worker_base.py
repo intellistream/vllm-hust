@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from copy import copy, deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
@@ -220,6 +220,43 @@ class WorkerBase:
         return
 
 
+@dataclass(frozen=True, slots=True)
+class _RequestOwnedDeferredStep:
+    """One deferred request-owned sampling step awaiting ``sample_tokens``.
+
+    Captured when the underlying ``execute_model`` returns ``None`` under
+    ``enable_request_owned_sampling``: the exact step fence, the trial
+    logical manager that must be committed only on success, and the exact
+    immutable step metadata that must be marked exactly once.  Nothing is
+    marked, flushed, emitted, or committed until ``sample_tokens``
+    completes the step; a failed completion never clears the record.
+    """
+
+    step_seq: int
+    trial_manager: AttentionLeaseManager
+    metadata: RequestOwnedStepMetadata
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.step_seq, bool)
+            or not isinstance(self.step_seq, int)
+            or self.step_seq <= 0
+        ):
+            raise TypeError(
+                f"step_seq must be a positive non-bool int, got {self.step_seq!r}."
+            )
+        if not isinstance(self.trial_manager, AttentionLeaseManager):
+            raise TypeError(
+                "trial_manager must be an AttentionLeaseManager, got "
+                f"{type(self.trial_manager).__name__}."
+            )
+        if not isinstance(self.metadata, RequestOwnedStepMetadata):
+            raise TypeError(
+                "metadata must be a RequestOwnedStepMetadata, got "
+                f"{type(self.metadata).__name__}."
+            )
+
+
 class WorkerWrapperBase:
     """
     This class represents one process in an executor/engine. It is responsible
@@ -259,6 +296,22 @@ class WorkerWrapperBase:
         #: worker through its private hook; never attached to a scheduler
         #: wire.
         self._request_owned_step_metadata: RequestOwnedStepMetadata | None = None
+
+        #: Pending deferred request-owned sampling step (G3).  Set exactly
+        #: when the underlying ``execute_model`` returns ``None`` under
+        #: ``enable_request_owned_sampling``; consumed (cleared) only by a
+        #: fully successful ``sample_tokens`` completion.  A pending record
+        #: rejects the next ``execute_model`` call and any replay without a
+        #: pending record, and is never cleared by a failed completion.
+        self._request_owned_deferred: _RequestOwnedDeferredStep | None = None
+
+        #: Irreversible request-owned fail-stop latch (G3).  Set only when
+        #: the computed-batch mark succeeded but the terminal completion
+        #: (flush/emit/pool snapshot) failed afterwards: the step is already
+        #: marked in the store and can never be retried, so every further
+        #: request-owned call fails closed instead of risking a duplicate
+        #: mark.
+        self._request_owned_fail_stop: str | None = None
 
     def shutdown(self) -> None:
         if self.worker is not None:
@@ -461,18 +514,49 @@ class WorkerWrapperBase:
 
     def _execute_request_owned_control_step(
         self, scheduler_output: SchedulerOutput
-    ) -> ModelRunnerOutput:
+    ) -> ModelRunnerOutput | None:
         """Execute the G2 worker boundary over the rank-local physical store.
 
         Commands are composed failure-atomically: a deep-copied logical
         candidate is the preflight (fence/outbox), the physical store is
         consulted only when the candidate accepts, and a physical refusal
         advances the authoritative fences through the external-reject seam
-        without any logical transition.  The positive step and zero-token
-        terminal validation below are unchanged: G2 is still control-only
-        at this milestone, so every token-bearing schedule is refused before
-        the underlying worker runs.
+        without any logical transition.
+
+        G3 sampling (``enable_request_owned_sampling``, default off):
+        the flag admits structurally valid token-bearing schedules through
+        the same store/lease/metadata checks.  A step whose underlying
+        ``execute_model`` returns ``None`` stores exactly one pending
+        deferred record (trial manager + exact metadata) keyed by
+        ``step_seq`` and returns ``None`` without marking, flushing,
+        emitting, or committing anything; the explicit :meth:`sample_tokens`
+        then runs the shared terminal path.  A synchronous
+        :class:`ModelRunnerOutput` takes the same terminal path
+        immediately.  The flag-off path preserves the control-only token
+        and split-return rejections byte-for-byte.  A failure after the
+        computed-batch mark is irreversible (the step is already marked)
+        and latches a fail-stop state that rejects all further
+        request-owned calls.
         """
+        # G3 lifecycle: fail-closed latch for an irreversible post-mark
+        # failure (the step is already marked and cannot be retried) must
+        # reject before any state is touched.
+        self._request_owned_fail_stop_guard()
+
+        # G3 lifecycle: a prior deferred step must complete through
+        # sample_tokens before any next execute call.  Fail closed before
+        # touching any state (including the start-of-call None handoff) so
+        # the pending record and its exact metadata stay intact.
+        if self._request_owned_deferred is not None:
+            raise RuntimeError(
+                "request-owned attention has a pending deferred sampling "
+                f"step (step_seq={self._request_owned_deferred.step_seq}): "
+                "sample_tokens must complete before the next execute_model "
+                "call."
+            )
+
+        sampling_enabled = self._request_owned_sampling_enabled()
+
         # G3 lifecycle: actively clear stale worker-private metadata at the
         # start of every request-owned call, before any validation.  The
         # ``None`` handoff clears the concrete worker's runner state too,
@@ -490,22 +574,48 @@ class WorkerWrapperBase:
 
         total_tokens = scheduler_output.total_num_scheduled_tokens
         per_request_tokens = scheduler_output.num_scheduled_tokens
-        if (
-            isinstance(total_tokens, bool)
-            or not isinstance(total_tokens, int)
-            or total_tokens != 0
-            or any(
-                isinstance(count, bool) or not isinstance(count, int) or count < 0
-                for count in per_request_tokens.values()
-            )
-            or sum(per_request_tokens.values()) != 0
-        ):
-            raise RuntimeError(
-                "request-owned attention G1 is control-only: refusing to "
-                "execute a nonempty or inconsistent token schedule through "
-                "replicated KV before the G2 owner-local allocator/routing "
-                "prerequisite exists."
-            )
+        if not sampling_enabled:
+            # Flag-off control-only gate (byte-for-byte unchanged): every
+            # token-bearing schedule is refused before the underlying worker
+            # runs.
+            if (
+                isinstance(total_tokens, bool)
+                or not isinstance(total_tokens, int)
+                or total_tokens != 0
+                or any(
+                    isinstance(count, bool) or not isinstance(count, int) or count < 0
+                    for count in per_request_tokens.values()
+                )
+                or sum(per_request_tokens.values()) != 0
+            ):
+                raise RuntimeError(
+                    "request-owned attention G1 is control-only: refusing to "
+                    "execute a nonempty or inconsistent token schedule through "
+                    "replicated KV before the G2 owner-local allocator/routing "
+                    "prerequisite exists."
+                )
+        else:
+            # G3 sampling: admit structurally valid token-bearing schedules
+            # (non-bool int types, nonnegativity, total == sum of per-request
+            # counts, the scheduler invariant) through the same store/lease/
+            # metadata checks; inconsistent envelopes still fail before the
+            # underlying worker runs.
+            if (
+                isinstance(total_tokens, bool)
+                or not isinstance(total_tokens, int)
+                or total_tokens < 0
+                or any(
+                    isinstance(count, bool) or not isinstance(count, int) or count < 0
+                    for count in per_request_tokens.values()
+                )
+                or sum(per_request_tokens.values()) != total_tokens
+            ):
+                raise RuntimeError(
+                    "request-owned attention sampling admits only a "
+                    "consistent non-bool token schedule, got "
+                    f"total={total_tokens!r} per_request="
+                    f"{dict(per_request_tokens)!r}."
+                )
 
         # Apply the step to a trial copy.  Manager fences/outbox become durable
         # only after a concrete synchronous output is available, so an
@@ -558,21 +668,37 @@ class WorkerWrapperBase:
                 trial_manager.record_published(token)
 
         # G3 seam: after command+publication validation, freeze the
-        # immutable worker-local execution metadata for this step.  The
-        # zero-token terminal gate above still refuses every token-bearing
-        # schedule before the model runner, so the handed metadata is
-        # always the empty heartbeat batch at this milestone; no computed
-        # progress is marked here.
-        self._request_owned_step_metadata = self._build_request_owned_step_metadata(
+        # immutable worker-local execution metadata for this step.  No
+        # computed progress is marked here; completion is declared by the
+        # shared terminal path (mark -> flush -> emit -> commit) once the
+        # executing GPU step finished, synchronously or through
+        # sample_tokens.
+        metadata = self._build_request_owned_step_metadata(
             store, step_seq, scheduler_output
         )
+        self._request_owned_step_metadata = metadata
         # G3 handoff: deliver the immutable metadata to the concrete worker
         # through its private hook, without attaching it to or mutating any
         # scheduler wire object; unsupported workers fail closed.
-        self._deliver_request_owned_step_metadata(self._request_owned_step_metadata)
+        self._deliver_request_owned_step_metadata(metadata)
 
         self._apply_mm_cache(scheduler_output)
         output = self.worker.execute_model(scheduler_output)
+
+        from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+
+        if sampling_enabled and output is None:
+            # Deferred sampling: keep the trial manager and the exact
+            # metadata in one pending record keyed by step_seq.  Nothing is
+            # marked, flushed, emitted, or committed until sample_tokens
+            # completes the step.
+            self._request_owned_deferred = _RequestOwnedDeferredStep(
+                step_seq=step_seq,
+                trial_manager=trial_manager,
+                metadata=metadata,
+            )
+            return None
+
         if output is None:
             raise RuntimeError(
                 "request-owned attention G1 does not support split sampling: "
@@ -582,8 +708,6 @@ class WorkerWrapperBase:
         # Async outputs can overlap subsequent steps.  Until receipt state is
         # kept in a step-keyed FIFO, decorating them here could drain events
         # into the wrong step, so fail explicitly rather than guessing.
-        from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-
         if isinstance(output, AsyncModelRunnerOutput):
             raise RuntimeError(
                 "request-owned attention G1 does not support async model "
@@ -593,6 +717,13 @@ class WorkerWrapperBase:
             raise RuntimeError(
                 "request-owned attention worker returned an unexpected "
                 f"output type {type(output).__name__}."
+            )
+
+        if sampling_enabled:
+            # Synchronous token output: same terminal path as the deferred
+            # sample_tokens completion (mark -> flush -> emit -> commit).
+            return self._complete_request_owned_step(
+                step_seq, trial_manager, metadata, output
             )
 
         # Never mutate a worker-owned output or EMPTY_MODEL_RUNNER_OUTPUT.
@@ -608,6 +739,42 @@ class WorkerWrapperBase:
         ]
         self._request_owned_control_manager = trial_manager
         return result
+
+    def _request_owned_sampling_enabled(self) -> bool:
+        """G3 sampling gate, default off.
+
+        The config field lands separately, so the wrapper reads it safely
+        with ``getattr(..., False)``: until then (and on every default
+        config) the flag-off control-only path is preserved unchanged.
+        The gate is strict: only a real ``bool`` admits the deferred
+        sampling protocol, so accidental truthy values (``1``,
+        ``"true"``) fail closed instead of silently enabling it.
+        """
+        value = getattr(
+            self.vllm_config.scheduler_config,
+            "enable_request_owned_sampling",
+            False,
+        )
+        if not isinstance(value, bool):
+            raise RuntimeError(
+                "enable_request_owned_sampling must be a bool, got "
+                f"{type(value).__name__} ({value!r})."
+            )
+        return value
+
+    def _request_owned_fail_stop_guard(self) -> None:
+        """Reject every request-owned call once the fail-stop latch is set.
+
+        The latch is set only after a successful computed-batch mark was
+        followed by a terminal completion failure: the step is already
+        marked in the store and can never be retried (a retry would hit a
+        duplicate mark), so further calls must fail closed instead of
+        risking duplicate or out-of-order marks."""
+        if self._request_owned_fail_stop is not None:
+            raise RuntimeError(
+                "request-owned attention is in an irreversible fail-stop "
+                f"state: {self._request_owned_fail_stop}"
+            )
 
     @staticmethod
     def _apply_request_owned_physical(
@@ -686,6 +853,154 @@ class WorkerWrapperBase:
                 "workers fail closed."
             )
         handoff(metadata)
+
+    def sample_tokens(
+        self, grammar_output: GrammarOutput
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Explicit wrapper sampling seam.
+
+        Default (request-owned attention disabled) delegates to the
+        underlying worker exactly like the historical ``__getattr__``
+        delegation.  With request-owned attention enabled, split sampling
+        is only supported under ``enable_request_owned_sampling`` with a
+        pending deferred step: the completion runs the same terminal path
+        as a synchronous token output.  Calls after an irreversible
+        post-mark failure also fail closed.  Any other call fails
+        closed."""
+        if not self.vllm_config.scheduler_config.enable_request_owned_attention:
+            return self.worker.sample_tokens(grammar_output)
+        # Irreversible post-mark failure latch: reject before any state.
+        self._request_owned_fail_stop_guard()
+        if not self._request_owned_sampling_enabled():
+            raise RuntimeError(
+                "request-owned attention does not support split sampling "
+                "without enable_request_owned_sampling: execute_model never "
+                "defers in this mode, so sample_tokens must not be called."
+            )
+        return self._sample_request_owned(grammar_output)
+
+    def _sample_request_owned(
+        self, grammar_output: GrammarOutput
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Complete one pending deferred request-owned sampling step.
+
+        Requires exactly one pending record (replay after success and
+        out-of-order calls fail closed), calls the underlying worker's
+        ``sample_tokens``, rejects ``None``/async/unexpected outputs, then
+        runs the shared terminal path (mark exactly once, flush, emit the
+        exact receipt batch with the post-flush pool snapshot, commit the
+        trial manager) on a copy of the worker output.  Worker-emitted
+        ``owner_sampling_batches`` ride the copied output untouched.  Any
+        failure leaves the pending record intact and the logical manager
+        uncommitted; only full success clears the pending record.  A
+        post-mark failure latches the wrapper fail-stop state: the step
+        is already marked in the store and cannot be retried, and the
+        pending record is never cleared."""
+        pending = self._request_owned_deferred
+        if pending is None:
+            raise RuntimeError(
+                "request-owned sample_tokens requires a pending deferred "
+                "step: execute_model returned None but no deferred record "
+                "exists (replay or out-of-order call)."
+            )
+
+        output = self.worker.sample_tokens(grammar_output)
+
+        from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+
+        if output is None:
+            raise RuntimeError(
+                "request-owned deferred sampling failed: "
+                "worker.sample_tokens returned None."
+            )
+        if isinstance(output, AsyncModelRunnerOutput):
+            raise RuntimeError(
+                "request-owned attention does not support async model "
+                "runner outputs from sample_tokens without a step-keyed "
+                "receipt FIFO."
+            )
+        if not isinstance(output, ModelRunnerOutput):
+            raise RuntimeError(
+                "request-owned attention worker returned an unexpected "
+                f"output type {type(output).__name__} from sample_tokens."
+            )
+
+        result = self._complete_request_owned_step(
+            pending.step_seq, pending.trial_manager, pending.metadata, output
+        )
+        # Clear the pending record only after the terminal path fully
+        # succeeded (manager committed); a failure above leaves it intact.
+        self._request_owned_deferred = None
+        return result
+
+    def _complete_request_owned_step(
+        self,
+        step_seq: int,
+        trial_manager: AttentionLeaseManager,
+        metadata: RequestOwnedStepMetadata,
+        output: ModelRunnerOutput,
+    ) -> ModelRunnerOutput:
+        """Shared terminal decoration for request-owned sampling.
+
+        Never mutates a worker-owned output or the shared empty singleton:
+        the output is copied first.  Then the exact step metadata is marked
+        exactly once (all-or-nothing in the store; marking the empty
+        metadata of a zero-token heartbeat step is a valid accepted no-op),
+        deferred physical frees are flushed, and the exact receipt batch
+        with the post-flush pool snapshot is attached before the trial
+        logical manager is committed.  A rejection of the mark fails
+        atomically: the logical manager stays uncommitted and (for the
+        deferred path) the pending record stays intact.  A failure after
+        the mark is irreversible -- the step is already marked in the
+        store and cannot be retried -- so the wrapper latches a fail-stop
+        state that rejects every further request-owned call."""
+        store = self._request_owned_kv_store
+        if store is None:
+            raise RuntimeError(
+                "request-owned attention worker store is not initialized: "
+                "the request-owned sampling completion requires the "
+                "rank-local RequestOwnedKVStore."
+            )
+
+        # Never mutate a worker-owned output or EMPTY_MODEL_RUNNER_OUTPUT.
+        result = copy(output)
+        # Atomic computed-batch mark: validates every entry and full
+        # coverage of the step's expectations before any record advances; a
+        # rejection fails closed with no partial logical commit.  Marking
+        # empty execution metadata (a zero-token heartbeat step) is a valid
+        # no-op accepted by the store.
+        mark = store.mark_computed_batch(metadata)
+        if not mark.accepted:
+            raise RuntimeError(
+                "request-owned computed batch mark failed: "
+                f"{mark.error or 'unknown error'}"
+            )
+        try:
+            # Post-execute completion fence: only now that the executing GPU
+            # step finished are deferred physical PREEMPT/RELEASE frees
+            # returned to the shared pool, so the receipt certifies physical
+            # free.  The attached capacity snapshot is block-ID-free and is
+            # taken after the flush.
+            store.flush()
+            batch = trial_manager.emit_batch(step_seq)
+            result.owner_receipt_batches = [
+                replace(batch, cache_pool=store.pool_snapshot())
+            ]
+        except BaseException as exc:
+            # The computed-batch mark already succeeded and is irreversible:
+            # a retry would hit a duplicate mark, so the step can never be
+            # retried.  Latch the wrapper fail-stop and re-raise; the
+            # pending record (if any) is not cleared, but the fail-stop
+            # guard rejects every further request-owned call before it can
+            # be touched.
+            self._request_owned_fail_stop = (
+                "computed batch mark succeeded but the irreversible "
+                f"terminal completion failed ({exc!r}); the step is "
+                "already marked and cannot be retried."
+            )
+            raise
+        self._request_owned_control_manager = trial_manager
+        return result
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
