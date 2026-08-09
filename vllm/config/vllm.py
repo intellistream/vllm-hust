@@ -2167,6 +2167,13 @@ class VllmConfig:
                 f"{self.parallel_config.pipeline_parallel_size}."
             )
 
+        if self.parallel_config.use_ray:
+            raise ValueError(
+                "Request-owned attention does not support the Ray executor. "
+                "The initial distributed runtime is MultiprocExecutor with "
+                "HCCL."
+            )
+
         if self.speculative_config is not None:
             raise ValueError(
                 "Request-owned attention is experimental and does not "

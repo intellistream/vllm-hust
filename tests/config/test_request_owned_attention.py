@@ -115,6 +115,17 @@ def test_enabled_rejects_pipeline_parallelism():
         _vllm_config(parallel_config=ParallelConfig(pipeline_parallel_size=2))
 
 
+def test_enabled_rejects_ray_executor():
+    # Ray is intentionally not installed in this NPU environment. Mutate an
+    # already validated disabled config, then invoke the feature validation
+    # directly so the test reaches this gate without importing optional Ray.
+    vllm_config = _vllm_config(enable_request_owned_attention=False)
+    vllm_config.scheduler_config.enable_request_owned_attention = True
+    vllm_config.parallel_config.distributed_executor_backend = "ray"
+    with pytest.raises(ValueError, match="does not support the Ray executor"):
+        vllm_config._validate_request_owned_attention()
+
+
 def test_enabled_rejects_speculative_decoding():
     with pytest.raises(ValueError, match="speculative"):
         _vllm_config(speculative_config=_speculative_config())

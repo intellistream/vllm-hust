@@ -67,7 +67,15 @@ class RayDistributedExecutor(Executor):
     uses_ray: bool = True
     supports_pp: bool = True
 
+    def _reject_request_owned_attention(self) -> None:
+        if self.scheduler_config.enable_request_owned_attention:
+            raise RuntimeError(
+                "Request-owned attention does not support the Ray executor; "
+                "use MultiprocExecutor with HCCL."
+            )
+
     def _init_executor(self) -> None:
+        self._reject_request_owned_attention()
         self.forward_dag: ray.dag.CompiledDAG | None = None
 
         # For TPU or XPU, avoid compiling NVIDIA's NCCL
@@ -392,7 +400,7 @@ class RayDistributedExecutor(Executor):
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
-        self._validate_request_owned_control_only_step(scheduler_output)
+        self._reject_request_owned_attention()
         if self.scheduler_output is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -439,10 +447,9 @@ class RayDistributedExecutor(Executor):
         non_block: bool = False,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         # execute_model() can defer token work until sample_tokens(). Recheck
-        # the mutable experimental gate at the actual dispatch boundary so a
-        # disabled -> enabled transition cannot send token work to Ray workers
-        # whose configuration still permits replicated KV execution.
-        self._validate_request_owned_control_only_step(scheduler_output)
+        # the mutable flag at the actual dispatch boundary so a disabled ->
+        # enabled transition cannot enter this unsupported backend.
+        self._reject_request_owned_attention()
 
         # Build the compiled DAG for the first time.
         if self.forward_dag is None:  # type: ignore
@@ -450,10 +457,7 @@ class RayDistributedExecutor(Executor):
 
         refs = self.forward_dag.execute((scheduler_output, grammar_output))  # type: ignore
 
-        use_all_worker_outputs = (
-            self.has_connector or self.scheduler_config.enable_request_owned_attention
-        )
-        if not use_all_worker_outputs:
+        if not self.has_connector:
             # Get output only from a single worker (output_rank)
             # When PP is not used, we block here until the result is available.
             if not non_block:
@@ -465,24 +469,8 @@ class RayDistributedExecutor(Executor):
             # the scheduler can yield to the next batch.
             return FutureWrapper(refs[0])
 
-        # Get output from all workers when a connector is present, or when
-        # request-owned attention is enabled (owner receipts from every rank
-        # must be aggregated or they would be dropped).
-        if self.scheduler_config.enable_request_owned_attention:
-            assert self.model_runner_output_aggregator is not None, (
-                "request-owned attention is enabled but the model runner "
-                "output aggregator was not constructed."
-            )
-            # Bind the shared aggregator to this scheduler's exact step_seq:
-            # the immutable per-step adapter delegates with
-            # expected_step_seq set to that step, so stale/future receipts
-            # fail closed on both the sync and FutureWrapper paths without
-            # storing any mutable step state on the shared aggregator.
-            aggregator = self.model_runner_output_aggregator.for_step(
-                scheduler_output.step_seq
-            )
-        else:
-            aggregator = self.kv_output_aggregator
+        # Get output from all workers when a connector is present.
+        aggregator = self.kv_output_aggregator
         assert aggregator is not None
         if not non_block:
             # Block and get results from all workers

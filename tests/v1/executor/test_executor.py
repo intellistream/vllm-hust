@@ -321,16 +321,16 @@ def test_multiproc_control_only_guard_precedes_transport(total, per_request):
     assert executor.rpc_broadcast_mq.enqueued == []
 
 
-def test_ray_deferred_dispatch_rechecks_control_only_guard():
+def test_ray_deferred_dispatch_rejects_unsupported_backend():
     """A mutable false -> true gate transition between execute_model() and
-    sample_tokens() must fail before constructing or executing the Ray DAG."""
+    sample_tokens() must reject Ray before constructing or executing its DAG."""
     executor = RayDistributedExecutor.__new__(RayDistributedExecutor)
     executor.scheduler_config = SimpleNamespace(enable_request_owned_attention=True)
     scheduler_output = _g0_scheduler_output()
     scheduler_output.total_num_scheduled_tokens = 1
     scheduler_output.num_scheduled_tokens = {"req": 1}
 
-    with pytest.raises(RuntimeError, match="control-only"):
+    with pytest.raises(RuntimeError, match="does not support the Ray executor"):
         executor._execute_dag(scheduler_output, None)
     assert not hasattr(executor, "forward_dag")
 
