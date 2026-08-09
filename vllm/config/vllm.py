@@ -2147,9 +2147,9 @@ class VllmConfig:
             )
 
     def _validate_request_owned_attention(self) -> None:
-        """Fail closed for the experimental request-owned attention (G2).
+        """Fail closed for the experimental request-owned attention (G3).
 
-        The specific envelope rejections below stay first and unchanged
+        The specific G2 envelope rejections below stay first and unchanged
         (pipeline parallelism, speculative decoding including MTP, non-eager
         execution / CUDA graphs, KV cache CPU offload/tiering, and KV
         transfer / PD disaggregation). G2 provides the control-plane receipt
@@ -2157,25 +2157,70 @@ class VllmConfig:
         supported envelope is now constructible: Multiproc/non-Ray execution,
         PP=1, eager execution without CUDA graphs, no speculative decoding,
         no KV cache offload/transfer/connectors, prefix caching disabled,
-        DCP=1, PCP=1, and synchronous scheduling. Every other combination
-        keeps failing closed with a precise diagnostic; token execution paths
-        retain their own independent gates and are not relaxed here.
+        DCP=1, PCP=1, and synchronous scheduling.
+
+        G3 additionally fails closed at construction time for combinations
+        whose runtime semantics the request-owned path does not implement
+        yet: the V2 model runner, dynamic batch overlap / micro-batching
+        (DBO), distributed EC cache transfer, KV-sharing fast prefill, any
+        executor other than Multiproc (UniProc is tolerated only for
+        single-process host/control tests), non-generative (pooling/draft)
+        runner types, and sequence parallelism / async TP
+        (``pass_config.enable_sp`` / ``pass_config.fuse_gemm_comms``).
+
+        Residual: FlashComm and the optional O-projection TP split are only
+        exposed through platform-plugin environment / ``additional_config``
+        switches; core config has no stable construction-time field for
+        them, so those plugin and runtime gates remain authoritative. Every
+        other combination keeps failing closed with a precise diagnostic;
+        token execution paths retain their own independent gates and are not
+        relaxed here.
         """
         if not self.scheduler_config.enable_request_owned_attention:
             return
 
-        if self.parallel_config.pipeline_parallel_size != 1:
+        parallel_config = self.parallel_config
+
+        if parallel_config.pipeline_parallel_size != 1:
             raise ValueError(
                 "Request-owned attention is experimental and requires "
                 "pipeline_parallel_size=1, but got pipeline_parallel_size="
-                f"{self.parallel_config.pipeline_parallel_size}."
+                f"{parallel_config.pipeline_parallel_size}."
             )
 
-        if self.parallel_config.use_ray:
+        if parallel_config.use_ray:
             raise ValueError(
                 "Request-owned attention does not support the Ray executor. "
                 "The initial distributed runtime is MultiprocExecutor with "
                 "HCCL."
+            )
+
+        executor_backend = parallel_config.distributed_executor_backend
+        if not isinstance(executor_backend, str):
+            raise ValueError(
+                "Request-owned attention requires the Multiproc executor, "
+                "but got a custom executor class "
+                f"{getattr(executor_backend, '__name__', repr(executor_backend))!r}. "
+                "Pass distributed_executor_backend='mp' to use request-owned "
+                "attention."
+            )
+        if executor_backend not in ("mp", "uni"):
+            raise ValueError(
+                "Request-owned attention requires the Multiproc executor, "
+                f"but got distributed_executor_backend={executor_backend!r}. "
+                "Only 'mp' (Multiproc) and, for single-process host/control "
+                "tests only, 'uni' (UniProc) are supported."
+            )
+        world_size = (
+            parallel_config.tensor_parallel_size
+            * parallel_config.pipeline_parallel_size
+        )
+        if executor_backend == "uni" and world_size > 1:
+            raise ValueError(
+                "Request-owned attention allows the UniProc executor only "
+                "for single-process host/control tests (world_size=1), but "
+                f"got distributed_executor_backend='uni' with world_size="
+                f"{world_size}."
             )
 
         if self.speculative_config is not None:
@@ -2231,20 +2276,20 @@ class VllmConfig:
                 "use request-owned attention."
             )
 
-        if self.parallel_config.decode_context_parallel_size > 1:
+        if parallel_config.decode_context_parallel_size > 1:
             raise ValueError(
                 "Request-owned attention is experimental and requires "
                 "decode_context_parallel_size=1, but got "
                 f"decode_context_parallel_size="
-                f"{self.parallel_config.decode_context_parallel_size}."
+                f"{parallel_config.decode_context_parallel_size}."
             )
 
-        if self.parallel_config.prefill_context_parallel_size > 1:
+        if parallel_config.prefill_context_parallel_size > 1:
             raise ValueError(
                 "Request-owned attention is experimental and requires "
                 "prefill_context_parallel_size=1, but got "
                 f"prefill_context_parallel_size="
-                f"{self.parallel_config.prefill_context_parallel_size}."
+                f"{parallel_config.prefill_context_parallel_size}."
             )
 
         if self.scheduler_config.async_scheduling:
@@ -2267,6 +2312,68 @@ class VllmConfig:
                 f"{self.model_config.is_multimodal_model} and "
                 f"model_config.is_encoder_decoder="
                 f"{self.model_config.is_encoder_decoder}."
+            )
+
+        if self.use_v2_model_runner:
+            raise ValueError(
+                "Request-owned attention is experimental and requires the "
+                "V1 model runner, but got use_v2_model_runner=True (Model "
+                "Runner V2 is not supported). Set VLLM_USE_V2_MODEL_RUNNER=0 "
+                "to use request-owned attention."
+            )
+
+        if parallel_config.use_ubatching:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support dynamic batch overlap (DBO) or micro-batching, but "
+                f"got parallel_config.enable_dbo="
+                f"{parallel_config.enable_dbo} and parallel_config."
+                f"ubatch_size={parallel_config.ubatch_size}."
+            )
+
+        ec_transfer_config = self.ec_transfer_config
+        if (
+            ec_transfer_config is not None
+            and ec_transfer_config.is_ec_transfer_instance
+        ):
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support distributed EC cache transfer, but got "
+                f"ec_transfer_config.ec_connector="
+                f"{ec_transfer_config.ec_connector!r} with ec_role="
+                f"{ec_transfer_config.ec_role!r}."
+            )
+
+        if self.cache_config.kv_sharing_fast_prefill:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support KV-sharing fast prefill, but got cache_config."
+                f"kv_sharing_fast_prefill="
+                f"{self.cache_config.kv_sharing_fast_prefill}."
+            )
+
+        scheduler_runner_type = self.scheduler_config.runner_type
+        model_runner_type = (
+            getattr(self.model_config, "runner_type", "generate")
+            if self.model_config is not None
+            else "generate"
+        )
+        if scheduler_runner_type != "generate" or model_runner_type != "generate":
+            raise ValueError(
+                "Request-owned attention is experimental and only supports "
+                "generative (text generation) models, but got "
+                f"scheduler_config.runner_type={scheduler_runner_type!r} and "
+                f"model_config.runner_type={model_runner_type!r}."
+            )
+
+        pass_config = self.compilation_config.pass_config
+        if pass_config.enable_sp or pass_config.fuse_gemm_comms:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support sequence parallelism (SP) or async TP "
+                "(fuse_gemm_comms), but got pass_config.enable_sp="
+                f"{pass_config.enable_sp} and pass_config.fuse_gemm_comms="
+                f"{pass_config.fuse_gemm_comms}."
             )
 
     def validate_block_size(self) -> None:

@@ -12,6 +12,16 @@ must fail closed with a specific diagnostic: pipeline parallelism, Ray,
 speculative decoding, non-eager compilation/CUDA graphs, KV cache CPU
 offload, KV transfer, prefix caching, decode/prefill context parallelism,
 async scheduling, and multimodal/encoder-decoder models.
+
+The G3 envelope adds construction-time rejections for combinations whose
+runtime semantics the request-owned path does not implement yet: Model
+Runner V2, dynamic batch overlap / micro-batching (DBO), distributed EC
+cache transfer, KV-sharing fast prefill, any executor other than Multiproc
+(UniProc tolerated only for single-process host/control tests), non-
+generative (pooling/draft) runner types, and sequence parallelism / async
+TP. FlashComm and the optional O-projection TP split are plugin-side
+switches with no core construction-time field, so they are not asserted
+here and keep their runtime gates.
 """
 
 import types
@@ -23,8 +33,10 @@ from vllm.config import (
     CompilationConfig,
     CompilationMode,
     CUDAGraphMode,
+    ECTransferConfig,
     KVTransferConfig,
     ParallelConfig,
+    PassConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -52,11 +64,13 @@ def _active_kv_transfer_config() -> KVTransferConfig:
 def _vllm_config(
     *,
     enable_request_owned_attention: bool = True,
+    scheduler_config: SchedulerConfig | None = None,
     compilation_config: CompilationConfig | None = None,
     parallel_config: ParallelConfig | None = None,
     cache_config: CacheConfig | None = None,
     speculative_config: SpeculativeConfig | None = None,
     kv_transfer_config: KVTransferConfig | None = None,
+    ec_transfer_config: ECTransferConfig | None = None,
     async_scheduling: bool | None = False,
 ) -> VllmConfig:
     """Build a VllmConfig around the request-owned attention envelope.
@@ -67,7 +81,8 @@ def _vllm_config(
     Passing any explicit config replaces exactly that part of the envelope.
     """
     return VllmConfig(
-        scheduler_config=SchedulerConfig.default_factory(
+        scheduler_config=scheduler_config
+        or SchedulerConfig.default_factory(
             enable_request_owned_attention=enable_request_owned_attention,
             async_scheduling=async_scheduling,
         ),
@@ -76,6 +91,7 @@ def _vllm_config(
         cache_config=cache_config or CacheConfig(enable_prefix_caching=False),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
+        ec_transfer_config=ec_transfer_config,
     )
 
 
@@ -114,6 +130,10 @@ def test_enabled_supported_envelope_constructs():
     )
     assert vllm_config.scheduler_config.enable_request_owned_attention is True
     assert vllm_config.scheduler_config.async_scheduling is False
+    # The allowed envelope is Multiproc / eager / V1 / no-DBO.
+    assert vllm_config.parallel_config.distributed_executor_backend == "mp"
+    assert vllm_config.use_v2_model_runner is False
+    assert vllm_config.parallel_config.use_ubatching is False
 
 
 def test_enabled_rejects_pipeline_parallelism():
@@ -257,6 +277,139 @@ def test_enabled_rejects_encoder_decoder_model():
         is_encoder_decoder=True,
     )
     with pytest.raises(ValueError, match="encoder-decoder"):
+        vllm_config._validate_request_owned_attention()
+
+
+def test_enabled_rejects_model_runner_v2(monkeypatch):
+    # Model Runner V2 is selected at construction through the
+    # VLLM_USE_V2_MODEL_RUNNER switch; request-owned attention is implemented
+    # on the V1 model runner and must fail closed on the resolved value.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    with pytest.raises(ValueError, match="V1 model runner"):
+        _vllm_config()
+
+
+@pytest.mark.parametrize(
+    "parallel_config",
+    [
+        ParallelConfig(enable_dbo=True),
+        ParallelConfig(ubatch_size=2),
+    ],
+)
+def test_enabled_rejects_dbo_ubatching(parallel_config):
+    with pytest.raises(ValueError, match="DBO"):
+        _vllm_config(parallel_config=parallel_config)
+
+
+def test_enabled_rejects_ec_transfer():
+    # A manually configured EC connector enables distributed EC cache
+    # transfer, so it must fail closed as well.
+    with pytest.raises(ValueError, match="ec_transfer_config"):
+        _vllm_config(
+            ec_transfer_config=ECTransferConfig(
+                ec_connector="TorchDistributedConnector",
+                ec_role="ec_producer",
+            )
+        )
+
+
+def test_enabled_rejects_kv_sharing_fast_prefill():
+    # CacheConfig defaults to enable_prefix_caching=True, which the G2 gate
+    # already rejects; keep the rest of the envelope allowed so this test
+    # isolates the KV-sharing fast-prefill rejection.
+    with pytest.raises(ValueError, match="kv_sharing_fast_prefill"):
+        _vllm_config(
+            cache_config=CacheConfig(
+                enable_prefix_caching=False,
+                kv_sharing_fast_prefill=True,
+            )
+        )
+
+
+def test_enabled_rejects_external_launcher_executor():
+    # An external-launcher executor changes the process/runtime contract, so
+    # it must fail closed. Mutate an already validated disabled config, then
+    # invoke the feature validation directly (matching the Ray test pattern).
+    vllm_config = _vllm_config(enable_request_owned_attention=False)
+    vllm_config.scheduler_config.enable_request_owned_attention = True
+    vllm_config.parallel_config.distributed_executor_backend = "external_launcher"
+    with pytest.raises(ValueError, match="Multiproc executor"):
+        vllm_config._validate_request_owned_attention()
+
+
+def test_enabled_rejects_custom_executor_class():
+    # A custom executor backend is passed as an Executor subclass; the gate
+    # must reject any non-Multiproc class. The stand-in class exercises the
+    # custom-executor path without importing the runtime executor package.
+    class CustomExecutor:
+        uses_ray = False
+
+    vllm_config = _vllm_config(enable_request_owned_attention=False)
+    vllm_config.scheduler_config.enable_request_owned_attention = True
+    vllm_config.parallel_config.distributed_executor_backend = CustomExecutor
+    with pytest.raises(ValueError, match="custom executor"):
+        vllm_config._validate_request_owned_attention()
+
+
+def test_enabled_rejects_uniproc_beyond_host_control():
+    # UniProc is tolerated only for single-process host/control tests; an
+    # explicit 'uni' backend over a multi-rank world must fail closed.
+    vllm_config = _vllm_config(enable_request_owned_attention=False)
+    vllm_config.scheduler_config.enable_request_owned_attention = True
+    vllm_config.parallel_config.distributed_executor_backend = "uni"
+    vllm_config.parallel_config.tensor_parallel_size = 2
+    with pytest.raises(ValueError, match="world_size"):
+        vllm_config._validate_request_owned_attention()
+
+
+@pytest.mark.parametrize("runner_type", ["pooling", "draft"])
+def test_enabled_rejects_non_generate_runner(runner_type):
+    # Pooling/draft runner types do not produce the generate-shaped output
+    # the request-owned path expects and must fail closed at construction.
+    with pytest.raises(ValueError, match="runner_type"):
+        _vllm_config(
+            scheduler_config=SchedulerConfig.default_factory(
+                enable_request_owned_attention=True,
+                async_scheduling=False,
+                runner_type=runner_type,
+            )
+        )
+
+
+def test_enabled_rejects_nested_mutation_kv_sharing_fast_prefill():
+    # Post-init nested config mutation must be caught by explicit
+    # re-validation on the same VllmConfig instance.
+    vllm_config = _vllm_config(enable_request_owned_attention=False)
+    vllm_config.scheduler_config.enable_request_owned_attention = True
+    vllm_config.cache_config.kv_sharing_fast_prefill = True
+    with pytest.raises(ValueError, match="kv_sharing_fast_prefill"):
+        vllm_config._validate_request_owned_attention()
+
+
+def test_enabled_rejects_async_tp_fuse_gemm_comms():
+    # Async TP (fuse_gemm_comms) implies sequence parallelism and changes
+    # the collective semantics of the request-owned path; it must fail
+    # closed at construction.
+    with pytest.raises(ValueError, match="sequence parallelism"):
+        _vllm_config(
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.NONE,
+                cudagraph_mode=CUDAGraphMode.NONE,
+                pass_config=PassConfig(fuse_gemm_comms=True),
+            )
+        )
+
+
+def test_enabled_rejects_sequence_parallelism_enable_sp():
+    # The explicit enable_sp=True switch reaches the same gate. Real
+    # construction with a model also reaches it; the post-init mutation path
+    # is used here because the Ascend platform plugin's construction-time
+    # defaults crash on a model_config-less test config before the
+    # request-owned gate runs.
+    vllm_config = _vllm_config(enable_request_owned_attention=False)
+    vllm_config.scheduler_config.enable_request_owned_attention = True
+    vllm_config.compilation_config.pass_config.enable_sp = True
+    with pytest.raises(ValueError, match="sequence parallelism"):
         vllm_config._validate_request_owned_attention()
 
 
