@@ -600,7 +600,7 @@ def test_build_zero_local_owner_batch_valid_and_one_step_fenced():
         _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
     ).accepted
 
-    empty = store.build_step_metadata(1, [])
+    empty = store.build_step_metadata(1, [], {})
     assert empty.accepted
     assert empty.error is None
     assert empty.metadata is not None
@@ -609,12 +609,12 @@ def test_build_zero_local_owner_batch_valid_and_one_step_fenced():
     assert empty.metadata.entries == ()
 
     # One-step fence: the same or an older step cannot be rebuilt.
-    assert not store.build_step_metadata(1, []).accepted
-    assert not store.build_step_metadata(0, []).accepted
-    assert not store.build_step_metadata(True, []).accepted
-    assert not store.build_step_metadata(-1, []).accepted
-    assert not store.build_step_metadata("1", []).accepted
-    assert not store.build_step_metadata(None, []).accepted
+    assert not store.build_step_metadata(1, [], {}).accepted
+    assert not store.build_step_metadata(0, [], {}).accepted
+    assert not store.build_step_metadata(True, [], {}).accepted
+    assert not store.build_step_metadata(-1, [], {}).accepted
+    assert not store.build_step_metadata("1", [], {}).accepted
+    assert not store.build_step_metadata(None, [], {}).accepted
 
 
 def test_build_rejects_same_step_allocation_plus_authorization():
@@ -626,13 +626,13 @@ def test_build_rejects_same_step_allocation_plus_authorization():
     assert store.reserve(
         _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
     ).accepted
-    same = store.build_step_metadata(1, [_token(key, 8, step_seq=1)])
+    same = store.build_step_metadata(1, [_token(key, 8, step_seq=1)], {key: 8})
     assert not same.accepted
     assert "same-step" in same.error
 
     # The allocation step itself is valid; the token belongs to the next step.
-    assert store.build_step_metadata(1, []).accepted
-    next_step = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert store.build_step_metadata(1, [], {}).accepted
+    next_step = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {key: 8})
     assert next_step.accepted
     assert next_step.metadata.entries[0].key == key
 
@@ -641,46 +641,73 @@ def test_build_rejects_wrong_missing_extra_duplicate_owner_step_state():
     manager = _make_manager()
     store = RequestOwnedKVStore(manager, owner_rank=0)
     key = _key("a")
+    other = _key("b")
     assert store.reserve(
         _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
     ).accepted
-    assert store.build_step_metadata(1, []).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
 
-    wrong_owner = store.build_step_metadata(2, [_token(key, 8, step_seq=2, owner_id=1)])
+    wrong_owner = store.build_step_metadata(
+        2, [_token(key, 8, step_seq=2, owner_id=1)], {key: 8}
+    )
     assert not wrong_owner.accepted
     assert "wrong-owner" in wrong_owner.error
 
-    missing = store.build_step_metadata(2, [_token(_key("ghost"), 8, step_seq=2)])
+    missing = store.build_step_metadata(
+        2, [_token(_key("ghost"), 8, step_seq=2)], {_key("ghost"): 8}
+    )
     assert not missing.accepted
     assert "missing lease" in missing.error
 
-    extra = store.build_step_metadata(2, [_token(key, 12, step_seq=2)])
-    assert not extra.accepted
-    assert "out-of-horizon" in extra.error
+    missing_count = store.build_step_metadata(
+        2, [_token(key, 8, step_seq=2), _token(other, 8, step_seq=2)], {key: 8}
+    )
+    assert not missing_count.accepted
+    assert "missing scheduled count" in missing_count.error
+
+    extra_count = store.build_step_metadata(
+        2, [_token(key, 8, step_seq=2)], {key: 8, other: 8}
+    )
+    assert not extra_count.accepted
+    assert "extra scheduled count" in extra_count.error
+
+    out_of_horizon = store.build_step_metadata(
+        2, [_token(key, 12, step_seq=2)], {key: 12}
+    )
+    assert not out_of_horizon.accepted
+    assert "out-of-horizon" in out_of_horizon.error
+
+    beyond_lease = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {key: 12})
+    assert not beyond_lease.accepted
+    assert "exceeds the lease horizon" in beyond_lease.error
 
     for count in (0, -1, True):
-        bad_count = store.build_step_metadata(2, [_token(key, count, step_seq=2)])
+        bad_count = store.build_step_metadata(
+            2, [_token(key, 8, step_seq=2)], {key: count}
+        )
         assert not bad_count.accepted
-        assert "runnable_num_tokens" in bad_count.error
+        assert "scheduled count" in bad_count.error
 
-    wrong_step = store.build_step_metadata(2, [_token(key, 8, step_seq=99)])
+    wrong_step = store.build_step_metadata(2, [_token(key, 8, step_seq=99)], {key: 8})
     assert not wrong_step.accepted
     assert "does not match" in wrong_step.error
 
     duplicate = store.build_step_metadata(
-        2, [_token(key, 8, step_seq=2), _token(key, 8, step_seq=2)]
+        2,
+        [_token(key, 8, step_seq=2), _token(key, 8, step_seq=2)],
+        {key: 8},
     )
     assert not duplicate.accepted
     assert "duplicate" in duplicate.error
 
-    ok = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    ok = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {key: 8})
     assert ok.accepted
     assert [entry.key for entry in ok.metadata.entries] == [key]
 
-    stale = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    stale = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {key: 8})
     assert not stale.accepted
     assert "stale" in stale.error
-    assert not store.build_step_metadata(1, []).accepted
+    assert not store.build_step_metadata(1, [], {}).accepted
 
 
 def test_build_rejects_pending_free_lease():
@@ -690,12 +717,12 @@ def test_build_rejects_pending_free_lease():
     assert store.reserve(
         _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
     ).accepted
-    assert store.build_step_metadata(1, []).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
     assert store.preempt(
         _command(key, OwnerCommandKind.PREEMPT, required=8, seq=2)
     ).accepted
 
-    pending = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    pending = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {key: 8})
     assert not pending.accepted
     assert "pending free" in pending.error
 
@@ -707,16 +734,16 @@ def test_build_exact_epoch():
     assert store.reserve(
         _command(epoch0, OwnerCommandKind.RESERVE, required=8, seq=1)
     ).accepted
-    assert store.build_step_metadata(1, []).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
 
     # A token for the same request id at another epoch has no record.
     wrong_epoch = store.build_step_metadata(
-        2, [_token(_key("e", epoch=1), 8, step_seq=2)]
+        2, [_token(_key("e", epoch=1), 8, step_seq=2)], {_key("e", epoch=1): 8}
     )
     assert not wrong_epoch.accepted
     assert "missing lease" in wrong_epoch.error
 
-    exact = store.build_step_metadata(2, [_token(epoch0, 8, step_seq=2)])
+    exact = store.build_step_metadata(2, [_token(epoch0, 8, step_seq=2)], {epoch0: 8})
     assert exact.accepted
     assert [entry.key for entry in exact.metadata.entries] == [epoch0]
 
@@ -728,8 +755,8 @@ def test_step_metadata_detached_immutability_and_pre_flush_readability():
     assert store.reserve(
         _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
     ).accepted
-    assert store.build_step_metadata(1, []).accepted
-    first = store.build_step_metadata(2, [_token(key, 10, step_seq=2)])
+    assert store.build_step_metadata(1, [], {}).accepted
+    first = store.build_step_metadata(2, [_token(key, 10, step_seq=2)], {key: 10})
     assert first.accepted
     snapshot = first.metadata
     entry = snapshot.entries[0]
@@ -746,12 +773,13 @@ def test_step_metadata_detached_immutability_and_pre_flush_readability():
         entry.key = _key("other")
 
     # Fully detached: a later EXTEND changes the live tables but never the
-    # already-built snapshot.
+    # already-built snapshot; the first handoff must be completed first.
+    assert store.mark_computed(key, 10)
     assert store.extend(
         _command(key, OwnerCommandKind.EXTEND, required=14, seq=3)
     ).accepted
-    assert store.build_step_metadata(3, []).accepted
-    later = store.build_step_metadata(4, [_token(key, 14, step_seq=4)])
+    assert store.build_step_metadata(3, [], {}).accepted
+    later = store.build_step_metadata(4, [_token(key, 14, step_seq=4)], {key: 4})
     assert later.accepted
     later_entry = later.metadata.entries[0]
     assert later_entry.tables != entry.tables
@@ -774,8 +802,8 @@ def test_step_metadata_heterogeneous_group_order():
     assert store.reserve(
         _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
     ).accepted
-    assert store.build_step_metadata(1, []).accepted
-    built = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {key: 8})
     assert built.accepted
     entry = built.metadata.entries[0]
 
@@ -787,7 +815,7 @@ def test_step_metadata_heterogeneous_group_order():
     assert _sizes(entry.tables) == (2, 2)
     assert _sizes(entry.delta) == (2, 2)
     assert entry.tables == store.get_block_table(key)
-    assert all(set(entry.tables[0]).isdisjoint(entry.tables[1]) for _ in (0,))
+    assert set(entry.tables[0]).isdisjoint(entry.tables[1])
 
 
 def test_extend_full_table_replacement_and_delta():
@@ -798,14 +826,15 @@ def test_extend_full_table_replacement_and_delta():
         _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
     )
     assert reserve_result.accepted
-    assert store.build_step_metadata(1, []).accepted
+    # Heartbeat steps: allocation without execution retains the deltas.
+    assert store.build_step_metadata(1, [], {}).accepted
     extend_result = store.extend(
         _command(key, OwnerCommandKind.EXTEND, required=14, seq=2)
     )
     assert extend_result.accepted
-    assert store.build_step_metadata(2, []).accepted
+    assert store.build_step_metadata(2, [], {}).accepted
 
-    built = store.build_step_metadata(3, [_token(key, 14, step_seq=3)])
+    built = store.build_step_metadata(3, [_token(key, 14, step_seq=3)], {key: 4})
     assert built.accepted
     entry = built.metadata.entries[0]
 
@@ -819,14 +848,75 @@ def test_extend_full_table_replacement_and_delta():
     )
     assert entry.delta == expected_delta
     assert entry.pre_step_num_computed_tokens == 0
-    assert entry.post_step_num_tokens == 14
+    # Post-step target is pre-step computed + scheduled count (a partial
+    # chunk below the 14-token lease horizon), not the horizon itself.
+    assert entry.post_step_num_tokens == 4
     assert entry.allocation_generation >= 1
 
-    # The delta was handed into the step: a later build sees nothing pending.
-    assert store.build_step_metadata(4, [_token(key, 14, step_seq=4)]).accepted
-    second = store.build_step_metadata(5, [_token(key, 14, step_seq=5)])
+    # The delta was handed into the step; the next handoff sees nothing
+    # pending and builds on the marked computed progress.
+    assert store.mark_computed(key, 4)
+    assert store.build_step_metadata(4, [], {}).accepted
+    second = store.build_step_metadata(5, [_token(key, 14, step_seq=5)], {key: 4})
     assert second.accepted
     assert second.metadata.entries[0].delta == ((), ())
+    assert second.metadata.entries[0].pre_step_num_computed_tokens == 4
+    assert second.metadata.entries[0].post_step_num_tokens == 8
+
+
+def test_partial_chunk_below_horizon_and_exact_mark_target():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("c")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=20, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+
+    built = store.build_step_metadata(2, [_token(key, 20, step_seq=2)], {key: 6})
+    assert built.accepted
+    entry = built.metadata.entries[0]
+    # The lease horizon is 20, but this step only runs 6 tokens: the target
+    # sits strictly below the horizon and mark must accept exactly it.
+    assert entry.post_step_num_tokens == 6
+    assert entry.post_step_num_tokens < entry.pre_step_num_computed_tokens + 20
+
+    assert not store.mark_computed(key, 5)
+    assert not store.mark_computed(key, 20)
+    assert store.mark_computed(key, 6)
+    assert store._records[key].num_computed_tokens == 6
+
+    # A later partial chunk continues from the marked progress.
+    assert store.build_step_metadata(3, [], {}).accepted
+    later = store.build_step_metadata(4, [_token(key, 20, step_seq=4)], {key: 8})
+    assert later.accepted
+    assert later.metadata.entries[0].pre_step_num_computed_tokens == 6
+    assert later.metadata.entries[0].post_step_num_tokens == 14
+    assert not store.mark_computed(key, 13)
+    assert store.mark_computed(key, 14)
+
+
+def test_zero_token_grant_heartbeat_retains_deltas():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("q")
+    reserve_result = store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    )
+    assert reserve_result.accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+
+    # A zero-token heartbeat may carry a newly published grant but must
+    # build empty execution metadata and keep the allocation delta pending.
+    heartbeat = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {})
+    assert heartbeat.accepted
+    assert heartbeat.metadata.entries == ()
+
+    # The later token-bearing step still receives the full pending delta.
+    built = store.build_step_metadata(3, [_token(key, 8, step_seq=3)], {key: 8})
+    assert built.accepted
+    assert built.metadata.entries[0].delta == reserve_result.delta
+    assert built.metadata.entries[0].post_step_num_tokens == 8
 
 
 def test_same_key_preempt_flush_reserve_generation_change():
@@ -836,8 +926,8 @@ def test_same_key_preempt_flush_reserve_generation_change():
     assert store.reserve(
         _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
     ).accepted
-    assert store.build_step_metadata(1, []).accepted
-    first = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert store.build_step_metadata(1, [], {}).accepted
+    first = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {key: 8})
     assert first.accepted
     first_generation = first.metadata.entries[0].allocation_generation
 
@@ -850,17 +940,44 @@ def test_same_key_preempt_flush_reserve_generation_change():
     assert store.reserve(
         _command(key, OwnerCommandKind.RESERVE, required=12, seq=4)
     ).accepted
-    assert store.build_step_metadata(3, []).accepted
-    second = store.build_step_metadata(4, [_token(key, 12, step_seq=4)])
+    # The stale handed-in snapshot cannot mark the recycled record: the
+    # physical allocation generation changed.
+    assert not store.mark_computed(key, first.metadata.entries[0].post_step_num_tokens)
+
+    assert store.build_step_metadata(3, [], {}).accepted
+    second = store.build_step_metadata(4, [_token(key, 12, step_seq=4)], {key: 12})
     assert second.accepted
     second_generation = second.metadata.entries[0].allocation_generation
     assert second_generation != first_generation
 
-    # A stale snapshot's mark is rejected: generation fenced.
+    # The recycled record's own post-step target is accepted exactly.
     assert not store.mark_computed(key, first.metadata.entries[0].post_step_num_tokens)
-    # The correct post-step target of the recycled record is accepted.
     assert not store.mark_computed(key, 8)
     assert store.mark_computed(key, 12)
+
+
+def test_build_rejects_unconsumed_pending_mark():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("u")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=16, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+    assert store.build_step_metadata(
+        2, [_token(key, 16, step_seq=2)], {key: 8}
+    ).accepted
+
+    # The handed-in execution was never marked complete: a new build for the
+    # same key is rejected until the exact target is marked.
+    rejected = store.build_step_metadata(3, [_token(key, 16, step_seq=3)], {key: 8})
+    assert not rejected.accepted
+    assert "unconsumed pending mark" in rejected.error
+
+    assert store.mark_computed(key, 8)
+    assert store.build_step_metadata(
+        3, [_token(key, 16, step_seq=3)], {key: 8}
+    ).accepted
 
 
 def test_allocation_deltas_not_lost_on_failed_build():
@@ -871,17 +988,19 @@ def test_allocation_deltas_not_lost_on_failed_build():
         _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
     )
     assert reserve_result.accepted
-    assert store.build_step_metadata(1, []).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
 
     # A failing build (duplicate token) must not consume or lose the delta.
     failed = store.build_step_metadata(
-        2, [_token(key, 8, step_seq=2), _token(key, 8, step_seq=2)]
+        2,
+        [_token(key, 8, step_seq=2), _token(key, 8, step_seq=2)],
+        {key: 8},
     )
     assert not failed.accepted
     assert "duplicate" in failed.error
 
     # The same step is retryable and still hands the full pending delta.
-    retry = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    retry = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {key: 8})
     assert retry.accepted
     assert retry.metadata.entries[0].delta == reserve_result.delta
 
@@ -893,8 +1012,8 @@ def test_mark_computed_strict_after_step_handoff():
     assert store.reserve(
         _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
     ).accepted
-    assert store.build_step_metadata(1, []).accepted
-    built = store.build_step_metadata(2, [_token(key, 10, step_seq=2)])
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(2, [_token(key, 10, step_seq=2)], {key: 10})
     assert built.accepted
     record = store._records[key]
     assert record.num_computed_tokens == 0
@@ -920,8 +1039,8 @@ def test_step_metadata_exposes_local_ids_but_never_wire_fields():
     assert store.reserve(
         _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
     ).accepted
-    assert store.build_step_metadata(1, []).accepted
-    built = store.build_step_metadata(2, [_token(key, 8, step_seq=2)])
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(2, [_token(key, 8, step_seq=2)], {key: 8})
     assert built.accepted
     entry = built.metadata.entries[0]
 

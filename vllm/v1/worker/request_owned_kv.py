@@ -37,22 +37,29 @@ G3 adds the worker-local one-step execution metadata API
 fully detached per-step snapshot (step sequence, exact lease keys, full
 per-group block tables, pre-step computed counts, post-step targets, a
 physical allocation generation, and the newly allocated local block deltas
-needed for local zeroing) from the exact own-rank scheduled lease tokens.
-The snapshot never exposes allocator ids, block objects, the injected
-manager, or any mutation/free method, and no local block id ever travels on
-a scheduler wire: the metadata is handed only to the local step consumer.
-The builder is one-step fenced (stale step reuse is rejected), rejects
-missing/extra/duplicate/wrong-owner/pending-free/out-of-horizon lease state
-and same-step RESERVE/EXTEND-plus-authorization for one key, and hands newly
-allocated deltas into a step only when the build succeeds: a failed build
-retains every pending delta.  A handed-in mark expectation is fenced by the
-record's physical allocation generation, so a stale snapshot can never
-advance computed progress on a recycled same-key record.
+needed for local zeroing) from the exact own-rank scheduled lease tokens
+plus the exact per-key scheduled token counts.  The post-step target is
+``pre-step computed + scheduled count`` and may sit strictly below the
+cumulative lease horizon (``OwnerLeaseToken.runnable_num_tokens``), which
+is a horizon, not this step's target.  A zero-token heartbeat builds empty
+execution metadata even when new grants were published, and retains every
+pending delta for the later token-bearing step.  The snapshot never exposes
+allocator ids, block objects, the injected manager, or any mutation/free
+method, and no local block id ever travels on a scheduler wire: the
+metadata is handed only to the local step consumer.  The builder is
+one-step fenced (stale step reuse is rejected), rejects missing/extra
+lease and count state, duplicates, wrong-owner, pending-free,
+out-of-horizon targets, same-step RESERVE/EXTEND-plus-authorization for one
+key, and a new build for a key with an unconsumed pending mark, and hands
+newly allocated deltas into a step only when the build succeeds: a failed
+build retains every pending delta.  A handed-in mark expectation is fenced
+by the record's physical allocation generation, so a stale snapshot can
+never advance computed progress on a recycled same-key record.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -494,20 +501,31 @@ class RequestOwnedKVStore:
         self,
         step_seq: int,
         tokens: Sequence[OwnerLeaseToken],
+        scheduled_counts: Mapping[OwnerLeaseKey, int],
     ) -> RequestOwnedStepMetadataResult:
         """Freeze the immutable worker-local G3 execution metadata for one
-        step from the exact scheduled own-rank lease tokens.
+        step from the exact scheduled own-rank lease tokens and the exact
+        per-key scheduled token counts.
 
         The batch is one-step fenced (``step_seq`` must be strictly newer
-        than the last successful build), and every token must be
-        own-rank, carry this step's sequence, be unique, reference an
-        active non-pending-free record, stay within the reserved horizon,
-        and not be combined with a same-step RESERVE/EXTEND for the same
-        key.  On success the newly allocated pending deltas of the batch
-        keys are handed into the step (the snapshot carries them for local
-        zeroing) and mark expectations are armed; on any rejection nothing
-        changes, so pending deltas are never silently lost and the same
-        step can be retried.  No scheduler wire object is mutated."""
+        than the last successful build).  ``tokens`` is the exact own-rank
+        authorization set and ``scheduled_counts`` the exact per-key
+        scheduled counts: for a token-bearing step the two key sets must
+        match exactly, counts must be positive non-bool ints, and the
+        post-step target ``record.num_computed_tokens + count`` must not
+        exceed the lease horizon (``OwnerLeaseToken.runnable_num_tokens``,
+        a cumulative horizon, not this step's target) nor the reserved
+        chunk horizon; a target strictly below the lease horizon is legal
+        (partial chunk).  A zero-count heartbeat (empty ``scheduled_counts``)
+        may carry newly published grants but always builds empty execution
+        metadata and retains every pending delta for the later token-bearing
+        step.  A token-bearing build also rejects a key with an unconsumed
+        pending mark from an earlier handoff unless the record was recycled
+        (generation changed).  On success the pending deltas of the batch
+        keys are handed into the step and mark expectations are armed; on
+        any rejection nothing changes, so pending deltas are never silently
+        lost and the same step can be retried.  No scheduler wire object is
+        mutated."""
         if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
             return RequestOwnedStepMetadataResult(
                 accepted=False,
@@ -524,12 +542,19 @@ class RequestOwnedKVStore:
                 error=f"stale step_seq {step_seq}: already built through "
                 f"{self._last_built_step_seq}.",
             )
-        if tokens is None:
+        if tokens is None or scheduled_counts is None:
             return RequestOwnedStepMetadataResult(
                 accepted=False,
                 step_seq=step_seq,
-                error="tokens must be the exact scheduled own-rank lease "
-                "tokens, got None.",
+                error="tokens and scheduled_counts must be the exact "
+                "scheduled own-rank lease tokens and per-key counts.",
+            )
+        if not isinstance(scheduled_counts, Mapping):
+            return RequestOwnedStepMetadataResult(
+                accepted=False,
+                step_seq=step_seq,
+                error="scheduled_counts must be a mapping keyed by "
+                f"OwnerLeaseKey, got {scheduled_counts!r}.",
             )
         lease_tokens = tuple(tokens)
         seen: set[OwnerLeaseKey] = set()
@@ -569,33 +594,107 @@ class RequestOwnedKVStore:
                     error=f"duplicate lease token for {token.key!r}.",
                 )
             seen.add(token.key)
-            record = self._records.get(token.key)
+
+        count_items = tuple(scheduled_counts.items())
+        for key, count in count_items:
+            if not isinstance(key, OwnerLeaseKey):
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"scheduled count key must be an OwnerLeaseKey, got {key!r}.",
+                )
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"scheduled count must be a positive non-bool int, "
+                    f"got {count!r} for {key!r}.",
+                )
+
+        token_keys = {token.key for token in lease_tokens}
+        count_keys = {key for key, _ in count_items}
+        if not count_keys:
+            # Zero-token heartbeat: grants may be newly published but nothing
+            # executes this step.  Build empty execution metadata, retain
+            # every pending delta for the later token-bearing step, and still
+            # close this step's fence (which clears the same-step allocation
+            # marker so the later authorization step is legal).
+            metadata = RequestOwnedStepMetadata(
+                step_seq=step_seq, owner_rank=self._owner_rank, entries=()
+            )
+            for record in self._records.values():
+                record.allocated_since_build = False
+            self._last_built_step_seq = step_seq
+            self._active_metadata = metadata
+            return RequestOwnedStepMetadataResult(
+                accepted=True, step_seq=step_seq, metadata=metadata
+            )
+
+        def _first_key(keys: set[OwnerLeaseKey]) -> OwnerLeaseKey:
+            return sorted(keys, key=lambda k: (k.request_id, k.owner_epoch))[0]
+
+        missing_counts = token_keys - count_keys
+        if missing_counts:
+            return RequestOwnedStepMetadataResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=f"missing scheduled count for {_first_key(missing_counts)!r}.",
+            )
+        extra_counts = count_keys - token_keys
+        if extra_counts:
+            return RequestOwnedStepMetadataResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=f"extra scheduled count for {_first_key(extra_counts)!r}.",
+            )
+
+        for token in lease_tokens:
+            key = token.key
+            record = self._records.get(key)
             if record is None:
                 return RequestOwnedStepMetadataResult(
                     accepted=False,
                     step_seq=step_seq,
-                    error=f"missing lease: no active record for {token.key!r}.",
+                    error=f"missing lease: no active record for {key!r}.",
                 )
             if record.pending_free:
                 return RequestOwnedStepMetadataResult(
                     accepted=False,
                     step_seq=step_seq,
-                    error=f"lease {token.key!r} is held pending free until "
-                    "the flush fence.",
+                    error=f"lease {key!r} is held pending free until the flush fence.",
                 )
             if record.allocated_since_build:
                 return RequestOwnedStepMetadataResult(
                     accepted=False,
                     step_seq=step_seq,
                     error=f"same-step RESERVE/EXTEND plus execution "
-                    f"authorization for {token.key!r}.",
+                    f"authorization for {key!r}.",
                 )
-            if count > record.reserved_num_tokens:
+            expectation = self._pending_marks.get(key)
+            if (
+                expectation is not None
+                and expectation.allocation_generation == record.generation
+            ):
                 return RequestOwnedStepMetadataResult(
                     accepted=False,
                     step_seq=step_seq,
-                    error=f"out-of-horizon lease token for {token.key!r}: "
-                    f"{count} > reserved {record.reserved_num_tokens}.",
+                    error=f"unconsumed pending mark for {key!r} from step "
+                    f"{expectation.step_seq}.",
+                )
+            target = record.num_computed_tokens + scheduled_counts[key]
+            if target > token.runnable_num_tokens:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"post-step target {target} exceeds the lease "
+                    f"horizon {token.runnable_num_tokens} for {key!r}.",
+                )
+            if target > record.reserved_num_tokens:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"out-of-horizon lease token for {key!r}: target "
+                    f"{target} > reserved {record.reserved_num_tokens}.",
                 )
 
         empty_delta = tuple(() for _ in range(self._num_groups))
@@ -606,7 +705,10 @@ class RequestOwnedKVStore:
                 pre_step_num_computed_tokens=(
                     self._records[token.key].num_computed_tokens
                 ),
-                post_step_num_tokens=token.runnable_num_tokens,
+                post_step_num_tokens=(
+                    self._records[token.key].num_computed_tokens
+                    + scheduled_counts[token.key]
+                ),
                 tables=self._tables(self._records[token.key]),
                 delta=(
                     self._records[token.key].pending_delta
@@ -623,15 +725,18 @@ class RequestOwnedKVStore:
         )
 
         # Commit atomically: hand the pending deltas of the batch keys into
-        # the step, arm the mark expectations, and advance the one-step
-        # fence.  The rejected paths above changed nothing.
+        # the step, arm the mark expectations with the exact post-step
+        # target, and advance the one-step fence.  The rejected paths above
+        # changed nothing.
         for token in lease_tokens:
             record = self._records[token.key]
             record.pending_delta = None
             self._pending_marks[token.key] = _MarkExpectation(
                 step_seq=step_seq,
                 allocation_generation=record.generation,
-                post_step_num_tokens=token.runnable_num_tokens,
+                post_step_num_tokens=(
+                    record.num_computed_tokens + scheduled_counts[token.key]
+                ),
             )
         for record in self._records.values():
             record.allocated_since_build = False

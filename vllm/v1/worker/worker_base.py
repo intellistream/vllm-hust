@@ -23,6 +23,7 @@ from vllm.v1.core.sched.ownership import (
     AttentionLeaseManager,
     OwnerCommand,
     OwnerCommandKind,
+    OwnerLeaseKey,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.request_owned_kv import (
@@ -600,18 +601,34 @@ class WorkerWrapperBase:
         scheduler_output: SchedulerOutput,
     ) -> RequestOwnedStepMetadata:
         """G3 wrapper seam: build the one-step immutable worker-local
-        execution metadata from the exact scheduled own-rank lease tokens
-        after command+publication validation.  The builder itself rejects
-        wrong/missing/extra/duplicate/stale/pending-free/out-of-horizon
-        lease state and is one-step fenced; a rejection here is fail-stop
-        because the store retains every pending delta and the step is
-        retryable.  No scheduler wire object is mutated."""
+        execution metadata after command+publication validation.  Execution
+        tokens/counts are derived only from positive
+        ``scheduler_output.num_scheduled_tokens`` for own-rank grants: a
+        zero-token G2 heartbeat may carry newly published grants but builds
+        empty execution metadata and retains allocation deltas for the later
+        token-bearing step, while a token-bearing step must match own-rank
+        authorization tokens and own-rank positive counts exactly.  The
+        builder itself rejects wrong/missing/extra/duplicate/stale/
+        pending-free/out-of-horizon lease and count state and is one-step
+        fenced; a rejection here is fail-stop because the store retains
+        every pending delta and the step is retryable.  No scheduler wire
+        object is mutated."""
         own_rank_tokens = [
             token
             for token in scheduler_output.scheduled_owner_leases
             if token.owner_id == self.global_rank
         ]
-        build = store.build_step_metadata(step_seq, own_rank_tokens)
+        scheduled_counts: dict[OwnerLeaseKey, int] = {}
+        for token in own_rank_tokens:
+            count = scheduler_output.num_scheduled_tokens.get(token.key.request_id, 0)
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise RuntimeError(
+                    "request-owned num_scheduled_tokens must be nonnegative "
+                    f"non-bool ints, got {count!r} for {token.key.request_id!r}."
+                )
+            if count > 0:
+                scheduled_counts[token.key] = count
+        build = store.build_step_metadata(step_seq, own_rank_tokens, scheduled_counts)
         if not build.accepted:
             raise RuntimeError(
                 "request-owned step metadata build failed: "

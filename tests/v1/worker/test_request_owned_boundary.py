@@ -90,6 +90,7 @@ class _FakeStore:
         self.calls: list[str] = []
         self.last_build_step: int | None = None
         self.last_build_tokens: tuple = ()
+        self.last_build_counts: dict = {}
 
     def reserve(self, command):
         self.calls.append("reserve")
@@ -115,10 +116,11 @@ class _FakeStore:
             error="RESTORE is out of scope for the physical KV store",
         )
 
-    def build_step_metadata(self, step_seq, tokens):
+    def build_step_metadata(self, step_seq, tokens, scheduled_counts):
         self.calls.append("build")
         self.last_build_step = step_seq
         self.last_build_tokens = tuple(tokens)
+        self.last_build_counts = dict(scheduled_counts)
         if self.reject_build:
             return SimpleNamespace(
                 accepted=False,
@@ -747,6 +749,7 @@ def test_g3_seam_builds_step_metadata_after_command_publication_validation() -> 
     assert store.calls == ["reserve", "build", "flush", "pool_snapshot"]
     assert store.last_build_step == 1
     assert store.last_build_tokens == ()
+    assert store.last_build_counts == {}
     metadata = wrapper._request_owned_step_metadata
     assert metadata is not None
     assert metadata.step_seq == 1
@@ -801,8 +804,8 @@ def test_no_local_id_on_scheduler_wires_while_metadata_is_worker_local() -> None
 
     # The store's G3 snapshot of a later executed lease carries local ids
     # (worker-local), while the receipt for the same key still does not.
-    assert store.build_step_metadata(2, []).accepted
-    built = store.build_step_metadata(3, [])
+    assert store.build_step_metadata(2, [], {}).accepted
+    built = store.build_step_metadata(3, [], {})
     assert built.accepted
     assert built.metadata.step_seq == 3
     assert built.metadata.entries == ()
