@@ -1,0 +1,373 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tests for G0 request-owner receipt aggregation.
+
+CPU-only: exercises :class:`ModelRunnerOutputAggregator` with protocol
+dataclasses and plain :class:`ModelRunnerOutput` values.  No GPU model runner
+and no NPU are constructed.
+"""
+
+import pickle
+
+import pytest
+
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.v1.core.sched.ownership import OwnerLeaseKey, OwnerReceipt, OwnerReceiptBatch
+from vllm.v1.executor.output_aggregator import ModelRunnerOutputAggregator
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
+
+
+def _receipt(
+    owner_rank: int,
+    request_id: str = "req-0",
+    owner_epoch: int = 1,
+    command_seq: int = 1,
+    accepted: bool = True,
+    runnable_through: int = 10,
+    released: bool = False,
+    **kwargs,
+) -> OwnerReceipt:
+    return OwnerReceipt(
+        key=OwnerLeaseKey(request_id=request_id, owner_epoch=owner_epoch),
+        owner_id=owner_rank,
+        command_seq=command_seq,
+        accepted=accepted,
+        runnable_through=runnable_through,
+        released=released,
+        **kwargs,
+    )
+
+
+def _batch(
+    owner_rank: int,
+    emitted_step_seq: int = 7,
+    events: tuple[OwnerReceipt, ...] = (),
+    **kwargs,
+) -> OwnerReceiptBatch:
+    return OwnerReceiptBatch(
+        owner_rank=owner_rank,
+        emitted_step_seq=emitted_step_seq,
+        events=tuple(events),
+        **kwargs,
+    )
+
+
+def _output(
+    owner_rank: int,
+    batches: list[OwnerReceiptBatch] | None,
+    empty: bool = False,
+) -> ModelRunnerOutput:
+    if empty:
+        return ModelRunnerOutput(
+            req_ids=[], req_id_to_index={}, owner_receipt_batches=batches
+        )
+    req_id = f"req-{owner_rank}"
+    return ModelRunnerOutput(
+        req_ids=[req_id],
+        req_id_to_index={req_id: 0},
+        sampled_token_ids=[[1]],
+        owner_receipt_batches=batches,
+    )
+
+
+def _three_worker_outputs(
+    step_seq: int = 7,
+    events_by_rank: dict[int, tuple[OwnerReceipt, ...]] | None = None,
+) -> list[ModelRunnerOutput]:
+    events_by_rank = events_by_rank or {}
+    return [
+        _output(0, [_batch(0, step_seq, events_by_rank.get(0, ()))], empty=True),
+        _output(1, [_batch(1, step_seq, events_by_rank.get(1, ()))], empty=True),
+        _output(2, [_batch(2, step_seq, events_by_rank.get(2, ()))], empty=True),
+    ]
+
+
+def _aggregator(*ranks: int, kv_aggregator=None) -> ModelRunnerOutputAggregator:
+    return ModelRunnerOutputAggregator(list(ranks), kv_aggregator=kv_aggregator)
+
+
+def test_selected_rank0_empty_output_with_events_survives():
+    """Selected output with req_ids=[] is valid and returns that output
+    carrying all batches."""
+    outputs = _three_worker_outputs(
+        events_by_rank={
+            1: (_receipt(1, request_id="req-a"),),
+            2: (_receipt(2, request_id="req-b"),),
+        }
+    )
+    result = _aggregator(0, 1, 2).aggregate(outputs)
+    assert result.req_ids == []
+    assert result.req_id_to_index == {}
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+    assert result.owner_receipt_batches[1].events == (_receipt(1, request_id="req-a"),)
+    assert result.owner_receipt_batches[2].events == (_receipt(2, request_id="req-b"),)
+
+
+def test_all_rank_empty_events_survives():
+    outputs = _three_worker_outputs()
+    result = _aggregator(0, 1, 2).aggregate(outputs)
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+    assert all(b.events == () for b in result.owner_receipt_batches)
+
+
+def test_batches_sorted_by_owner_rank_preserving_event_order():
+    """Batches carried in any output order are returned sorted by numeric
+    global owner rank; event order within a batch is preserved."""
+    ev_a = _receipt(1, request_id="req-a", command_seq=1)
+    ev_b = _receipt(1, request_id="req-a", command_seq=2)
+    outputs = [
+        _output(0, [_batch(2, events=(_receipt(2, request_id="req-z"),))], empty=True),
+        _output(1, [_batch(0)], empty=True),
+        _output(2, [_batch(1, events=(ev_a, ev_b))], empty=True),
+    ]
+    result = _aggregator(0, 1, 2).aggregate(outputs)
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+    assert result.owner_receipt_batches[1].events == (ev_a, ev_b)
+
+
+def test_no_singleton_or_original_mutation():
+    """The shared EMPTY_MODEL_RUNNER_OUTPUT singleton and the original worker
+    outputs must never be mutated."""
+    outputs = _three_worker_outputs()
+    # Use the actual shared singleton as the selected (rank-0) output and
+    # carry rank 0's batch on worker 1's output so all ranks are covered.
+    batch0 = outputs[0].owner_receipt_batches[0]
+    outputs[0] = EMPTY_MODEL_RUNNER_OUTPUT
+    outputs[1].owner_receipt_batches = [
+        outputs[1].owner_receipt_batches[0],
+        batch0,
+    ]
+    result = _aggregator(0, 1, 2).aggregate(outputs)
+    assert result is not EMPTY_MODEL_RUNNER_OUTPUT
+    assert EMPTY_MODEL_RUNNER_OUTPUT.owner_receipt_batches is None
+    assert outputs[1].owner_receipt_batches is not result.owner_receipt_batches
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+    # Shallow copy: non-mutated containers are shared with the selected output.
+    assert result.sampled_token_ids is EMPTY_MODEL_RUNNER_OUTPUT.sampled_token_ids
+    assert result.req_ids == []
+
+
+def test_missing_owner_rank_fails_closed():
+    outputs = [
+        _output(0, [_batch(0)], empty=True),
+        _output(1, [_batch(1)], empty=True),
+        _output(2, None, empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="missing OwnerReceiptBatch"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+def test_all_workers_disabled_fails_closed():
+    """Enabled aggregator with no batches anywhere (feature disabled on every
+    worker) is a missing-batch failure, never a silent no-op."""
+    outputs = [
+        ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+        ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+        ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+    ]
+    with pytest.raises(RuntimeError, match="missing OwnerReceiptBatch"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+def test_duplicate_owner_rank_fails_closed():
+    outputs = [
+        _output(0, [_batch(0)], empty=True),
+        _output(1, [_batch(1), _batch(1)], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="duplicate OwnerReceiptBatch"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+def test_unexpected_owner_rank_fails_closed():
+    outputs = [
+        _output(0, [_batch(0)], empty=True),
+        _output(1, [_batch(3)], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="unexpected owner rank"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+def test_mixed_step_seq_fails_closed():
+    outputs = [
+        _output(0, [_batch(0, emitted_step_seq=7)], empty=True),
+        _output(1, [_batch(1, emitted_step_seq=8)], empty=True),
+        _output(2, [_batch(2, emitted_step_seq=7)], empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="mixed emitted_step_seq"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+def test_expected_step_seq_mismatch_fails_closed():
+    outputs = _three_worker_outputs(step_seq=7)
+    aggregator = _aggregator(0, 1, 2)
+    with pytest.raises(RuntimeError, match="expected_step_seq"):
+        aggregator.aggregate(outputs, expected_step_seq=8)
+    result = aggregator.aggregate(outputs, expected_step_seq=7)
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+
+
+def test_exact_duplicate_event_deduped():
+    """Exact payload replay is idempotent: equal payloads (even as distinct
+    objects) with the same identity collapse to one event."""
+    ev = _receipt(1, request_id="req-a", command_seq=3)
+    duplicate = _receipt(1, request_id="req-a", command_seq=3)
+    outputs = [
+        _output(0, [_batch(0)], empty=True),
+        _output(1, [_batch(1, events=(ev, duplicate, ev))], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    result = _aggregator(0, 1, 2).aggregate(outputs)
+    assert result.owner_receipt_batches[1].events == (ev,)
+
+
+def test_event_owner_id_must_match_batch_owner_rank():
+    """A worker cannot spoof or misroute another owner's receipt: an event
+    whose owner_id differs from its enclosing batch owner_rank fails closed."""
+    spoofed = _receipt(2, request_id="req-a")
+    outputs = [
+        _output(0, [_batch(0)], empty=True),
+        _output(1, [_batch(1, events=(spoofed,))], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="does not match enclosing batch"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+def test_conflicting_duplicate_event_fatal():
+    """Same identity with a conflicting payload raises instead of silently
+    dropping or keeping one variant."""
+    ev = _receipt(1, request_id="req-a", command_seq=3, runnable_through=10)
+    conflicting = _receipt(1, request_id="req-a", command_seq=3, runnable_through=99)
+    outputs = [
+        _output(0, [_batch(0)], empty=True),
+        _output(1, [_batch(1, events=(ev, conflicting))], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="conflicting duplicate OwnerReceipt"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+def test_kv_and_owner_composition():
+    """KV connector composition and owner receipt aggregation compose on one
+    outputs list without mutating originals or the singleton."""
+    kv_aggregator = KVOutputAggregator(expected_finished_count=3)
+    outputs = [
+        _output(
+            0,
+            [_batch(0)],
+            empty=True,
+        ),
+        _output(
+            1,
+            [_batch(1, events=(_receipt(1, request_id="req-a"),))],
+            empty=True,
+        ),
+        _output(
+            2,
+            [_batch(2)],
+            empty=True,
+        ),
+    ]
+    for i, output in enumerate(outputs):
+        output.kv_connector_output = KVConnectorOutput(
+            finished_sending={"req_send"},
+            invalid_block_ids={i},
+        )
+
+    result = _aggregator(0, 1, 2, kv_aggregator=kv_aggregator).aggregate(outputs)
+
+    # KV composition visible on the returned (copied) selected output.
+    assert result.kv_connector_output.finished_sending == {"req_send"}
+    assert result.kv_connector_output.invalid_block_ids == {0, 1, 2}
+    # Owner batches carried alongside.
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+    assert result.owner_receipt_batches[1].events == (_receipt(1, request_id="req-a"),)
+    # Originals untouched.
+    for i, output in enumerate(outputs):
+        assert output.kv_connector_output.finished_sending == {"req_send"}
+        assert output.kv_connector_output.invalid_block_ids == {i}
+    assert EMPTY_MODEL_RUNNER_OUTPUT.kv_connector_output is None
+
+
+def test_kv_composition_protects_shared_singleton():
+    """KV composition on a singleton selected output must not mutate the
+    singleton."""
+    outputs = _three_worker_outputs()
+    # Keep rank 0's batch covered while using the singleton as selected.
+    outputs[0] = EMPTY_MODEL_RUNNER_OUTPUT
+    outputs[1].owner_receipt_batches = [
+        outputs[1].owner_receipt_batches[0],
+        _batch(0),
+    ]
+    kv_aggregator = KVOutputAggregator(expected_finished_count=3)
+    for i, output in enumerate(outputs):
+        if output is EMPTY_MODEL_RUNNER_OUTPUT:
+            continue
+        output.kv_connector_output = KVConnectorOutput(invalid_block_ids={i})
+
+    result = _aggregator(0, 1, 2, kv_aggregator=kv_aggregator).aggregate(outputs)
+    assert result.kv_connector_output is not None
+    assert result.kv_connector_output.invalid_block_ids == {1, 2}
+    assert EMPTY_MODEL_RUNNER_OUTPUT.kv_connector_output is None
+    assert EMPTY_MODEL_RUNNER_OUTPUT.owner_receipt_batches is None
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+
+
+def test_selected_none_fails_explicitly():
+    """All batches present but the selected output is None: fail explicitly
+    instead of silently dropping the aggregated receipts."""
+    outputs = _three_worker_outputs()
+    outputs[0] = None
+    outputs[1].owner_receipt_batches = [
+        outputs[1].owner_receipt_batches[0],
+        _batch(0),
+    ]
+    with pytest.raises(RuntimeError, match="selected output"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+def test_no_worker_outputs_fails_closed():
+    with pytest.raises(RuntimeError, match="at least one worker output"):
+        _aggregator(0, 1, 2).aggregate([])
+
+
+def test_empty_expected_owner_ranks():
+    aggregator = ModelRunnerOutputAggregator([])
+    output = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+    result = aggregator.aggregate([output])
+    assert result.owner_receipt_batches == []
+    assert result is not output
+
+
+def test_output_rank_selection():
+    outputs = _three_worker_outputs(
+        events_by_rank={0: (_receipt(0, request_id="req-0"),)}
+    )
+    result = _aggregator(0, 1, 2).aggregate(outputs, output_rank=2)
+    assert result.req_ids == []
+    assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+
+
+def test_model_runner_output_default_and_pickle():
+    """ModelRunnerOutput keeps owner_receipt_batches=None by default and
+    round-trips batches through pickle (the wire format used by the
+    multiproc MQs)."""
+    output = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+    assert output.owner_receipt_batches is None
+    assert EMPTY_MODEL_RUNNER_OUTPUT.owner_receipt_batches is None
+
+    output.owner_receipt_batches = [
+        _batch(1, events=(_receipt(1, request_id="req-a"),)),
+        _batch(2),
+    ]
+    restored = pickle.loads(pickle.dumps(output))
+    assert restored.owner_receipt_batches == output.owner_receipt_batches
+    assert restored.owner_receipt_batches[0].events == (
+        _receipt(1, request_id="req-a"),
+    )

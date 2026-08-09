@@ -20,6 +20,7 @@ from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest
+from vllm.v1.executor.output_aggregator import ModelRunnerOutputAggregator
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -110,6 +111,32 @@ class Executor(ABC):
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
         self.kv_output_aggregator: KVOutputAggregator | None = None
+        # G0 request-owned attention: generic all-worker aggregator, built only
+        # when the feature gate is enabled. Composes owner receipt batches
+        # (and the KV aggregator when a connector is configured).
+        self.model_runner_output_aggregator: ModelRunnerOutputAggregator | None = None
+        self._build_model_runner_output_aggregator()
+
+    def _expected_owner_ranks(self) -> list[int]:
+        """Process-global ranks of the workers whose outputs reach this
+        executor, i.e. the owner ranks that must each emit exactly one
+        OwnerReceiptBatch per step when request-owned attention is enabled."""
+        return list(range(self.parallel_config.world_size))
+
+    def _build_model_runner_output_aggregator(self) -> None:
+        """(Re)build the generic aggregator from the current config.
+
+        Called from ``__init__`` (gate may already be on) and again from
+        ``init_kv_output_aggregator`` once a KV connector aggregator exists,
+        so owner + KV composition always sees the latest KV aggregator.
+        """
+        if not self.scheduler_config.enable_request_owned_attention:
+            self.model_runner_output_aggregator = None
+            return
+        self.model_runner_output_aggregator = ModelRunnerOutputAggregator(
+            expected_owner_ranks=self._expected_owner_ranks(),
+            kv_aggregator=self.kv_output_aggregator,
+        )
 
     @abstractmethod
     def _init_executor(self) -> None:
@@ -282,6 +309,9 @@ class Executor(ABC):
         self.kv_output_aggregator = KVOutputAggregator.from_connector(
             connector, self.parallel_config.world_size
         )
+        # Rebuild the generic aggregator so owner-receipt aggregation composes
+        # the newly available KV aggregator when request-owned attention is on.
+        self._build_model_runner_output_aggregator()
 
     @cached_property  # Avoid unnecessary RPC calls
     def supported_tasks(self) -> tuple[SupportedTask, ...]:

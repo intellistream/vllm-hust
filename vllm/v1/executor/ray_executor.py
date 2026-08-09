@@ -443,7 +443,10 @@ class RayDistributedExecutor(Executor):
 
         refs = self.forward_dag.execute((scheduler_output, grammar_output))  # type: ignore
 
-        if not self.has_connector:
+        use_all_worker_outputs = (
+            self.has_connector or self.scheduler_config.enable_request_owned_attention
+        )
+        if not use_all_worker_outputs:
             # Get output only from a single worker (output_rank)
             # When PP is not used, we block here until the result is available.
             if not non_block:
@@ -455,17 +458,23 @@ class RayDistributedExecutor(Executor):
             # the scheduler can yield to the next batch.
             return FutureWrapper(refs[0])
 
-        # Get output from all workers when connector is present
-        assert self.kv_output_aggregator is not None
+        # Get output from all workers when a connector is present, or when
+        # request-owned attention is enabled (owner receipts from every rank
+        # must be aggregated or they would be dropped).
+        if self.scheduler_config.enable_request_owned_attention:
+            aggregator = self.model_runner_output_aggregator
+        else:
+            aggregator = self.kv_output_aggregator
+        assert aggregator is not None
         if not non_block:
             # Block and get results from all workers
             outputs = ray.get(refs)
             for output in outputs:
                 detach_zero_copy_from_model_runner_output(output)
-            return self.kv_output_aggregator.aggregate(outputs)
+            return aggregator.aggregate(outputs)
 
         # Return a future that will aggregate outputs from all workers
-        return FutureWrapper(refs, self.kv_output_aggregator)
+        return FutureWrapper(refs, aggregator)
 
     def collective_rpc(  # type: ignore[override]
         self,

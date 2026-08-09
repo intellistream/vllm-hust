@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import pickle
 from unittest import TestCase
 
-from vllm.v1.outputs import LogprobsLists
+from vllm.v1.core.sched.ownership import OwnerLeaseKey, OwnerReceipt, OwnerReceiptBatch
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists, ModelRunnerOutput
 
 
 class TestLogprobsLists(TestCase):
@@ -97,3 +99,37 @@ class TestLogprobsLists(TestCase):
         assert len(sliced.logprob_token_ids) == 9  # All tokens
         assert sliced.logprob_token_ids == self.logprobsLists.logprob_token_ids
         assert sliced.cu_num_generated_tokens is None
+
+
+class TestModelRunnerOutputOwnerReceiptBatches(TestCase):
+    def test_default_is_none(self):
+        """Backward compatible default: owner_receipt_batches is None unless
+        a worker opts in, and the shared EMPTY singleton stays safe."""
+        output = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+        assert output.owner_receipt_batches is None
+        assert EMPTY_MODEL_RUNNER_OUTPUT.owner_receipt_batches is None
+
+    def test_pickle_roundtrip(self):
+        """Owner receipt batches survive the pickle wire format used by the
+        multiproc message queues."""
+        receipt = OwnerReceipt(
+            key=OwnerLeaseKey(request_id="req-0", owner_epoch=1),
+            owner_id=1,
+            command_seq=2,
+            accepted=True,
+            runnable_through=10,
+        )
+        batch = OwnerReceiptBatch(
+            owner_rank=1,
+            emitted_step_seq=7,
+            events=(receipt,),
+            free_capacity=42,
+        )
+        output = ModelRunnerOutput(
+            req_ids=["req-0"],
+            req_id_to_index={"req-0": 0},
+            owner_receipt_batches=[batch],
+        )
+        restored = pickle.loads(pickle.dumps(output))
+        assert restored.owner_receipt_batches == [batch]
+        assert restored.owner_receipt_batches[0].events == (receipt,)

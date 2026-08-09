@@ -60,6 +60,7 @@ from vllm.utils.system_utils import (
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
+from vllm.v1.executor.output_aggregator import ModelRunnerOutputAggregator
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -307,13 +308,30 @@ class MultiprocExecutor(Executor):
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        if self.scheduler_config.enable_request_owned_attention:
+            # G0: aggregate owner receipt batches from every worker.  The
+            # generic aggregator also composes the KV aggregator when one is
+            # configured; the broadcast output_rank stays None so every
+            # worker MQ is drained.  Fail closed if the aggregator was not
+            # constructed instead of silently falling back to rank-0 only.
+            assert self.model_runner_output_aggregator is not None, (
+                "request-owned attention is enabled but the model runner "
+                "output aggregator was not constructed."
+            )
+            aggregator = self.model_runner_output_aggregator
+        else:
+            aggregator = self.kv_output_aggregator
+        # The generic aggregator is passed through the legacy
+        # ``kv_output_aggregator`` slot (both expose ``aggregate(outputs,
+        # output_rank=...)``) so custom ``collective_rpc`` overrides that keep
+        # the historical signature keep working without a new keyword.
         return self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
             unique_reply_rank=self.output_rank,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
-            kv_output_aggregator=self.kv_output_aggregator,
+            kv_output_aggregator=aggregator,
         )
 
     def sample_tokens(  # type: ignore[override]
@@ -345,10 +363,21 @@ class MultiprocExecutor(Executor):
         kwargs: dict | None = None,
         non_block: bool = False,
         unique_reply_rank: int | None = None,
-        kv_output_aggregator: KVOutputAggregator | None = None,
+        kv_output_aggregator: (
+            KVOutputAggregator | ModelRunnerOutputAggregator | None
+        ) = None,
     ) -> Any:
         """Returns single result if unique_reply_rank and/or kv_output_aggregator
-        is provided, otherwise list."""
+        is provided, otherwise list.
+
+        ``kv_output_aggregator`` accepts either :class:`KVOutputAggregator` or
+        the generic :class:`ModelRunnerOutputAggregator` (both expose
+        ``aggregate(outputs, output_rank=...)``); request-owned attention
+        passes the generic aggregator through this legacy slot so custom
+        overrides that keep the historical signature keep working.  Any
+        aggregator forces ``output_rank=None`` so the broadcast reaches every
+        worker and every response MQ is drained.
+        """
         assert self.rpc_broadcast_mq is not None, (
             "collective_rpc should not be called on follower node"
         )

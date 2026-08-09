@@ -11,6 +11,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.ownership import OwnerReceiptBatch
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -279,6 +280,14 @@ class ModelRunnerOutput:
     # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
+
+    # G0 request-owned attention: per-worker owner receipt envelope(s) emitted
+    # for the current step. ``None`` means the feature is disabled on this
+    # worker (or the worker is not participating); an enabled worker always
+    # emits exactly one OwnerReceiptBatch even when ``events`` is empty.
+    # Carried on ModelRunnerOutput so the existing all-worker outputs list and
+    # transport aggregate receipts with zero new IPC.
+    owner_receipt_batches: list[OwnerReceiptBatch] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(
