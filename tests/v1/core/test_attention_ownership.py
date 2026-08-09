@@ -30,6 +30,14 @@ from vllm.v1.core.sched.ownership import (
 from vllm.v1.request import Request, RequestStatus
 
 
+def test_owner_lease_key_rejects_malformed_identity() -> None:
+    for epoch in (True, False, -1, 1.0, "1", None):
+        with pytest.raises(TypeError, match="owner_epoch"):
+            OwnerLeaseKey("req", epoch)
+    with pytest.raises(TypeError, match="request_id"):
+        OwnerLeaseKey(1, 0)
+
+
 def _key(request_id: str = "req-0", epoch: int = 0) -> OwnerLeaseKey:
     return OwnerLeaseKey(request_id=request_id, owner_epoch=epoch)
 

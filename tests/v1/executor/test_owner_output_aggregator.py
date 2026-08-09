@@ -115,40 +115,53 @@ def test_all_rank_empty_events_survives():
     assert all(b.events == () for b in result.owner_receipt_batches)
 
 
-def test_batches_sorted_by_owner_rank_preserving_event_order():
-    """Batches carried in any output order are returned sorted by numeric
-    global owner rank; event order within a batch is preserved."""
+def test_authenticated_transport_slots_preserve_event_order():
+    """Each slot carries its own rank's batch and event order is preserved."""
     ev_a = _receipt(1, request_id="req-a", command_seq=1)
     ev_b = _receipt(1, request_id="req-a", command_seq=2)
     outputs = [
-        _output(0, [_batch(2, events=(_receipt(2, request_id="req-z"),))], empty=True),
-        _output(1, [_batch(0)], empty=True),
-        _output(2, [_batch(1, events=(ev_a, ev_b))], empty=True),
+        _output(0, [_batch(0)], empty=True),
+        _output(1, [_batch(1, events=(ev_a, ev_b))], empty=True),
+        _output(2, [_batch(2, events=(_receipt(2, request_id="req-z"),))], empty=True),
     ]
     result = _aggregator(0, 1, 2).aggregate(outputs)
     assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
     assert result.owner_receipt_batches[1].events == (ev_a, ev_b)
 
 
+def test_transport_slot_cannot_impersonate_another_owner() -> None:
+    outputs = [
+        _output(0, [_batch(1)], empty=True),
+        _output(1, [_batch(0)], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="transport slot 0"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
+def test_transport_slot_cannot_supply_multiple_owner_batches() -> None:
+    outputs = [
+        _output(0, [_batch(0), _batch(1)], empty=True),
+        _output(1, None, empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    with pytest.raises(RuntimeError, match="exactly one OwnerReceiptBatch"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
 def test_no_singleton_or_original_mutation():
     """The shared EMPTY_MODEL_RUNNER_OUTPUT singleton and the original worker
     outputs must never be mutated."""
     outputs = _three_worker_outputs()
-    # Use the actual shared singleton as the selected (rank-0) output and
-    # carry rank 0's batch on worker 1's output so all ranks are covered.
-    batch0 = outputs[0].owner_receipt_batches[0]
-    outputs[0] = EMPTY_MODEL_RUNNER_OUTPUT
-    outputs[1].owner_receipt_batches = [
-        outputs[1].owner_receipt_batches[0],
-        batch0,
-    ]
+    selected = outputs[0]
     result = _aggregator(0, 1, 2).aggregate(outputs)
-    assert result is not EMPTY_MODEL_RUNNER_OUTPUT
+    assert result is not selected
     assert EMPTY_MODEL_RUNNER_OUTPUT.owner_receipt_batches is None
-    assert outputs[1].owner_receipt_batches is not result.owner_receipt_batches
+    assert selected.owner_receipt_batches == [_batch(0)]
+    assert selected.owner_receipt_batches is not result.owner_receipt_batches
     assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
     # Shallow copy: non-mutated containers are shared with the selected output.
-    assert result.sampled_token_ids is EMPTY_MODEL_RUNNER_OUTPUT.sampled_token_ids
+    assert result.sampled_token_ids is selected.sampled_token_ids
     assert result.req_ids == []
 
 
@@ -158,7 +171,7 @@ def test_missing_owner_rank_fails_closed():
         _output(1, [_batch(1)], empty=True),
         _output(2, None, empty=True),
     ]
-    with pytest.raises(RuntimeError, match="missing OwnerReceiptBatch"):
+    with pytest.raises(RuntimeError, match="exactly one OwnerReceiptBatch"):
         _aggregator(0, 1, 2).aggregate(outputs)
 
 
@@ -170,7 +183,7 @@ def test_all_workers_disabled_fails_closed():
         ModelRunnerOutput(req_ids=[], req_id_to_index={}),
         ModelRunnerOutput(req_ids=[], req_id_to_index={}),
     ]
-    with pytest.raises(RuntimeError, match="missing OwnerReceiptBatch"):
+    with pytest.raises(RuntimeError, match="exactly one OwnerReceiptBatch"):
         _aggregator(0, 1, 2).aggregate(outputs)
 
 
@@ -180,7 +193,7 @@ def test_duplicate_owner_rank_fails_closed():
         _output(1, [_batch(1), _batch(1)], empty=True),
         _output(2, [_batch(2)], empty=True),
     ]
-    with pytest.raises(RuntimeError, match="duplicate OwnerReceiptBatch"):
+    with pytest.raises(RuntimeError, match="exactly one OwnerReceiptBatch"):
         _aggregator(0, 1, 2).aggregate(outputs)
 
 
@@ -190,7 +203,7 @@ def test_unexpected_owner_rank_fails_closed():
         _output(1, [_batch(3)], empty=True),
         _output(2, [_batch(2)], empty=True),
     ]
-    with pytest.raises(RuntimeError, match="unexpected owner rank"):
+    with pytest.raises(RuntimeError, match="claims owner rank"):
         _aggregator(0, 1, 2).aggregate(outputs)
 
 
@@ -232,6 +245,14 @@ def test_expected_step_seq_mismatch_fails_closed():
         aggregator.aggregate(outputs, expected_step_seq=8)
     result = aggregator.aggregate(outputs, expected_step_seq=7)
     assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("expected", [True, False, 0, -1, 7.0, "7"])
+def test_invalid_expected_step_seq_fails_closed(expected) -> None:
+    with pytest.raises(RuntimeError, match="expected_step_seq must be"):
+        _aggregator(0, 1, 2).aggregate(
+            _three_worker_outputs(step_seq=7), expected_step_seq=expected
+        )
 
 
 def test_for_step_correct_step_aggregates():
@@ -483,6 +504,33 @@ def test_event_owner_id_must_match_batch_owner_rank():
         _aggregator(0, 1, 2).aggregate(outputs)
 
 
+def test_bool_event_identity_cannot_alias_integer_identity() -> None:
+    valid = _receipt(1, owner_epoch=1, command_seq=1)
+    bool_owner = OwnerReceipt(
+        key=OwnerLeaseKey("req-bool-owner", 1),
+        owner_id=True,
+        command_seq=2,
+        accepted=False,
+    )
+    outputs = _three_worker_outputs(events_by_rank={1: (valid, bool_owner)})
+    with pytest.raises(RuntimeError, match="does not match enclosing batch"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+    # OwnerLeaseKey now rejects a bool epoch before it can hash/equal-alias 1.
+    with pytest.raises(TypeError, match="owner_epoch"):
+        OwnerLeaseKey("req", True)
+
+    bool_seq = OwnerReceipt(
+        key=OwnerLeaseKey("req-bool-seq", 1),
+        owner_id=1,
+        command_seq=True,
+        accepted=False,
+    )
+    outputs = _three_worker_outputs(events_by_rank={1: (bool_seq,)})
+    with pytest.raises(RuntimeError, match="command_seq"):
+        _aggregator(0, 1, 2).aggregate(outputs)
+
+
 def test_conflicting_duplicate_event_fatal():
     """Same identity with a conflicting payload raises instead of silently
     dropping or keeping one variant."""
@@ -539,40 +587,24 @@ def test_kv_and_owner_composition():
     assert EMPTY_MODEL_RUNNER_OUTPUT.kv_connector_output is None
 
 
-def test_kv_composition_protects_shared_singleton():
-    """KV composition on a singleton selected output must not mutate the
-    singleton."""
+def test_kv_composition_keeps_singleton_and_originals_untouched():
     outputs = _three_worker_outputs()
-    # Keep rank 0's batch covered while using the singleton as selected.
-    outputs[0] = EMPTY_MODEL_RUNNER_OUTPUT
-    outputs[1].owner_receipt_batches = [
-        outputs[1].owner_receipt_batches[0],
-        _batch(0),
-    ]
     kv_aggregator = KVOutputAggregator(expected_finished_count=3)
     for i, output in enumerate(outputs):
-        if output is EMPTY_MODEL_RUNNER_OUTPUT:
-            continue
         output.kv_connector_output = KVConnectorOutput(invalid_block_ids={i})
 
     result = _aggregator(0, 1, 2, kv_aggregator=kv_aggregator).aggregate(outputs)
     assert result.kv_connector_output is not None
-    assert result.kv_connector_output.invalid_block_ids == {1, 2}
+    assert result.kv_connector_output.invalid_block_ids == {0, 1, 2}
     assert EMPTY_MODEL_RUNNER_OUTPUT.kv_connector_output is None
     assert EMPTY_MODEL_RUNNER_OUTPUT.owner_receipt_batches is None
     assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
 
 
-def test_selected_none_fails_explicitly():
-    """All batches present but the selected output is None: fail explicitly
-    instead of silently dropping the aggregated receipts."""
+def test_none_transport_slot_fails_explicitly():
     outputs = _three_worker_outputs()
     outputs[0] = None
-    outputs[1].owner_receipt_batches = [
-        outputs[1].owner_receipt_batches[0],
-        _batch(0),
-    ]
-    with pytest.raises(RuntimeError, match="selected output"):
+    with pytest.raises(RuntimeError, match="exactly one OwnerReceiptBatch"):
         _aggregator(0, 1, 2).aggregate(outputs)
 
 

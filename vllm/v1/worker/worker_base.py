@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from copy import copy
+from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
@@ -380,29 +380,45 @@ class WorkerWrapperBase:
                 f"step_seq, got {step_seq!r}."
             )
 
+        total_tokens = scheduler_output.total_num_scheduled_tokens
+        per_request_tokens = scheduler_output.num_scheduled_tokens
+        if (
+            isinstance(total_tokens, bool)
+            or not isinstance(total_tokens, int)
+            or total_tokens != 0
+            or any(
+                isinstance(count, bool) or not isinstance(count, int) or count < 0
+                for count in per_request_tokens.values()
+            )
+            or sum(per_request_tokens.values()) != 0
+        ):
+            raise RuntimeError(
+                "request-owned attention G1 is control-only: refusing to "
+                "execute a nonempty or inconsistent token schedule through "
+                "replicated KV before the G2 owner-local allocator/routing "
+                "prerequisite exists."
+            )
+
+        # Apply the step to a trial copy.  Manager fences/outbox become durable
+        # only after a concrete synchronous output is available, so an
+        # underlying exception/None/async result cannot poison the next step.
         manager = self._request_owned_control_manager
         if manager is None:
-            manager = AttentionLeaseManager(
+            trial_manager = AttentionLeaseManager(
                 owner_rank=self.global_rank,
                 capacity=_REQUEST_OWNED_CONTROL_ONLY_CAPACITY,
             )
-            self._request_owned_control_manager = manager
+        else:
+            trial_manager = deepcopy(manager)
 
         # Commands form one reliable in-order stream per owner.  Every worker
         # receives the global envelope but consumes only its own commands.
         for command in scheduler_output.owner_commands:
             if command.owner_id == self.global_rank:
-                manager.apply(command)
+                trial_manager.apply(command)
         for token in scheduler_output.scheduled_owner_leases:
             if token.owner_id == self.global_rank:
-                manager.record_published(token)
-
-        if scheduler_output.total_num_scheduled_tokens != 0:
-            raise RuntimeError(
-                "request-owned attention G1 is control-only: refusing to "
-                "execute scheduled tokens through replicated KV before the "
-                "G2 owner-local allocator/routing prerequisite exists."
-            )
+                trial_manager.record_published(token)
 
         self._apply_mm_cache(scheduler_output)
         output = self.worker.execute_model(scheduler_output)
@@ -430,7 +446,8 @@ class WorkerWrapperBase:
 
         # Never mutate a worker-owned output or EMPTY_MODEL_RUNNER_OUTPUT.
         result = copy(output)
-        result.owner_receipt_batches = [manager.emit_batch(step_seq)]
+        result.owner_receipt_batches = [trial_manager.emit_batch(step_seq)]
+        self._request_owned_control_manager = trial_manager
         return result
 
     def reset_mm_cache(self) -> None:

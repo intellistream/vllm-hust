@@ -299,6 +299,27 @@ def test_multiproc_executor_owner_aggregation_sync():
     assert [b.owner_rank for b in result.owner_receipt_batches] == [0, 1, 2]
 
 
+@pytest.mark.parametrize(
+    "total, per_request",
+    [
+        (1, {"req": 1}),
+        (0, {"req": 1}),
+        (False, {}),
+        (0.0, {}),
+        (0, {"req": True}),
+    ],
+)
+def test_multiproc_control_only_guard_precedes_transport(total, per_request):
+    executor = _g0_fake_executor([])
+    scheduler_output = _g0_scheduler_output()
+    scheduler_output.total_num_scheduled_tokens = total
+    scheduler_output.num_scheduled_tokens = per_request
+
+    with pytest.raises(RuntimeError, match="control-only"):
+        executor.execute_model(scheduler_output)
+    assert executor.rpc_broadcast_mq.enqueued == []
+
+
 def test_multiproc_executor_owner_aggregation_future():
     """G0 owner aggregation drains every worker MQ on the Future path too,
     with the same step binding as the sync path."""

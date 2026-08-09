@@ -50,7 +50,11 @@ from copy import copy
 from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
-from vllm.v1.core.sched.ownership import OwnerReceipt, OwnerReceiptBatch
+from vllm.v1.core.sched.ownership import (
+    OwnerLeaseKey,
+    OwnerReceipt,
+    OwnerReceiptBatch,
+)
 from vllm.v1.outputs import ModelRunnerOutput
 
 # Identity of a receipt event for deduplication:
@@ -118,6 +122,15 @@ class ModelRunnerOutputAggregator:
                 "ModelRunnerOutputAggregator.aggregate() requires at least one "
                 "worker output."
             )
+        if expected_step_seq is not None and (
+            isinstance(expected_step_seq, bool)
+            or not isinstance(expected_step_seq, int)
+            or expected_step_seq <= 0
+        ):
+            raise RuntimeError(
+                "ModelRunnerOutputAggregator: expected_step_seq must be a "
+                f"positive non-bool int, got {expected_step_seq!r}."
+            )
 
         batches = self._collect_owner_batches(outputs, expected_step_seq)
 
@@ -155,47 +168,57 @@ class ModelRunnerOutputAggregator:
         """
         batches_by_rank: dict[int, OwnerReceiptBatch] = {}
         emitted_step_seq: int | None = None
-        for output in outputs:
-            if output is None:
-                continue
-            for batch in output.owner_receipt_batches or ():
-                if isinstance(batch.owner_rank, bool) or not isinstance(
-                    batch.owner_rank, int
-                ):
-                    raise RuntimeError(
-                        "ModelRunnerOutputAggregator: owner_rank must be a "
-                        f"non-bool int, got {batch.owner_rank!r}."
-                    )
-                if (
-                    isinstance(batch.emitted_step_seq, bool)
-                    or not isinstance(batch.emitted_step_seq, int)
-                    or batch.emitted_step_seq <= 0
-                ):
-                    raise RuntimeError(
-                        "ModelRunnerOutputAggregator: emitted_step_seq must be "
-                        "a positive non-bool int, got "
-                        f"{batch.emitted_step_seq!r}."
-                    )
-                if batch.owner_rank not in self._expected_owner_ranks:
-                    raise RuntimeError(
-                        "ModelRunnerOutputAggregator: unexpected owner rank "
-                        f"{batch.owner_rank} (expected "
-                        f"{self._expected_owner_ranks})."
-                    )
-                if batch.owner_rank in batches_by_rank:
-                    raise RuntimeError(
-                        "ModelRunnerOutputAggregator: duplicate OwnerReceiptBatch "
-                        f"for owner rank {batch.owner_rank}."
-                    )
-                if emitted_step_seq is None:
-                    emitted_step_seq = batch.emitted_step_seq
-                elif batch.emitted_step_seq != emitted_step_seq:
-                    raise RuntimeError(
-                        "ModelRunnerOutputAggregator: mixed emitted_step_seq "
-                        f"({emitted_step_seq} vs {batch.emitted_step_seq}) in "
-                        "one aggregation."
-                    )
-                batches_by_rank[batch.owner_rank] = batch
+        if self._expected_owner_ranks and len(outputs) != len(
+            self._expected_owner_ranks
+        ):
+            raise RuntimeError(
+                "ModelRunnerOutputAggregator: transport returned "
+                f"{len(outputs)} worker output slots, expected "
+                f"{len(self._expected_owner_ranks)}."
+            )
+        for slot, expected_rank in enumerate(self._expected_owner_ranks):
+            output = outputs[slot]
+            batches = None if output is None else output.owner_receipt_batches
+            if batches is None or len(batches) != 1:
+                count = 0 if batches is None else len(batches)
+                raise RuntimeError(
+                    "ModelRunnerOutputAggregator: transport slot "
+                    f"{slot} for owner rank {expected_rank} must carry exactly "
+                    f"one OwnerReceiptBatch, got {count}."
+                )
+            batch = batches[0]
+            if isinstance(batch.owner_rank, bool) or not isinstance(
+                batch.owner_rank, int
+            ):
+                raise RuntimeError(
+                    "ModelRunnerOutputAggregator: owner_rank must be a "
+                    f"non-bool int, got {batch.owner_rank!r}."
+                )
+            if batch.owner_rank != expected_rank:
+                raise RuntimeError(
+                    "ModelRunnerOutputAggregator: transport slot "
+                    f"{slot} belongs to owner rank {expected_rank}, but its "
+                    f"batch claims owner rank {batch.owner_rank}."
+                )
+            if (
+                isinstance(batch.emitted_step_seq, bool)
+                or not isinstance(batch.emitted_step_seq, int)
+                or batch.emitted_step_seq <= 0
+            ):
+                raise RuntimeError(
+                    "ModelRunnerOutputAggregator: emitted_step_seq must be "
+                    "a positive non-bool int, got "
+                    f"{batch.emitted_step_seq!r}."
+                )
+            if emitted_step_seq is None:
+                emitted_step_seq = batch.emitted_step_seq
+            elif batch.emitted_step_seq != emitted_step_seq:
+                raise RuntimeError(
+                    "ModelRunnerOutputAggregator: mixed emitted_step_seq "
+                    f"({emitted_step_seq} vs {batch.emitted_step_seq}) in "
+                    "one aggregation."
+                )
+            batches_by_rank[batch.owner_rank] = batch
 
         missing = [
             rank for rank in self._expected_owner_ranks if rank not in batches_by_rank
@@ -228,13 +251,44 @@ class ModelRunnerOutputAggregator:
                 # Every event must belong to the owner that emitted the
                 # enclosing batch; otherwise a worker could spoof or misroute
                 # another owner's receipt.
-                if event.owner_id != batch.owner_rank:
+                if (
+                    isinstance(event.owner_id, bool)
+                    or not isinstance(event.owner_id, int)
+                    or event.owner_id != batch.owner_rank
+                ):
                     raise RuntimeError(
                         "ModelRunnerOutputAggregator: OwnerReceipt owner_id "
                         f"{event.owner_id} does not match enclosing batch "
                         f"owner_rank {batch.owner_rank} (request_id="
                         f"{event.key.request_id!r}, command_seq="
                         f"{event.command_seq})."
+                    )
+                if not isinstance(event.key, OwnerLeaseKey):
+                    raise RuntimeError(
+                        "ModelRunnerOutputAggregator: OwnerReceipt key must be "
+                        f"an OwnerLeaseKey, got {event.key!r}."
+                    )
+                if not isinstance(event.key.request_id, str):
+                    raise RuntimeError(
+                        "ModelRunnerOutputAggregator: request_id must be a string."
+                    )
+                if (
+                    isinstance(event.key.owner_epoch, bool)
+                    or not isinstance(event.key.owner_epoch, int)
+                    or event.key.owner_epoch < 0
+                ):
+                    raise RuntimeError(
+                        "ModelRunnerOutputAggregator: owner_epoch must be a "
+                        "nonnegative non-bool int."
+                    )
+                if (
+                    isinstance(event.command_seq, bool)
+                    or not isinstance(event.command_seq, int)
+                    or event.command_seq <= 0
+                ):
+                    raise RuntimeError(
+                        "ModelRunnerOutputAggregator: command_seq must be a "
+                        "positive non-bool int."
                     )
                 identity = (
                     batch.owner_rank,

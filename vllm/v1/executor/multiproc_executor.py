@@ -311,6 +311,7 @@ class MultiprocExecutor(Executor):
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        self._validate_request_owned_control_only_step(scheduler_output)
         if self.scheduler_config.enable_request_owned_attention:
             # G0: aggregate owner receipt batches from every worker.  The
             # generic aggregator also composes the KV aggregator when one is

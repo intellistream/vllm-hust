@@ -138,6 +138,35 @@ class Executor(ABC):
             kv_aggregator=self.kv_output_aggregator,
         )
 
+    def _validate_request_owned_control_only_step(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Reject token execution before any executor transport in G1.
+
+        This also protects against mutating the nested scheduler config after
+        ``VllmConfig`` validation: no backend may dispatch replicated token KV
+        merely because its remote worker retained an older disabled config.
+        """
+        if not self.scheduler_config.enable_request_owned_attention:
+            return
+        total = scheduler_output.total_num_scheduled_tokens
+        per_request = scheduler_output.num_scheduled_tokens
+        if (
+            isinstance(total, bool)
+            or not isinstance(total, int)
+            or total != 0
+            or any(
+                isinstance(count, bool) or not isinstance(count, int) or count < 0
+                for count in per_request.values()
+            )
+            or sum(per_request.values()) != 0
+        ):
+            raise RuntimeError(
+                "request-owned attention G1 is control-only: refusing to "
+                "dispatch a nonempty or inconsistent token schedule before "
+                "the G2 owner-local allocator/routing prerequisite exists."
+            )
+
     @abstractmethod
     def _init_executor(self) -> None:
         raise NotImplementedError
@@ -248,6 +277,7 @@ class Executor(ABC):
     def execute_model(
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        self._validate_request_owned_control_only_step(scheduler_output)
         output = self.collective_rpc(  # type: ignore[call-overload]
             "execute_model", args=(scheduler_output,), non_block=non_block
         )

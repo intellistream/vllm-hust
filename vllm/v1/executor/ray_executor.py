@@ -392,6 +392,7 @@ class RayDistributedExecutor(Executor):
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        self._validate_request_owned_control_only_step(scheduler_output)
         if self.scheduler_output is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "

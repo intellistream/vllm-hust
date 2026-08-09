@@ -141,6 +141,18 @@ try:
             else:
                 scheduler_output, grammar_output = execute_model_input
                 intermediate_tensors = None
+            if self.vllm_config.scheduler_config.enable_request_owned_attention:
+                if intermediate_tensors is not None:
+                    raise RuntimeError(
+                        "request-owned attention G1 does not support Ray "
+                        "pipeline intermediate tensors."
+                    )
+                # The compiled DAG normally bypasses WorkerWrapperBase and
+                # calls model_runner directly.  That would execute replicated
+                # token KV before receipt validation, so route the G1 envelope
+                # through the same control-only worker boundary instead.  It
+                # rejects token-bearing steps and split/async sampling.
+                return self._execute_request_owned_control_step(scheduler_output)
             assert self.worker.model_runner is not None
             output = self.worker.model_runner.execute_model(
                 scheduler_output, intermediate_tensors

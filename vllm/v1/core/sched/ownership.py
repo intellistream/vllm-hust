@@ -44,6 +44,19 @@ class OwnerLeaseKey:
     request_id: str
     owner_epoch: int
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.request_id, str):
+            raise TypeError(f"request_id must be a string, got {self.request_id!r}.")
+        if (
+            isinstance(self.owner_epoch, bool)
+            or not isinstance(self.owner_epoch, int)
+            or self.owner_epoch < 0
+        ):
+            raise TypeError(
+                "owner_epoch must be a nonnegative non-bool int, got "
+                f"{self.owner_epoch!r}."
+            )
+
 
 class OwnerCommandKind(enum.Enum):
     """Kinds of owner commands issued by the coordinator."""

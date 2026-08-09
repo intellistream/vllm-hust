@@ -9,6 +9,7 @@ import pytest
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.ownership import (
+    AttentionLeaseManager,
     OwnerCommand,
     OwnerCommandKind,
     OwnerLeaseKey,
@@ -93,21 +94,22 @@ def test_targeted_reserve_refuses_while_other_rank_emits_empty_batch() -> None:
     assert receipt.free_capacity == 0
 
 
-def test_command_processing_precedes_underlying_worker() -> None:
+def test_command_processing_precedes_underlying_worker(monkeypatch) -> None:
     step = _output()
     step.owner_commands = [_reserve(owner_id=1)]
-    wrapper = None
+    order = []
+    original_apply = AttentionLeaseManager.apply
 
-    def before_return(_scheduler_output) -> None:
-        assert wrapper is not None
-        manager = wrapper._request_owned_control_manager
-        assert manager is not None
-        assert len(manager._outbox) == 1
+    def record_apply(manager, command):
+        order.append("apply")
+        return original_apply(manager, command)
 
-    worker = _FakeWorker(before_return=before_return)
+    monkeypatch.setattr(AttentionLeaseManager, "apply", record_apply)
+    worker = _FakeWorker(before_return=lambda _: order.append("worker"))
     wrapper = _wrapper(1, worker)
     wrapper.execute_model(step)
     assert worker.calls == 1
+    assert order == ["apply", "worker"]
 
 
 def test_scheduled_tokens_fail_before_underlying_worker() -> None:
@@ -119,6 +121,30 @@ def test_scheduled_tokens_fail_before_underlying_worker() -> None:
     with pytest.raises(RuntimeError, match="replicated KV"):
         wrapper.execute_model(step)
     assert worker.calls == 0
+    assert wrapper._request_owned_control_manager is None
+
+
+@pytest.mark.parametrize(
+    "total, per_request",
+    [
+        (False, {}),
+        (0.0, {}),
+        (0, {"req": 1}),
+        (1, {}),
+        (0, {"req": True}),
+        (0, {"req": -1, "other": 1}),
+    ],
+)
+def test_inconsistent_token_envelope_fails_before_worker(total, per_request) -> None:
+    worker = _FakeWorker()
+    wrapper = _wrapper(0, worker)
+    step = _output()
+    step.total_num_scheduled_tokens = total
+    step.num_scheduled_tokens = per_request
+    with pytest.raises(RuntimeError, match="inconsistent token schedule"):
+        wrapper.execute_model(step)
+    assert worker.calls == 0
+    assert wrapper._request_owned_control_manager is None
 
 
 def test_empty_singleton_is_never_mutated() -> None:
@@ -131,13 +157,19 @@ def test_empty_singleton_is_never_mutated() -> None:
 
 
 def test_none_and_async_outputs_fail_explicitly() -> None:
+    step = _output()
+    step.owner_commands = [_reserve(owner_id=0)]
     none_worker = _FakeWorker(output=None)
+    none_wrapper = _wrapper(0, none_worker)
     with pytest.raises(RuntimeError, match="split sampling"):
-        _wrapper(0, none_worker).execute_model(_output())
+        none_wrapper.execute_model(step)
+    assert none_wrapper._request_owned_control_manager is None
 
     async_worker = _FakeWorker(output=_FakeAsyncOutput())
+    async_wrapper = _wrapper(0, async_worker)
     with pytest.raises(RuntimeError, match="step-keyed receipt FIFO"):
-        _wrapper(0, async_worker).execute_model(_output())
+        async_wrapper.execute_model(step)
+    assert async_wrapper._request_owned_control_manager is None
 
 
 @pytest.mark.parametrize("step_seq", [0, -1, True, False, 1.5, "1", None])
