@@ -52,9 +52,19 @@ The sampling-enabled contract (active only when
   ``expected_sampling_owner_ranks`` list is an enabled-but-empty contract
   that fails closed on any transport slot; it is never silently treated as
   disabled.
+* Deferred-execute tolerance: when every transport slot is ``None`` (the
+  deferred ``execute_model`` round, where every worker deferred sampling),
+  :meth:`aggregate` returns ``None`` without demanding receipt or sampling
+  envelopes.  A mixed ``None``/non-``None`` round still fails closed (a
+  ``None`` slot cannot carry its envelopes), and the sampling-disabled
+  aggregator never tolerates ``None`` slots.
 * Every batch in one aggregation carries the same ``emitted_step_seq``; an
   optional ``expected_step_seq`` (as bound by
   :meth:`ModelRunnerOutputAggregator.for_step`) must match.
+* An all-``None`` outputs list is the deferred ``execute_model`` round:
+  :meth:`aggregate` returns ``None`` without demanding envelopes, and the
+  same per-step adapter is then reused for the immediate ``sample_tokens``
+  round.  A mixed ``None``/non-``None`` round fails closed.
 * Each batch's ``owner_rank`` must equal its transport slot's expected
   owner rank, its ``row_ids`` must align exactly 1:1 with the partial
   output's ``req_ids`` (``row_ids[i].request_uid.request_id ==
@@ -194,6 +204,12 @@ class ModelRunnerOutputAggregator:
         never mutated.  Returns a shallow copy of ``outputs[output_rank]``
         carrying the aggregated owner receipt batches sorted by numeric
         global owner rank.
+
+        With the sampling contract enabled, an all-``None`` outputs list is
+        the deferred ``execute_model`` round: it returns ``None`` without
+        demanding envelopes, so the bound adapter can be reused for the
+        immediate ``sample_tokens`` round.  Mixed ``None``/non-``None``
+        rounds fail closed.
         """
         if not outputs:
             raise RuntimeError(
@@ -209,6 +225,37 @@ class ModelRunnerOutputAggregator:
                 "ModelRunnerOutputAggregator: expected_step_seq must be a "
                 f"positive non-bool int, got {expected_step_seq!r}."
             )
+
+        if self._expected_sampling_owner_ranks is not None and all(
+            output is None for output in outputs
+        ):
+            # Deferred execute round: every worker deferred sampling, so no
+            # receipt or sampling envelopes exist yet.  Propagate None
+            # without demanding envelopes; the immediate sample_tokens round
+            # carries them.  The exact transport cardinality is still
+            # validated against both enabled rank contracts before the fast
+            # path, so a truncated or padded all-None round can never be
+            # silently accepted.  Mixed None/non-None rounds fail closed in
+            # the collection paths below (a None transport slot cannot carry
+            # its envelopes), and the sampling-disabled aggregator never
+            # tolerates None slots.
+            expected_sampling = len(self._expected_sampling_owner_ranks)
+            if len(outputs) != expected_sampling:
+                raise RuntimeError(
+                    "ModelRunnerOutputAggregator: deferred transport round "
+                    f"returned {len(outputs)} worker output slots, expected "
+                    f"{expected_sampling} for the enabled sampling contract."
+                )
+            if self._expected_owner_ranks and len(outputs) != len(
+                self._expected_owner_ranks
+            ):
+                raise RuntimeError(
+                    "ModelRunnerOutputAggregator: deferred transport round "
+                    f"returned {len(outputs)} worker output slots, expected "
+                    f"{len(self._expected_owner_ranks)} for the enabled "
+                    "owner receipt contract."
+                )
+            return None
 
         sampling_batches = None
         if self._expected_sampling_owner_ranks is not None:

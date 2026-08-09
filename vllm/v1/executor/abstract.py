@@ -136,6 +136,16 @@ class Executor(ABC):
         self.model_runner_output_aggregator = ModelRunnerOutputAggregator(
             expected_owner_ranks=self._expected_owner_ranks(),
             kv_aggregator=self.kv_output_aggregator,
+            # G3 request-owned sampling: when enabled, every process-global
+            # owner rank must emit exactly one OwnerSamplingBatch per
+            # terminal round, and the aggregator tolerates the deferred
+            # all-None execute round.  Sampling disabled (the default) keeps
+            # the aggregator byte-for-byte unchanged.
+            expected_sampling_owner_ranks=(
+                self._expected_owner_ranks()
+                if self.scheduler_config.enable_request_owned_sampling
+                else None
+            ),
         )
 
     def _validate_request_owned_control_only_step(
@@ -148,6 +158,13 @@ class Executor(ABC):
         merely because its remote worker retained an older disabled config.
         """
         if not self.scheduler_config.enable_request_owned_attention:
+            return
+        if getattr(self.scheduler_config, "enable_request_owned_sampling", False):
+            # G3 request-owned sampling transport: the owner-sampling
+            # aggregator is authoritative across the deferred execute ->
+            # sample_tokens flow, so the G1 control-only gate lifts.  With
+            # the sampling flag off (the default) the gate below stays
+            # byte-for-byte unchanged.
             return
         total = scheduler_output.total_num_scheduled_tokens
         per_request = scheduler_output.num_scheduled_tokens

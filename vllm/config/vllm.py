@@ -1216,6 +1216,8 @@ class VllmConfig:
 
         self._validate_request_owned_attention()
 
+        self._validate_request_owned_sampling()
+
         # async tp is built on top of sequence parallelism and requires it.
         pass_config = self.compilation_config.pass_config
         if pass_config.fuse_gemm_comms:
@@ -2388,6 +2390,55 @@ class VllmConfig:
                 f"{pass_config.enable_sp} and pass_config.fuse_gemm_comms="
                 f"{pass_config.fuse_gemm_comms}."
             )
+
+    def _validate_request_owned_sampling(self) -> None:
+        """Fail closed for the experimental request-owned sampling transport.
+
+        ``enable_request_owned_sampling`` is a transport-only opt-in on top
+        of the request-owned attention envelope: it makes the owner-sampling
+        aggregator authoritative across the deferred ``execute_model ->
+        None -> sample_tokens`` Multiproc flow.  It therefore requires the
+        existing request-owned attention envelope (which already enforces
+        eager execution, no speculative decoding, PP=1, synchronous
+        scheduling, and the rest of the G2/G3 rejections above) and strictly
+        the Multiproc executor: the exact per-step adapter
+        bind/reuse/clear state machine is proven only for the multiproc
+        message-queue transport, so UniProc (even at world_size=1), Ray,
+        ``external_launcher``, and custom executor classes fail closed.
+        """
+        if not self.scheduler_config.enable_request_owned_sampling:
+            return
+
+        if not self.scheduler_config.enable_request_owned_attention:
+            raise ValueError(
+                "Request-owned sampling is experimental and requires "
+                "enable_request_owned_attention=True (the existing "
+                "request-owned attention envelope), but got "
+                "enable_request_owned_attention="
+                f"{self.scheduler_config.enable_request_owned_attention}."
+            )
+
+        parallel_config = self.parallel_config
+        if parallel_config.use_ray:
+            raise ValueError(
+                "Request-owned sampling requires the Multiproc executor and "
+                "does not support the Ray executor."
+            )
+        executor_backend = parallel_config.distributed_executor_backend
+        if executor_backend != "mp":
+            raise ValueError(
+                "Request-owned sampling requires "
+                "distributed_executor_backend='mp', but got "
+                f"{executor_backend!r}. UniProc (even for single-process "
+                "host/control tests), Ray, 'external_launcher', and custom "
+                "executor classes are not supported because the per-step "
+                "sampling adapter state machine is proven only for the "
+                "Multiproc transport."
+            )
+        # Eager execution, no speculative decoding, PP=1, synchronous
+        # scheduling, and the rest of the request-owned envelope are already
+        # enforced by _validate_request_owned_attention above (which the
+        # first check requires), so no duplicate rejections are needed here.
 
     def validate_block_size(self) -> None:
         """Validate block_size against DCP and mamba constraints.

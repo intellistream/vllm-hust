@@ -175,6 +175,22 @@ class SchedulerConfig:
     Q/KV/O routing path is connected; unsupported features are rejected by
     ``VllmConfig`` validation."""
 
+    enable_request_owned_sampling: bool = False
+    """Experimental request-owned sampling transport (G3).
+
+    Defaults to False.  When enabled together with
+    ``enable_request_owned_attention``, the Multiproc executor makes the
+    owner-sampling aggregator authoritative across the deferred
+    ``execute_model -> None -> sample_tokens`` flow: the per-step adapter
+    bound during ``execute_model`` is reused for the immediate
+    ``sample_tokens`` round and cleared only after successful terminal
+    aggregation.  ``VllmConfig`` validation requires the existing
+    request-owned attention envelope and
+    ``distributed_executor_backend='mp'``; UniProc (even at world_size=1),
+    Ray, ``external_launcher``, and custom executor classes are rejected.
+    The flag changes no computation graph structure, so it is deliberately
+    not part of :meth:`compute_hash`."""
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -247,6 +263,22 @@ class SchedulerConfig:
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
         """Skip validation if the value is `None` when initialisation is delayed."""
         return None if value is None else handler(value)
+
+    @field_validator("enable_request_owned_sampling", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_sampling(cls, value: Any) -> Any:
+        """Reject non-bool values before pydantic coercion.
+
+        The experimental flag is a strict bool gate: integer/string truthy
+        values such as ``1`` or ``"true"`` must fail closed instead of being
+        silently coerced into the enabled state.
+        """
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_sampling must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
         if is_encoder_decoder:

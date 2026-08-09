@@ -117,6 +117,15 @@ class MultiprocExecutor(Executor):
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
+        # G3 request-owned sampling transport: exact per-step adapter state.
+        # At most one adapter is pending, between the deferred execute_model
+        # round (all workers returned None) and the immediate sample_tokens
+        # round.  It is cleared only after successful terminal aggregation or
+        # when the transport enters the explicit fail-stop state below.
+        self._pending_sampling_adapter: (
+            ModelRunnerOutputAggregatorStepAdapter | None
+        ) = None
+        self._sampling_transport_failed = False
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -312,6 +321,10 @@ class MultiprocExecutor(Executor):
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         self._validate_request_owned_control_only_step(scheduler_output)
+        if getattr(self.scheduler_config, "enable_request_owned_sampling", False):
+            return self._execute_model_request_owned_sampling(
+                scheduler_output, non_block
+            )
         if self.scheduler_config.enable_request_owned_attention:
             # G0: aggregate owner receipt batches from every worker.  The
             # generic aggregator also composes the KV aggregator when one is
@@ -348,6 +361,10 @@ class MultiprocExecutor(Executor):
     def sample_tokens(  # type: ignore[override]
         self, grammar_output: GrammarOutput | None, non_block: bool = False
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
+        if getattr(self.scheduler_config, "enable_request_owned_sampling", False):
+            return self._sample_tokens_request_owned_sampling(
+                grammar_output, non_block
+            )
         return self.collective_rpc(
             "sample_tokens",
             args=(grammar_output,),
@@ -356,6 +373,152 @@ class MultiprocExecutor(Executor):
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,
         )
+
+    def _request_owned_sampling_adapter(
+        self, step_seq: int
+    ) -> ModelRunnerOutputAggregatorStepAdapter:
+        """Bind the exact per-step adapter and stash it as pending.
+
+        Fails closed on overwrite: a pending adapter from an earlier step
+        that was never terminally aggregated (a deferred execute_model round)
+        must first be consumed by its immediate sample_tokens round, so a
+        stale adapter can never be overwritten by a newer step or replayed.
+        """
+        if self._sampling_transport_failed:
+            raise RuntimeError(
+                "Executor failed: request-owned sampling transport is in "
+                "fail-stop state after a protocol violation."
+            )
+        assert self.model_runner_output_aggregator is not None, (
+            "request-owned sampling is enabled but the model runner output "
+            "aggregator was not constructed."
+        )
+        adapter = self.model_runner_output_aggregator.for_step(step_seq)
+        pending = self._pending_sampling_adapter
+        if pending is not None:
+            raise RuntimeError(
+                "request-owned sampling: execute_model for step "
+                f"{pending.step_seq} is still pending its immediate "
+                f"sample_tokens round; refusing to overwrite it with step "
+                f"{step_seq}. The pending adapter must be terminally "
+                "aggregated (or the transport fail-stopped) first."
+            )
+        self._pending_sampling_adapter = adapter
+        return adapter
+
+    def _clear_pending_sampling_adapter(self) -> None:
+        """Clear the pending adapter after successful terminal aggregation."""
+        self._pending_sampling_adapter = None
+
+    def _fail_sampling_transport(self) -> None:
+        """Enter the explicit fail-stop state and drop the pending adapter so
+        it can never be replayed, reused, or overwritten."""
+        self._sampling_transport_failed = True
+        self._pending_sampling_adapter = None
+
+    def _execute_model_request_owned_sampling(
+        self, scheduler_output: SchedulerOutput, non_block: bool
+    ) -> ModelRunnerOutput | None:
+        """Deferred execute round under the G3 sampling transport.
+
+        Binds and stashes the exact per-step adapter, then aggregates the
+        round through it.  An all-None round (every worker deferred
+        sampling) leaves the adapter pending for the immediate
+        ``sample_tokens`` round; a concrete round is terminal and leaves no
+        pending adapter.  ``non_block=True`` fails closed: the bind/reuse/
+        clear state transition cannot be proven across a deferred future
+        boundary (this executor cannot observe when the future is realized
+        relative to later binds), so the synchronous path is the only proven
+        one.
+        """
+        if non_block:
+            raise RuntimeError(
+                "request-owned sampling requires synchronous execution "
+                "(non_block=False): the exact per-step adapter state "
+                "transition (bind during execute_model, reuse for the "
+                "immediate sample_tokens round, clear after terminal "
+                "aggregation) cannot be proven across a deferred future "
+                "boundary; refusing non_block=True."
+            )
+        adapter = self._request_owned_sampling_adapter(scheduler_output.step_seq)
+        try:
+            result = self.collective_rpc(
+                "execute_model",
+                args=(scheduler_output,),
+                unique_reply_rank=self.output_rank,
+                non_block=False,
+                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+                kv_output_aggregator=adapter,
+            )
+        except Exception:
+            # Any transport/aggregation failure fail-stops: no pending
+            # adapter may survive to be replayed.
+            self._fail_sampling_transport()
+            raise
+        if result is None:
+            # Deferred: every worker returned None; keep the exact adapter
+            # pending for the immediate sample_tokens round.
+            return None
+        # Concrete: the execute round was terminal; no pending sampling
+        # adapter remains.
+        self._clear_pending_sampling_adapter()
+        return result
+
+    def _sample_tokens_request_owned_sampling(
+        self, grammar_output: GrammarOutput | None, non_block: bool
+    ) -> ModelRunnerOutput:
+        """Terminal sample round under the G3 sampling transport.
+
+        Reuses the exact per-step adapter stashed by the immediately
+        preceding deferred execute_model round.  The adapter binds
+        ``expected_step_seq`` to the execute round's step, so every worker
+        emission in the sample round must carry that exact step fence.  The
+        pending adapter is cleared only after this successful terminal
+        aggregation; any failure enters the explicit fail-stop state.
+        """
+        if non_block:
+            raise RuntimeError(
+                "request-owned sampling requires synchronous execution "
+                "(non_block=False): the terminal sample_tokens round must "
+                "complete before any later bind can be proven safe; "
+                "refusing non_block=True."
+            )
+        if self._sampling_transport_failed:
+            raise RuntimeError(
+                "Executor failed: request-owned sampling transport is in "
+                "fail-stop state after a protocol violation."
+            )
+        adapter = self._pending_sampling_adapter
+        if adapter is None:
+            raise RuntimeError(
+                "request-owned sampling: sample_tokens has no pending "
+                "per-step adapter. sample_tokens must immediately follow a "
+                "deferred execute_model round for the same step; a stale, "
+                "replayed, or unbound call is refused."
+            )
+        try:
+            result = self.collective_rpc(
+                "sample_tokens",
+                args=(grammar_output,),
+                unique_reply_rank=self.output_rank,
+                non_block=False,
+                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+                kv_output_aggregator=adapter,
+            )
+        except Exception:
+            self._fail_sampling_transport()
+            raise
+        if result is None:
+            # All workers returned None on the terminal sampling round: not
+            # a successful terminal aggregation.
+            self._fail_sampling_transport()
+            raise RuntimeError(
+                "request-owned sampling: sample_tokens returned None; the "
+                "terminal sampling round must aggregate concrete worker "
+                "outputs. Entering fail-stop state."
+            )
+        self._clear_pending_sampling_adapter()
+        return result
 
     def execute_dummy_batch(self) -> None:
         self.collective_rpc("execute_dummy_batch", unique_reply_rank=self.output_rank)
