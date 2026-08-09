@@ -512,8 +512,7 @@ class WorkerWrapperBase:
                 trial_manager = candidate
                 continue
             reject_error = physical.error or (
-                "physical request-owned KV store rejected the command "
-                "without an error"
+                "physical request-owned KV store rejected the command without an error"
             )
             trial_manager.apply(command, external_reject_error=reject_error)
 

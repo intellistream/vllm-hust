@@ -33,7 +33,6 @@ non-deferred no-op; a RESERVE on that key consumes the tombstone and
 allocates fresh blocks.
 """
 
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -291,9 +290,7 @@ class RequestOwnedKVStore:
         record.num_computed_tokens = num_tokens
         return True
 
-    def get_block_table(
-        self, key: OwnerLeaseKey
-    ) -> tuple[tuple[int, ...], ...] | None:
+    def get_block_table(self, key: OwnerLeaseKey) -> tuple[tuple[int, ...], ...] | None:
         """Private full per-group tables; readable until :meth:`flush`."""
         record = self._records.get(key)
         if record is None:
@@ -337,9 +334,8 @@ class RequestOwnedKVStore:
             OwnerCacheGroupSnapshot(
                 group_index=index,
                 spec_kind=get_kv_cache_spec_kind(spec).value,
-                effective_tokens_per_block=spec.block_size * max(
-                    1, int(getattr(spec, "compress_ratio", 1))
-                ),
+                effective_tokens_per_block=spec.block_size
+                * max(1, int(getattr(spec, "compress_ratio", 1))),
                 allocated_blocks=allocated[index],
                 resident_blocks=allocated[index],
             )

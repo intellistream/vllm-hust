@@ -112,9 +112,7 @@ def test_reserve_and_extend_tables():
     key = _key("r1")
     initial = _free(manager)
 
-    reserve = store.reserve(
-        _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
-    )
+    reserve = store.reserve(_command(key, OwnerCommandKind.RESERVE, required=10, seq=1))
     assert reserve.accepted
     assert reserve.error is None
     # 10 tokens at block_size 4 -> 3 blocks per group, all newly allocated.
@@ -127,9 +125,7 @@ def test_reserve_and_extend_tables():
     )
     assert _free(manager) == initial - 6
 
-    extend = store.extend(
-        _command(key, OwnerCommandKind.EXTEND, required=14, seq=2)
-    )
+    extend = store.extend(_command(key, OwnerCommandKind.EXTEND, required=14, seq=2))
     assert extend.accepted
     assert _sizes(extend.tables) == (4, 4)
     assert _sizes(extend.delta) == (1, 1)
@@ -142,9 +138,7 @@ def test_zero_token_reserve_and_noop_extend():
     key = _key("z")
     initial = _free(manager)
 
-    reserve = store.reserve(
-        _command(key, OwnerCommandKind.RESERVE, required=0, seq=1)
-    )
+    reserve = store.reserve(_command(key, OwnerCommandKind.RESERVE, required=0, seq=1))
     assert reserve.accepted
     assert reserve.tables == ((), ())
     assert reserve.delta == ((), ())
@@ -153,18 +147,14 @@ def test_zero_token_reserve_and_noop_extend():
     assert not store.mark_computed(key, 1)
 
     # The first real allocation arrives via EXTEND (horizon 0 -> 4).
-    extend = store.extend(
-        _command(key, OwnerCommandKind.EXTEND, required=4, seq=2)
-    )
+    extend = store.extend(_command(key, OwnerCommandKind.EXTEND, required=4, seq=2))
     assert extend.accepted
     assert _sizes(extend.delta) == (1, 1)
     assert _free(manager) == initial - 2
 
     # A no-op EXTEND (nothing new to allocate) never touches the manager.
     assert store.mark_computed(key, 4)
-    noop = store.extend(
-        _command(key, OwnerCommandKind.EXTEND, required=4, seq=3)
-    )
+    noop = store.extend(_command(key, OwnerCommandKind.EXTEND, required=4, seq=3))
     assert noop.accepted
     assert noop.delta == ((), ())
     assert _free(manager) == initial - 2
@@ -300,9 +290,7 @@ def test_preempt_and_release_deferred_until_flush():
     ).accepted
     assert _free(manager) == initial - 6
 
-    preempt = store.preempt(
-        _command(key, OwnerCommandKind.PREEMPT, required=10, seq=2)
-    )
+    preempt = store.preempt(_command(key, OwnerCommandKind.PREEMPT, required=10, seq=2))
     assert preempt.accepted and preempt.deferred
     # Blocks stay resident (and the allocator id non-reusable) pre-flush.
     assert _free(manager) == initial - 6
@@ -321,9 +309,7 @@ def test_preempt_and_release_deferred_until_flush():
     assert [g.allocated_blocks for g in store.pool_snapshot().groups] == [0, 0]
 
     # The key is reusable after flush and allocates a fresh table.
-    again = store.reserve(
-        _command(key, OwnerCommandKind.RESERVE, required=10, seq=4)
-    )
+    again = store.reserve(_command(key, OwnerCommandKind.RESERVE, required=10, seq=4))
     assert again.accepted
     assert _sizes(again.tables) == (3, 3)
     assert _free(manager) == initial - 6
@@ -386,15 +372,11 @@ def test_preempt_flush_release_tombstone():
 
     # The aborting RELEASE is accepted as a non-deferred no-op and ends
     # the tombstone: a repeated RELEASE is now unknown again.
-    release = store.release(
-        _command(key, OwnerCommandKind.RELEASE, required=10, seq=4)
-    )
+    release = store.release(_command(key, OwnerCommandKind.RELEASE, required=10, seq=4))
     assert release.accepted
     assert not release.deferred
     assert _free(manager) == initial
-    again = store.release(
-        _command(key, OwnerCommandKind.RELEASE, required=10, seq=5)
-    )
+    again = store.release(_command(key, OwnerCommandKind.RELEASE, required=10, seq=5))
     assert not again.accepted
     assert "no lease to release" in again.error
 
@@ -416,17 +398,13 @@ def test_preempt_flush_resume():
     assert store.flush() == (key,)
     assert _free(manager) == initial
 
-    resume = store.reserve(
-        _command(key, OwnerCommandKind.RESERVE, required=10, seq=3)
-    )
+    resume = store.reserve(_command(key, OwnerCommandKind.RESERVE, required=10, seq=3))
     assert resume.accepted
     assert _sizes(resume.tables) == (3, 3)
     assert _free(manager) == initial - 6
     # Tombstone consumed: the resumed lease frees via the normal RELEASE
     # deferral path, and the release-flush leaves no tombstone behind.
-    release = store.release(
-        _command(key, OwnerCommandKind.RELEASE, required=10, seq=4)
-    )
+    release = store.release(_command(key, OwnerCommandKind.RELEASE, required=10, seq=4))
     assert release.accepted and release.deferred
     store.flush()
     assert _free(manager) == initial
@@ -445,8 +423,10 @@ def test_pool_snapshot_is_canonical_and_block_id_free():
     assert isinstance(snapshot.groups, tuple)
     assert [isinstance(g, OwnerCacheGroupSnapshot) for g in snapshot.groups]
     assert [g.group_index for g in snapshot.groups] == [0, 1]
-    assert [g.spec_kind for g in snapshot.groups] == ["full_attention",
-                                                      "sliding_window"]
+    assert [g.spec_kind for g in snapshot.groups] == [
+        "full_attention",
+        "sliding_window",
+    ]
     assert [g.effective_tokens_per_block for g in snapshot.groups] == [4, 4]
     assert [g.allocated_blocks for g in snapshot.groups] == [0, 0]
     assert snapshot.owner_rank == 7
@@ -479,9 +459,7 @@ def test_restore_and_prefix_paths_rejected():
     store = RequestOwnedKVStore(manager, owner_rank=0)
     key = _key("r")
 
-    restore = store.restore(
-        _command(key, OwnerCommandKind.RESTORE, required=10, seq=1)
-    )
+    restore = store.restore(_command(key, OwnerCommandKind.RESTORE, required=10, seq=1))
     assert not restore.accepted
     assert "out of scope" in restore.error
     assert store.get_block_table(key) is None
@@ -511,8 +489,10 @@ def _make_dsv4_manager(
     config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=(
-            [KVCacheTensor(size=num_blocks * 1024, shared_by=["a"]),
-             KVCacheTensor(size=num_blocks * 2048, shared_by=["b"])]
+            [
+                KVCacheTensor(size=num_blocks * 1024, shared_by=["a"]),
+                KVCacheTensor(size=num_blocks * 2048, shared_by=["b"]),
+            ]
             if tensors is None
             else tensors
         ),
@@ -536,8 +516,7 @@ def test_dsv4_shaped_heterogeneous_groups():
     manager = _make_dsv4_manager()
     store = RequestOwnedKVStore(manager, owner_rank=0)
     snapshot = store.pool_snapshot()
-    assert [g.spec_kind for g in snapshot.groups] == ["mla_attention",
-                                                      "sliding_window"]
+    assert [g.spec_kind for g in snapshot.groups] == ["mla_attention", "sliding_window"]
     # Effective tokens per block honors MLA compression (block_size * 4x).
     assert [g.effective_tokens_per_block for g in snapshot.groups] == [16, 4]
     # One globally unique shared-pool block ID spans every tensor: the

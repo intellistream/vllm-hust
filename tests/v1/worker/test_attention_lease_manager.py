@@ -858,14 +858,17 @@ def test_command_allocation_is_reserve_only_and_matches_token_count() -> None:
         num_tokens=0,
         status=OwnerAdmissionStatus.WAITING,
     )
-    assert OwnerCommand(
-        key=key,
-        owner_id=1,
-        command_seq=5,
-        kind=OwnerCommandKind.RESERVE,
-        required_num_tokens=0,
-        allocation=empty,
-    ).allocation is empty
+    assert (
+        OwnerCommand(
+            key=key,
+            owner_id=1,
+            command_seq=5,
+            kind=OwnerCommandKind.RESERVE,
+            required_num_tokens=0,
+            allocation=empty,
+        ).allocation
+        is empty
+    )
 
 
 def test_command_requires_nonnegative_nonbool_token_count() -> None:

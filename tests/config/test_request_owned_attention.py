@@ -219,9 +219,7 @@ def test_enabled_rejects_decode_context_parallelism():
 
 def test_enabled_rejects_prefill_context_parallelism():
     with pytest.raises(ValueError, match="prefill_context_parallel_size"):
-        _vllm_config(
-            parallel_config=ParallelConfig(prefill_context_parallel_size=2)
-        )
+        _vllm_config(parallel_config=ParallelConfig(prefill_context_parallel_size=2))
 
 
 def test_enabled_rejects_async_scheduling():
