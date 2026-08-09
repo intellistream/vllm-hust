@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from copy import copy, deepcopy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
@@ -16,8 +17,19 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
-from vllm.v1.core.sched.ownership import AttentionLeaseManager
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.sched.ownership import (
+    AttentionLeaseManager,
+    OwnerCommand,
+    OwnerCommandKind,
+)
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.worker.request_owned_kv import (
+    AllocationResult,
+    DeferredFreeResult,
+    RequestOwnedKVStore,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -31,12 +43,6 @@ else:
 logger = init_logger(__name__)
 
 _R = TypeVar("_R")
-
-# G1 binds the command/receipt transport without pretending that the legacy
-# replicated KV allocator is owner-local capacity.  Zero makes every reserve
-# fail before publication; G2 replaces this control-only reference manager
-# with physical owner-local allocation authority.
-_REQUEST_OWNED_CONTROL_ONLY_CAPACITY = 0
 
 
 class CompilationTimes(NamedTuple):
@@ -223,6 +229,7 @@ class WorkerWrapperBase:
         self.worker: WorkerBase
         self.vllm_config: VllmConfig
         self._request_owned_control_manager: AttentionLeaseManager | None = None
+        self._request_owned_kv_store: RequestOwnedKVStore | None = None
 
     def shutdown(self) -> None:
         if self.worker is not None:
@@ -333,6 +340,67 @@ class WorkerWrapperBase:
         with set_current_vllm_config(self.vllm_config):
             self.worker.initialize_from_config(kv_cache_config)  # type: ignore
 
+            # G2: after the underlying worker initializes, bind this rank's
+            # physical store when request-owned attention is enabled.  The
+            # store reuses one real KVCacheManager over this rank's
+            # KVCacheConfig; prefix caching, Eagle, events, and stats are all
+            # disabled because the scheduler-side manager stays the only
+            # prefix/Eagle authority and this store never publishes block IDs.
+            if self.vllm_config.scheduler_config.enable_request_owned_attention:
+                self._request_owned_kv_store = self._create_request_owned_kv_store(
+                    kv_cache_config
+                )
+
+    def _create_request_owned_kv_store(
+        self, kv_cache_config: KVCacheConfig
+    ) -> RequestOwnedKVStore:
+        """Build the rank-local physical KV store (G2).
+
+        Scheduler/hash block sizes, DCP/PCP world sizes, and max batched
+        tokens come from the same vllm_config facts the scheduler uses, so
+        the store's block pool accounting matches the coordinator's.
+        """
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, self.vllm_config
+        )
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            max_model_len=self.vllm_config.model_config.max_model_len,
+            scheduler_block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+            max_num_batched_tokens=(
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            enable_caching=False,
+            use_eagle=False,
+            log_stats=False,
+            enable_kv_cache_events=False,
+            dcp_world_size=(
+                self.vllm_config.parallel_config.decode_context_parallel_size
+            ),
+            pcp_world_size=(
+                self.vllm_config.parallel_config.prefill_context_parallel_size
+            ),
+        )
+        return RequestOwnedKVStore(kv_cache_manager, owner_rank=self.global_rank)
+
+    def _request_owned_logical_capacity(self) -> int:
+        """Nonphysical logical token budget for the reference lease manager.
+
+        G2 keeps the logical manager only as the protocol fence/outbox
+        engine; the rank-local physical store is the actual capacity
+        authority.  This documented upper bound (max_model_len *
+        max_num_seqs) is deliberately not a physical capacity claim: it is
+        large enough that every command a physically-capable store could
+        accept is also granted logically, so no capacity decision is made on
+        logical grounds.
+        """
+        assert self.vllm_config is not None
+        return (
+            self.vllm_config.model_config.max_model_len
+            * self.vllm_config.scheduler_config.max_num_seqs
+        )
+
     def init_device(self):
         assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
@@ -365,13 +433,16 @@ class WorkerWrapperBase:
     def _execute_request_owned_control_step(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput:
-        """Execute the G1 control-only worker boundary.
+        """Execute the G2 worker boundary over the rank-local physical store.
 
-        Public configuration currently rejects this feature until G2.  This
-        internal seam exists so command ordering, zero-work receipts, and the
-        live executor return path can be tested without granting fake physical
-        KV authority.  It therefore refuses every token-bearing step before
-        calling the underlying worker.
+        Commands are composed failure-atomically: a deep-copied logical
+        candidate is the preflight (fence/outbox), the physical store is
+        consulted only when the candidate accepts, and a physical refusal
+        advances the authoritative fences through the external-reject seam
+        without any logical transition.  The positive step and zero-token
+        terminal validation below are unchanged: G2 is still control-only
+        at this milestone, so every token-bearing schedule is refused before
+        the underlying worker runs.
         """
         step_seq = scheduler_output.step_seq
         if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
@@ -402,20 +473,46 @@ class WorkerWrapperBase:
         # Apply the step to a trial copy.  Manager fences/outbox become durable
         # only after a concrete synchronous output is available, so an
         # underlying exception/None/async result cannot poison the next step.
+        store = self._request_owned_kv_store
+        if store is None:
+            raise RuntimeError(
+                "request-owned attention worker store is not initialized: "
+                "initialize_from_config must construct the rank-local "
+                "RequestOwnedKVStore before execution."
+            )
+
         manager = self._request_owned_control_manager
         if manager is None:
-            trial_manager = AttentionLeaseManager(
+            manager = AttentionLeaseManager(
                 owner_rank=self.global_rank,
-                capacity=_REQUEST_OWNED_CONTROL_ONLY_CAPACITY,
+                capacity=self._request_owned_logical_capacity(),
             )
-        else:
-            trial_manager = deepcopy(manager)
+        trial_manager = deepcopy(manager)
 
         # Commands form one reliable in-order stream per owner.  Every worker
         # receives the global envelope but consumes only its own commands.
+        # Per own-rank command, failure-atomic composition: the candidate is
+        # a deep copy of the current trial logical manager; its apply() is the
+        # logical preflight.  A logical refusal adopts the candidate (its
+        # fences/outbox are durable) and never touches the physical store.  A
+        # logical accept invokes the corresponding physical operation; a
+        # physical accept adopts the candidate, while a physical refusal
+        # discards the candidate and advances the authoritative fences via
+        # external_reject_error, without any logical transition.
         for command in scheduler_output.owner_commands:
-            if command.owner_id == self.global_rank:
-                trial_manager.apply(command)
+            if command.owner_id != self.global_rank:
+                continue
+            candidate = deepcopy(trial_manager)
+            preflight = candidate.apply(command)
+            if not preflight.accepted:
+                trial_manager = candidate
+                continue
+            physical = self._apply_request_owned_physical(command, store)
+            if physical.accepted:
+                trial_manager = candidate
+                continue
+            trial_manager.apply(command, external_reject_error=physical.error)
+
         for token in scheduler_output.scheduled_owner_leases:
             if token.owner_id == self.global_rank:
                 trial_manager.record_published(token)
@@ -446,9 +543,36 @@ class WorkerWrapperBase:
 
         # Never mutate a worker-owned output or EMPTY_MODEL_RUNNER_OUTPUT.
         result = copy(output)
-        result.owner_receipt_batches = [trial_manager.emit_batch(step_seq)]
+        # Post-execute completion fence: only now that the executing GPU step
+        # finished are deferred physical PREEMPT/RELEASE frees returned to the
+        # shared pool, so the receipt certifies physical free.  The attached
+        # capacity snapshot is block-ID-free and is taken after the flush.
+        store.flush()
+        batch = trial_manager.emit_batch(step_seq)
+        result.owner_receipt_batches = [
+            replace(batch, cache_pool=store.pool_snapshot())
+        ]
         self._request_owned_control_manager = trial_manager
         return result
+
+    @staticmethod
+    def _apply_request_owned_physical(
+        command: OwnerCommand, store: RequestOwnedKVStore
+    ) -> AllocationResult | DeferredFreeResult:
+        """Dispatch one own-rank command to the corresponding physical
+        store operation.  The store rejects any kind/state mismatch itself,
+        so this seam never duplicates the logical state machine."""
+        if command.kind is OwnerCommandKind.RESERVE:
+            return store.reserve(command)
+        if command.kind is OwnerCommandKind.EXTEND:
+            return store.extend(command)
+        if command.kind is OwnerCommandKind.PREEMPT:
+            return store.preempt(command)
+        if command.kind is OwnerCommandKind.RELEASE:
+            return store.release(command)
+        if command.kind is OwnerCommandKind.RESTORE:
+            return store.restore(command)
+        raise RuntimeError(f"unknown owner command kind {command.kind}")
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
