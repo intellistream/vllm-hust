@@ -386,6 +386,19 @@ def test_control_only_gate_lift_is_config_local_not_transport_local():
     executor._validate_request_owned_control_only_step(scheduler_output)
 
 
+def test_control_only_gate_rejects_mutated_non_bool_sampling_flag():
+    """Post-validation config mutation cannot turn truthy integers into a
+    token-gate bypass."""
+    executor = _fake_executor([_FakeMq() for _ in range(3)])
+    executor.scheduler_config.enable_request_owned_sampling = 1
+    scheduler_output = _scheduler_output(7)
+    scheduler_output.total_num_scheduled_tokens = 1
+    scheduler_output.num_scheduled_tokens = {"req": 1}
+
+    with pytest.raises(RuntimeError, match="must remain a bool"):
+        executor._validate_request_owned_control_only_step(scheduler_output)
+
+
 def test_abstract_executor_builds_sampling_aggregator():
     """The base executor builds the sampling-enabled aggregator with every
     process-global rank as an expected sampling owner rank when the flag is

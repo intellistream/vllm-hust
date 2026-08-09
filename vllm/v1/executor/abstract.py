@@ -159,7 +159,17 @@ class Executor(ABC):
         """
         if not self.scheduler_config.enable_request_owned_attention:
             return
-        if getattr(self.scheduler_config, "enable_request_owned_sampling", False):
+        sampling_enabled = getattr(
+            self.scheduler_config, "enable_request_owned_sampling", False
+        )
+        if not isinstance(sampling_enabled, bool):
+            raise RuntimeError(
+                "request-owned sampling gate must remain a bool after "
+                f"configuration validation, got {sampling_enabled!r}; "
+                "refusing a mutated config from bypassing the control-only "
+                "token gate."
+            )
+        if sampling_enabled:
             # G3 request-owned sampling transport: the owner-sampling
             # aggregator is authoritative across the deferred execute ->
             # sample_tokens flow, so the G1 control-only gate lifts.  With
