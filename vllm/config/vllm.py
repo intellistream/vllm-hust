@@ -2182,8 +2182,7 @@ class VllmConfig:
                 f"compilation_config.mode={mode_name}."
             )
         if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            cudagraph_name = getattr(compilation_config.cudagraph_mode, "name",
-                                     None)
+            cudagraph_name = getattr(compilation_config.cudagraph_mode, "name", None)
             raise ValueError(
                 "Request-owned attention is experimental and does not "
                 "support CUDA graphs, but got compilation_config."
