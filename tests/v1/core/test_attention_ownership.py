@@ -292,7 +292,9 @@ def test_reserve_extend_chunk_horizon_gating() -> None:
     assert [t.runnable_num_tokens for t in tokens] == [100]
 
     # Publication never exceeds the receipted horizon.
-    assert coordinator.published_through(key) <= coordinator.runnable_num_tokens_of(key)
+    assert coordinator.published_num_tokens(key) <= coordinator.runnable_num_tokens_of(
+        key
+    )
 
 
 def test_accepted_receipts_fail_closed_on_horizon_violations() -> None:
@@ -305,7 +307,7 @@ def test_accepted_receipts_fail_closed_on_horizon_violations() -> None:
     coordinator.assign(key)
     _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=50))
     _publish(coordinator, manager, step_seq=1)
-    assert coordinator.published_through(key) == 50
+    assert coordinator.published_num_tokens(key) == 50
 
     # A receipt that regresses below the published horizon fails closed.
     command = coordinator.extend(key, required_num_tokens=50)
@@ -319,7 +321,7 @@ def test_accepted_receipts_fail_closed_on_horizon_violations() -> None:
     with pytest.raises(PublicationViolationError):
         coordinator.apply_receipt(regress)
     assert coordinator.runnable_num_tokens_of(key) == 50
-    assert coordinator.published_through(key) == 50
+    assert coordinator.published_num_tokens(key) == 50
 
     # A receipt that exceeds the command's requested horizon fails closed.
     exceed = OwnerReceipt(
@@ -332,7 +334,7 @@ def test_accepted_receipts_fail_closed_on_horizon_violations() -> None:
     with pytest.raises(PublicationViolationError):
         coordinator.apply_receipt(exceed)
     assert coordinator.runnable_num_tokens_of(key) == 50
-    assert coordinator.published_through(key) == 50
+    assert coordinator.published_num_tokens(key) == 50
 
 
 # -- lifecycle: preempt / restore / resume ---------------------------------------
@@ -349,13 +351,13 @@ def test_preempt_releases_capacity_and_resume_reacquires_on_same_owner() -> None
     _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=100))
     _publish(coordinator, manager, step_seq=1)
     assert coordinator.runnable_num_tokens_of(key) == 40
-    assert coordinator.published_through(key) == 40
+    assert coordinator.published_num_tokens(key) == 40
     # The initial grant commits exactly the granted tokens to capacity.
     assert manager.free_capacity() == 1000 - 40
 
     # PREEMPT preserves the owner and releases active runnable capacity down
     # to the published horizon.
-    command = coordinator.preempt(key, preempt_through=40)
+    command = coordinator.preempt(key, preempt_num_tokens=40)
     receipt = _grant(coordinator, manager, command)
     assert receipt.accepted
     assert coordinator.is_preempted(key)
@@ -402,17 +404,17 @@ def test_published_tokens_cannot_be_refused() -> None:
     coordinator.assign(key)
     _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=50))
     _publish(coordinator, manager, step_seq=1)
-    assert manager.published_through(key) == 50
+    assert manager.published_num_tokens(key) == 50
 
     # A preempt below the published horizon would refuse published tokens:
     # the worker rejects it and the coordinator state does not change.
-    command = coordinator.preempt(key, preempt_through=30)
+    command = coordinator.preempt(key, preempt_num_tokens=30)
     receipt = manager.apply(command)
     assert not receipt.accepted
     assert "refuses published tokens" in receipt.error
     assert not coordinator.apply_receipt(receipt)
     assert not coordinator.is_preempted(key)
-    assert coordinator.published_through(key) == 50
+    assert coordinator.published_num_tokens(key) == 50
     assert coordinator.runnable_num_tokens_of(key) == 50
 
 
@@ -579,7 +581,7 @@ def test_zero_capacity_reserve_refused_and_provisional_retried() -> None:
     assert receipt.runnable_num_tokens is None
     assert not coordinator.apply_receipt(receipt)
     assert coordinator.runnable_num_tokens_of(key) is None
-    assert coordinator.published_through(key) == 0
+    assert coordinator.published_num_tokens(key) == 0
 
     # Abandon the provisional assignment and retry another owner.
     assert coordinator.abandon(key)
@@ -895,7 +897,7 @@ def test_publish_only_from_reserve_or_extend_grants() -> None:
     assert [t.runnable_num_tokens for t in tokens] == [40]
 
     # PREEMPT, RESTORE, and RELEASE receipts never advance publication.
-    _grant(coordinator, manager, coordinator.preempt(key, preempt_through=40))
+    _grant(coordinator, manager, coordinator.preempt(key, preempt_num_tokens=40))
     assert _publish(coordinator, manager, step_seq=2) == []
     _grant(coordinator, manager, coordinator.restore(key, required_num_tokens=40))
     assert _publish(coordinator, manager, step_seq=3) == []

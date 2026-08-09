@@ -78,7 +78,7 @@ def test_reserve_grants_absolute_horizon() -> None:
     assert receipt.error is None
     assert receipt.runnable_num_tokens == 40
     assert receipt.free_capacity == 160
-    assert manager.published_through(key) == 0
+    assert manager.published_num_tokens(key) == 0
 
 
 def test_zero_token_reserve_is_accepted_empty_lease() -> None:
@@ -94,7 +94,7 @@ def test_zero_token_reserve_is_accepted_empty_lease() -> None:
     assert empty.error is None
     assert empty.runnable_num_tokens == 0
     assert manager.free_capacity() == 0
-    assert manager.published_through(key) == 0
+    assert manager.published_num_tokens(key) == 0
     # A nonzero request against zero capacity remains a real refusal.
     refused = manager.apply(
         _command(_key("req-1"), 1, 2, OwnerCommandKind.RESERVE, required_num_tokens=1)
@@ -255,7 +255,7 @@ def test_published_tokens_cannot_be_refused() -> None:
         _command(key, 1, 1, OwnerCommandKind.RESERVE, required_num_tokens=100)
     )
     manager.record_published(_token(key, 1, runnable_num_tokens=40))
-    assert manager.published_through(key) == 40
+    assert manager.published_num_tokens(key) == 40
 
     # Preempt below the published horizon refuses published tokens.
     preempt = manager.apply(
@@ -492,7 +492,7 @@ def test_record_published_fences_command_and_step_sequences() -> None:
     manager.record_published(
         _token(key, 1, runnable_num_tokens=80, step_seq=2, command_seq=2)
     )
-    assert manager.published_through(key) == 80
+    assert manager.published_num_tokens(key) == 80
 
 
 def test_record_published_wrong_owner_ignored() -> None:
@@ -503,7 +503,7 @@ def test_record_published_wrong_owner_ignored() -> None:
     )
     # Tokens for other owners are ignored, not errors.
     manager.record_published(_token(key, 9, runnable_num_tokens=40))
-    assert manager.published_through(key) == 0
+    assert manager.published_num_tokens(key) == 0
 
 
 def test_release_clears_dma_and_residency_facts() -> None:
@@ -665,3 +665,53 @@ def test_command_allocation_must_match_key() -> None:
     )
     assert bare.allocation is None
     assert pickle.loads(pickle.dumps(bare)) == bare
+
+
+def test_command_requires_nonnegative_nonbool_token_count() -> None:
+    """OwnerCommand rejects bool/negative/non-int required_num_tokens while
+    keeping the existing allocation validation intact."""
+    key = _key()
+    descriptor = OwnerAllocationDescriptor(
+        key=key,
+        num_prompt_tokens=4,
+        num_computed_tokens=1,
+        num_tokens=4,
+        status=OwnerAdmissionStatus.WAITING,
+    )
+    for bad in (True, False, -1, 1.5, "1", None):
+        with pytest.raises(TypeError, match="required_num_tokens"):
+            OwnerCommand(
+                key=key,
+                owner_id=1,
+                command_seq=1,
+                kind=OwnerCommandKind.RESERVE,
+                required_num_tokens=bad,  # type: ignore[arg-type]
+            )
+    # Zero remains a legal count (empty RESERVE), and the allocation
+    # validation still applies alongside the count check.
+    zero = OwnerCommand(
+        key=key,
+        owner_id=1,
+        command_seq=1,
+        kind=OwnerCommandKind.RESERVE,
+        required_num_tokens=0,
+        allocation=descriptor,
+    )
+    assert zero.required_num_tokens == 0
+    assert zero.allocation is descriptor
+    mismatched = OwnerAllocationDescriptor(
+        key=_key("req-other"),
+        num_prompt_tokens=4,
+        num_computed_tokens=1,
+        num_tokens=4,
+        status=OwnerAdmissionStatus.WAITING,
+    )
+    with pytest.raises(ValueError, match="must match"):
+        OwnerCommand(
+            key=key,
+            owner_id=1,
+            command_seq=1,
+            kind=OwnerCommandKind.RESERVE,
+            required_num_tokens=4,
+            allocation=mismatched,
+        )

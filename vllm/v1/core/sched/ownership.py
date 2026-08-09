@@ -182,6 +182,15 @@ class OwnerCommand:
     allocation: OwnerAllocationDescriptor | None = None
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.required_num_tokens, bool)
+            or not isinstance(self.required_num_tokens, int)
+            or self.required_num_tokens < 0
+        ):
+            raise TypeError(
+                "required_num_tokens must be a nonnegative non-bool int, "
+                f"got {self.required_num_tokens!r}."
+            )
         if self.allocation is None:
             return
         if not isinstance(self.allocation, OwnerAllocationDescriptor):
@@ -464,23 +473,23 @@ class OwnerLeaseCoordinator:
     def preempt(
         self,
         key: OwnerLeaseKey,
-        preempt_through: int | None = None,
+        preempt_num_tokens: int | None = None,
     ) -> OwnerCommand:
         lease = self._leases[key]
         if lease.released or lease.release_pending:
             raise OwnershipError(f"cannot PREEMPT released {key}")
         if lease.superseded:
             raise OwnershipError(f"cannot PREEMPT superseded {key}")
-        through = (
-            preempt_through
-            if preempt_through is not None
+        num_tokens = (
+            preempt_num_tokens
+            if preempt_num_tokens is not None
             else (
                 lease.runnable_num_tokens
                 if lease.runnable_num_tokens is not None
                 else lease.required_num_tokens
             )
         )
-        return self._issue(key, OwnerCommandKind.PREEMPT, through)
+        return self._issue(key, OwnerCommandKind.PREEMPT, num_tokens)
 
     def restore(self, key: OwnerLeaseKey, required_num_tokens: int) -> OwnerCommand:
         """Request the separate DMA/cold-residency restore intent.
@@ -522,12 +531,12 @@ class OwnerLeaseCoordinator:
                 )
             return lease.release_command
         lease.release_pending = True
-        through = (
+        num_tokens = (
             lease.runnable_num_tokens
             if lease.runnable_num_tokens is not None
             else lease.required_num_tokens
         )
-        command = self._issue(key, OwnerCommandKind.RELEASE, through)
+        command = self._issue(key, OwnerCommandKind.RELEASE, num_tokens)
         lease.release_command = command
         return command
 
@@ -694,7 +703,7 @@ class OwnerLeaseCoordinator:
     def runnable_num_tokens_of(self, key: OwnerLeaseKey) -> int | None:
         return self._leases[key].runnable_num_tokens
 
-    def published_through(self, key: OwnerLeaseKey) -> int:
+    def published_num_tokens(self, key: OwnerLeaseKey) -> int:
         return self._publish_watermark.get(key, 0)
 
     def is_preempted(self, key: OwnerLeaseKey) -> bool:
@@ -726,7 +735,7 @@ class OwnerLeaseCoordinator:
 class _WorkerLease:
     """Per-lease bookkeeping kept by the reference worker manager.
 
-    ``runnable_num_tokens`` (exclusive 0-based bound) and ``published_through``
+    ``runnable_num_tokens`` (exclusive 0-based bound) and ``published_num_tokens``
     are the logical token counts the worker is legally bound to honor;
     ``committed_tokens`` is the separate active physical commitment that
     occupies capacity.  PREEMPT zeroes the commitment while retaining the
@@ -734,7 +743,7 @@ class _WorkerLease:
     """
 
     runnable_num_tokens: int
-    published_through: int = 0
+    published_num_tokens: int = 0
     committed_tokens: int = 0
     #: command_seq of the last accepted grant (RESERVE/EXTEND); published
     #: tokens must carry exactly this sequence.
@@ -873,14 +882,14 @@ class AttentionLeaseManager:
                 return self._receipt(command, accepted=False, error="duplicate reserve")
             # Resume: reacquire capacity on the same owner; the old runnable
             # capacity was released by the PREEMPT receipt.
-            if command.required_num_tokens < lease.published_through:
+            if command.required_num_tokens < lease.published_num_tokens:
                 return self._receipt(
                     command,
                     accepted=False,
                     error="refuses published tokens",
                 )
             granted = self._grant(command, lease)
-            if granted < lease.published_through or (
+            if granted < lease.published_num_tokens or (
                 granted <= 0 and command.required_num_tokens > 0
             ):
                 # Reacquiring below the honored (published) count would
@@ -935,7 +944,7 @@ class AttentionLeaseManager:
             return self._receipt(command, accepted=False, error="lease superseded")
         if lease.preempted:
             return self._receipt(command, accepted=False, error="lease is preempted")
-        if command.required_num_tokens < lease.published_through:
+        if command.required_num_tokens < lease.published_num_tokens:
             return self._receipt(
                 command,
                 accepted=False,
@@ -972,7 +981,7 @@ class AttentionLeaseManager:
             )
         if lease.superseded:
             return self._receipt(command, accepted=False, error="lease superseded")
-        if command.required_num_tokens < lease.published_through:
+        if command.required_num_tokens < lease.published_num_tokens:
             return self._receipt(
                 command,
                 accepted=False,
@@ -1000,7 +1009,7 @@ class AttentionLeaseManager:
             return self._receipt(
                 command, accepted=False, error="lease is not preempted"
             )
-        if command.required_num_tokens < lease.published_through:
+        if command.required_num_tokens < lease.published_num_tokens:
             return self._receipt(
                 command,
                 accepted=False,
@@ -1026,7 +1035,7 @@ class AttentionLeaseManager:
             return self._receipt(
                 command, accepted=False, error="lease already released"
             )
-        if command.required_num_tokens < lease.published_through:
+        if command.required_num_tokens < lease.published_num_tokens:
             return self._receipt(
                 command,
                 accepted=False,
@@ -1114,8 +1123,8 @@ class AttentionLeaseManager:
                 f"token for {token.key} exceeds granted count "
                 f"{lease.runnable_num_tokens}"
             )
-        lease.published_through = max(
-            lease.published_through, token.runnable_num_tokens
+        lease.published_num_tokens = max(
+            lease.published_num_tokens, token.runnable_num_tokens
         )
         lease.last_step_seq = token.step_seq
 
@@ -1156,9 +1165,9 @@ class AttentionLeaseManager:
         )
         return max(0, self.capacity - committed)
 
-    def published_through(self, key: OwnerLeaseKey) -> int:
+    def published_num_tokens(self, key: OwnerLeaseKey) -> int:
         lease = self._leases.get(key)
-        return lease.published_through if lease is not None else 0
+        return lease.published_num_tokens if lease is not None else 0
 
     def is_released(self, key: OwnerLeaseKey) -> bool:
         lease = self._leases.get(key)
