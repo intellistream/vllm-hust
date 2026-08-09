@@ -2147,15 +2147,19 @@ class VllmConfig:
             )
 
     def _validate_request_owned_attention(self) -> None:
-        """Fail closed for the experimental request-owned attention (G0/G1).
+        """Fail closed for the experimental request-owned attention (G2).
 
         The specific envelope rejections below stay first and unchanged
         (pipeline parallelism, speculative decoding including MTP, non-eager
         execution / CUDA graphs, KV cache CPU offload/tiering, and KV
-        transfer / PD disaggregation). Any otherwise-valid enabled
-        configuration is still refused: only the G1 control/layout contract
-        exists today, physical owner-local KV allocation/routing is a G2
-        prerequisite, and replicated-KV execution is refused until it lands.
+        transfer / PD disaggregation). G2 provides the control-plane receipt
+        contract and worker-local physical KV allocation, so the remaining
+        supported envelope is now constructible: Multiproc/non-Ray execution,
+        PP=1, eager execution without CUDA graphs, no speculative decoding,
+        no KV cache offload/transfer/connectors, prefix caching disabled,
+        DCP=1, PCP=1, and synchronous scheduling. Every other combination
+        keeps failing closed with a precise diagnostic; token execution paths
+        retain their own independent gates and are not relaxed here.
         """
         if not self.scheduler_config.enable_request_owned_attention:
             return
@@ -2218,17 +2222,52 @@ class VllmConfig:
                 f"kv_role={self.kv_transfer_config.kv_role!r}."
             )
 
-        # Terminal gate: the envelope checks above cannot pass today. Only
-        # the G1 control/layout contract exists; physical owner-local KV
-        # allocation and routing are a G2 prerequisite, and replicated-KV
-        # execution is refused until that prerequisite exists.
-        raise ValueError(
-            "Request-owned attention cannot be enabled: only the G1 "
-            "control/layout contract exists, while physical owner-local KV "
-            "allocation and routing are a G2 prerequisite. Replicated-KV "
-            "execution is refused until owner-local KV allocation/routing "
-            "is implemented."
-        )
+        if self.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support prefix caching, but got cache_config."
+                f"enable_prefix_caching={self.cache_config.enable_prefix_caching}. "
+                "Disable prefix caching (enable_prefix_caching=False) to "
+                "use request-owned attention."
+            )
+
+        if self.parallel_config.decode_context_parallel_size > 1:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "decode_context_parallel_size=1, but got "
+                f"decode_context_parallel_size="
+                f"{self.parallel_config.decode_context_parallel_size}."
+            )
+
+        if self.parallel_config.prefill_context_parallel_size > 1:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "prefill_context_parallel_size=1, but got "
+                f"prefill_context_parallel_size="
+                f"{self.parallel_config.prefill_context_parallel_size}."
+            )
+
+        if self.scheduler_config.async_scheduling:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "synchronous scheduling, but scheduler_config."
+                f"async_scheduling resolved to "
+                f"{self.scheduler_config.async_scheduling}. Pass "
+                "async_scheduling=False to use request-owned attention."
+            )
+
+        if self.model_config is not None and (
+            self.model_config.is_multimodal_model
+            or self.model_config.is_encoder_decoder
+        ):
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support multimodal or encoder-decoder models, but got "
+                f"model_config.is_multimodal_model="
+                f"{self.model_config.is_multimodal_model} and "
+                f"model_config.is_encoder_decoder="
+                f"{self.model_config.is_encoder_decoder}."
+            )
 
     def validate_block_size(self) -> None:
         """Validate block_size against DCP and mamba constraints.

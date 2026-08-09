@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Tests for the experimental request-owned attention (G0/G1) config gate.
+"""Tests for the experimental request-owned attention (G2) config gate.
 
 The feature flag lives on SchedulerConfig and defaults to False. When enabled,
-VllmConfig must fail closed on unsupported modes (pipeline parallelism,
-speculative decoding, non-eager/CUDA-graph execution, KV cache CPU offload)
-with their specific diagnostics, and the formerly supported envelope is now
-refused as well: only the G1 control/layout contract exists, physical
-owner-local KV allocation/routing is a G2 prerequisite, and replicated-KV
-execution is refused.
+VllmConfig must construct within the supported G2 envelope: Multiproc/non-Ray
+execution, PP=1, eager execution without CUDA graphs, no speculative decoding,
+no KV cache CPU offload/tiering or KV transfer/connectors, prefix caching
+disabled, DCP=1, PCP=1, and synchronous scheduling. Every unsupported mode
+must fail closed with a specific diagnostic: pipeline parallelism, Ray,
+speculative decoding, non-eager compilation/CUDA graphs, KV cache CPU
+offload, KV transfer, prefix caching, decode/prefill context parallelism,
+async scheduling, and multimodal/encoder-decoder models.
 """
+
+import types
 
 import pytest
 
@@ -53,21 +57,23 @@ def _vllm_config(
     cache_config: CacheConfig | None = None,
     speculative_config: SpeculativeConfig | None = None,
     kv_transfer_config: KVTransferConfig | None = None,
+    async_scheduling: bool | None = False,
 ) -> VllmConfig:
     """Build a VllmConfig around the request-owned attention envelope.
 
-    By default the formerly supported G0 envelope is used: eager execution,
-    PP=1, no speculative decoding, no KV cache CPU offload/tiering or KV
-    transfer. Enabling the flag now always fails closed at the terminal
-    G2/replicated-KV gate even inside this envelope.
+    By default the supported G2 envelope is used: eager execution, PP=1,
+    no speculative decoding, no KV cache CPU offload/tiering or KV transfer,
+    prefix caching disabled, DCP=1, PCP=1, and synchronous scheduling.
+    Passing any explicit config replaces exactly that part of the envelope.
     """
     return VllmConfig(
         scheduler_config=SchedulerConfig.default_factory(
             enable_request_owned_attention=enable_request_owned_attention,
+            async_scheduling=async_scheduling,
         ),
         compilation_config=compilation_config or _eager_compilation_config(),
         parallel_config=parallel_config or ParallelConfig(),
-        cache_config=cache_config or CacheConfig(),
+        cache_config=cache_config or CacheConfig(enable_prefix_caching=False),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
     )
@@ -80,7 +86,7 @@ def test_request_owned_attention_defaults_off():
 
 def test_disabled_leaves_existing_validation_unchanged():
     # When disabled, every combination that constructs today must still
-    # construct; the G0 gate must not alter existing behavior.
+    # construct; the request-owned gate must not alter existing behavior.
     vllm_config = _vllm_config(
         enable_request_owned_attention=False,
         compilation_config=CompilationConfig(),
@@ -92,22 +98,22 @@ def test_disabled_leaves_existing_validation_unchanged():
     assert vllm_config.scheduler_config.enable_request_owned_attention is False
 
 
-def test_enabled_supported_envelope_fails_closed_g2():
-    # The formerly supported G0 envelope (eager, PP=1, no spec decoding, no
-    # KV offload/transfer; chunked prefill, TP>1 and prefix caching allowed)
-    # now hits the terminal gate: only the G1 control/layout contract exists,
-    # physical owner-local KV allocation/routing is a G2 prerequisite, and
-    # replicated-KV execution is refused.
-    with pytest.raises(ValueError, match="G2 prerequisite"):
-        _vllm_config(
-            enable_request_owned_attention=True,
-            compilation_config=_eager_compilation_config(),
-            parallel_config=ParallelConfig(
-                pipeline_parallel_size=1,
-                tensor_parallel_size=2,
-            ),
-            cache_config=CacheConfig(enable_prefix_caching=True),
-        )
+def test_enabled_supported_envelope_constructs():
+    # The supported G2 envelope (Multiproc, PP=1, eager, no speculative
+    # decoding, no KV offload/transfer, prefix caching disabled, DCP=1,
+    # PCP=1, synchronous scheduling) must construct and keep the flag on.
+    vllm_config = _vllm_config(
+        enable_request_owned_attention=True,
+        compilation_config=_eager_compilation_config(),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=2,
+        ),
+        cache_config=CacheConfig(enable_prefix_caching=False),
+        async_scheduling=False,
+    )
+    assert vllm_config.scheduler_config.enable_request_owned_attention is True
+    assert vllm_config.scheduler_config.async_scheduling is False
 
 
 def test_enabled_rejects_pipeline_parallelism():
@@ -194,13 +200,74 @@ def test_enabled_rejects_kv_transfer():
         _vllm_config(kv_transfer_config=_active_kv_transfer_config())
 
 
+def test_enabled_rejects_prefix_caching():
+    with pytest.raises(ValueError, match="enable_prefix_caching"):
+        _vllm_config(cache_config=CacheConfig(enable_prefix_caching=True))
+
+
+def test_enabled_rejects_decode_context_parallelism():
+    # TP must be divisible by DCP for ParallelConfig to construct, so the
+    # offending configuration uses DCP=2 over TP=2.
+    with pytest.raises(ValueError, match="decode_context_parallel_size"):
+        _vllm_config(
+            parallel_config=ParallelConfig(
+                tensor_parallel_size=2,
+                decode_context_parallel_size=2,
+            )
+        )
+
+
+def test_enabled_rejects_prefill_context_parallelism():
+    with pytest.raises(ValueError, match="prefill_context_parallel_size"):
+        _vllm_config(
+            parallel_config=ParallelConfig(prefill_context_parallel_size=2)
+        )
+
+
+def test_enabled_rejects_async_scheduling():
+    with pytest.raises(ValueError, match="async_scheduling"):
+        _vllm_config(async_scheduling=True)
+
+
+def test_enabled_rejects_resolved_async_scheduling_default():
+    # The default (async_scheduling=None) resolves to True on the Multiproc
+    # executor before feature validation runs, so the enabled flag must fail
+    # closed on the resolved value rather than only on an explicit request.
+    with pytest.raises(ValueError, match="async_scheduling"):
+        _vllm_config(async_scheduling=None)
+
+
+def test_enabled_rejects_multimodal_model():
+    # A real ModelConfig cannot be constructed without a model path, so the
+    # feature validation is invoked directly on an already validated config
+    # with a minimal model_config stub exposing the stable predicates.
+    vllm_config = _vllm_config(enable_request_owned_attention=False)
+    vllm_config.scheduler_config.enable_request_owned_attention = True
+    vllm_config.model_config = types.SimpleNamespace(
+        is_multimodal_model=True,
+        is_encoder_decoder=False,
+    )
+    with pytest.raises(ValueError, match="multimodal"):
+        vllm_config._validate_request_owned_attention()
+
+
+def test_enabled_rejects_encoder_decoder_model():
+    vllm_config = _vllm_config(enable_request_owned_attention=False)
+    vllm_config.scheduler_config.enable_request_owned_attention = True
+    vllm_config.model_config = types.SimpleNamespace(
+        is_multimodal_model=False,
+        is_encoder_decoder=True,
+    )
+    with pytest.raises(ValueError, match="encoder-decoder"):
+        vllm_config._validate_request_owned_attention()
+
+
 def test_hash_differs_when_enabled():
     # Request-owned attention changes the computation graph (per-request
     # attention kernel selection), so the scheduler config hash must
     # distinguish it. VllmConfig.compute_hash() folds in
-    # scheduler_config.compute_hash(), but an enabled VllmConfig can no
-    # longer be constructed (the gate fails closed), so the distinction is
-    # covered at the SchedulerConfig level.
+    # scheduler_config.compute_hash(), and the enabled envelope constructs,
+    # so the distinction is checked at the SchedulerConfig level.
     disabled = SchedulerConfig.default_factory()
     enabled = SchedulerConfig.default_factory(
         enable_request_owned_attention=True,
