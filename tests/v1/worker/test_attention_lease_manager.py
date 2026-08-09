@@ -358,3 +358,94 @@ def test_protocol_types_are_frozen_and_pickle_safe() -> None:
             value.runnable_through = 9  # type: ignore[misc]
     assert isinstance(receipt, OwnerReceipt)
     assert command.kind is OwnerCommandKind.RESERVE
+
+
+# -- red-team follow-up: publication enforcement, facts on release --------------
+
+
+def test_record_published_refuses_inactive_leases() -> None:
+    manager = _manager(capacity=200, ceiling=40)
+    key = _key()
+    # Unknown lease.
+    with pytest.raises(PublicationViolationError):
+        manager.record_published(_token(key, 1, runnable_through=10))
+    manager.apply(_command(key, 1, 1, OwnerCommandKind.RESERVE, requested_through=100))
+    # Preempted lease.
+    manager.apply(_command(key, 1, 2, OwnerCommandKind.PREEMPT, requested_through=40))
+    with pytest.raises(PublicationViolationError):
+        manager.record_published(_token(key, 1, runnable_through=40))
+    # Released lease.
+    manager.apply(_command(key, 1, 3, OwnerCommandKind.RELEASE, requested_through=40))
+    with pytest.raises(PublicationViolationError):
+        manager.record_published(_token(key, 1, runnable_through=40))
+    # Superseded lease (old epoch tombstoned by a newer epoch).
+    old = _key("req-sup", epoch=0)
+    new = _key("req-sup", epoch=1)
+    manager.apply(_command(old, 1, 4, OwnerCommandKind.RESERVE, requested_through=10))
+    manager.apply(_command(new, 1, 5, OwnerCommandKind.RESERVE, requested_through=10))
+    with pytest.raises(PublicationViolationError):
+        manager.record_published(_token(old, 1, runnable_through=10))
+
+
+def test_record_published_fences_command_and_step_sequences() -> None:
+    manager = _manager(capacity=200, ceiling=40)
+    key = _key()
+    manager.apply(_command(key, 1, 1, OwnerCommandKind.RESERVE, requested_through=100))
+    # A token carrying a stale command sequence is refused.
+    stale = _token(key, 1, runnable_through=40, step_seq=1, command_seq=2)
+    with pytest.raises(PublicationViolationError):
+        manager.record_published(stale)
+    # The correct sequence records; duplicate or regressed steps are refused.
+    manager.record_published(
+        _token(key, 1, runnable_through=40, step_seq=1, command_seq=1)
+    )
+    duplicate = _token(key, 1, runnable_through=40, step_seq=1, command_seq=1)
+    with pytest.raises(PublicationViolationError):
+        manager.record_published(duplicate)
+    regressed = _token(key, 1, runnable_through=40, step_seq=0, command_seq=1)
+    with pytest.raises(PublicationViolationError):
+        manager.record_published(regressed)
+    # A later step with a fresh grant sequence proceeds.
+    manager.apply(_command(key, 1, 2, OwnerCommandKind.EXTEND, requested_through=100))
+    manager.record_published(
+        _token(key, 1, runnable_through=80, step_seq=2, command_seq=2)
+    )
+    assert manager.published_through(key) == 80
+
+
+def test_record_published_wrong_owner_ignored() -> None:
+    manager = _manager(capacity=200, ceiling=40)
+    key = _key()
+    manager.apply(_command(key, 1, 1, OwnerCommandKind.RESERVE, requested_through=100))
+    # Tokens for other owners are ignored, not errors.
+    manager.record_published(_token(key, 9, runnable_through=40))
+    assert manager.published_through(key) == 0
+
+
+def test_release_clears_dma_and_residency_facts() -> None:
+    manager = _manager(capacity=200, ceiling=40)
+    key = _key()
+    manager.apply(_command(key, 1, 1, OwnerCommandKind.RESERVE, requested_through=100))
+    manager.apply(_command(key, 1, 2, OwnerCommandKind.PREEMPT, requested_through=40))
+    restore = manager.apply(
+        _command(key, 1, 3, OwnerCommandKind.RESTORE, requested_through=100)
+    )
+    assert restore.accepted
+    assert restore.pending_dma == 1
+    inflight = manager.emit_batch(emitted_step_seq=4)
+    assert inflight.pending_dma == 1
+    assert inflight.resident_pages == 0
+
+    release = manager.apply(
+        _command(key, 1, 5, OwnerCommandKind.RELEASE, requested_through=40)
+    )
+    assert release.accepted
+    assert release.pending_dma == 0
+    assert manager.release_count() == 1
+    # The freed lease contributes no DMA/residency facts to the batch and
+    # its capacity returns.
+    batch = manager.emit_batch(emitted_step_seq=6)
+    assert batch.pending_dma == 0
+    assert batch.resident_pages == 0
+    assert batch.free_capacity == 200
+    assert [r.released for r in batch.events] == [True]

@@ -142,16 +142,15 @@ def test_assignment_charges_local_commitment_exactly_once() -> None:
     # leave owner 1 at 5 and hand this request to owner 2.
     assert coordinator.assign(_key("req-3"), projected_work=1) == 1
 
+    # Admit the lease first (finish requires an accepted RESERVE); the
+    # reservation itself carries no extra charge.
+    manager = AttentionLeaseManager(owner_rank=1, capacity=1000)
+    _grant(coordinator, manager, coordinator.reserve(key1, requested_through=1))
     # Release refunds the charge exactly once.
     command = coordinator.finish(key1)
-    receipt = OwnerReceipt(
-        key=key1,
-        owner_id=1,
-        command_seq=command.command_seq,
-        accepted=True,
-        released=True,
-        runnable_through=0,
-    )
+    receipt = manager.apply(command)
+    assert receipt.accepted
+    assert receipt.released
     assert coordinator.apply_receipt(receipt)
     assert coordinator.release_count() == 1
     # Refunded: owner 1 (3) beats owner 2 (4) again.
@@ -698,3 +697,154 @@ def test_request_and_output_carriers_are_backward_compatible() -> None:
     assert out.step_seq == 5
     assert out.owner_assignment_observations[0].owner_id == 1
     assert SchedulerOutput.make_empty().step_seq == 0
+
+
+# -- red-team follow-up: charge semantics, sequencing, finish, publication -------
+
+
+def test_observation_work_excludes_coordinator_local_charges() -> None:
+    """``work`` is the external/base workload observation; coordinator-local
+    projected charges are added by ``assign()`` separately and must never be
+    folded back into the observation (no double counting)."""
+    coordinator = OwnerLeaseCoordinator()
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=1, observation_seq=1, work=3)
+    )
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=2, observation_seq=1, work=5)
+    )
+    assert coordinator.assign(_key("req-1"), projected_work=2) == 1
+    # Owner 1's score is 3 (base work) + 2 (local charge) = 5, tying owner
+    # 2's base 5.  Re-reporting the same base work keeps the charge: if the
+    # producer had folded the charge into ``work`` (5), owner 1 would score
+    # 7 and owner 2 would win the next assignment.
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=1, observation_seq=2, work=3)
+    )
+    assert coordinator.assign(_key("req-2"), projected_work=1) == 1
+
+
+def test_owner_command_sequence_is_monotonic_across_keys() -> None:
+    """Commands for an owner are delivered reliably and in order: the
+    per-owner ``command_seq`` fence increases monotonically across all
+    request keys, so the worker consumes one strictly increasing stream."""
+    coordinator = _coordinator_with_owners(1)
+    manager = AttentionLeaseManager(owner_rank=1, capacity=1000)
+    key_a = _key("req-a")
+    key_b = _key("req-b")
+    coordinator.assign(key_a)
+    coordinator.assign(key_b)
+    commands = [
+        coordinator.reserve(key_a, requested_through=50),
+        coordinator.reserve(key_b, requested_through=50),
+        coordinator.extend(key_a, requested_through=100),
+        coordinator.extend(key_b, requested_through=100),
+    ]
+    seqs = [c.command_seq for c in commands]
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == len(seqs)
+    # The worker consumes the stream in order without any fence violation.
+    for command in commands:
+        receipt = manager.apply(command)
+        assert receipt.accepted
+
+
+def test_finish_is_idempotent_while_release_pending() -> None:
+    coordinator = OwnerLeaseCoordinator()
+    manager = AttentionLeaseManager(owner_rank=1, capacity=1000)
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=1, observation_seq=1, work=0)
+    )
+    key = _key()
+    coordinator.assign(key)
+    _grant(coordinator, manager, coordinator.reserve(key, requested_through=50))
+    _publish(coordinator, manager, step_seq=1)
+
+    # A double finish before the first receipt converges: the same
+    # outstanding RELEASE is returned and command_seq does not advance.
+    first = coordinator.finish(key)
+    second = coordinator.finish(key)
+    assert first == second
+    assert first.kind is OwnerCommandKind.RELEASE
+    assert coordinator.is_release_pending(key)
+    assert not coordinator.is_released(key)
+
+    # Applying the outstanding RELEASE once frees exactly once.
+    receipt = manager.apply(first)
+    assert receipt.accepted
+    assert receipt.released
+    assert coordinator.apply_receipt(receipt)
+    assert coordinator.release_count() == 1
+    assert coordinator.is_released(key)
+    with pytest.raises(OwnershipError):
+        coordinator.finish(key)
+
+
+def test_finish_rejected_before_any_accepted_reserve() -> None:
+    coordinator = _coordinator_with_owners(1, 2)
+    key = _key()
+    coordinator.assign(key)
+    # Provisional: no RESERVE has been accepted, so finish is refused.
+    with pytest.raises(OwnershipError):
+        coordinator.finish(key)
+    # After a refused RESERVE the lease is still provisional: finish is
+    # still refused and the caller must abandon instead.
+    command = coordinator.reserve(key, requested_through=50)
+    refused = OwnerReceipt(
+        key=key,
+        owner_id=1,
+        command_seq=command.command_seq,
+        accepted=False,
+    )
+    assert not coordinator.apply_receipt(refused)
+    with pytest.raises(OwnershipError):
+        coordinator.finish(key)
+    assert coordinator.abandon(key)
+    assert coordinator.owner_of(key) is None
+
+
+def test_publish_waits_for_receipted_grants() -> None:
+    coordinator = OwnerLeaseCoordinator()
+    manager = AttentionLeaseManager(owner_rank=1, capacity=1000, grant_ceiling=40)
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=1, observation_seq=1, work=0)
+    )
+    key = _key()
+    coordinator.assign(key)
+
+    # A RESERVE that has not been receipted publishes nothing.
+    command = coordinator.reserve(key, requested_through=100)
+    assert _publish(coordinator, manager, step_seq=1) == []
+    # Only after its accepted receipt does the grant publish.
+    _grant(coordinator, manager, command)
+    tokens = _publish(coordinator, manager, step_seq=2)
+    assert [t.runnable_through for t in tokens] == [40]
+
+    # An EXTEND in flight (issued, not receipted) publishes nothing new.
+    command = coordinator.extend(key, requested_through=100)
+    assert _publish(coordinator, manager, step_seq=3) == []
+    _grant(coordinator, manager, command)
+    tokens = _publish(coordinator, manager, step_seq=4)
+    assert [t.runnable_through for t in tokens] == [80]
+
+
+def test_publish_only_from_reserve_or_extend_grants() -> None:
+    coordinator = OwnerLeaseCoordinator()
+    manager = AttentionLeaseManager(owner_rank=1, capacity=1000, grant_ceiling=40)
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=1, observation_seq=1, work=0)
+    )
+    key = _key()
+    coordinator.assign(key)
+    _grant(coordinator, manager, coordinator.reserve(key, requested_through=100))
+    tokens = _publish(coordinator, manager, step_seq=1)
+    assert [t.runnable_through for t in tokens] == [40]
+
+    # PREEMPT, RESTORE, and RELEASE receipts never advance publication.
+    _grant(coordinator, manager, coordinator.preempt(key, preempt_through=40))
+    assert _publish(coordinator, manager, step_seq=2) == []
+    _grant(coordinator, manager, coordinator.restore(key, requested_through=40))
+    assert _publish(coordinator, manager, step_seq=3) == []
+    _grant(coordinator, manager, coordinator.finish(key))
+    assert _publish(coordinator, manager, step_seq=4) == []
+    assert coordinator.is_released(key)
