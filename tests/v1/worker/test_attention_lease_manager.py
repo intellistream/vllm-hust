@@ -245,6 +245,131 @@ def test_lower_epoch_commands_are_rejected_except_tombstone_release() -> None:
     assert manager.free_capacity() == manager.capacity - 10
 
 
+def test_external_reject_fresh_reserve_advances_fence_without_lease() -> None:
+    manager = _manager()
+    key = _key()
+    rejected = manager.apply(
+        _command(key, 1, 1, OwnerCommandKind.RESERVE, required_num_tokens=10),
+        external_reject_error="physical allocation failed",
+    )
+    assert not rejected.accepted
+    assert rejected.error == "physical allocation failed"
+    # No lease or commitment was created by the rejected preflight.
+    assert manager.free_capacity() == manager.capacity
+    assert manager.published_num_tokens(key) == 0
+    assert not manager.is_released(key)
+    # The authoritative fence still advanced: the exact duplicate is stale
+    # (canonical error, not the caller-supplied error) ...
+    duplicate = manager.apply(
+        _command(key, 1, 1, OwnerCommandKind.RESERVE, required_num_tokens=10),
+        external_reject_error="physical allocation failed",
+    )
+    assert not duplicate.accepted
+    assert "stale or duplicate command sequence" in duplicate.error
+    # ... and the next higher command can proceed as ordinary apply.
+    committed = manager.apply(
+        _command(key, 1, 2, OwnerCommandKind.RESERVE, required_num_tokens=10)
+    )
+    assert committed.accepted
+    assert committed.runnable_num_tokens == 10
+
+
+def test_external_reject_extend_preserves_lease_state() -> None:
+    manager = _manager()
+    key = _key()
+    first = manager.apply(
+        _command(key, 1, 1, OwnerCommandKind.RESERVE, required_num_tokens=10)
+    )
+    assert first.accepted
+    manager.record_published(_token(key, 1, 10))
+    rejected = manager.apply(
+        _command(key, 1, 2, OwnerCommandKind.EXTEND, required_num_tokens=20),
+        external_reject_error="physical allocation failed",
+    )
+    assert not rejected.accepted
+    assert rejected.error == "physical allocation failed"
+    # The previous runnable/published/commitment facts are untouched.
+    assert manager.published_num_tokens(key) == 10
+    assert manager.free_capacity() == manager.capacity - 10
+    # A later ordinary EXTEND proceeds normally.
+    extended = manager.apply(
+        _command(key, 1, 3, OwnerCommandKind.EXTEND, required_num_tokens=20)
+    )
+    assert extended.accepted
+    assert extended.runnable_num_tokens == 20
+
+
+def test_external_reject_preserves_canonical_fence_errors() -> None:
+    manager = _manager()
+    key = _key()
+    # Wrong owner keeps its canonical error, not the caller-supplied one.
+    wrong_owner = manager.apply(
+        _command(key, 2, 1, OwnerCommandKind.RESERVE, required_num_tokens=10),
+        external_reject_error="physical allocation failed",
+    )
+    assert not wrong_owner.accepted
+    assert "wrong owner rank" in wrong_owner.error
+    # Stale request epoch keeps its canonical error as well.
+    old = _key("req-fenced", epoch=0)
+    new = _key("req-fenced", epoch=1)
+    assert manager.apply(
+        _command(old, 1, 1, OwnerCommandKind.RESERVE, required_num_tokens=10)
+    ).accepted
+    assert manager.apply(
+        _command(new, 1, 2, OwnerCommandKind.RESERVE, required_num_tokens=10)
+    ).accepted
+    stale = manager.apply(
+        _command(old, 1, 3, OwnerCommandKind.RESERVE, required_num_tokens=10),
+        external_reject_error="physical allocation failed",
+    )
+    assert not stale.accepted
+    assert "stale request epoch" in stale.error
+
+
+def test_external_reject_stale_release_tombstone_still_honored_later() -> None:
+    manager = _manager()
+    old = _key("req-tomb", epoch=0)
+    new = _key("req-tomb", epoch=1)
+    assert manager.apply(
+        _command(old, 1, 1, OwnerCommandKind.RESERVE, required_num_tokens=10)
+    ).accepted
+    assert manager.apply(
+        _command(new, 1, 2, OwnerCommandKind.RESERVE, required_num_tokens=10)
+    ).accepted
+    # The stale-old RELEASE passes the tombstone fence exception, so the
+    # external reject fires and no logical RELEASE is dispatched ...
+    rejected = manager.apply(
+        _command(old, 1, 3, OwnerCommandKind.RELEASE, required_num_tokens=10),
+        external_reject_error="physical allocation failed",
+    )
+    assert not rejected.accepted
+    assert rejected.error == "physical allocation failed"
+    assert manager.release_count() == 0
+    # ... and the same RELEASE on a fresh sequence is still honored exactly
+    # once by ordinary apply, freeing the tombstoned commitment.
+    released = manager.apply(
+        _command(old, 1, 4, OwnerCommandKind.RELEASE, required_num_tokens=10)
+    )
+    assert released.accepted
+    assert released.released
+    assert manager.release_count() == 1
+    assert manager.free_capacity() == manager.capacity - 10
+
+
+def test_external_reject_receipt_lands_in_emit_batch() -> None:
+    manager = _manager()
+    key = _key()
+    rejected = manager.apply(
+        _command(key, 1, 1, OwnerCommandKind.RESERVE, required_num_tokens=10),
+        external_reject_error="physical allocation failed",
+    )
+    batch = manager.emit_batch(emitted_step_seq=1)
+    assert batch.events == (rejected,)
+    assert not batch.events[0].accepted
+    assert batch.events[0].error == "physical allocation failed"
+    assert batch.free_capacity == manager.capacity
+
+
 # -- publication invariants --------------------------------------------------------
 
 
@@ -667,6 +792,82 @@ def test_command_allocation_must_match_key() -> None:
     assert pickle.loads(pickle.dumps(bare)) == bare
 
 
+def test_command_allocation_is_reserve_only_and_matches_token_count() -> None:
+    """The allocation descriptor is RESERVE-only and its num_tokens must
+    equal the command's required_num_tokens (the worker consumes the
+    descriptor as the physical allocation intent)."""
+    key = _key()
+    descriptor = OwnerAllocationDescriptor(
+        key=key,
+        num_prompt_tokens=4,
+        num_computed_tokens=1,
+        num_tokens=4,
+        status=OwnerAdmissionStatus.WAITING,
+    )
+    # Legal combination: RESERVE with matching counts.
+    reserve = OwnerCommand(
+        key=key,
+        owner_id=1,
+        command_seq=1,
+        kind=OwnerCommandKind.RESERVE,
+        required_num_tokens=4,
+        allocation=descriptor,
+    )
+    assert reserve.allocation is descriptor
+    # A descriptor is illegal on every non-RESERVE command kind.
+    for kind in (
+        OwnerCommandKind.EXTEND,
+        OwnerCommandKind.PREEMPT,
+        OwnerCommandKind.RESTORE,
+        OwnerCommandKind.RELEASE,
+    ):
+        with pytest.raises(ValueError, match="RESERVE"):
+            OwnerCommand(
+                key=key,
+                owner_id=1,
+                command_seq=2,
+                kind=kind,
+                required_num_tokens=4,
+                allocation=descriptor,
+            )
+    # num_tokens must equal required_num_tokens exactly (both directions).
+    with pytest.raises(ValueError, match="num_tokens"):
+        OwnerCommand(
+            key=key,
+            owner_id=1,
+            command_seq=3,
+            kind=OwnerCommandKind.RESERVE,
+            required_num_tokens=8,
+            allocation=descriptor,
+        )
+    with pytest.raises(ValueError, match="num_tokens"):
+        OwnerCommand(
+            key=key,
+            owner_id=1,
+            command_seq=4,
+            kind=OwnerCommandKind.RESERVE,
+            required_num_tokens=2,
+            allocation=descriptor,
+        )
+    # A zero-token empty RESERVE with a matching zero-count descriptor is
+    # the legal empty lease.
+    empty = OwnerAllocationDescriptor(
+        key=key,
+        num_prompt_tokens=0,
+        num_computed_tokens=0,
+        num_tokens=0,
+        status=OwnerAdmissionStatus.WAITING,
+    )
+    assert OwnerCommand(
+        key=key,
+        owner_id=1,
+        command_seq=5,
+        kind=OwnerCommandKind.RESERVE,
+        required_num_tokens=0,
+        allocation=empty,
+    ).allocation is empty
+
+
 def test_command_requires_nonnegative_nonbool_token_count() -> None:
     """OwnerCommand rejects bool/negative/non-int required_num_tokens while
     keeping the existing allocation validation intact."""
@@ -688,17 +889,17 @@ def test_command_requires_nonnegative_nonbool_token_count() -> None:
                 required_num_tokens=bad,  # type: ignore[arg-type]
             )
     # Zero remains a legal count (empty RESERVE), and the allocation
-    # validation still applies alongside the count check.
-    zero = OwnerCommand(
-        key=key,
-        owner_id=1,
-        command_seq=1,
-        kind=OwnerCommandKind.RESERVE,
-        required_num_tokens=0,
-        allocation=descriptor,
-    )
-    assert zero.required_num_tokens == 0
-    assert zero.allocation is descriptor
+    # validation still applies alongside the count check: a descriptor
+    # whose num_tokens does not match a zero-count command is rejected.
+    with pytest.raises(ValueError, match="num_tokens"):
+        OwnerCommand(
+            key=key,
+            owner_id=1,
+            command_seq=1,
+            kind=OwnerCommandKind.RESERVE,
+            required_num_tokens=0,
+            allocation=descriptor,
+        )
     mismatched = OwnerAllocationDescriptor(
         key=_key("req-other"),
         num_prompt_tokens=4,

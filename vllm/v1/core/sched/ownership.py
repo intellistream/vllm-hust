@@ -183,9 +183,10 @@ class OwnerCommand:
     #: Zero is a legal empty RESERVE; nonzero against zero capacity is
     #: rejected by the receiver.
     required_num_tokens: int
-    #: Optional RESERVE allocation descriptor (key must match; counts are
-    #: validated by the descriptor itself).  ``None`` when the caller does
-    #: not participate in allocation publication.
+    #: Optional RESERVE-only allocation descriptor: legal exclusively on
+    #: RESERVE commands, its key must match the command key, and
+    #: ``num_tokens`` must equal ``required_num_tokens``.  ``None`` when the
+    #: caller does not participate in allocation publication.
     allocation: OwnerAllocationDescriptor | None = None
 
     def __post_init__(self) -> None:
@@ -209,6 +210,16 @@ class OwnerCommand:
             raise ValueError(
                 f"allocation key {self.allocation.key!r} must match "
                 f"command key {self.key!r}."
+            )
+        if self.kind is not OwnerCommandKind.RESERVE:
+            raise ValueError(
+                "allocation is only legal on RESERVE commands, got "
+                f"{self.kind.value}."
+            )
+        if self.allocation.num_tokens != self.required_num_tokens:
+            raise ValueError(
+                "allocation.num_tokens must equal required_num_tokens, got "
+                f"{self.allocation.num_tokens} != {self.required_num_tokens}."
             )
 
 
@@ -958,8 +969,31 @@ class AttentionLeaseManager:
 
     # -- command handling ------------------------------------------------------
 
-    def apply(self, command: OwnerCommand) -> OwnerReceipt:
-        """Consume one owner command and produce its receipt."""
+    def apply(
+        self,
+        command: OwnerCommand,
+        *,
+        external_reject_error: str | None = None,
+    ) -> OwnerReceipt:
+        """Consume one owner command and produce its receipt.
+
+        ``external_reject_error`` is an optional external physical-allocation
+        rejection seam for preflight callers (e.g. a worker that applied this
+        command to a deep copy, attempted real physical allocation, and lost).
+        When set, the command first runs through exactly the same
+        wrong-owner, global command-sequence, and request-epoch fences as an
+        ordinary apply -- including higher-epoch supersession and the
+        stale-old-epoch RELEASE tombstone exception -- and is then rejected
+        with ``external_reject_error`` before any RESERVE/EXTEND/PREEMPT/
+        RESTORE/RELEASE logical state transition is dispatched.  No lease,
+        commitment, or publication state is created or mutated on that path,
+        but the authoritative fences still advance so the coordinator's
+        command stream stays in sync and the preflight cannot be replayed.
+        Fence violations keep their canonical errors (``wrong owner rank``,
+        ``stale or duplicate command sequence``, ``stale request epoch``)
+        rather than the caller-supplied error.  When ``None`` (default), the
+        behavior is bit-for-bit unchanged.
+        """
         if command.owner_id != self.owner_rank:
             return self._receipt(command, accepted=False, error="wrong owner rank")
         fence = self._command_fence.get(command.owner_id, 0)
@@ -999,6 +1033,15 @@ class AttentionLeaseManager:
                     # committed until the old lease's own RELEASE receipt.
                     self._leases[old_key].superseded = True
                 self._epoch_fence[command.key.request_id] = command.key.owner_epoch
+
+        if external_reject_error is not None:
+            # External physical-allocation rejection seam: the fences above
+            # were enforced/advanced exactly as ordinary apply, so the
+            # coordinator stream stays authoritative, but no logical state
+            # transition is dispatched and no lease/commitment is created.
+            return self._receipt(
+                command, accepted=False, error=external_reject_error
+            )
 
         lease = self._leases.get(command.key)
         if command.kind is OwnerCommandKind.RESERVE:
