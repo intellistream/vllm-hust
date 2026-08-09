@@ -1163,6 +1163,10 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             kv_cache_usage=self.kv_cache_manager.usage,
+            # Request-owned attention uses the scheduler call ordinal as its
+            # global execution/receipt fence.  This is intentionally distinct
+            # from sched_step_seq, which only advances for deferred KV frees.
+            step_seq=self.current_step,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
