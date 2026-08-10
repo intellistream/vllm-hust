@@ -123,8 +123,38 @@ if [[ "${ARTIFACT_SHA,,}" != "${TARGET_SHA,,}" ]]; then
   exit 2
 fi
 
-git -C "$TARGET_GIT_REPOSITORY" fetch --quiet \
-  origin main:refs/remotes/origin/main
+fetch_target_main_with_retry() {
+  local max_attempts=${PERFGATE_TARGET_FETCH_MAX_ATTEMPTS:-4}
+  local delay_seconds=${PERFGATE_TARGET_FETCH_INITIAL_DELAY_SECONDS:-15}
+  local attempt=1
+
+  if [[ ! "$max_attempts" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PERFGATE_TARGET_FETCH_MAX_ATTEMPTS must be a positive integer" >&2
+    return 2
+  fi
+  if [[ ! "$delay_seconds" =~ ^[0-9]+$ ]]; then
+    echo "PERFGATE_TARGET_FETCH_INITIAL_DELAY_SECONDS must be a non-negative integer" >&2
+    return 2
+  fi
+
+  while [[ "$attempt" -le "$max_attempts" ]]; do
+    echo "[perfgate-publisher] target main fetch attempt ${attempt}/${max_attempts}"
+    if git -C "$TARGET_GIT_REPOSITORY" fetch --quiet \
+      origin main:refs/remotes/origin/main; then
+      return 0
+    fi
+    if [[ "$attempt" -lt "$max_attempts" ]]; then
+      sleep "$delay_seconds"
+    fi
+    attempt=$((attempt + 1))
+    delay_seconds=$((delay_seconds * 2))
+  done
+
+  echo "Failed to fetch target main after ${max_attempts} attempts" >&2
+  return 1
+}
+
+fetch_target_main_with_retry
 UPDATE_POINTER=()
 if [[ "$(git -C "$TARGET_GIT_REPOSITORY" rev-parse origin/main)" == "$TARGET_SHA" ]]; then
   UPDATE_POINTER=(--update-latest-pointer)

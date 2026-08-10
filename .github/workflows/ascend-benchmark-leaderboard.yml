@@ -276,9 +276,10 @@ jobs:
       HF_HUB_DISABLE_TELEMETRY: "1"
       HF_HUB_DISABLE_XET: "1"
       HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
-      HF_HOME: ${{ github.workspace }}/../.hf-cache
-      HUGGINGFACE_HUB_CACHE: ${{ github.workspace }}/../.hf-cache/hub
-      TRANSFORMERS_CACHE: ${{ github.workspace }}/../.hf-cache/transformers
+      # Set this repository variable to a runner-local persistent directory to
+      # reuse large model snapshots across benchmark runs.
+      VLLM_HUST_HF_CACHE_ROOT: ${{ vars.VLLM_HUST_HF_CACHE_ROOT || '' }}
+      SAME_SPEC_READY_TIMEOUT_SECONDS: "2400"
       HF_TOKEN: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_to_hf) && secrets.HF_TOKEN || '' }}
       HF_REPO_ID: intellistream/vllm-hust-benchmark-results
       MODEL_NAME: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && (github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.model_name || 'Qwen/Qwen2.5-3B-Instruct') || (github.event_name == 'workflow_dispatch' && inputs.model_name || 'Qwen/Qwen2.5-14B-Instruct') }}
@@ -950,8 +951,30 @@ jobs:
 
       - name: Prepare Hugging Face cache directories
         run: |
-          mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE"
-          chmod 700 "$HF_HOME"
+          cache_root="${VLLM_HUST_HF_CACHE_ROOT:-${GITHUB_WORKSPACE}/../.hf-cache}"
+          cache_root="${cache_root%/}"
+          if [[ -z "$cache_root" || "$cache_root" == "/" ]]; then
+            echo "VLLM_HUST_HF_CACHE_ROOT must name a cache directory." >&2
+            exit 2
+          fi
+
+          hub_cache="$cache_root/hub"
+          transformers_cache="$cache_root/transformers"
+          if ! mkdir -p "$hub_cache" "$transformers_cache"; then
+            echo "Unable to create Hugging Face cache directories under: $cache_root" >&2
+            exit 2
+          fi
+          if [[ ! -r "$cache_root" || ! -w "$cache_root" || ! -x "$cache_root" ]]; then
+            echo "Hugging Face cache root must be readable and writable by the runner: $cache_root" >&2
+            exit 2
+          fi
+          {
+            echo "HF_HOME=$cache_root"
+            echo "HF_HUB_CACHE=$hub_cache"
+            echo "HUGGINGFACE_HUB_CACHE=$hub_cache"
+            echo "TRANSFORMERS_CACHE=$transformers_cache"
+          } >> "$GITHUB_ENV"
+          echo "Hugging Face cache root: $cache_root"
           echo "HF endpoint: $HF_ENDPOINT"
 
       - name: Resolve benchmark Python runtime
@@ -963,6 +986,32 @@ jobs:
           echo "PYTHON_BIN=$PYTHON_BIN" >> "$GITHUB_ENV"
           dirname "$PYTHON_BIN" >> "$GITHUB_PATH"
           "$PYTHON_BIN" --version
+
+      - name: Report benchmark model cache status
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vllm-hust-benchmark/src
+        run: |
+          "$PYTHON_BIN" - <<'PY'
+          import os
+
+          from huggingface_hub import snapshot_download
+          from vllm_hust_benchmark.same_spec import (
+              runtime_model_path_has_required_artifacts,
+          )
+
+          model_id = os.environ["MODEL_NAME"]
+          try:
+              snapshot = snapshot_download(model_id, local_files_only=True)
+          except Exception as exc:
+              print(
+                  "[benchmark-cache] cache miss for "
+                  f"{model_id}: {exc.__class__.__name__}: {exc}"
+              )
+          else:
+              complete = runtime_model_path_has_required_artifacts(snapshot)
+              status = "complete" if complete else "incomplete"
+              print(f"[benchmark-cache] {status} snapshot for {model_id}: {snapshot}")
+          PY
 
       - name: Install ascend-runtime-manager from fresh checkout
         run: |
@@ -1145,7 +1194,10 @@ jobs:
           "${PYTHON_BIN}" -m pip install --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" "wheel" "packaging>=24.2"
           VLLM_TARGET_DEVICE=empty "${PYTHON_BIN}" -m pip install -e . --no-build-isolation --no-deps
           "${PYTHON_BIN}" scripts/ensure_vllm_provider.py --remove-conflicts
-          "${PYTHON_BIN}" -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema
+          # vLLM is installed with --no-deps above because the Ascend runner
+          # provides its torch/runtime stack. Install this required runtime
+          # dependency explicitly so prefix caching can hash request blocks.
+          "${PYTHON_BIN}" -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema "xxhash>=3.5.0"
           "${PYTHON_BIN}" scripts/ensure_vllm_provider.py
 
       - name: Verify installation
@@ -1198,6 +1250,11 @@ jobs:
 
           if not ascend_plugin:
             raise SystemExit("ascend platform plugin entry point is not installed")
+          try:
+            import xxhash
+          except ImportError as exc:
+            raise SystemExit("xxhash is required by the configured prefix-caching hash algorithm") from exc
+          print(f"xxhash version: {metadata.version('xxhash')}")
           PY
 
       - name: Runner health preflight (before benchmark)
@@ -1329,11 +1386,35 @@ jobs:
           PUBLISH_TO_BENCHMARK_REPO: "0"
           PUBLISH_TO_HF: "0"
         run: |
+          set -euo pipefail
           echo "status=failed" >> "$GITHUB_OUTPUT"
+
+          fetch_with_retry() {
+            local max_attempts=4
+            local delay_seconds=15
+            local attempt=1
+
+            while [[ "$attempt" -le "$max_attempts" ]]; do
+              echo "[perfgate-producer] fetch attempt ${attempt}/${max_attempts}: git fetch $*"
+              if git -C "$VLLM_HUST_BENCHMARK_REPO" fetch --quiet "$@"; then
+                return 0
+              fi
+              echo "[perfgate-producer] fetch failed (${attempt}/${max_attempts}): git fetch $*" >&2
+              if [[ "$attempt" -lt "$max_attempts" ]]; then
+                sleep "$delay_seconds"
+              fi
+              attempt=$((attempt + 1))
+              delay_seconds=$((delay_seconds * 2))
+            done
+
+            echo "[perfgate-producer] fetch failed after ${max_attempts} attempts: git fetch $*" >&2
+            return 1
+          }
+
           if [[ "$(git -C "$VLLM_HUST_BENCHMARK_REPO" rev-parse --is-shallow-repository)" == "true" ]]; then
-            git -C "$VLLM_HUST_BENCHMARK_REPO" fetch --quiet --unshallow origin main
+            fetch_with_retry --unshallow origin main
           else
-            git -C "$VLLM_HUST_BENCHMARK_REPO" fetch --quiet origin main
+            fetch_with_retry origin main
           fi
           git -C "$VLLM_HUST_BENCHMARK_REPO" merge-base --is-ancestor HEAD origin/main
           perfgate_spec_file="${PERFGATE_SPEC_FILE:-}"
@@ -1419,6 +1500,12 @@ jobs:
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
           VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
           RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}
+          # Consumer candidates stay single-measurement. Repeated measurement
+          # and representative-run selection belong only to the main producer.
+          PERFGATE_WARMUP_RUNS: "0"
+          PERFGATE_MEASURED_RUNS: "1"
+          PERFGATE_AGGREGATION: "primary-median-run"
+          PERFGATE_REQUIRE_PROVENANCE: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '1' || '0' }}
         run: |
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
           max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}
@@ -1461,6 +1548,10 @@ jobs:
           VLLM_HUST_REPO: ${{ github.workspace }}
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
           VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
+          PERFGATE_WARMUP_RUNS: "0"
+          PERFGATE_MEASURED_RUNS: "1"
+          PERFGATE_AGGREGATION: "primary-median-run"
+          PERFGATE_REQUIRE_PROVENANCE: "1"
         run: |
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
           bash .github/workflows/scripts/perfgate_stage2_rebase_and_benchmark.sh
