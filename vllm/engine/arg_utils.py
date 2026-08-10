@@ -710,6 +710,11 @@ class EngineArgs:
 
     stream_interval: int = SchedulerConfig.stream_interval
 
+    enable_request_owned_attention: bool = (
+        SchedulerConfig.enable_request_owned_attention
+    )
+    enable_request_owned_sampling: bool = SchedulerConfig.enable_request_owned_sampling
+
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
@@ -1463,6 +1468,14 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--enable-request-owned-attention",
+            **scheduler_kwargs["enable_request_owned_attention"],
+        )
+        scheduler_group.add_argument(
+            "--enable-request-owned-sampling",
+            **scheduler_kwargs["enable_request_owned_sampling"],
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -2163,6 +2176,8 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            enable_request_owned_attention=self.enable_request_owned_attention,
+            enable_request_owned_sampling=self.enable_request_owned_sampling,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

@@ -144,3 +144,106 @@ def test_mm_prefix_lm_raises_batched_tokens_floor():
         vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
 
     assert vllm_config.scheduler_config.max_num_batched_tokens >= 2496
+
+
+def test_request_owned_flags_default_false():
+    """Both experimental request-owned flags default to False and never
+    change the scheduler config unless explicitly enabled."""
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    engine_args = EngineArgs.from_cli_args(args=parser.parse_args([]))
+    assert engine_args.enable_request_owned_attention is False
+    assert engine_args.enable_request_owned_sampling is False
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_attention is False
+    assert vllm_config.scheduler_config.enable_request_owned_sampling is False
+
+
+def test_request_owned_attention_flag_propagates_independently(monkeypatch):
+    """--enable-request-owned-attention alone maps exactly to the
+    SchedulerConfig field, leaving sampling off."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--enforce-eager",
+            "--no-enable-prefix-caching",
+            "--no-async-scheduling",
+            "--enable-request-owned-attention",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_attention is True
+    assert engine_args.enable_request_owned_sampling is False
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_attention is True
+    assert vllm_config.scheduler_config.enable_request_owned_sampling is False
+
+
+def test_request_owned_sampling_flag_propagates_independently():
+    """--enable-request-owned-sampling alone reaches its own EngineArgs field,
+    and existing VllmConfig validation still rejects it without the
+    request-owned attention envelope."""
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--enable-request-owned-sampling",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_attention is False
+    assert engine_args.enable_request_owned_sampling is True
+
+    with pytest.raises(ValueError, match="enable_request_owned_attention=True"):
+        engine_args.create_engine_config()
+
+
+def test_request_owned_flags_together_reach_scheduler_config(monkeypatch):
+    """The vllm serve CLI form (Multiproc + both flags) parses and reaches
+    scheduler config construction with both booleans enabled."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--enforce-eager",
+            "--no-enable-prefix-caching",
+            "--no-async-scheduling",
+            "--enable-request-owned-attention",
+            "--enable-request-owned-sampling",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_attention is True
+    assert engine_args.enable_request_owned_sampling is True
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_attention is True
+    assert vllm_config.scheduler_config.enable_request_owned_sampling is True
+
+
+def test_request_owned_invalid_envelope_still_rejected():
+    """Enabling the flags does not widen the fail-closed envelope: an
+    unsupported pipeline shape is still rejected by existing VllmConfig
+    validation."""
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--pipeline-parallel-size",
+            "2",
+            "--enable-request-owned-attention",
+            "--enable-request-owned-sampling",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
+        engine_args.create_engine_config()
