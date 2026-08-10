@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -323,6 +324,44 @@ def test_preflight_rejects_benchmark_main_that_moved_after_rehearsal(
     assert not Path(env["REPLAY_RECEIPT_FILE"]).exists()
 
 
+def test_preflight_retries_transient_fetch_failure(
+    replay_environment: tuple[dict[str, str], Path],
+) -> None:
+    env, _remote = replay_environment
+    fake_bin = Path(env["REPLAY_RECEIPT_FILE"]).parent / "fake-bin"
+    fake_bin.mkdir()
+    fetch_count = fake_bin / "fetch-count"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    (fake_bin / "git").write_text(
+        f"""#!/bin/bash
+set -euo pipefail
+count=0
+if [[ -f {str(fetch_count)!r} ]]; then count=$(< {str(fetch_count)!r}); fi
+if [[ \"$*\" == *\" fetch origin main\"* ]]; then
+  count=$((count + 1))
+  printf '%s\\n' \"$count\" > {str(fetch_count)!r}
+  if [[ \"$count\" -eq 1 ]]; then exit 1; fi
+fi
+exec {real_git!r} \"$@\"
+""",
+        encoding="utf-8",
+    )
+    (fake_bin / "git").chmod(0o755)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["REPLAY_FETCH_MAX_ATTEMPTS"] = "2"
+    env["REPLAY_FETCH_RETRY_SECONDS"] = "0"
+
+    result = run(
+        ["bash", str(SCRIPT_PATH), "preflight"],
+        REPO_ROOT,
+        env=env,
+    )
+
+    assert "Replay preflight passed" in result.stdout
+    assert fetch_count.read_text(encoding="utf-8").strip() == "2"
+
+
 def test_publish_requires_writer_after_all_static_inputs_are_valid(
     replay_environment: tuple[dict[str, str], Path],
 ) -> None:
@@ -383,6 +422,40 @@ def test_publish_pushes_and_verifies_via_local_bare_remote(
     assert run(["git", "remote", "get-url", "origin"], benchmark).stdout.strip() == str(
         remote
     )
+
+
+def test_publish_does_not_export_writer_token_to_sync_children(
+    replay_environment: tuple[dict[str, str], Path],
+) -> None:
+    env, _remote = replay_environment
+    env["REPLAY_WRITER_TOKEN"] = "test-writer-token"
+    token_env_log = Path(env["REPLAY_RECEIPT_FILE"]).with_name("token-env.log")
+    fake_python = Path(env["PYTHON_BIN"])
+    probe_python = token_env_log.with_name("probe-python")
+    probe_python.write_text(
+        f"""#!/bin/bash
+set -euo pipefail
+if [[ -n \"${{GITHUB_ENV:-}}\" ]]; then
+  if [[ \"${{REPLAY_WRITER_TOKEN+x}}\" == x ]]; then
+    printf 'set\\n' > {str(token_env_log)!r}
+  else
+    printf 'unset\\n' > {str(token_env_log)!r}
+  fi
+fi
+exec {str(fake_python)!r} \"$@\"
+""",
+        encoding="utf-8",
+    )
+    probe_python.chmod(0o755)
+    env["PYTHON_BIN"] = str(probe_python)
+
+    run(
+        ["bash", str(SCRIPT_PATH), "publish"],
+        REPO_ROOT,
+        env=env,
+    )
+
+    assert token_env_log.read_text(encoding="utf-8").strip() == "unset"
 
 
 def test_publish_failure_cleans_askpass_and_preserves_remote(

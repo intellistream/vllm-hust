@@ -26,6 +26,21 @@ for name in \
   require_env "$name"
 done
 
+REPLAY_FETCH_MAX_ATTEMPTS=${REPLAY_FETCH_MAX_ATTEMPTS:-4}
+REPLAY_FETCH_RETRY_SECONDS=${REPLAY_FETCH_RETRY_SECONDS:-5}
+case "$REPLAY_FETCH_MAX_ATTEMPTS" in
+  ''|*[!0-9]*|0*)
+    echo "REPLAY_FETCH_MAX_ATTEMPTS must be a positive integer" >&2
+    exit 2
+    ;;
+esac
+case "$REPLAY_FETCH_RETRY_SECONDS" in
+  ''|*[!0-9]*)
+    echo "REPLAY_FETCH_RETRY_SECONDS must be a non-negative integer" >&2
+    exit 2
+    ;;
+esac
+
 if [[ "$mode" == "publish" ]]; then
   require_env REPLAY_WRITER_TOKEN
   require_env REPLAY_RECEIPT_FILE
@@ -111,7 +126,29 @@ if [[ "${ALLOW_LOCAL_REPLAY_REMOTE:-0}" != "1" ]]; then
     *) echo "unexpected benchmark origin: $remote_url" >&2; exit 2 ;;
   esac
 fi
-git -C "$BENCHMARK_REPO_DIR" fetch origin main
+fetch_target_branch_with_retry() {
+  local phase=$1
+  local attempt=1
+  while (( attempt <= REPLAY_FETCH_MAX_ATTEMPTS )); do
+    if [[ -n "${askpass_script:-}" ]]; then
+      if env GIT_ASKPASS="$askpass_script" GIT_TERMINAL_PROMPT=0 \
+        git -C "$BENCHMARK_REPO_DIR" fetch origin main; then
+        return 0
+      fi
+    elif git -C "$BENCHMARK_REPO_DIR" fetch origin main; then
+      return 0
+    fi
+    if (( attempt == REPLAY_FETCH_MAX_ATTEMPTS )); then
+      echo "replay ${phase} fetch failed after ${REPLAY_FETCH_MAX_ATTEMPTS} attempts" >&2
+      return 1
+    fi
+    echo "replay ${phase} fetch failed; retrying in ${REPLAY_FETCH_RETRY_SECONDS}s (attempt $attempt/$REPLAY_FETCH_MAX_ATTEMPTS)" >&2
+    sleep "$REPLAY_FETCH_RETRY_SECONDS"
+    attempt=$((attempt + 1))
+  done
+}
+
+fetch_target_branch_with_retry preflight
 benchmark_head=$(git -C "$BENCHMARK_REPO_DIR" rev-parse HEAD)
 benchmark_remote_main=$(git -C "$BENCHMARK_REPO_DIR" rev-parse origin/main)
 if [[ "$benchmark_head" != "$EXPECTED_BENCHMARK_MAIN_SHA" \
@@ -214,17 +251,22 @@ cleanup_askpass() {
 }
 trap cleanup_askpass EXIT
 askpass_script="$askpass_dir/askpass.sh"
-cat > "$askpass_script" <<'EOF'
+askpass_token_file="$askpass_dir/token"
+umask 077
+writer_token="$REPLAY_WRITER_TOKEN"
+printf '%s' "$writer_token" > "$askpass_token_file"
+unset REPLAY_WRITER_TOKEN
+cat > "$askpass_script" <<EOF
 #!/bin/sh
-case "$1" in
+case "\$1" in
   *Username*) printf '%s\n' x-access-token ;;
-  *Password*) printf '%s\n' "$REPLAY_WRITER_TOKEN" ;;
+  *Password*) cat "$askpass_token_file" ;;
   *) exit 1 ;;
 esac
 EOF
 chmod 700 "$askpass_script"
 
-env -u GITHUB_ACTIONS \
+env -u GITHUB_ACTIONS -u REPLAY_WRITER_TOKEN \
   PYTHONPATH="$BENCHMARK_REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
   BENCHMARK_REPO_DIR="$BENCHMARK_REPO_DIR" \
   WEBSITE_REPO_DIR="$WEBSITE_REPO_DIR" \
@@ -250,7 +292,6 @@ env -u GITHUB_ACTIONS \
   GIT_COMMITTER_EMAIL=benchmark-bot@vllm-hust.local \
   GIT_ASKPASS="$askpass_script" \
   GIT_TERMINAL_PROMPT=0 \
-  REPLAY_WRITER_TOKEN="$REPLAY_WRITER_TOKEN" \
   bash "$sync_script"
 
 receipt_value() {
@@ -280,7 +321,7 @@ if [[ ! "$verified_commit" =~ ^[0-9a-f]{40}$ ]]; then
   exit 2
 fi
 
-git -C "$BENCHMARK_REPO_DIR" fetch origin main
+fetch_target_branch_with_retry post-publish
 remote_commit=$(git -C "$BENCHMARK_REPO_DIR" rev-parse origin/main)
 if [[ "$remote_commit" != "$verified_commit" ]]; then
   echo "remote replay commit mismatch" >&2

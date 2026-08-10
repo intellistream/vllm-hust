@@ -45,18 +45,37 @@ def test_replay_workflow_has_minimal_permissions_and_no_hf_path() -> None:
 def test_replay_workflow_downloads_exact_source_run_artifact() -> None:
     text = workflow_text()
 
-    assert "source_run_id:" in text
-    assert "source_run_attempt:" in text
-    assert "expected_target_sha:" in text
-    assert "expected_benchmark_main_sha:" in text
     assert "confirmation:" in text
-    assert "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093" in text
+    assert 'SOURCE_RUN_ID: "31004708110"' in text
+    assert 'SOURCE_RUN_ATTEMPT: "1"' in text
+    assert 'EXPECTED_TARGET_SHA: "4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0"' in text
     assert (
-        "name: ascend-benchmark-${{ inputs.source_run_id }}-"
-        "${{ inputs.source_run_attempt }}" in text
+        'EXPECTED_BENCHMARK_MAIN_SHA: "734f3fc3cc7a809889ac1780a1fd980e98226cef"'
+        in text
     )
-    assert "run-id: ${{ inputs.source_run_id }}" in text
+    assert "source_run_id:" not in text
+    assert "expected_target_sha:" not in text
+    assert "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093" in text
+    assert "name: ascend-benchmark-31004708110-1" in text
+    assert "run-id: 31004708110" in text
     assert "repository: ${{ github.repository }}" in text
+
+
+def test_replay_workflow_verifies_source_run_before_download() -> None:
+    text = workflow_text()
+
+    verify_start = text.index("      - name: Verify approved source run metadata")
+    download_start = text.index("      - name: Download immutable source artifact")
+    verify_block = text[verify_start:download_start]
+
+    assert "actions/runs/${SOURCE_RUN_ID}" in verify_block
+    assert '".github/workflows/ascend-benchmark-leaderboard.yml"' in verify_block
+    assert '"push"' in verify_block
+    assert '"main"' in verify_block
+    assert ".head_sha == $expected_sha" in verify_block
+    assert ".run_attempt | tostring" in verify_block
+    assert '.status == "completed"' in verify_block
+    assert '.conclusion == "success"' in verify_block
 
 
 def test_writer_secret_is_scoped_to_publish_step() -> None:
