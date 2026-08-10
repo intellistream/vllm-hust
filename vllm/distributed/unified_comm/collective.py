@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -530,8 +532,6 @@ class CollectiveGroup:
 
     def _detect_topology(self) -> TopologyInfo:
         """自动探测硬件拓扑信息。"""
-        import os
-
         device_type = self._group_info.device.type
         gpus_per_node = 8  # 保守默认值
 
@@ -565,10 +565,15 @@ class CollectiveGroup:
             if nccl_ib == "0":
                 has_rdma = self._probe_rdma()
 
+        # 多网卡探测：优先读取 NCCL_IB_HCA（显式配置），否则回退系统枚举。
+        nic_names = self._detect_inter_node_nics()
+        nic_count = max(1, len(nic_names))
+
         # 带宽估计
         intra_bw = 600.0 if has_nvswitch else 300.0
 
-        inter_bw = 100.0 if has_rdma else 25.0
+        # 估算聚合能力：单 NIC 100Gbps，按 NIC 数线性叠加并限制上限。
+        inter_bw = min(800.0, 100.0 * nic_count) if has_rdma else 25.0
 
         return TopologyInfo(
             num_nodes=num_nodes,
@@ -578,6 +583,8 @@ class CollectiveGroup:
             has_nvswitch=has_nvswitch,
             has_rdma=has_rdma,
             device_type=device_type,
+            nic_count=nic_count,
+            nic_names=nic_names,
         )
 
     def _is_intra_node(self) -> bool:
@@ -593,6 +600,30 @@ class CollectiveGroup:
             result = False
         self._cached_is_intra_node = result
         return result
+
+    @staticmethod
+    def _detect_inter_node_nics(
+        ib_root: Path = Path("/sys/class/infiniband"),
+    ) -> list[str]:
+        """探测可用于跨节点通信的 NIC 列表。"""
+        nccl_hcas = os.environ.get("NCCL_IB_HCA", "").strip()
+        if nccl_hcas:
+            entries = [entry.strip() for entry in nccl_hcas.split(",")]
+            if not any(entry.startswith("^") for entry in entries):
+                names = {
+                    entry.removeprefix("=").split(":", 1)[0]
+                    for entry in entries
+                    if entry
+                }
+                if names:
+                    return sorted(names)
+
+        if ib_root.is_dir():
+            with contextlib.suppress(OSError):
+                return sorted(entry.name for entry in ib_root.iterdir())
+
+        # 最后兜底：默认单网卡
+        return []
 
     @staticmethod
     def _probe_nvswitch() -> bool:

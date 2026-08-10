@@ -1,8 +1,10 @@
 name: Ascend Benchmark Leaderboard
 
 on:
+  push:
+    branches: [main]
   pull_request:
-    types: [labeled]
+    types: [labeled, synchronize, reopened]
   issue_comment:
     types: [created]
   schedule:
@@ -242,12 +244,16 @@ jobs:
     if: >-
       always() &&
       (
+        github.event_name == 'push' ||
         github.event_name == 'workflow_dispatch' ||
         github.event_name == 'schedule' ||
         (
           github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name == github.repository &&
-          (github.event.label.name == 'ready' || github.event.label.name == 'verified')
+          (
+            contains(github.event.pull_request.labels.*.name, 'ready') ||
+            contains(github.event.pull_request.labels.*.name, 'verified')
+          )
         ) ||
         (github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.should_run == '1')
       )
@@ -260,15 +266,20 @@ jobs:
       - ascend
       - 910b
       - docker
-    timeout-minutes: 60
+      - ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'npu-2' || (github.event_name == 'workflow_dispatch' && (vars.VLLM_HUST_MANUAL_RUNNER_LABEL || 'npu-1') || 'ascend-benchmark') }}
+    # Perfgate producer runs 1 warmup + 3 measured client passes (P0-7), so allow
+    # roughly 4x the previous single-run client wall time.
+    timeout-minutes: 150
     env:
       HOME: ${{ github.workspace }}/.ci-home
       DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
       HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HUB_DISABLE_XET: "1"
       HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
-      HF_HOME: ${{ github.workspace }}/../.hf-cache
-      HUGGINGFACE_HUB_CACHE: ${{ github.workspace }}/../.hf-cache/hub
-      TRANSFORMERS_CACHE: ${{ github.workspace }}/../.hf-cache/transformers
+      # Set this repository variable to a runner-local persistent directory to
+      # reuse large model snapshots across benchmark runs.
+      VLLM_HUST_HF_CACHE_ROOT: ${{ vars.VLLM_HUST_HF_CACHE_ROOT || '' }}
+      SAME_SPEC_READY_TIMEOUT_SECONDS: "2400"
       HF_TOKEN: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_to_hf) && secrets.HF_TOKEN || '' }}
       HF_REPO_ID: intellistream/vllm-hust-benchmark-results
       MODEL_NAME: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && (github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.model_name || 'Qwen/Qwen2.5-3B-Instruct') || (github.event_name == 'workflow_dispatch' && inputs.model_name || 'Qwen/Qwen2.5-14B-Instruct') }}
@@ -308,17 +319,25 @@ jobs:
       WEBSITE_LEADERBOARD_URL: ${{ vars.VLLM_HUST_LEADERBOARD_URL || '' }}
       PUBLISH_TO_BENCHMARK_REPO: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.VLLM_HUST_PUBLISH_BENCHMARK_ON_MAIN == '1') || (github.event_name == 'schedule' && vars.VLLM_HUST_SCHEDULE_PUBLISH_BENCHMARK != '0') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_benchmark_repo)) && '1' || '0' }}
       PUBLISH_TO_HF: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_to_hf && secrets.HF_TOKEN != '') && '1' || '0' }}
-      TARGET_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && format('https://github.com/{0}.git', github.repository) || format('git@github.com:{0}.git', github.repository) }}
-      TARGET_REPO_SHA: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_head_sha || github.sha }}
-      BENCHMARK_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-hust-benchmark.git' || 'git@github.com:vLLM-HUST/vllm-hust-benchmark.git' }}
+      TARGET_REPO_URL: https://github.com/${{ github.repository }}.git
+      # Fetch a stable named ref before checking out the head SHA. GitHub does
+      # not guarantee upload-pack access for an otherwise unreachable SHA.
+      TARGET_REPO_REF: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
+      TARGET_REPO_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_head_sha || github.sha }}
+      BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
       BENCHMARK_REPO_SLUG: vLLM-HUST/vllm-hust-benchmark
       BENCHMARK_REPO_GH_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN || '' }}
       BENCHMARK_REPO_SSH_KEY: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY || '' }}
       BENCHMARK_REPO_REF: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && (vars.VLLM_HUST_BENCHMARK_REPO_REF || 'main') || 'main' }}
-      WEBSITE_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-hust-website.git' || 'git@github.com:vLLM-HUST/vllm-hust-website.git' }}
-      VLLM_ASCEND_HUST_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/vllm-ascend-hust.git' || 'git@github.com:vLLM-HUST/vllm-ascend-hust.git' }}
+      PERFGATE_BENCHMARK_RUNNER_SHA: ${{ vars.VLLM_HUST_PERFGATE_BENCHMARK_RUNNER_SHA || '' }}
+      WEBSITE_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-website.git
+      VLLM_ASCEND_HUST_REPO_URL: https://github.com/vLLM-HUST/vllm-ascend-hust.git
+      VLLM_ASCEND_HUST_REPO_REF: ""
+      PERFGATE_VLLM_ASCEND_HUST_SHA: ${{ vars.VLLM_HUST_PERFGATE_VLLM_ASCEND_HUST_SHA || '' }}
       ISSUE_COMMENT_PR_NUMBER: ${{ github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_number || '' }}
-      HUST_ASCEND_MANAGER_REPO_URL: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && 'https://github.com/vLLM-HUST/ascend-runtime-manager.git' || 'git@github.com:vLLM-HUST/ascend-runtime-manager.git' }}
+      HUST_ASCEND_MANAGER_REPO_URL: https://github.com/vLLM-HUST/ascend-runtime-manager.git
+      HUST_ASCEND_MANAGER_REPO_REF: ""
+      PERFGATE_RUNTIME_MANAGER_SHA: ${{ vars.VLLM_HUST_PERFGATE_RUNTIME_MANAGER_SHA || '' }}
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
       # Disable precompiled CUDA wheel fetch from wheels.vllm.ai.
       # The Ascend benchmark uses the vllm-ascend-hust plugin, not CUDA
@@ -362,6 +381,22 @@ jobs:
             echo "ASCEND_BENCHMARK_USE_SUDO=0" >> "$GITHUB_ENV"
           fi
 
+          # A dedicated runner container may expose one physical node such as
+          # /dev/davinci2. CANN renumbers that isolated device to logical 0
+          # inside the container, so preserving the physical suffix would hide
+          # the only available NPU from torch_npu.
+          mapfile -t runner_devnodes < <(
+            find /dev -maxdepth 1 -name 'davinci[0-9]*' -printf '%f\n' 2>/dev/null \
+              | sort -t i -k2 -n
+          )
+          if [[ "${RUNNER_NAME:-}" =~ npu([0-9]+)$ ]] \
+            && [[ "${#runner_devnodes[@]}" -eq 1 ]] \
+            && [[ "${runner_devnodes[0]}" == "davinci${BASH_REMATCH[1]}" ]]; then
+            echo "Dedicated ${RUNNER_NAME} container exposes ${runner_devnodes[0]}; using logical NPU 0."
+            echo "ASCEND_VISIBLE_DEVICES=0" >> "$GITHUB_ENV"
+            echo "ASCEND_RT_VISIBLE_DEVICES=0" >> "$GITHUB_ENV"
+          fi
+
           # Auto-detect NPU devices when no visibility env is set.
           # This is needed for root runners (where the root helper is
           # skipped) and any other case where the caller did not pre-set
@@ -378,8 +413,8 @@ jobs:
                 | sort -t i -k2 -n | paste -sd ',' || true)"
             fi
             if [[ -n "$detected_devices" ]]; then
-              echo "Auto-detected NPU devices: $detected_devices"
-              echo "ASCEND_VISIBLE_DEVICES=$detected_devices" >> "$GITHUB_ENV"
+              echo "Auto-detected candidate NPU devices: $detected_devices"
+              echo "ASCEND_CI_DETECTED_DEVICES=$detected_devices" >> "$GITHUB_ENV"
             else
               echo "[WARN] No NPU devices detected." >&2
             fi
@@ -414,6 +449,27 @@ jobs:
             echo "Install or refresh the benchmark root helper at $DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER, then rerun the workflow." >&2
             exit 1
           }
+
+      - name: Resolve trusted main dependency SHAs
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in \
+            PERFGATE_BENCHMARK_RUNNER_SHA \
+            PERFGATE_VLLM_ASCEND_HUST_SHA \
+            PERFGATE_RUNTIME_MANAGER_SHA; do
+            value="${!name:-}"
+            if [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "$name must be configured as a full immutable 40-character Git SHA for trusted main publication" >&2
+              exit 2
+            fi
+          done
+          {
+            echo "BENCHMARK_REPO_REF=$PERFGATE_BENCHMARK_RUNNER_SHA"
+            echo "VLLM_ASCEND_HUST_REPO_REF=$PERFGATE_VLLM_ASCEND_HUST_SHA"
+            echo "HUST_ASCEND_MANAGER_REPO_REF=$PERFGATE_RUNTIME_MANAGER_SHA"
+          } >> "$GITHUB_ENV"
 
       - name: Configure GitHub SSH checkout
         if: ${{ env.BENCHMARK_REPO_SSH_KEY != '' }}
@@ -488,8 +544,10 @@ jobs:
             local repo_url=$1
             local target_dir=$2
             local target_sha=$3
-            local attempts=${GIT_CHECKOUT_RETRY_ATTEMPTS:-6}
+            local target_ref=$4
+            local attempts=${GIT_CHECKOUT_RETRY_ATTEMPTS:-3}
             local delay_seconds=${GIT_CHECKOUT_RETRY_DELAY_SECONDS:-30}
+            local timeout_seconds=${GIT_CHECKOUT_TIMEOUT_SECONDS:-90}
             local try=1
             local parent_dir
             local temp_dir
@@ -500,18 +558,14 @@ jobs:
             mkdir -p "$parent_dir"
             rm -rf "$temp_dir"
             while [[ "$try" -le "$attempts" ]]; do
-              if git \
-                -c http.version=HTTP/1.1 \
-                -c http.lowSpeedLimit=1024 \
-                -c http.lowSpeedTime=30 \
-                clone --depth 1 "$repo_url" "$temp_dir"; then
-                if ! git -C "$temp_dir" rev-parse --verify --quiet "$target_sha^{commit}" >/dev/null; then
-                  git -C "$temp_dir" \
-                    -c http.version=HTTP/1.1 \
-                    -c http.lowSpeedLimit=1024 \
-                    -c http.lowSpeedTime=30 \
-                    fetch --depth 1 origin "$target_sha"
-                fi
+              mkdir -p "$temp_dir"
+              if git -C "$temp_dir" -c init.defaultBranch=main init \
+                && git -C "$temp_dir" remote add origin "$repo_url" \
+                && timeout --foreground "${timeout_seconds}s" git -C "$temp_dir" \
+                  -c http.version=HTTP/1.1 \
+                  -c http.lowSpeedLimit=1024 \
+                  -c http.lowSpeedTime=30 \
+                  fetch --no-tags --depth 1 origin "$target_ref"; then
                 git -C "$temp_dir" checkout --force "$target_sha"
                 rm -rf "$target_dir"
                 mv "$temp_dir" "$target_dir"
@@ -527,10 +581,35 @@ jobs:
             done
 
             echo "Failed to clone $repo_url after ${attempts} attempts" >&2
+
+            # The self-hosted runner's Git smart-HTTP mirror can lag behind
+            # GitHub's pull-request refs. The benchmark still needs the exact
+            # event source tree, so fall back to GitHub's SHA-addressed archive.
+            # Keep an origin remote: later steps may fetch main for Stage 2.
+            local repo_slug=${repo_url#https://github.com/}
+            repo_slug=${repo_slug%.git}
+            rm -rf "$temp_dir"
+            mkdir -p "$temp_dir"
+            if curl --fail --location --retry 3 --retry-all-errors \
+              "https://codeload.github.com/${repo_slug}/tar.gz/${target_sha}" \
+              | tar -xz --strip-components=1 -C "$temp_dir"; then
+              test -f "$temp_dir/pyproject.toml"
+              git -C "$temp_dir" init -q
+              git -C "$temp_dir" remote add origin "$repo_url"
+              git -C "$temp_dir" add -A
+              git -C "$temp_dir" -c user.name=ci -c user.email=ci@localhost \
+                commit -qm "CI source snapshot ${target_sha}"
+              rm -rf "$target_dir"
+              mv "$temp_dir" "$target_dir"
+              echo "Checked out SHA-addressed codeload snapshot: $target_sha"
+              return 0
+            fi
+
+            echo "Codeload fallback failed for $target_sha" >&2
             return 1
           }
 
-          clone_with_retry "$TARGET_REPO_URL" "$GITHUB_WORKSPACE" "$TARGET_REPO_SHA"
+          clone_with_retry "$TARGET_REPO_URL" "$GITHUB_WORKSPACE" "$TARGET_REPO_SHA" "$TARGET_REPO_REF"
 
       - name: L3 benchmark publication preflight
         shell: bash
@@ -568,7 +647,17 @@ jobs:
           }
 
           fetch_with_retry --deepen=500 origin main || fetch_with_retry --unshallow origin main || true
-          fetch_with_retry --no-tags origin "$PR_HEAD_SHA" "$PR_BASE_SHA"
+          if ! fetch_with_retry --no-tags origin "$PR_HEAD_SHA" "$PR_BASE_SHA"; then
+            # The source archive fallback above intentionally has no upstream
+            # ancestry. Use the exact PR base SHA for Stage 1 instead of
+            # pretending that the synthetic snapshot has a Git fork point.
+            # Stage 2 will either fetch main successfully or record a rebase
+            # conflict, both of which preserve a fail-closed performance gate.
+            echo "PR refs unavailable from the runner mirror; using PR base SHA as the conservative fork point." >&2
+            echo "FORK_POINT=$PR_BASE_SHA" >> "$GITHUB_ENV"
+            echo "Fork point fallback: $PR_BASE_SHA"
+            exit 0
+          fi
           git checkout --force "$PR_HEAD_SHA"
           fork_point="$(git merge-base "$PR_HEAD_SHA" "$PR_BASE_SHA")"
           echo "FORK_POINT=$fork_point" >> "$GITHUB_ENV"
@@ -582,6 +671,7 @@ jobs:
             local target_ref=${3:-}
             local attempts=6
             local delay_seconds=20
+            local timeout_seconds=${GIT_CHECKOUT_TIMEOUT_SECONDS:-90}
             local try=1
             local parent_dir
             local temp_dir
@@ -594,11 +684,13 @@ jobs:
             rm -rf "$target_dir" "$temp_dir"
             while [[ "$try" -le "$attempts" ]]; do
               echo "Clone attempt ${try}/${attempts}: $repo_url"
-              if git clone --depth 1 "$repo_url" "$temp_dir"; then
+              if timeout --foreground "${timeout_seconds}s" \
+                git clone --depth 1 "$repo_url" "$temp_dir"; then
                 if [[ -n "$target_ref" ]]; then
                   checkout_ref="$target_ref"
                   if ! git -C "$temp_dir" rev-parse --verify --quiet "$target_ref^{commit}" >/dev/null; then
-                    git -C "$temp_dir" fetch --depth 1 origin "$target_ref"
+                    timeout --foreground "${timeout_seconds}s" \
+                      git -C "$temp_dir" fetch --depth 1 origin "$target_ref"
                     checkout_ref=FETCH_HEAD
                   fi
                   git -C "$temp_dir" checkout --force "$checkout_ref"
@@ -658,11 +750,13 @@ jobs:
             local target_dir=$2
             local attempts=4
             local delay_seconds=15
+            local timeout_seconds=${GIT_CHECKOUT_TIMEOUT_SECONDS:-90}
             local try=1
 
             rm -rf "$target_dir"
             while [[ "$try" -le "$attempts" ]]; do
-              if git clone --depth 1 "$repo_url" "$target_dir"; then
+              if timeout --foreground "${timeout_seconds}s" \
+                git clone --depth 1 "$repo_url" "$target_dir"; then
                 return 0
               fi
               echo "Clone failed ($try/$attempts): $repo_url" >&2
@@ -673,6 +767,24 @@ jobs:
             done
 
             echo "Failed to clone $repo_url after ${attempts} attempts" >&2
+
+            # The PR benchmark still uses the website's aggregation script to
+            # build local leaderboard data, but it does not need website Git
+            # history.  Use codeload when this runner cannot reach GitHub's
+            # smart-HTTP endpoint.
+            local repo_slug=${repo_url#https://github.com/}
+            repo_slug=${repo_slug%.git}
+            rm -rf "$target_dir"
+            mkdir -p "$target_dir"
+            if curl --fail --location --retry 3 --retry-all-errors \
+              "https://codeload.github.com/${repo_slug}/tar.gz/main" \
+              | tar -xz --strip-components=1 -C "$target_dir"; then
+              test -f "$target_dir/scripts/aggregate_results.py"
+              echo "Checked out website source through codeload fallback."
+              return 0
+            fi
+
+            echo "Website codeload fallback failed for ${repo_slug}" >&2
             return 1
           }
 
@@ -683,13 +795,20 @@ jobs:
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
+            local target_ref=${3:-}
             local attempts=4
             local delay_seconds=15
+            local timeout_seconds=${GIT_CHECKOUT_TIMEOUT_SECONDS:-90}
             local try=1
 
             rm -rf "$target_dir"
             while [[ "$try" -le "$attempts" ]]; do
-              if git clone --depth 1 "$repo_url" "$target_dir"; then
+              if timeout --foreground "${timeout_seconds}s" \
+                git clone --depth 1 "$repo_url" "$target_dir"; then
+                if [[ -n "$target_ref" ]]; then
+                  git -C "$target_dir" fetch --depth 1 origin "$target_ref"
+                  git -C "$target_dir" checkout --force FETCH_HEAD
+                fi
                 return 0
               fi
               echo "Clone failed ($try/$attempts): $repo_url" >&2
@@ -703,7 +822,10 @@ jobs:
             return 1
           }
 
-          clone_with_retry "$VLLM_ASCEND_HUST_REPO_URL" "$GITHUB_WORKSPACE/vllm-ascend-hust"
+          clone_with_retry \
+            "$VLLM_ASCEND_HUST_REPO_URL" \
+            "$GITHUB_WORKSPACE/vllm-ascend-hust" \
+            "$VLLM_ASCEND_HUST_REPO_REF"
 
       - name: Preflight benchmark root helper
         shell: bash
@@ -780,13 +902,20 @@ jobs:
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
+            local target_ref=${3:-}
             local attempts=4
             local delay_seconds=15
+            local timeout_seconds=${GIT_CHECKOUT_TIMEOUT_SECONDS:-90}
             local try=1
 
             rm -rf "$target_dir"
             while [[ "$try" -le "$attempts" ]]; do
-              if git clone --depth 1 "$repo_url" "$target_dir"; then
+              if timeout --foreground "${timeout_seconds}s" \
+                git clone --depth 1 "$repo_url" "$target_dir"; then
+                if [[ -n "$target_ref" ]]; then
+                  git -C "$target_dir" fetch --depth 1 origin "$target_ref"
+                  git -C "$target_dir" checkout --force FETCH_HEAD
+                fi
                 return 0
               fi
               echo "Clone failed ($try/$attempts): $repo_url" >&2
@@ -800,12 +929,52 @@ jobs:
             return 1
           }
 
-          clone_with_retry "$HUST_ASCEND_MANAGER_REPO_URL" "$GITHUB_WORKSPACE/ascend-runtime-manager"
+          clone_with_retry \
+            "$HUST_ASCEND_MANAGER_REPO_URL" \
+            "$GITHUB_WORKSPACE/ascend-runtime-manager" \
+            "$HUST_ASCEND_MANAGER_REPO_REF"
+
+      - name: Verify trusted main dependency SHAs
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C "$GITHUB_WORKSPACE/vllm-hust-benchmark" rev-parse HEAD)" = "$PERFGATE_BENCHMARK_RUNNER_SHA"
+          test "$(git -C "$GITHUB_WORKSPACE/vllm-ascend-hust" rev-parse HEAD)" = "$PERFGATE_VLLM_ASCEND_HUST_SHA"
+          test "$(git -C "$GITHUB_WORKSPACE/ascend-runtime-manager" rev-parse HEAD)" = "$PERFGATE_RUNTIME_MANAGER_SHA"
+          if ! PYTHONPATH="$GITHUB_WORKSPACE/vllm-hust-benchmark/src${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -m vllm_hust_benchmark.perfgate_baselines publish --help | \
+            grep -Fq -- '--runtime-manager-sha'; then
+            echo "Pinned benchmark runner does not support --runtime-manager-sha; update VLLM_HUST_PERFGATE_BENCHMARK_RUNNER_SHA to a compatible immutable SHA." >&2
+            exit 2
+          fi
 
       - name: Prepare Hugging Face cache directories
         run: |
-          mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE"
-          chmod 700 "$HF_HOME"
+          cache_root="${VLLM_HUST_HF_CACHE_ROOT:-${GITHUB_WORKSPACE}/../.hf-cache}"
+          cache_root="${cache_root%/}"
+          if [[ -z "$cache_root" || "$cache_root" == "/" ]]; then
+            echo "VLLM_HUST_HF_CACHE_ROOT must name a cache directory." >&2
+            exit 2
+          fi
+
+          hub_cache="$cache_root/hub"
+          transformers_cache="$cache_root/transformers"
+          if ! mkdir -p "$hub_cache" "$transformers_cache"; then
+            echo "Unable to create Hugging Face cache directories under: $cache_root" >&2
+            exit 2
+          fi
+          if [[ ! -r "$cache_root" || ! -w "$cache_root" || ! -x "$cache_root" ]]; then
+            echo "Hugging Face cache root must be readable and writable by the runner: $cache_root" >&2
+            exit 2
+          fi
+          {
+            echo "HF_HOME=$cache_root"
+            echo "HF_HUB_CACHE=$hub_cache"
+            echo "HUGGINGFACE_HUB_CACHE=$hub_cache"
+            echo "TRANSFORMERS_CACHE=$transformers_cache"
+          } >> "$GITHUB_ENV"
+          echo "Hugging Face cache root: $cache_root"
           echo "HF endpoint: $HF_ENDPOINT"
 
       - name: Resolve benchmark Python runtime
@@ -817,6 +986,32 @@ jobs:
           echo "PYTHON_BIN=$PYTHON_BIN" >> "$GITHUB_ENV"
           dirname "$PYTHON_BIN" >> "$GITHUB_PATH"
           "$PYTHON_BIN" --version
+
+      - name: Report benchmark model cache status
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vllm-hust-benchmark/src
+        run: |
+          "$PYTHON_BIN" - <<'PY'
+          import os
+
+          from huggingface_hub import snapshot_download
+          from vllm_hust_benchmark.same_spec import (
+              runtime_model_path_has_required_artifacts,
+          )
+
+          model_id = os.environ["MODEL_NAME"]
+          try:
+              snapshot = snapshot_download(model_id, local_files_only=True)
+          except Exception as exc:
+              print(
+                  "[benchmark-cache] cache miss for "
+                  f"{model_id}: {exc.__class__.__name__}: {exc}"
+              )
+          else:
+              complete = runtime_model_path_has_required_artifacts(snapshot)
+              status = "complete" if complete else "incomplete"
+              print(f"[benchmark-cache] {status} snapshot for {model_id}: {snapshot}")
+          PY
 
       - name: Install ascend-runtime-manager from fresh checkout
         run: |
@@ -999,7 +1194,10 @@ jobs:
           "${PYTHON_BIN}" -m pip install --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" "wheel" "packaging>=24.2"
           VLLM_TARGET_DEVICE=empty "${PYTHON_BIN}" -m pip install -e . --no-build-isolation --no-deps
           "${PYTHON_BIN}" scripts/ensure_vllm_provider.py --remove-conflicts
-          "${PYTHON_BIN}" -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema
+          # vLLM is installed with --no-deps above because the Ascend runner
+          # provides its torch/runtime stack. Install this required runtime
+          # dependency explicitly so prefix caching can hash request blocks.
+          "${PYTHON_BIN}" -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema "xxhash>=3.5.0"
           "${PYTHON_BIN}" scripts/ensure_vllm_provider.py
 
       - name: Verify installation
@@ -1052,6 +1250,11 @@ jobs:
 
           if not ascend_plugin:
             raise SystemExit("ascend platform plugin entry point is not installed")
+          try:
+            import xxhash
+          except ImportError as exc:
+            raise SystemExit("xxhash is required by the configured prefix-caching hash algorithm") from exc
+          print(f"xxhash version: {metadata.version('xxhash')}")
           PY
 
       - name: Runner health preflight (before benchmark)
@@ -1160,6 +1363,135 @@ jobs:
           PERFGATE_ALLOW_BASELINE_FALLBACK: "0"
         run: bash .github/workflows/scripts/perfgate_fetch_baseline.sh "$FORK_POINT"
 
+      # Perfgate producer runs before the independent formal leaderboard path.
+      # Its artifact is uploaded immediately so a later formal failure/timeout
+      # cannot prevent central exact baseline publication.
+      - name: Run perfgate baseline producer benchmark
+        id: perfgate-producer
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        env:
+          WORKSPACE_ROOT: ${{ github.workspace }}
+          VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
+          VLLM_HUST_REPO: ${{ github.workspace }}
+          VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
+          VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
+          RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}-perfgate
+          MAIN_BENCH_SCENARIO: ${{ vars.VLLM_HUST_MAIN_BENCHMARK_SCENARIO || 'random-online' }}
+          HARDWARE_CHIP_MODEL: 910B2
+          PERFGATE_SPEC_FILE: ${{ vars.VLLM_HUST_PERFGATE_SPEC_FILE || '' }}
+          PERFGATE_WARMUP_RUNS: "1"
+          PERFGATE_MEASURED_RUNS: "3"
+          PERFGATE_AGGREGATION: "primary-median-run"
+          PUBLISH_TO_BENCHMARK_REPO: "0"
+          PUBLISH_TO_HF: "0"
+        run: |
+          set -euo pipefail
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+
+          fetch_with_retry() {
+            local max_attempts=4
+            local delay_seconds=15
+            local attempt=1
+
+            while [[ "$attempt" -le "$max_attempts" ]]; do
+              echo "[perfgate-producer] fetch attempt ${attempt}/${max_attempts}: git fetch $*"
+              if git -C "$VLLM_HUST_BENCHMARK_REPO" fetch --quiet "$@"; then
+                return 0
+              fi
+              echo "[perfgate-producer] fetch failed (${attempt}/${max_attempts}): git fetch $*" >&2
+              if [[ "$attempt" -lt "$max_attempts" ]]; then
+                sleep "$delay_seconds"
+              fi
+              attempt=$((attempt + 1))
+              delay_seconds=$((delay_seconds * 2))
+            done
+
+            echo "[perfgate-producer] fetch failed after ${max_attempts} attempts: git fetch $*" >&2
+            return 1
+          }
+
+          if [[ "$(git -C "$VLLM_HUST_BENCHMARK_REPO" rev-parse --is-shallow-repository)" == "true" ]]; then
+            fetch_with_retry --unshallow origin main
+          else
+            fetch_with_retry origin main
+          fi
+          git -C "$VLLM_HUST_BENCHMARK_REPO" merge-base --is-ancestor HEAD origin/main
+          perfgate_spec_file="${PERFGATE_SPEC_FILE:-}"
+          if [[ -z "$perfgate_spec_file" ]]; then
+            export PYTHONPATH="${VLLM_HUST_BENCHMARK_REPO}/src${PYTHONPATH:+:$PYTHONPATH}"
+            perfgate_spec_file="$("${PYTHON_BIN:-python3}" -m vllm_hust_benchmark.perfgate_specs resolve \
+              --scenario "${MAIN_BENCH_SCENARIO}" \
+              --hardware-chip-model "${HARDWARE_CHIP_MODEL}" \
+              --repo-root "${VLLM_HUST_BENCHMARK_REPO}")"
+          fi
+          if [[ "$perfgate_spec_file" = /* ]]; then
+            export SAME_SPEC_SPEC_FILE="$perfgate_spec_file"
+          else
+            export SAME_SPEC_SPEC_FILE="${VLLM_HUST_BENCHMARK_REPO}/${perfgate_spec_file}"
+          fi
+          echo "[perfgate-producer] using spec file: $SAME_SPEC_SPEC_FILE"
+          source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
+          max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}
+          retry_delay_seconds=${NODE_ENV_RETRY_DELAY_SECONDS:-30}
+          attempt=1
+          while [[ "$attempt" -le "$max_attempts" ]]; do
+            echo "[perfgate-producer] attempt ${attempt}/${max_attempts}"
+            set +e
+            bash .github/workflows/scripts/run_ascend_benchmark_ci.sh
+            rc=$?
+            set -e
+            if [[ "$rc" -eq 0 ]]; then
+              break
+            fi
+            if [[ "$rc" -eq 86 && "$attempt" -lt "$max_attempts" ]]; then
+              bash .github/workflows/scripts/cleanup_ascend_ci_processes.sh || true
+              sleep "$retry_delay_seconds"
+              attempt=$((attempt + 1))
+              continue
+            fi
+            exit "$rc"
+          done
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+      - name: Upload perfgate producer artifact
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.perfgate-producer.outputs.status == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascend-perfgate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/.benchmarks/ci/ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}-perfgate/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Sanitize runner before central baseline publication
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.perfgate-producer.outputs.status == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/workflows/scripts/cleanup_ascend_ci_processes.sh
+          test -z "${GIT_ASKPASS:-}"
+          test -z "${PERFGATE_BASELINE_WRITER_TOKEN:-}"
+
+      - name: Publish central perfgate baseline
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.perfgate-producer.outputs.status == 'success' }}
+        shell: bash
+        env:
+          # The scoped writer exists only in this trusted main publication step.
+          PERFGATE_BASELINE_WRITER_TOKEN: ${{ secrets.VLLM_HUST_CENTRAL_BASELINE_WRITER_TOKEN }}
+          RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}-perfgate
+          RESULT_ROOT: ${{ github.workspace }}/.benchmarks/ci/ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}-perfgate
+          PERFGATE_CENTRAL_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
+          PERFGATE_BENCHMARK_REPO_DIR: ${{ github.workspace }}/vllm-hust-benchmark
+          PERFGATE_TARGET_GIT_REPOSITORY: ${{ github.workspace }}
+          PERFGATE_EXPECTED_WARMUP_RUNS: "1"
+          PERFGATE_EXPECTED_MEASURED_RUNS: "3"
+          PERFGATE_EXPECTED_SCHEMA_VERSION: "perfgate-measurement/v2"
+          PERFGATE_EXPECTED_STRATEGY: "warmup+primary-median-run"
+          PERFGATE_EXPECTED_AGGREGATION: "primary-median-run"
+        run: |
+          set -euo pipefail
+          bash .github/workflows/scripts/perfgate_store_baseline.sh
+
       - name: Run benchmark CI and optional formal publish
         env:
           WORKSPACE_ROOT: ${{ github.workspace }}
@@ -1168,6 +1500,12 @@ jobs:
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
           VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
           RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}
+          # Consumer candidates stay single-measurement. Repeated measurement
+          # and representative-run selection belong only to the main producer.
+          PERFGATE_WARMUP_RUNS: "0"
+          PERFGATE_MEASURED_RUNS: "1"
+          PERFGATE_AGGREGATION: "primary-median-run"
+          PERFGATE_REQUIRE_PROVENANCE: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '1' || '0' }}
         run: |
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
           max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}
@@ -1210,6 +1548,10 @@ jobs:
           VLLM_HUST_REPO: ${{ github.workspace }}
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
           VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
+          PERFGATE_WARMUP_RUNS: "0"
+          PERFGATE_MEASURED_RUNS: "1"
+          PERFGATE_AGGREGATION: "primary-median-run"
+          PERFGATE_REQUIRE_PROVENANCE: "1"
         run: |
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
           bash .github/workflows/scripts/perfgate_stage2_rebase_and_benchmark.sh
@@ -1521,6 +1863,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Enforce perfgate producer result
+        if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.perfgate-producer.outputs.status != 'success' }}
+        run: |
+          echo "Dedicated perfgate producer did not complete successfully" >&2
+          exit 1
+
       - name: Update PR benchmark comment
         if: ${{ always() && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'issue_comment') }}
         continue-on-error: true
@@ -1575,51 +1923,3 @@ jobs:
               });
               core.info('Created benchmark PR comment');
             }
-
-  store-main-perfgate-baseline:
-    name: Store main perfgate baseline
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.VLLM_HUST_MAIN_BENCHMARK_SCENARIOS == '' }}
-    needs: ascend-benchmark
-    runs-on: ubuntu-latest
-    env:
-      TARGET_REPO_SHA: ${{ github.sha }}
-    permissions:
-      contents: write
-      actions: read
-    steps:
-      - name: Checkout target repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Checkout benchmark repo
-        shell: bash
-        env:
-          BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
-          BENCHMARK_REPO_REF: main
-        run: |
-          set -euo pipefail
-          git clone --depth 1 "$BENCHMARK_REPO_URL" vllm-hust-benchmark
-          if ! git -C vllm-hust-benchmark rev-parse --verify --quiet "$BENCHMARK_REPO_REF^{commit}" >/dev/null; then
-            git -C vllm-hust-benchmark fetch --depth 1 origin "$BENCHMARK_REPO_REF"
-            git -C vllm-hust-benchmark checkout --force FETCH_HEAD
-          else
-            git -C vllm-hust-benchmark checkout --force "$BENCHMARK_REPO_REF"
-          fi
-
-      - name: Download benchmark artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ascend-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .benchmarks/ci
-
-      - name: Store perfgate baseline
-        shell: bash
-        env:
-          RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}
-          RESULT_ROOT: ${{ github.workspace }}/.benchmarks/ci/ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}
-          PYTHON_BIN: python3
-          BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
-          BENCHMARK_REPO_REF: main
-          SAME_SPEC_SPEC_FILE: ${{ github.workspace }}/vllm-hust-benchmark/${{ vars.VLLM_HUST_SAME_SPEC_SPEC_FILE || vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || 'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-qwen25-14b-910b2.json' }}
-        run: bash .github/workflows/scripts/perfgate_store_baseline.sh

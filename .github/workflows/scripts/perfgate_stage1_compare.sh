@@ -4,9 +4,10 @@ set -euo pipefail
 RUN_ID=${RUN_ID:-ci-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-${GITHUB_SHA:-local}}
 RESULT_ROOT=${RESULT_ROOT:-${GITHUB_WORKSPACE:-$PWD}/.benchmarks/ci/$RUN_ID}
 GITHUB_ENV=${GITHUB_ENV:-/dev/null}
-MODE=${PERFGATE_MODE:-report}
 REPORT_FILE=${PERFGATE_REPORT_FILE:-$RESULT_ROOT/perfgate_report.md}
 STAGE1_CURRENT=${PERFGATE_STAGE1_CURRENT_FILE:-$RESULT_ROOT/submissions/$RUN_ID/run_leaderboard.json}
+STAGE1_PROVENANCE=${PERFGATE_STAGE1_PROVENANCE_FILE:-$RESULT_ROOT/submissions/$RUN_ID/perfgate-provenance.json}
+EXPECTED_TARGET_SHA=${TARGET_REPO_SHA:-${GITHUB_SHA:-$(git rev-parse HEAD)}}
 
 write_env() {
   local name=$1
@@ -53,6 +54,38 @@ if [[ "${PERFGATE_BASELINE_AVAILABLE:-1}" != "1" || -z "${PERFGATE_BASELINE_FILE
   echo "Stage 1 performance gate skipped: $reason"
   exit 0
 fi
+
+set +e
+provenance_output=$("${PYTHON_BIN:-python}" \
+  .github/workflows/scripts/validate_perfgate_candidate_provenance.py \
+  --baseline-metadata "${PERFGATE_BASELINE_METADATA_FILE:-}" \
+  --candidate-provenance "$STAGE1_PROVENANCE" \
+  --expected-target-sha "$EXPECTED_TARGET_SHA" 2>&1)
+provenance_rc=$?
+set -e
+if [[ "$provenance_rc" -ne 0 ]]; then
+  reason="Stage 1 candidate provenance validation failed: $provenance_output"
+  mkdir -p "$(dirname "$REPORT_FILE")"
+  {
+    echo "## Performance Gate Report"
+    echo
+    echo "**Overall: FAIL**"
+    echo
+    echo "$reason"
+    echo
+    echo "Stage 1 comparison was not run."
+    echo "Stage 2 was not run."
+  } > "$REPORT_FILE"
+  write_env PERFGATE_STAGE1_RESULT fail
+  write_env PERFGATE_STAGE1_PROVENANCE_VALID 0
+  write_env PERFGATE_STAGE1_PROVENANCE_FAILURE_REASON "$reason"
+  write_env PERFGATE_STAGE2_NOT_RUN_REASON "$reason"
+  write_env PERFGATE_REPORT_FILE "$REPORT_FILE"
+  echo "$reason" >&2
+  exit 0
+fi
+echo "$provenance_output"
+write_env PERFGATE_STAGE1_PROVENANCE_VALID 1
 
 set +e
 expected_spec_id=$(read_expected_spec_id)

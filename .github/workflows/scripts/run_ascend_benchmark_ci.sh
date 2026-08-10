@@ -13,6 +13,7 @@ RAW_RESULT_FILE=${RAW_RESULT_FILE:-$RESULT_ROOT/raw_benchmark.json}
 SUBMISSIONS_ROOT=${SUBMISSIONS_ROOT:-$RESULT_ROOT/submissions}
 SUBMISSION_DIR=${SUBMISSION_DIR:-$SUBMISSIONS_ROOT/$RUN_ID}
 AGGREGATE_OUTPUT_DIR=${AGGREGATE_OUTPUT_DIR:-$RESULT_ROOT/leaderboard-data}
+ARTIFACT_FINALIZER_SCRIPT=${ARTIFACT_FINALIZER_SCRIPT:-$VLLM_HUST_BENCHMARK_REPO/scripts/collect-run-artifact.sh}
 BENCHMARK_PUBLICATION_SYNC_SCRIPT=${BENCHMARK_PUBLICATION_SYNC_SCRIPT:-$VLLM_HUST_REPO/.github/workflows/scripts/sync_benchmark_snapshots_to_github.sh}
 SERVER_LOG=${SERVER_LOG:-$RESULT_ROOT/server.log}
 RUNNER_PREFLIGHT_FAILURE_FILE=${RUNNER_PREFLIGHT_FAILURE_FILE:-$RESULT_ROOT/runner_preflight_failure.txt}
@@ -25,7 +26,7 @@ BENCH_CONSTRAINTS_FILE=${BENCH_CONSTRAINTS_FILE:-}
 SAME_SPEC_BENCHMARK_ENABLED=${SAME_SPEC_BENCHMARK_ENABLED:-1}
 SAME_SPEC_SPEC_FILE=${SAME_SPEC_SPEC_FILE:-}
 SAME_SPEC_CONSTRAINTS_FILE=${SAME_SPEC_CONSTRAINTS_FILE:-$VLLM_HUST_BENCHMARK_REPO/docs/official-baselines/official-ascend-constraints.stub.json}
-SAME_SPEC_READY_TIMEOUT_SECONDS=${SAME_SPEC_READY_TIMEOUT_SECONDS:-600}
+SAME_SPEC_READY_TIMEOUT_SECONDS=${SAME_SPEC_READY_TIMEOUT_SECONDS:-1200}
 SAME_SPEC_PR_PREVIEW_COMPAT=${SAME_SPEC_PR_PREVIEW_COMPAT:-1}
 ALLOW_RANDOM_HF_PUBLISH=${ALLOW_RANDOM_HF_PUBLISH:-0}
 
@@ -79,6 +80,23 @@ marker_pid_file=""
 marker_pgid_file=""
 selected_device=""
 NPU_SMI_BIN=${NPU_SMI_BIN:-$(command -v npu-smi || true)}
+
+if [[ "${RUNNER_NAME:-}" =~ npu([0-9]+)$ ]]; then
+  runner_physical_device="${BASH_REMATCH[1]}"
+  shopt -s nullglob
+  runner_devnodes=(/dev/davinci[0-9]*)
+  shopt -u nullglob
+
+  if [[ "${#runner_devnodes[@]}" -eq 1 ]] \
+    && [[ "$(basename "${runner_devnodes[0]}")" == "davinci${runner_physical_device}" ]]; then
+    export ASCEND_VISIBLE_DEVICES=0
+    export ASCEND_RT_VISIBLE_DEVICES=0
+    echo "Pinned isolated runner ${RUNNER_NAME} to logical Ascend device 0 (${runner_devnodes[0]})."
+  elif [[ -z "${ASCEND_RT_VISIBLE_DEVICES:-}" && -z "${ASCEND_VISIBLE_DEVICES:-}" ]]; then
+    export ASCEND_RT_VISIBLE_DEVICES="$runner_physical_device"
+    echo "Pinned Ascend device from runner name ${RUNNER_NAME}: ${ASCEND_RT_VISIBLE_DEVICES}"
+  fi
+fi
 
 USER_PROVIDED_ASCEND_VISIBLE_DEVICES=0
 if [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" || -n "${ASCEND_VISIBLE_DEVICES:-}" ]]; then
@@ -350,6 +368,7 @@ SUDO_PRESERVE_ENV_VARS=(
   HCCL_EXEC_TIMEOUT
   HF_ENDPOINT
   HF_HOME
+  HF_HUB_DISABLE_XET
   HF_TOKEN
   HOME
   HOST
@@ -363,6 +382,10 @@ SUDO_PRESERVE_ENV_VARS=(
   MODEL_PRECISION
   NODE_COUNT
   PATH
+  PERFGATE_AGGREGATION
+  PERFGATE_MEASURED_RUNS
+  PERFGATE_REQUIRE_PROVENANCE
+  PERFGATE_WARMUP_RUNS
   PIP_CACHE_DIR
   PORT
   PUBLISH_TO_BENCHMARK_REPO
@@ -413,6 +436,7 @@ export_sudo_preserved_env_vars() {
 
   for var_name in "${SUDO_PRESERVE_ENV_VARS[@]}"; do
     if [[ -n "${!var_name+x}" ]]; then
+      # shellcheck disable=SC2163  # Export the variable named by var_name.
       export "$var_name"
     fi
   done
@@ -925,6 +949,7 @@ prepare_hf_publish_cache_for_runner() {
 
 sync_benchmark_publication_to_github() {
   local publisher_script=${BENCHMARK_PUBLICATION_SYNC_SCRIPT:-$VLLM_HUST_REPO/.github/workflows/scripts/sync_benchmark_snapshots_to_github.sh}
+  local snapshot_commit_message="chore(data): sync benchmark publication $RUN_ID"
 
   if [[ "$PUBLISH_TO_BENCHMARK_REPO" != "1" ]]; then
     return 0
@@ -935,32 +960,61 @@ sync_benchmark_publication_to_github() {
     return 2
   fi
 
-  BENCHMARK_REPO_DIR="$VLLM_HUST_BENCHMARK_REPO" \
-  WEBSITE_REPO_DIR="$VLLM_HUST_WEBSITE_REPO" \
-  CURRENT_SUBMISSION_DIR="$SUBMISSION_DIR" \
-  VLLM_HUST_REPO_DIR="$VLLM_HUST_REPO" \
-  LOCAL_SNAPSHOT_OUTPUT_DIR="$AGGREGATE_OUTPUT_DIR" \
-  PYTHON_BIN="$PYTHON_BIN" \
-  BENCHMARK_REPO_SLUG="${BENCHMARK_REPO_SLUG:-vLLM-HUST/vllm-hust-benchmark}" \
-  BENCHMARK_REPO_GH_TOKEN="${BENCHMARK_REPO_GH_TOKEN:-}" \
-  BENCHMARK_REPO_SSH_KEY="${BENCHMARK_REPO_SSH_KEY:-}" \
-  SNAPSHOT_COMMIT_MESSAGE="chore(data): sync benchmark publication $RUN_ID" \
-  RUN_ID="$RUN_ID" \
-  "$publisher_script"
+  env \
+    BENCHMARK_REPO_DIR="$VLLM_HUST_BENCHMARK_REPO" \
+    WEBSITE_REPO_DIR="$VLLM_HUST_WEBSITE_REPO" \
+    CURRENT_SUBMISSION_DIR="$SUBMISSION_DIR" \
+    VLLM_HUST_REPO_DIR="$VLLM_HUST_REPO" \
+    LOCAL_SNAPSHOT_OUTPUT_DIR="$AGGREGATE_OUTPUT_DIR" \
+    PYTHON_BIN="$PYTHON_BIN" \
+    BENCHMARK_REPO_SLUG="${BENCHMARK_REPO_SLUG:-vLLM-HUST/vllm-hust-benchmark}" \
+    BENCHMARK_REPO_GH_TOKEN="${BENCHMARK_REPO_GH_TOKEN:-}" \
+    BENCHMARK_REPO_SSH_KEY="${BENCHMARK_REPO_SSH_KEY:-}" \
+    SNAPSHOT_COMMIT_MESSAGE="$snapshot_commit_message" \
+    RUN_ID="$RUN_ID" \
+    "$publisher_script"
+}
+
+collect_submission_evidence() {
+  local collector_script=${ARTIFACT_FINALIZER_SCRIPT:-$VLLM_HUST_BENCHMARK_REPO/scripts/collect-run-artifact.sh}
+  local current_vllm_hust_commit
+  local current_plugin_commit
+
+  if [[ ! -f "$collector_script" ]]; then
+    echo "submission evidence collector is missing: $collector_script" >&2
+    return 2
+  fi
+
+  current_vllm_hust_commit=$(git -C "$VLLM_HUST_REPO" rev-parse HEAD 2>/dev/null || true)
+  current_plugin_commit=$(git -C "$VLLM_ASCEND_HUST_REPO" rev-parse HEAD 2>/dev/null || true)
+
+  CURRENT_RUNTIME_PYTHON="$PYTHON_BIN" \
+  CURRENT_VLLM_HUST_REPO="$VLLM_HUST_REPO" \
+  CURRENT_VLLM_ASCEND_HUST_REPO="$VLLM_ASCEND_HUST_REPO" \
+  CURRENT_GIT_COMMIT="$current_vllm_hust_commit" \
+  CURRENT_PLUGIN_GIT_COMMIT="$current_plugin_commit" \
+    bash "$collector_script" "$SUBMISSION_DIR"
+}
+
+finalize_submission_artifact() {
+  collect_submission_evidence
 }
 
 run_same_spec_current_benchmark() {
   local same_spec_runner=$VLLM_HUST_BENCHMARK_REPO/scripts/run-current-ascend-same-spec.sh
   local same_spec_raw_result=$RESULT_ROOT/raw_benchmark_result.json
   local same_spec_submission_dir=$RESULT_ROOT/submission
-  local same_spec_ready_timeout_seconds=${SAME_SPEC_READY_TIMEOUT_SECONDS:-600}
+  local same_spec_ready_timeout_seconds=${SAME_SPEC_READY_TIMEOUT_SECONDS:-1200}
   local effective_same_spec_file=$SAME_SPEC_SPEC_FILE
   local same_spec_server_log=$RESULT_ROOT/server.stdout.log
   local same_spec_status=0
+  local same_spec_result_root=$RESULT_ROOT
   local current_vllm_hust_commit
   local current_vllm_hust_ref
   local current_plugin_commit
   local current_plugin_ref
+  local benchmark_runner_commit
+  local runtime_manager_commit
   local display_version
 
   if [[ ! -f "$same_spec_runner" ]]; then
@@ -992,6 +1046,8 @@ run_same_spec_current_benchmark() {
   current_vllm_hust_ref=${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-$(git -C "$VLLM_HUST_REPO" branch --show-current 2>/dev/null || echo main)}}
   current_plugin_commit=$(git -C "$VLLM_ASCEND_HUST_REPO" rev-parse HEAD 2>/dev/null || true)
   current_plugin_ref=$(git -C "$VLLM_ASCEND_HUST_REPO" branch --show-current 2>/dev/null || echo main)
+  benchmark_runner_commit=$(git -C "$VLLM_HUST_BENCHMARK_REPO" rev-parse HEAD 2>/dev/null || true)
+  runtime_manager_commit=$(git -C "${HUST_ASCEND_MANAGER_REPO:-}" rev-parse HEAD 2>/dev/null || true)
   display_version=$(printf '%s' "${TARGET_REPO_SHA:-${GITHUB_SHA:-local}}" | cut -c1-8)
 
   rm -f "$same_spec_raw_result" "$RAW_RESULT_FILE"
@@ -1053,6 +1109,8 @@ PY
     echo "Using PR preview same-spec compatibility overlay: $effective_same_spec_file"
   fi
 
+  echo "[same-spec-current] effective readiness timeout: ${same_spec_ready_timeout_seconds}s"
+
   run_same_spec_runner() {
     if [[ "$ASCEND_BENCHMARK_USE_SUDO" == "1" ]]; then
       READY_TIMEOUT_SECONDS="$same_spec_ready_timeout_seconds" \
@@ -1072,12 +1130,15 @@ PY
         CURRENT_PLUGIN_GIT_COMMIT="$current_plugin_commit" \
         CURRENT_SUBMITTER="${GITHUB_ACTOR:-ci}" \
         CURRENT_DATA_SOURCE="vllm-hust-ci-same-spec" \
-        RESULT_DIR="$RESULT_ROOT" \
-        RESULT_ROOT="$RESULT_ROOT" \
+        RESULT_DIR="$same_spec_result_root" \
+        RESULT_ROOT="$same_spec_result_root" \
         RUN_ID="$RUN_ID" \
         CURRENT_SERVER_PORT="$PORT" \
         CURRENT_CLIENT_PORT="$PORT" \
         CONSTRAINTS_FILE="$SAME_SPEC_CONSTRAINTS_FILE" \
+        PERFGATE_WARMUP_RUNS="${PERFGATE_WARMUP_RUNS:-0}" \
+        PERFGATE_MEASURED_RUNS="${PERFGATE_MEASURED_RUNS:-1}" \
+        PERFGATE_AGGREGATION="${PERFGATE_AGGREGATION:-primary-median-run}" \
         run_with_same_spec_stderr_filter run_ascend_root_helper same-spec "$same_spec_runner" "$effective_same_spec_file"
     else
       run_with_same_spec_stderr_filter env \
@@ -1104,6 +1165,9 @@ PY
         CURRENT_SERVER_PORT="$PORT" \
         CURRENT_CLIENT_PORT="$PORT" \
         CONSTRAINTS_FILE="$SAME_SPEC_CONSTRAINTS_FILE" \
+        PERFGATE_WARMUP_RUNS="${PERFGATE_WARMUP_RUNS:-0}" \
+        PERFGATE_MEASURED_RUNS="${PERFGATE_MEASURED_RUNS:-1}" \
+        PERFGATE_AGGREGATION="${PERFGATE_AGGREGATION:-primary-median-run}" \
         bash "$same_spec_runner" "$effective_same_spec_file"
     fi
   }
@@ -1153,6 +1217,76 @@ PY
   cp "$same_spec_raw_result" "$RAW_RESULT_FILE"
   cp "$same_spec_submission_dir/leaderboard_manifest.json" "$SUBMISSION_DIR/leaderboard_manifest.json"
   cp "$same_spec_submission_dir/run_leaderboard.json" "$SUBMISSION_DIR/run_leaderboard.json"
+
+  # P0-7: when the perfgate multi-run measurement strategy is enabled, the
+  # measurement.json strategy record is mandatory evidence for the baseline.
+  if [[ -f "$same_spec_submission_dir/measurement.json" ]]; then
+    cp "$same_spec_submission_dir/measurement.json" "$SUBMISSION_DIR/measurement.json"
+  elif [[ "${PERFGATE_WARMUP_RUNS:-0}" -gt 0 || "${PERFGATE_MEASURED_RUNS:-1}" -gt 1 ]]; then
+    echo "same-spec benchmark did not produce measurement.json although the repeated-run measurement strategy is enabled" >&2
+    return 2
+  fi
+
+  if [[ "${PERFGATE_REQUIRE_PROVENANCE:-0}" == "1" || "${PERFGATE_WARMUP_RUNS:-0}" -gt 0 || "${PERFGATE_MEASURED_RUNS:-1}" -gt 1 ]]; then
+    local provenance_sha
+    for provenance_sha in "$current_vllm_hust_commit" "$current_plugin_commit" "$benchmark_runner_commit" "$runtime_manager_commit"; do
+      if ! [[ "$provenance_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "Could not resolve full lowercase runtime provenance SHAs" >&2
+        return 2
+      fi
+    done
+
+    PERFGATE_PROVENANCE_OUTPUT="$SUBMISSION_DIR/perfgate-provenance.json" \
+    PERFGATE_VLLM_HUST_SHA="$current_vllm_hust_commit" \
+    PERFGATE_VLLM_ASCEND_HUST_SHA="$current_plugin_commit" \
+    PERFGATE_BENCHMARK_RUNNER_SHA="$benchmark_runner_commit" \
+    PERFGATE_RUNTIME_MANAGER_SHA="$runtime_manager_commit" \
+    PERFGATE_HARDWARE_CHIP_MODEL="$HARDWARE_CHIP_MODEL" \
+    PERFGATE_CANN_VERSION="${HUST_ASCEND_RUNTIME_VERSION:-}" \
+      "$PYTHON_BIN" - <<'PY'
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+
+import torch
+import torch_npu
+
+
+def one_line(value, name):
+    normalized = str(value or "").strip().replace("\n", " ").replace("\r", " ")
+    if not normalized:
+        raise RuntimeError(f"unable to determine {name}")
+    return normalized
+
+
+cann_version = os.environ.get("PERFGATE_CANN_VERSION")
+if not cann_version:
+    try:
+        from torch_npu import version as torch_npu_version
+        cann_version = getattr(torch_npu_version, "cann", None)
+    except Exception:
+        cann_version = None
+
+payload = {
+    "schema_version": "perfgate-runtime-provenance/v1",
+    "vllm_hust_sha": one_line(os.environ["PERFGATE_VLLM_HUST_SHA"], "vllm-hust SHA"),
+    "vllm_ascend_hust_sha": one_line(os.environ["PERFGATE_VLLM_ASCEND_HUST_SHA"], "vllm-ascend-hust SHA"),
+    "benchmark_runner_sha": one_line(os.environ["PERFGATE_BENCHMARK_RUNNER_SHA"], "benchmark runner SHA"),
+    "runtime_manager_sha": one_line(os.environ["PERFGATE_RUNTIME_MANAGER_SHA"], "runtime manager SHA"),
+    "hardware_chip_model": one_line(os.environ["PERFGATE_HARDWARE_CHIP_MODEL"], "hardware chip model"),
+    "cann_version": one_line(cann_version, "CANN version"),
+    "torch_version": one_line(torch.__version__, "PyTorch version"),
+    "torch_npu_version": one_line(
+        getattr(torch_npu, "__version__", None)
+        or importlib.metadata.version("torch-npu"),
+        "torch-npu version",
+    ),
+}
+output = Path(os.environ["PERFGATE_PROVENANCE_OUTPUT"])
+output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  fi
 }
 
 start_server() {
@@ -1254,8 +1388,6 @@ if [[ "$ASCEND_BENCHMARK_USE_SUDO" == "1" ]]; then
 fi
 
 if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then
-  EFFECTIVE_DATASET_NAME="$BENCH_SCENARIO"
-  EFFECTIVE_DATASET_PATH=""
   EFFECTIVE_INPUT_LEN=${BENCH_INPUT_LEN:-}
   EFFECTIVE_OUTPUT_LEN=${BENCH_OUTPUT_LEN:-}
   EFFECTIVE_CONSTRAINTS_FILE=$SAME_SPEC_CONSTRAINTS_FILE
@@ -1263,8 +1395,6 @@ if [[ "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then
 else
   case "$BENCH_SCENARIO" in
     random-online)
-      EFFECTIVE_DATASET_NAME="random"
-      EFFECTIVE_DATASET_PATH=""
       EFFECTIVE_INPUT_LEN=${BENCH_INPUT_LEN:-$BENCH_RANDOM_INPUT_LEN}
       EFFECTIVE_OUTPUT_LEN=${BENCH_OUTPUT_LEN:-$BENCH_RANDOM_OUTPUT_LEN}
       EFFECTIVE_CONSTRAINTS_FILE=${BENCH_CONSTRAINTS_FILE:-$VLLM_HUST_REPO/.github/workflows/data/random-online-ci-constraints.json}
@@ -1289,8 +1419,6 @@ else
         echo "BENCH_CONSTRAINTS_FILE is required for sharegpt-online" >&2
         exit 2
       fi
-      EFFECTIVE_DATASET_NAME="sharegpt"
-      EFFECTIVE_DATASET_PATH="$BENCH_DATASET_PATH"
       EFFECTIVE_INPUT_LEN=${BENCH_INPUT_LEN:-1024}
       EFFECTIVE_OUTPUT_LEN=${BENCH_OUTPUT_LEN:-256}
       EFFECTIVE_CONSTRAINTS_FILE="$BENCH_CONSTRAINTS_FILE"
@@ -1444,6 +1572,12 @@ PY
     --concurrent-requests "$BENCH_MAX_CONCURRENCY" \
     --core-version "$CORE_VERSION" \
     --submissions-dir "$SUBMISSIONS_ROOT"
+fi
+
+finalize_submission_artifact
+if [[ ! -f "$SUBMISSION_DIR/STATUS" ]] || [[ "$(cat "$SUBMISSION_DIR/STATUS")" != "OK" ]]; then
+  echo "submission evidence collector did not finalize STATUS=OK: $SUBMISSION_DIR" >&2
+  exit 2
 fi
 
 if [[ "$PUBLISH_TO_BENCHMARK_REPO" == "1" ]]; then
