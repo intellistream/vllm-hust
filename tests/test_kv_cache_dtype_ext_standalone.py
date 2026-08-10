@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Standalone unit tests for KV cache dtype extension logic.
 
 Completely self-contained: inlines the relevant logic from the modified
@@ -8,9 +9,8 @@ vllm files so that tests run without the full vllm dependency chain.
 import typing
 from enum import IntEnum
 
-import torch
 import pytest
-
+import torch
 
 # ===========================================================================
 # Inlined logic from vllm/config/cache.py
@@ -152,7 +152,6 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
 
 
 class TestCacheDTypeIncludesNewTypes:
-
     def test_includes_int4(self):
         assert "int4" in typing.get_args(CacheDType)
 
@@ -174,7 +173,6 @@ class TestCacheDTypeIncludesNewTypes:
 
 
 class TestStrDtypeToTorchDtype:
-
     def test_int4_maps_to_uint8(self):
         assert STR_DTYPE_TO_TORCH_DTYPE["int4"] == torch.uint8
 
@@ -197,18 +195,32 @@ class TestStrDtypeToTorchDtype:
 
 
 class TestIsQuantizedKvCache:
-
-    @pytest.mark.parametrize("dtype", [
-        "int4", "fp4_e2m1", "nvfp4",
-        "fp8", "fp8_e4m3", "fp8_e5m2",
-        "int4_per_token_head", "int8_per_token_head", "fp8_per_token_head",
-    ])
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            "int4",
+            "fp4_e2m1",
+            "nvfp4",
+            "fp8",
+            "fp8_e4m3",
+            "fp8_e5m2",
+            "int4_per_token_head",
+            "int8_per_token_head",
+            "fp8_per_token_head",
+        ],
+    )
     def test_quantized_dtypes_return_true(self, dtype):
         assert is_quantized_kv_cache(dtype) is True, f"{dtype} should be quantized"
 
-    @pytest.mark.parametrize("dtype", [
-        "auto", "float16", "bfloat16", "float32",
-    ])
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            "auto",
+            "float16",
+            "bfloat16",
+            "float32",
+        ],
+    )
     def test_non_quantized_dtypes_return_false(self, dtype):
         assert is_quantized_kv_cache(dtype) is False, f"{dtype} should not be quantized"
 
@@ -219,7 +231,6 @@ class TestIsQuantizedKvCache:
 
 
 class TestKVQuantMode:
-
     def test_int4_exists(self):
         assert hasattr(KVQuantMode, "INT4")
         assert KVQuantMode.INT4.value == 6
@@ -257,24 +268,32 @@ class TestKVQuantMode:
 
 
 class TestGetKvQuantMode:
-
-    @pytest.mark.parametrize("dtype,expected", [
-        ("int4", KVQuantMode.INT4),
-        ("fp4_e2m1", KVQuantMode.FP4_E2M1),
-        ("nvfp4", KVQuantMode.NVFP4),
-        ("fp8", KVQuantMode.FP8_PER_TENSOR),
-        ("fp8_e4m3", KVQuantMode.FP8_PER_TENSOR),
-        ("fp8_e5m2", KVQuantMode.FP8_PER_TENSOR),
-        ("int4_per_token_head", KVQuantMode.INT4_PER_TOKEN_HEAD),
-        ("int8_per_token_head", KVQuantMode.INT8_PER_TOKEN_HEAD),
-        ("fp8_per_token_head", KVQuantMode.FP8_PER_TOKEN_HEAD),
-    ])
+    @pytest.mark.parametrize(
+        "dtype,expected",
+        [
+            ("int4", KVQuantMode.INT4),
+            ("fp4_e2m1", KVQuantMode.FP4_E2M1),
+            ("nvfp4", KVQuantMode.NVFP4),
+            ("fp8", KVQuantMode.FP8_PER_TENSOR),
+            ("fp8_e4m3", KVQuantMode.FP8_PER_TENSOR),
+            ("fp8_e5m2", KVQuantMode.FP8_PER_TENSOR),
+            ("int4_per_token_head", KVQuantMode.INT4_PER_TOKEN_HEAD),
+            ("int8_per_token_head", KVQuantMode.INT8_PER_TOKEN_HEAD),
+            ("fp8_per_token_head", KVQuantMode.FP8_PER_TOKEN_HEAD),
+        ],
+    )
     def test_known_dtypes(self, dtype, expected):
         assert get_kv_quant_mode(dtype) is expected, f"{dtype} -> {expected}"
 
-    @pytest.mark.parametrize("dtype", [
-        "auto", "float16", "bfloat16", "float32",
-    ])
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            "auto",
+            "float16",
+            "bfloat16",
+            "float32",
+        ],
+    )
     def test_non_quantized_returns_none(self, dtype):
         assert get_kv_quant_mode(dtype) is KVQuantMode.NONE
 
@@ -285,13 +304,15 @@ class TestGetKvQuantMode:
 
 
 class TestInt4KvCacheFullDim:
-
-    @pytest.mark.parametrize("head_size,expected", [
-        (16, 8),
-        (64, 32),
-        (128, 64),
-        (256, 128),
-    ])
+    @pytest.mark.parametrize(
+        "head_size,expected",
+        [
+            (16, 8),
+            (64, 32),
+            (128, 64),
+            (256, 128),
+        ],
+    )
     def test_expected_sizes(self, head_size, expected):
         """INT4 packs 2 values per byte."""
         assert int4_kv_cache_full_dim(head_size) == expected
@@ -303,14 +324,16 @@ class TestInt4KvCacheFullDim:
 
 
 class TestFp4E2m1KvCacheFullDim:
-
-    @pytest.mark.parametrize("head_size,expected", [
-        (16, 9),     # 1 block: 8 data + 1 scale
-        (64, 36),    # 4 blocks: 32 data + 4 scale
-        (128, 72),   # 8 blocks: 64 data + 8 scale
-        (256, 144),  # 16 blocks: 128 data + 16 scale
-        (20, 18),    # 2 blocks: 16 data + 2 scale
-    ])
+    @pytest.mark.parametrize(
+        "head_size,expected",
+        [
+            (16, 9),  # 1 block: 8 data + 1 scale
+            (64, 36),  # 4 blocks: 32 data + 4 scale
+            (128, 72),  # 8 blocks: 64 data + 8 scale
+            (256, 144),  # 16 blocks: 128 data + 16 scale
+            (20, 18),  # 2 blocks: 16 data + 2 scale
+        ],
+    )
     def test_expected_sizes(self, head_size, expected):
         """FP4 data + fp8 block scales (1 per 16 elements)."""
         assert fp4_e2m1_kv_cache_full_dim(head_size) == expected
@@ -322,12 +345,14 @@ class TestFp4E2m1KvCacheFullDim:
 
 
 class TestNvfp4KvCacheFullDim:
-
-    @pytest.mark.parametrize("head_size,expected", [
-        (64, 36),
-        (128, 72),
-        (256, 144),
-    ])
+    @pytest.mark.parametrize(
+        "head_size,expected",
+        [
+            (64, 36),
+            (128, 72),
+            (256, 144),
+        ],
+    )
     def test_expected_sizes(self, head_size, expected):
         assert nvfp4_kv_cache_full_dim(head_size) == expected
 
@@ -338,7 +363,6 @@ class TestNvfp4KvCacheFullDim:
 
 
 class TestCrossComponentConsistency:
-
     def test_quantized_and_mode_agree(self):
         """Quantized dtypes should have non-NONE mode and vice versa."""
         for dtype in typing.get_args(CacheDType):
@@ -351,6 +375,5 @@ class TestCrossComponentConsistency:
                 if dtype == "kivi_int4":
                     continue
                 raise AssertionError(
-                    f"Mismatch for {dtype}: is_quantized={is_quant}, "
-                    f"mode={mode}"
+                    f"Mismatch for {dtype}: is_quantized={is_quant}, mode={mode}"
                 )
