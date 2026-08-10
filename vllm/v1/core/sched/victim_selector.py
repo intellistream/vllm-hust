@@ -136,6 +136,7 @@ def get_victim_selector(vllm_config) -> VictimSelector:
             f"additional_config.{VICTIM_SELECTOR_PLUGIN_CONFIG_KEY} must be "
             "a non-empty string"
         )
+    requested_plugin = requested_plugin.strip()
 
     try:
         from importlib.metadata import EntryPoints, entry_points

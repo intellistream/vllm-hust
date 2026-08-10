@@ -90,6 +90,14 @@ def test_requested_plugin_is_selected_deterministically():
     assert log_args[4] == 1
 
 
+def test_requested_plugin_name_is_stripped_before_matching():
+    bidkv = _entry_point("bidkv")
+    with patch("importlib.metadata.entry_points", return_value=[bidkv]):
+        selector = get_victim_selector(_config(victim_selector_plugin=" bidkv "))
+
+    assert isinstance(selector, _ValidSelector)
+
+
 def test_multiple_plugins_do_not_affect_default_selection():
     with patch("importlib.metadata.entry_points") as discover:
         selector = get_victim_selector(_config())
