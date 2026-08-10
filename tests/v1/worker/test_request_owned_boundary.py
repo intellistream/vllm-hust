@@ -32,6 +32,9 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheTensor,
+    MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -266,6 +269,47 @@ def _kv_cache_config(num_blocks: int = 32, block_size: int = 4) -> KVCacheConfig
     )
 
 
+def _mla_spec(block_size: int, compress_ratio: int) -> MLAAttentionSpec:
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        compress_ratio=compress_ratio,
+    )
+
+
+def _uniform_kv_cache_config(
+    num_blocks: int = 32,
+    block_size: int = 4,
+    inner_specs: dict[str, MLAAttentionSpec] | None = None,
+) -> KVCacheConfig:
+    """DeepSeek-V4-Flash-shaped config with one uniform wrapper group.
+
+    The inner specs share a block size and base type but differ in
+    ``compress_ratio``; the default dict order is deliberately adverse
+    (128 first, 4 second) so a naive first-spec pick is observable.
+    """
+    if inner_specs is None:
+        inner_specs = {
+            "high": _mla_spec(block_size, compress_ratio=128),
+            "low": _mla_spec(block_size, compress_ratio=4),
+        }
+    uniform = UniformTypeKVCacheSpecs(block_size=block_size, kv_cache_specs=inner_specs)
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=1024,
+                shared_by=["a", "b"],
+                offset=7,
+                block_stride=9,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["a"], kv_cache_spec=uniform)],
+    )
+
+
 def _real_wrapper(worker: _FakeWorker, num_blocks: int = 32) -> WorkerWrapperBase:
     wrapper = WorkerWrapperBase(global_rank=0)
     wrapper.vllm_config = _real_vllm_config()
@@ -333,6 +377,128 @@ def test_store_not_constructed_when_feature_disabled(monkeypatch) -> None:
     _RecordingKVCacheManager.last_kwargs = None
     wrapper.initialize_from_config([_kv_cache_config()])
     assert wrapper._request_owned_kv_store is None
+    assert _RecordingKVCacheManager.last_kwargs is None
+
+
+def test_plain_config_normalization_keeps_identity() -> None:
+    raw = _kv_cache_config()
+    assert worker_base_module._normalize_request_owned_kv_cache_config(raw) is raw
+
+
+def test_uniform_store_binds_min_compress_ratio_representative(
+    monkeypatch,
+) -> None:
+    worker = _FakeWorker()
+    wrapper = WorkerWrapperBase(global_rank=0)
+    wrapper.vllm_config = _real_vllm_config()
+    wrapper.worker = worker
+    wrapper.mm_receiver_cache = None
+    raw = _uniform_kv_cache_config()
+    monkeypatch.setattr(worker_base_module, "KVCacheManager", _RecordingKVCacheManager)
+    wrapper.initialize_from_config([raw])
+
+    # The underlying worker still initialized with the original raw config.
+    assert worker.initialized_config is raw
+    # The store manager ran on a normalized copy whose uniform group is bound
+    # to the allocation-binding inner spec: minimum positive compress_ratio
+    # (4), not the dict-first spec (128).
+    manager_config = _RecordingKVCacheManager.last_kwargs["kv_cache_config"]
+    assert manager_config is not raw
+    group_spec = manager_config.kv_cache_groups[0].kv_cache_spec
+    assert isinstance(group_spec, MLAAttentionSpec)
+    assert group_spec.compress_ratio == 4
+    # Store metadata sees the concrete spec: concrete kind and
+    # block_size * binding ratio effective tokens per block.
+    snapshot = wrapper._request_owned_kv_store.pool_snapshot()
+    assert snapshot.groups[0].spec_kind == "mla_attention"
+    assert snapshot.groups[0].effective_tokens_per_block == 4 * 4
+    # The original wrapper, dict insertion order, and inner specs are
+    # untouched by store construction.
+    original_group = raw.kv_cache_groups[0].kv_cache_spec
+    assert isinstance(original_group, UniformTypeKVCacheSpecs)
+    assert list(original_group.kv_cache_specs) == ["high", "low"]
+    assert original_group.kv_cache_specs["high"].compress_ratio == 128
+    assert original_group.kv_cache_specs["low"].compress_ratio == 4
+
+
+def test_normalized_config_is_distinct_copy_preserving_metadata() -> None:
+    raw = _uniform_kv_cache_config(num_blocks=48)
+    raw.kv_cache_groups.append(
+        KVCacheGroupSpec(
+            layer_names=["b"],
+            kv_cache_spec=FullAttentionSpec(
+                block_size=4,
+                num_kv_heads=2,
+                head_size=8,
+                dtype=torch.float32,
+            ),
+        )
+    )
+
+    normalized = worker_base_module._normalize_request_owned_kv_cache_config(raw)
+
+    assert normalized is not raw
+    assert normalized.num_blocks == raw.num_blocks == 48
+    # Group order and layer names are preserved; only the uniform wrapper is
+    # replaced by its binding representative, and the plain group is copied
+    # untouched.
+    assert [g.layer_names for g in normalized.kv_cache_groups] == [
+        ["a"],
+        ["b"],
+    ]
+    uniform_spec = normalized.kv_cache_groups[0].kv_cache_spec
+    assert isinstance(uniform_spec, MLAAttentionSpec)
+    assert uniform_spec.compress_ratio == 4
+    assert isinstance(normalized.kv_cache_groups[1].kv_cache_spec, FullAttentionSpec)
+    # KVCacheTensor geometry is preserved on distinct deep-copied objects.
+    assert len(normalized.kv_cache_tensors) == len(raw.kv_cache_tensors) == 1
+    normalized_tensor = normalized.kv_cache_tensors[0]
+    raw_tensor = raw.kv_cache_tensors[0]
+    assert normalized_tensor is not raw_tensor
+    assert (
+        normalized_tensor.size,
+        normalized_tensor.offset,
+        normalized_tensor.block_stride,
+    ) == (raw_tensor.size, raw_tensor.offset, raw_tensor.block_stride)
+    assert normalized_tensor.shared_by == raw_tensor.shared_by
+    # The raw config (wrapper, dict order, inner specs) is unmodified.
+    original_group = raw.kv_cache_groups[0].kv_cache_spec
+    assert isinstance(original_group, UniformTypeKVCacheSpecs)
+    assert list(original_group.kv_cache_specs) == ["high", "low"]
+    assert original_group.kv_cache_specs["high"].compress_ratio == 128
+
+
+def test_uniform_empty_wrapper_fails_closed(monkeypatch) -> None:
+    worker = _FakeWorker()
+    wrapper = WorkerWrapperBase(global_rank=0)
+    wrapper.vllm_config = _real_vllm_config()
+    wrapper.worker = worker
+    wrapper.mm_receiver_cache = None
+    raw = _uniform_kv_cache_config(inner_specs={})
+    monkeypatch.setattr(worker_base_module, "KVCacheManager", _RecordingKVCacheManager)
+    _RecordingKVCacheManager.last_kwargs = None
+    with pytest.raises(ValueError, match="no inner KV cache specs"):
+        wrapper.initialize_from_config([raw])
+    assert _RecordingKVCacheManager.last_kwargs is None
+
+
+@pytest.mark.parametrize("bad_ratio", [True, 0, -1])
+def test_uniform_malformed_ratio_fails_closed(monkeypatch, bad_ratio) -> None:
+    worker = _FakeWorker()
+    wrapper = WorkerWrapperBase(global_rank=0)
+    wrapper.vllm_config = _real_vllm_config()
+    wrapper.worker = worker
+    wrapper.mm_receiver_cache = None
+    raw = _uniform_kv_cache_config(
+        inner_specs={
+            "bad": _mla_spec(4, compress_ratio=bad_ratio),
+            "good": _mla_spec(4, compress_ratio=4),
+        }
+    )
+    monkeypatch.setattr(worker_base_module, "KVCacheManager", _RecordingKVCacheManager)
+    _RecordingKVCacheManager.last_kwargs = None
+    with pytest.raises(ValueError, match="invalid compress_ratio"):
+        wrapper.initialize_from_config([raw])
     assert _RecordingKVCacheManager.last_kwargs is None
 
 

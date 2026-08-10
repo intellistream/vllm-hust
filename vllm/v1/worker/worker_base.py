@@ -24,7 +24,11 @@ from vllm.v1.core.sched.ownership import (
     OwnerCommand,
     OwnerCommandKind,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.request_owned_kv import (
     AllocationResult,
     DeferredFreeResult,
@@ -257,6 +261,64 @@ class _RequestOwnedDeferredStep:
             )
 
 
+def _effective_compress_ratio(kv_cache_spec: KVCacheSpec) -> int:
+    """Allocation-binding compress ratio of one candidate inner spec.
+
+    A spec without a ``compress_ratio`` field (e.g. plain full attention) is
+    uncompressed, i.e. ratio 1.  ``None`` is treated the same way so a
+    half-populated fixture cannot crash the representative comparison.
+    """
+    ratio = getattr(kv_cache_spec, "compress_ratio", 1)
+    return 1 if ratio is None else ratio
+
+
+def _normalize_request_owned_kv_cache_config(
+    kv_cache_config: KVCacheConfig,
+) -> KVCacheConfig:
+    """Rank-local manager config for the request-owned KV store (G4).
+
+    The store's ``KVCacheManager`` needs the same concrete per-group specs
+    the scheduler uses (``generate_scheduler_kv_cache_config`` semantics): a
+    ``UniformTypeKVCacheSpecs`` wrapper has no registered manager and no
+    ``compress_ratio``, so it cannot size the block pool or report
+    ``effective_tokens_per_block``.  This helper deep-copies the worker's raw
+    config only when uniform groups exist (otherwise the original object is
+    returned unchanged so plain configs keep identity) and binds each uniform
+    group to its allocation-binding inner spec: the one with the smallest
+    positive integer ``compress_ratio`` (absent field defaults to 1), i.e.
+    the largest storage footprint.  The raw config handed to the underlying
+    worker is never mutated.
+    """
+    if not any(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_config.kv_cache_groups
+    ):
+        return kv_cache_config
+
+    normalized = deepcopy(kv_cache_config)
+    for group in normalized.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            continue
+        inner_specs = spec.kv_cache_specs
+        if not inner_specs:
+            raise ValueError(
+                "Cannot build the request-owned KV store: uniform KV cache "
+                f"group {group.layer_names!r} has no inner KV cache specs."
+            )
+        representative = min(inner_specs.values(), key=_effective_compress_ratio)
+        ratio = _effective_compress_ratio(representative)
+        if isinstance(ratio, bool) or not isinstance(ratio, int) or ratio <= 0:
+            raise ValueError(
+                "Cannot build the request-owned KV store: uniform KV cache "
+                f"group {group.layer_names!r} resolves to a representative "
+                f"with invalid compress_ratio {ratio!r}; expected a positive "
+                "non-bool integer."
+            )
+        group.kv_cache_spec = representative
+    return normalized
+
+
 class WorkerWrapperBase:
     """
     This class represents one process in an executor/engine. It is responsible
@@ -441,7 +503,11 @@ class WorkerWrapperBase:
         Scheduler/hash block sizes, DCP/PCP world sizes, and max batched
         tokens come from the same vllm_config facts the scheduler uses, so
         the store's block pool accounting matches the coordinator's.
+        The rank-local manager runs on the normalized config (uniform
+        wrapper groups bound to their allocation-binding inner spec), never
+        on the raw config the underlying worker initialized with.
         """
+        kv_cache_config = _normalize_request_owned_kv_cache_config(kv_cache_config)
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, self.vllm_config
         )
