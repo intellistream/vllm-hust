@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from dataclasses import replace
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -32,7 +33,13 @@ try:
     _SimpleCPUOffloadConnector = import_module(
         _ASCEND_CONNECTOR_MODULE
     ).AscendSimpleCPUOffloadConnector
-except ImportError:
+except ModuleNotFoundError as error:
+    missing_module = error.name or ""
+    if not (
+        missing_module == _ASCEND_CONNECTOR_MODULE
+        or _ASCEND_CONNECTOR_MODULE.startswith(f"{missing_module}.")
+    ):
+        raise
     _SimpleCPUOffloadConnector = import_module(
         "vllm.distributed.kv_transfer.kv_connector.v1."
         "simple_cpu_offload_connector"
@@ -47,6 +54,18 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
+
+
+def _advance_recompute_progress(
+    remaining_tokens: int,
+    scheduled_tokens: int,
+) -> tuple[int, int, bool]:
+    """Consume the scheduled part of a CPU-hit prefix."""
+    if remaining_tokens < 0 or scheduled_tokens < 0:
+        raise ValueError("Recompute progress must be non-negative")
+    recomputed_tokens = min(remaining_tokens, scheduled_tokens)
+    remaining_tokens -= recomputed_tokens
+    return remaining_tokens, recomputed_tokens, remaining_tokens == 0
 
 
 class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
@@ -109,11 +128,16 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
         self._decisions: dict[str, MaterializationDecision] = {}
         self._decision_hit_tokens: dict[str, int] = {}
         self._decision_times: dict[str, float] = {}
+        self._recompute_remaining_tokens: dict[str, int] = {}
+        self._new_recompute_attempts: set[str] = set()
         self._worker_copy_samples: list[TimingSampleMetadata] = []
         self._worker_recompute_samples: list[TimingSampleMetadata] = []
-        self._load_events_started: dict[int, tuple[float, dict[str, int]]] = {}
-        self._recompute_started_at: float | None = None
-        self._recompute_reported = False
+        self._load_events_started: dict[
+            int, tuple[float, dict[str, int], dict[str, float]]
+        ] = {}
+        self._recompute_step_started_at: float | None = None
+        self._recompute_service_ms: dict[str, float] = {}
+        self._recompute_queue_wait_ms: dict[str, float] = {}
 
     def get_num_new_matched_tokens(
         self,
@@ -133,6 +157,11 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
             hit_tokens,
             hit_blocks,
             kv_bytes=hit_blocks * self._kv_bytes_per_block,
+            max_age_ms=self._decision_config.max_observation_age_ms,
+        )
+        observation = replace(
+            observation,
+            active_materialization_count=len(self._decisions),
         )
         decision = choose_materialization(observation, self._decision_config)
         self._decisions[request.request_id] = decision
@@ -144,8 +173,11 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
             hit_blocks,
             decision,
             gpu_local_hit_tokens=num_computed_tokens,
+            observation=observation,
         )
         if decision.mode == "recompute":
+            self._recompute_remaining_tokens[request.request_id] = hit_tokens
+            self._new_recompute_attempts.add(request.request_id)
             return 0, False
         return hit_tokens, is_async
 
@@ -155,15 +187,38 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
     ) -> KVConnectorMetadata:
         """Attach recompute requests to otherwise native offload metadata."""
         base = super().build_connector_meta(scheduler_output)
+        for request_id in scheduler_output.finished_req_ids:
+            self._clear_request_state(request_id)
         if not isinstance(base, SimpleCPUOffloadMetadata):
             return base
-        recompute_requests = {
-            request_id: self._decision_hit_tokens[request_id]
-            for request_id in scheduler_output.num_scheduled_tokens
-            if request_id in self._decisions
-            and self._decisions[request_id].mode == "recompute"
-            and request_id in self._decision_hit_tokens
-        }
+        recompute_requests: dict[str, int] = {}
+        reset_recompute_requests: set[str] = set()
+        completed_recompute_requests: set[str] = set()
+        for request_id, scheduled_tokens in (
+            scheduler_output.num_scheduled_tokens.items()
+        ):
+            if (
+                request_id not in self._decisions
+                or self._decisions[request_id].mode != "recompute"
+                or request_id not in self._decision_hit_tokens
+            ):
+                continue
+            remaining = self._recompute_remaining_tokens.get(request_id, 0)
+            remaining, recomputed_tokens, completed = _advance_recompute_progress(
+                remaining,
+                max(0, int(scheduled_tokens)),
+            )
+            if recomputed_tokens == 0:
+                continue
+            recompute_requests[request_id] = self._decision_hit_tokens[request_id]
+            if request_id in self._new_recompute_attempts:
+                reset_recompute_requests.add(request_id)
+                self._new_recompute_attempts.discard(request_id)
+            if completed:
+                completed_recompute_requests.add(request_id)
+                self._recompute_remaining_tokens.pop(request_id, None)
+            else:
+                self._recompute_remaining_tokens[request_id] = remaining
         load_request_ids = set(base.load_event_to_reqs.get(base.load_event, []))
         load_block_counts = {
             request_id: max(
@@ -175,31 +230,45 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
         }
         if not recompute_requests and not load_block_counts:
             return base
+        tracked_request_ids = set(recompute_requests) | set(load_block_counts)
         return DynamicCPUOffloadMetadata.from_base(
             base,
             recompute_requests,
+            reset_recompute_requests,
+            completed_recompute_requests,
             load_block_counts,
+            {
+                request_id: self._decision_times[request_id]
+                for request_id in tracked_request_ids
+                if request_id in self._decision_times
+            },
         )
 
     def bind_connector_metadata(
         self,
         connector_metadata: KVConnectorMetadata,
     ) -> None:
-        """Track the start of worker-side recompute work."""
+        """Track the start of one worker-side recompute step."""
         super().bind_connector_metadata(connector_metadata)
-        self._recompute_started_at = None
-        self._recompute_reported = False
+        self._recompute_step_started_at = None
         if (
             isinstance(connector_metadata, DynamicCPUOffloadMetadata)
             and connector_metadata.recompute_requests
         ):
-            self._recompute_started_at = time.monotonic()
+            for request_id in connector_metadata.reset_recompute_requests:
+                self._recompute_service_ms.pop(request_id, None)
+                decision_time = connector_metadata.decision_times.get(request_id)
+                if decision_time is not None:
+                    self._recompute_queue_wait_ms[request_id] = max(
+                        0.0,
+                        (time.monotonic() - decision_time) * 1000.0,
+                    )
+            self._recompute_step_started_at = time.monotonic()
 
     def clear_connector_metadata(self) -> None:
         """Clear native metadata and per-step worker timing state."""
         super().clear_connector_metadata()
-        self._recompute_started_at = None
-        self._recompute_reported = False
+        self._recompute_step_started_at = None
 
     def get_finished(
         self,
@@ -235,13 +304,22 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
             }
             self._load_events_started.setdefault(
                 metadata.load_event,
-                (launch_started_at, request_blocks),
+                (
+                    launch_started_at,
+                    request_blocks,
+                    {
+                        request_id: metadata.decision_times.get(
+                            request_id, launch_started_at
+                        )
+                        for request_id in request_blocks
+                    },
+                ),
             )
 
         result = super().get_finished(finished_req_ids)
         finished_recving = result[1] or set()
         completed_at = time.monotonic()
-        for event_idx, (started_at, request_blocks) in list(
+        for event_idx, (started_at, request_blocks, decision_times) in list(
             self._load_events_started.items()
         ):
             completed_request_ids = finished_recving.intersection(request_blocks)
@@ -256,6 +334,14 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
                         size=block_count,
                         service_ms=service_ms,
                         kv_bytes=block_count * self._kv_bytes_per_block,
+                        queue_wait_ms=max(
+                            0.0,
+                            (
+                                launch_started_at
+                                - decision_times.get(request_id, launch_started_at)
+                            )
+                            * 1000.0,
+                        ),
                     )
                 )
             self._load_events_started.pop(event_idx, None)
@@ -263,19 +349,33 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
         if (
             isinstance(metadata, DynamicCPUOffloadMetadata)
             and metadata.recompute_requests
-            and self._recompute_started_at is not None
-            and not self._recompute_reported
+            and self._recompute_step_started_at is not None
         ):
-            service_ms = (completed_at - self._recompute_started_at) * 1000.0
+            step_service_ms = (
+                completed_at - self._recompute_step_started_at
+            ) * 1000.0
             for request_id, hit_tokens in metadata.recompute_requests.items():
-                self._worker_recompute_samples.append(
-                    TimingSampleMetadata(
-                        request_id=request_id,
-                        size=max(1, hit_tokens),
-                        service_ms=service_ms,
-                    )
+                service_ms = (
+                    self._recompute_service_ms.get(request_id, 0.0)
+                    + step_service_ms
                 )
-            self._recompute_reported = True
+                if request_id in metadata.completed_recompute_requests:
+                    self._worker_recompute_samples.append(
+                        TimingSampleMetadata(
+                            request_id=request_id,
+                            size=max(1, hit_tokens),
+                            service_ms=service_ms,
+                            queue_wait_ms=self._recompute_queue_wait_ms.pop(
+                                request_id, 0.0
+                            ),
+                        )
+                    )
+                    self._recompute_service_ms.pop(request_id, None)
+                else:
+                    self._recompute_service_ms[request_id] = service_ms
+        for request_id in finished_req_ids:
+            self._recompute_service_ms.pop(request_id, None)
+            self._recompute_queue_wait_ms.pop(request_id, None)
         return result
 
     def build_connector_worker_meta(self):
@@ -339,18 +439,21 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
                 self._clear_request_state(request_id)
                 continue
             extra_wait_ms = total_ms - service_ms
+            queue_wait_ms = max(0.0, float(critical_sample.queue_wait_ms))
             if is_load:
                 self._telemetry.observe_load(
                     critical_sample.size,
                     total_ms,
                     service_ms,
                     critical_sample.kv_bytes,
+                    queue_wait_ms=queue_wait_ms,
                 )
             else:
                 self._telemetry.observe_recompute(
                     critical_sample.size,
                     total_ms,
                     service_ms,
+                    queue_wait_ms=queue_wait_ms,
                 )
             self._audit.complete(
                 request_id,
@@ -358,6 +461,7 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
                 total_ms,
                 service_ms=service_ms,
                 extra_wait_ms=extra_wait_ms,
+                queue_wait_ms=queue_wait_ms,
             )
             self._clear_request_state(request_id)
 
@@ -366,6 +470,9 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
         self._decisions.pop(request_id, None)
         self._decision_hit_tokens.pop(request_id, None)
         self._decision_times.pop(request_id, None)
+        self._recompute_remaining_tokens.pop(request_id, None)
+        self._new_recompute_attempts.discard(request_id)
+        getattr(self, "_recompute_queue_wait_ms", {}).pop(request_id, None)
 
     def _estimate_hit_blocks(self, hit_tokens: int) -> int:
         """Convert hit tokens to the connector's scheduler block count."""

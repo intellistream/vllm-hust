@@ -6,7 +6,10 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from kv_materialization_plugin.decision import MaterializationDecision
+from kv_materialization_plugin.decision import (
+    MaterializationDecision,
+    MaterializationObservation,
+)
 
 
 @dataclass(slots=True)
@@ -21,6 +24,23 @@ class AuditRecord:
     predicted_load_ms: float | None
     predicted_recompute_ms: float | None
     fallback: bool
+    kv_bytes: int = 0
+    active_materialization_count: int = 0
+    timing_scope: str = (
+        "decision_to_worker_sample_return;"
+        " phase_queue=admission_to_service_start"
+    )
+    queue_wait_isolated: bool = False
+    load_queue_wait_ms: float | None = None
+    load_service_ms: float | None = None
+    load_extra_wait_ms: float | None = None
+    load_observation_age_ms: float | None = None
+    load_sample_count: int = 0
+    recompute_service_ms: float | None = None
+    recompute_queue_wait_ms: float | None = None
+    recompute_extra_wait_ms: float | None = None
+    recompute_observation_age_ms: float | None = None
+    recompute_sample_count: int = 0
     run_id: str | None = None
     mode: str | None = None
     gpu_local_hit_tokens: int | None = None
@@ -29,6 +49,7 @@ class AuditRecord:
     actual_cost_ms: float | None = None
     service_ms: float | None = None
     extra_wait_ms: float | None = None
+    queue_wait_ms: float | None = None
     status: str = "decided"
 
 
@@ -58,6 +79,7 @@ class AuditLog:
         hit_blocks: int,
         decision: MaterializationDecision,
         gpu_local_hit_tokens: int | None = None,
+        observation: MaterializationObservation | None = None,
     ) -> None:
         """Start or replace a record for a request."""
         self._records[request_id] = AuditRecord(
@@ -69,6 +91,41 @@ class AuditLog:
             predicted_load_ms=decision.predicted_load_ms,
             predicted_recompute_ms=decision.predicted_recompute_ms,
             fallback=decision.fallback,
+            kv_bytes=observation.kv_bytes if observation else 0,
+            active_materialization_count=(
+                observation.active_materialization_count if observation else 0
+            ),
+            queue_wait_isolated=bool(
+                observation
+                and observation.load_queue_wait_ms is not None
+                and observation.recompute_queue_wait_ms is not None
+            ),
+            load_service_ms=observation.load_service_ms if observation else None,
+            load_queue_wait_ms=(
+                observation.load_queue_wait_ms if observation else None
+            ),
+            load_extra_wait_ms=(
+                observation.load_extra_wait_ms if observation else None
+            ),
+            load_observation_age_ms=(
+                observation.load_observation_age_ms if observation else None
+            ),
+            load_sample_count=observation.load_sample_count if observation else 0,
+            recompute_service_ms=(
+                observation.recompute_service_ms if observation else None
+            ),
+            recompute_queue_wait_ms=(
+                observation.recompute_queue_wait_ms if observation else None
+            ),
+            recompute_extra_wait_ms=(
+                observation.recompute_extra_wait_ms if observation else None
+            ),
+            recompute_observation_age_ms=(
+                observation.recompute_observation_age_ms if observation else None
+            ),
+            recompute_sample_count=(
+                observation.recompute_sample_count if observation else 0
+            ),
             run_id=self._run_id,
             mode=self._mode,
             gpu_local_hit_tokens=gpu_local_hit_tokens,
@@ -82,6 +139,7 @@ class AuditLog:
         actual_cost_ms: float,
         service_ms: float | None = None,
         extra_wait_ms: float | None = None,
+        queue_wait_ms: float | None = None,
         status: str = "completed",
     ) -> None:
         """Complete an existing record."""
@@ -92,6 +150,7 @@ class AuditLog:
         record.actual_cost_ms = actual_cost_ms
         record.service_ms = service_ms
         record.extra_wait_ms = extra_wait_ms
+        record.queue_wait_ms = queue_wait_ms
         record.status = status
         self._write(record)
 

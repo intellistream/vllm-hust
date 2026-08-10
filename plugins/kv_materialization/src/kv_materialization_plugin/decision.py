@@ -49,10 +49,17 @@ class MaterializationObservation:
     hit_tokens: int
     hit_blocks: int
     kv_bytes: int = 0
+    active_materialization_count: int = 0
     load_total_ms: float | None = None
+    load_service_ms: float | None = None
+    load_queue_wait_ms: float | None = None
+    load_extra_wait_ms: float | None = None
     load_observation_age_ms: float | None = None
     load_sample_count: int = 0
     recompute_total_ms: float | None = None
+    recompute_service_ms: float | None = None
+    recompute_queue_wait_ms: float | None = None
+    recompute_extra_wait_ms: float | None = None
     recompute_observation_age_ms: float | None = None
     recompute_sample_count: int = 0
 
@@ -68,6 +75,7 @@ class MaterializationDecision:
     fallback: bool = False
     invalid_fields: tuple[str, ...] = ()
     estimate_source: str = "unavailable"
+    confidence_guard: str | None = None
 
 
 def _fallback(
@@ -96,6 +104,12 @@ def _validate_observation(
         invalid.append("hit_blocks")
     if not isinstance(observation.kv_bytes, int) or observation.kv_bytes < 0:
         invalid.append("kv_bytes")
+    if (
+        not isinstance(observation.active_materialization_count, int)
+        or isinstance(observation.active_materialization_count, bool)
+        or observation.active_materialization_count < 0
+    ):
+        invalid.append("active_materialization_count")
 
     if not _finite_nonnegative(observation.load_total_ms):
         invalid.append("load_total_ms")
@@ -108,11 +122,20 @@ def _validate_observation(
         invalid.append("recompute_sample_count")
 
     for field_name in (
+        "load_queue_wait_ms",
+        "recompute_queue_wait_ms",
         "load_observation_age_ms",
         "recompute_observation_age_ms",
     ):
         age = getattr(observation, field_name)
-        if not _finite_nonnegative(age) or float(age) > config.max_observation_age_ms:
+        if not _finite_nonnegative(age):
+            invalid.append(field_name)
+    for field_name in (
+        "load_observation_age_ms",
+        "recompute_observation_age_ms",
+    ):
+        age = getattr(observation, field_name)
+        if _finite_nonnegative(age) and float(age) > config.max_observation_age_ms:
             invalid.append(field_name)
     return tuple(invalid)
 
@@ -138,8 +161,31 @@ def choose_materialization(
     if not config.enabled:
         return MaterializationDecision(mode=config.fallback_mode, reason="disabled")
 
+    if observation.active_materialization_count > 0:
+        return _fallback(
+            config,
+            "unsupported_concurrent_context",
+            ("active_materialization_count",),
+        )
+
     invalid_fields = _validate_observation(observation, config)
     if invalid_fields:
+        confidence_fields = {
+            "load_sample_count",
+            "recompute_sample_count",
+            "load_observation_age_ms",
+            "recompute_observation_age_ms",
+            "load_queue_wait_ms",
+            "recompute_queue_wait_ms",
+        }
+        if set(invalid_fields).issubset(confidence_fields):
+            return MaterializationDecision(
+                mode=config.fallback_mode,
+                reason="insufficient_observation_confidence",
+                fallback=True,
+                invalid_fields=invalid_fields,
+                confidence_guard="recent_samples_and_phase_timestamps",
+            )
         return _fallback(config, "invalid_or_missing_observation", invalid_fields)
 
     assert observation.load_total_ms is not None

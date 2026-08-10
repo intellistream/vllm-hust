@@ -26,6 +26,10 @@ class TimingSample:
     extra_wait_ms: float
     timestamp: float
     kv_bytes: int = 0
+    # Time from plugin admission to the first service phase.  This is a
+    # runtime-observed admission/queue interval, not a claim about a device
+    # driver's internal queue.
+    queue_wait_ms: float | None = None
 
 
 class TelemetryWindow:
@@ -48,6 +52,7 @@ class TelemetryWindow:
         total_ms: float,
         service_ms: float,
         kv_bytes: int = 0,
+        queue_wait_ms: float | None = None,
         timestamp: float | None = None,
     ) -> None:
         """Record a completed CPU-to-device load."""
@@ -57,6 +62,7 @@ class TelemetryWindow:
             total_ms,
             service_ms,
             kv_bytes,
+            queue_wait_ms,
             timestamp,
         )
 
@@ -65,6 +71,7 @@ class TelemetryWindow:
         tokens: int,
         total_ms: float,
         service_ms: float,
+        queue_wait_ms: float | None = None,
         timestamp: float | None = None,
     ) -> None:
         """Record a completed prefix recompute."""
@@ -74,6 +81,7 @@ class TelemetryWindow:
             total_ms,
             service_ms,
             0,
+            queue_wait_ms,
             timestamp,
         )
 
@@ -82,23 +90,39 @@ class TelemetryWindow:
         hit_tokens: int,
         hit_blocks: int,
         kv_bytes: int = 0,
+        max_age_ms: float | None = None,
     ) -> MaterializationObservation:
-        """Create a decision observation from the closest recent buckets."""
+        """Create a decision observation from exact-size recent buckets.
+
+        End-to-end materialization time is not safely transferable between
+        arbitrary prefix sizes. Missing exact buckets are therefore exposed as
+        missing observations and handled by the decision fallback.
+        """
         now = time.time()
-        load = self._closest(self._load, hit_blocks)
-        recompute = self._closest(self._recompute, hit_tokens)
-        load_stats = self._stats(load, now)
-        recompute_stats = self._stats(recompute, now)
+        if max_age_ms is not None and (
+            not math.isfinite(max_age_ms) or max_age_ms < 0.0
+        ):
+            raise ValueError("max_age_ms must be finite and non-negative")
+        load = self._load.get(hit_blocks)
+        recompute = self._recompute.get(hit_tokens)
+        load_stats = self._stats(load, now, max_age_ms)
+        recompute_stats = self._stats(recompute, now, max_age_ms)
         return MaterializationObservation(
             hit_tokens=hit_tokens,
             hit_blocks=hit_blocks,
             kv_bytes=kv_bytes,
             load_total_ms=load_stats[0],
-            load_observation_age_ms=load_stats[1],
-            load_sample_count=load_stats[2],
+            load_service_ms=load_stats[1],
+            load_queue_wait_ms=load_stats[2],
+            load_extra_wait_ms=load_stats[3],
+            load_observation_age_ms=load_stats[4],
+            load_sample_count=load_stats[5],
             recompute_total_ms=recompute_stats[0],
-            recompute_observation_age_ms=recompute_stats[1],
-            recompute_sample_count=recompute_stats[2],
+            recompute_service_ms=recompute_stats[1],
+            recompute_queue_wait_ms=recompute_stats[2],
+            recompute_extra_wait_ms=recompute_stats[3],
+            recompute_observation_age_ms=recompute_stats[4],
+            recompute_sample_count=recompute_stats[5],
         )
 
     def state(self) -> dict[str, list[dict[str, Any]]]:
@@ -158,6 +182,7 @@ class TelemetryWindow:
         total_ms: float,
         service_ms: float,
         kv_bytes: int,
+        queue_wait_ms: float | None,
         timestamp: float | None,
     ) -> None:
         if timestamp is None:
@@ -170,51 +195,82 @@ class TelemetryWindow:
             extra_wait_ms=extra_wait_ms,
             timestamp=timestamp,
             kv_bytes=kv_bytes,
+            queue_wait_ms=queue_wait_ms,
         )
         self._validate_sample(sample)
         buckets[size].append(sample)
 
     @staticmethod
     def _validate_sample(sample: TimingSample) -> None:
+        numeric_values = (
+            sample.total_ms,
+            sample.service_ms,
+            sample.extra_wait_ms,
+            sample.timestamp,
+        )
         if (
-            sample.size <= 0
-            or sample.total_ms < 0
-            or sample.service_ms < 0
-            or sample.extra_wait_ms < 0
+            not isinstance(sample.size, int)
+            or isinstance(sample.size, bool)
+            or sample.size <= 0
+            or not isinstance(sample.kv_bytes, int)
+            or isinstance(sample.kv_bytes, bool)
             or sample.kv_bytes < 0
+            or any(
+                not isinstance(value, int | float) or isinstance(value, bool)
+                for value in numeric_values
+            )
             or not all(
-                math.isfinite(value)
-                for value in (
-                    sample.total_ms,
-                    sample.service_ms,
-                    sample.extra_wait_ms,
-                    sample.timestamp,
+                math.isfinite(value) and value >= 0.0 for value in numeric_values
+            )
+            or (
+                sample.queue_wait_ms is not None
+                and (
+                    not isinstance(sample.queue_wait_ms, int | float)
+                    or isinstance(sample.queue_wait_ms, bool)
+                    or not math.isfinite(sample.queue_wait_ms)
+                    or sample.queue_wait_ms < 0.0
                 )
             )
         ):
-            raise ValueError("Telemetry measurements must be non-negative")
-
-    @staticmethod
-    def _closest(
-        buckets: dict[int, deque[TimingSample]], size: int
-    ) -> deque[TimingSample] | None:
-        if not buckets:
-            return None
-        key = min(buckets, key=lambda candidate: abs(candidate - size))
-        return buckets[key]
+            raise ValueError(
+                "Telemetry measurements must be finite, non-negative numbers"
+            )
 
     @staticmethod
     def _stats(
         samples: deque[TimingSample] | None,
         now: float,
-    ) -> tuple[float | None, float | None, int]:
+        max_age_ms: float | None,
+    ) -> tuple[
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+        int,
+    ]:
         if not samples:
-            return None, None, 0
-        newest = max(sample.timestamp for sample in samples)
+            return None, None, None, None, None, 0
+        eligible = [
+            sample
+            for sample in samples
+            if max_age_ms is None
+            or max(0.0, (now - sample.timestamp) * 1000.0) <= max_age_ms
+        ]
+        if not eligible:
+            return None, None, None, None, None, 0
+        newest = max(sample.timestamp for sample in eligible)
         return (
-            float(median(sample.total_ms for sample in samples)),
+            float(median(sample.total_ms for sample in eligible)),
+            float(median(sample.service_ms for sample in eligible)),
+            (
+                float(median(sample.queue_wait_ms for sample in eligible))
+                if all(sample.queue_wait_ms is not None for sample in eligible)
+                else None
+            ),
+            float(median(sample.extra_wait_ms for sample in eligible)),
             max(0.0, (now - newest) * 1000.0),
-            len(samples),
+            len(eligible),
         )
 
 
