@@ -10,13 +10,13 @@ import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from vllm.v1.core.sched.ownership import OwnerLeaseToken
+from vllm.v1.core.sched.ownership import OwnerCachePoolSnapshot, OwnerLeaseToken
 
 PROBE_DIR_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_DIR"
 RUN_ID_ENV = "VLLM_TELEMETRY_RUN_ID"
 MAX_RECORDS_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_MAX_RECORDS"
 MAX_BYTES_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_MAX_BYTES"
-SCHEMA = "g4-request-owner-layout-observation/v1"
+SCHEMA = "g4-request-owner-layout-observation/v2"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 
@@ -55,12 +55,14 @@ class OwnerLayoutProbe:
         self._records = 0
         self._bytes = 0
         self._stream = path.open("x", encoding="utf-8")
-        self._write({
-            "schema": SCHEMA,
-            "kind": "header",
-            "run_id": run_id,
-            "world_size": world_size,
-        })
+        self._write(
+            {
+                "schema": SCHEMA,
+                "kind": "header",
+                "run_id": run_id,
+                "world_size": world_size,
+            }
+        )
 
     @classmethod
     def requested(cls) -> bool:
@@ -95,13 +97,16 @@ class OwnerLayoutProbe:
             raise RuntimeError(
                 f"request-owner layout probe exceeded {self.max_records} records"
             )
-        payload = json.dumps(
-            record,
-            ensure_ascii=True,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ) + "\n"
+        payload = (
+            json.dumps(
+                record,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
         encoded = payload.encode("utf-8")
         if self._bytes + len(encoded) > self.max_bytes:
             raise RuntimeError(
@@ -118,6 +123,7 @@ class OwnerLayoutProbe:
         step_seq: int,
         leases: Sequence[OwnerLeaseToken],
         num_scheduled_tokens: Mapping[str, int],
+        cache_pool_snapshots: Mapping[int, OwnerCachePoolSnapshot] | None = None,
     ) -> None:
         if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
             raise ValueError(
@@ -173,24 +179,70 @@ class OwnerLayoutProbe:
             count = scheduled[request_id]
             owner_row_counts[lease.owner_id] += count
             owner_request_counts[lease.owner_id] += 1
-            assignments.append({
-                "request_id": request_id,
-                "owner_epoch": lease.key.owner_epoch,
-                "owner_rank": lease.owner_id,
-                "num_scheduled_tokens": count,
-                "runnable_num_tokens": lease.runnable_num_tokens,
-            })
-        self._write({
-            "schema": SCHEMA,
-            "kind": "step",
-            "run_id": self.run_id,
-            "step_seq": step_seq,
-            "assignments": assignments,
-            "scheduled_request_count": len(assignments),
-            "total_scheduled_tokens": sum(owner_row_counts),
-            "owner_request_counts": owner_request_counts,
-            "owner_row_counts": owner_row_counts,
-            "zero_row_owner_ranks": [
-                rank for rank, count in enumerate(owner_row_counts) if count == 0
-            ],
-        })
+            assignments.append(
+                {
+                    "request_id": request_id,
+                    "owner_epoch": lease.key.owner_epoch,
+                    "owner_rank": lease.owner_id,
+                    "num_scheduled_tokens": count,
+                    "runnable_num_tokens": lease.runnable_num_tokens,
+                }
+            )
+        owner_cache_pools = None
+        if cache_pool_snapshots is not None:
+            expected_ranks = set(range(self.world_size))
+            if set(cache_pool_snapshots) != expected_ranks:
+                raise ValueError(
+                    "cache_pool_snapshots must cover every owner rank, got "
+                    f"{sorted(cache_pool_snapshots)!r}"
+                )
+            owner_cache_pools = []
+            for rank in range(self.world_size):
+                snapshot = cache_pool_snapshots[rank]
+                if not isinstance(snapshot, OwnerCachePoolSnapshot):
+                    raise TypeError(
+                        "cache_pool_snapshots must contain "
+                        f"OwnerCachePoolSnapshot, got {snapshot!r}"
+                    )
+                if snapshot.owner_rank != rank:
+                    raise ValueError(
+                        "cache pool mapping rank does not match snapshot owner: "
+                        f"{rank} != {snapshot.owner_rank}"
+                    )
+                owner_cache_pools.append(
+                    {
+                        "owner_rank": snapshot.owner_rank,
+                        "total_blocks": snapshot.total_blocks,
+                        "free_blocks": snapshot.free_blocks,
+                        "bytes_per_block": snapshot.bytes_per_block,
+                        "groups": [
+                            {
+                                "group_index": group.group_index,
+                                "spec_kind": group.spec_kind,
+                                "effective_tokens_per_block": (
+                                    group.effective_tokens_per_block
+                                ),
+                                "allocated_blocks": group.allocated_blocks,
+                                "resident_blocks": group.resident_blocks,
+                            }
+                            for group in snapshot.groups
+                        ],
+                    }
+                )
+        self._write(
+            {
+                "schema": SCHEMA,
+                "kind": "step",
+                "run_id": self.run_id,
+                "step_seq": step_seq,
+                "assignments": assignments,
+                "scheduled_request_count": len(assignments),
+                "total_scheduled_tokens": sum(owner_row_counts),
+                "owner_request_counts": owner_request_counts,
+                "owner_row_counts": owner_row_counts,
+                "zero_row_owner_ranks": [
+                    rank for rank, count in enumerate(owner_row_counts) if count == 0
+                ],
+                "owner_cache_pools": owner_cache_pools,
+            }
+        )

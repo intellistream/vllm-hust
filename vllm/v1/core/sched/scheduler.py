@@ -2583,6 +2583,11 @@ class Scheduler(SchedulerInterface):
                 step_seq=self.current_step,
                 leases=scheduled_owner_leases,
                 num_scheduled_tokens=num_scheduled_tokens,
+                cache_pool_snapshots=(
+                    self._owner_pool_snapshots
+                    if self._owner_pool_snapshot_seen
+                    else None
+                ),
             )
 
         scheduler_output = SchedulerOutput(

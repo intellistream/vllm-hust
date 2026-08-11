@@ -11,7 +11,12 @@ from vllm.v1.core.sched.owner_layout_probe import (
     RUN_ID_ENV,
     OwnerLayoutProbe,
 )
-from vllm.v1.core.sched.ownership import OwnerLeaseKey, OwnerLeaseToken
+from vllm.v1.core.sched.ownership import (
+    OwnerCacheGroupSnapshot,
+    OwnerCachePoolSnapshot,
+    OwnerLeaseKey,
+    OwnerLeaseToken,
+)
 
 
 def _lease(request_id: str, owner: int, step: int = 3) -> OwnerLeaseToken:
@@ -44,7 +49,7 @@ def test_probe_records_mixed_and_zero_owner_rows(tmp_path, monkeypatch) -> None:
     assert records[0] == {
         "kind": "header",
         "run_id": "owner-cell",
-        "schema": "g4-request-owner-layout-observation/v1",
+        "schema": "g4-request-owner-layout-observation/v2",
         "world_size": 4,
     }
     step = records[1]
@@ -57,6 +62,90 @@ def test_probe_records_mixed_and_zero_owner_rows(tmp_path, monkeypatch) -> None:
     assert step["scheduled_request_count"] == 2
     assert step["total_scheduled_tokens"] == 7
     assert step["zero_row_owner_ranks"] == [1, 3]
+    assert step["owner_cache_pools"] is None
+
+
+def _pool(rank: int, *, free_blocks: int) -> OwnerCachePoolSnapshot:
+    return OwnerCachePoolSnapshot(
+        owner_rank=rank,
+        total_blocks=16,
+        free_blocks=free_blocks,
+        bytes_per_block=4096,
+        groups=(
+            OwnerCacheGroupSnapshot(
+                group_index=0,
+                spec_kind="full",
+                effective_tokens_per_block=128,
+                allocated_blocks=16 - free_blocks,
+                resident_blocks=16 - free_blocks,
+            ),
+        ),
+    )
+
+
+def test_probe_records_block_id_free_physical_capacity(tmp_path) -> None:
+    probe = OwnerLayoutProbe(
+        path=tmp_path / "probe.jsonl",
+        run_id="capacity-cell",
+        world_size=2,
+        max_records=4,
+        max_bytes=4096,
+    )
+    probe.record_step(
+        step_seq=1,
+        leases=[_lease("req", 0, step=1)],
+        num_scheduled_tokens={"req": 1},
+        cache_pool_snapshots={0: _pool(0, free_blocks=12), 1: _pool(1, free_blocks=16)},
+    )
+    records = [
+        json.loads(line) for line in (tmp_path / "probe.jsonl").read_text().splitlines()
+    ]
+    pools = records[1]["owner_cache_pools"]
+    assert [pool["owner_rank"] for pool in pools] == [0, 1]
+    assert pools[0] == {
+        "owner_rank": 0,
+        "total_blocks": 16,
+        "free_blocks": 12,
+        "bytes_per_block": 4096,
+        "groups": [
+            {
+                "group_index": 0,
+                "spec_kind": "full",
+                "effective_tokens_per_block": 128,
+                "allocated_blocks": 4,
+                "resident_blocks": 4,
+            }
+        ],
+    }
+    assert "block_id" not in repr(pools)
+
+
+def test_probe_rejects_partial_or_mislabeled_capacity(tmp_path) -> None:
+    probe = OwnerLayoutProbe(
+        path=tmp_path / "probe.jsonl",
+        run_id="capacity-cell",
+        world_size=2,
+        max_records=4,
+        max_bytes=4096,
+    )
+    with pytest.raises(ValueError, match="cover every owner rank"):
+        probe.record_step(
+            step_seq=1,
+            leases=[],
+            num_scheduled_tokens={},
+            cache_pool_snapshots={0: _pool(0, free_blocks=16)},
+        )
+
+    with pytest.raises(ValueError, match="does not match snapshot owner"):
+        probe.record_step(
+            step_seq=2,
+            leases=[],
+            num_scheduled_tokens={},
+            cache_pool_snapshots={
+                0: _pool(1, free_blocks=16),
+                1: _pool(0, free_blocks=16),
+            },
+        )
 
 
 def test_probe_fails_closed_on_identity_or_bounds(tmp_path, monkeypatch) -> None:
