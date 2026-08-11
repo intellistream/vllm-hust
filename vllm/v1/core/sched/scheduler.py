@@ -1644,7 +1644,16 @@ class Scheduler(SchedulerInterface):
             scheduler_output, model_runner_output
         )
 
-        if self.scheduler_config.enable_request_owned_attention:
+        scheduler_config = getattr(self, "scheduler_config", None)
+        request_owned_attention = getattr(
+            scheduler_config, "enable_request_owned_attention", False
+        )
+        if not isinstance(request_owned_attention, bool):
+            raise RuntimeError(
+                "enable_request_owned_attention must remain a bool at the "
+                f"scheduler output boundary, got {request_owned_attention!r}."
+            )
+        if request_owned_attention:
             # G2: apply structurally valid receipts before any ordinary
             # output or request mutation below.
             self._apply_request_owned_receipts(scheduler_output, model_runner_output)
@@ -2025,7 +2034,11 @@ class Scheduler(SchedulerInterface):
         owner-local allocator/coordinator authority.  Structural violations
         and nonempty events raise before ordinary output or request mutation.
         """
-        if not self.scheduler_config.enable_request_owned_attention:
+        if not getattr(
+            getattr(self, "scheduler_config", None),
+            "enable_request_owned_attention",
+            False,
+        ):
             return
 
         step_seq = scheduler_output.step_seq
@@ -2119,8 +2132,13 @@ class Scheduler(SchedulerInterface):
         envelope arriving while the sampling gate is disabled is rejected.
         """
         batches = model_runner_output.owner_sampling_batches
+        # Some narrow scheduler utility/test paths intentionally construct a
+        # bare Scheduler without running __init__.  They remain the default-off
+        # protocol path, so an absent config is equivalent to both request-owned
+        # gates being false.  A real owner envelope still fails closed below.
+        scheduler_config = getattr(self, "scheduler_config", None)
         sampling_enabled = getattr(
-            self.scheduler_config, "enable_request_owned_sampling", False
+            scheduler_config, "enable_request_owned_sampling", False
         )
         if not isinstance(sampling_enabled, bool):
             raise RuntimeError(
@@ -2144,7 +2162,9 @@ class Scheduler(SchedulerInterface):
                 "unexpected sampling authority path."
             )
 
-        if not self.scheduler_config.enable_request_owned_attention:
+        if not getattr(
+            scheduler_config, "enable_request_owned_attention", False
+        ):
             raise RuntimeError(
                 "owner-sampling envelope ingress requires "
                 "enable_request_owned_attention; the scheduler is not "
