@@ -118,7 +118,7 @@ def _make_scheduler(
     scheduler._owner_emitted_command_seq = {}
     scheduler._owner_outbox = []
     scheduler._owner_token_plans = {}
-    scheduler._owner_promoted = {}
+    scheduler._owner_pending_dispatch = {}
     scheduler._init_request_owned_control_plane()
     return scheduler
 
@@ -954,6 +954,51 @@ def test_aggregate_budget_freezes_plan_in_running_order() -> None:
         (t.key.request_id, t.runnable_num_tokens) for t in out3.scheduled_owner_leases
     ] == [("req-b", 32)]
     assert scheduler.prev_step_scheduled_req_ids == {"req-b"}
+
+
+def test_zero_budget_promotion_remains_new_until_first_dispatch() -> None:
+    scheduler = _make_scheduler(max_num_scheduled_tokens=32)
+    requests = [_request(f"req-{index}", num_prompt_tokens=64) for index in range(3)]
+    for request in requests:
+        scheduler.add_request(request)
+
+    reserve_step = scheduler.schedule()
+    commands = {
+        command.key.request_id: command
+        for command in reserve_step.owner_commands
+    }
+    assert set(commands) == {"req-0", "req-1", "req-2"}
+    events_by_rank = {}
+    for command in commands.values():
+        events_by_rank.setdefault(command.owner_id, []).append(
+            _receipt(
+                command.key,
+                command.owner_id,
+                command.command_seq,
+                runnable=32,
+            )
+        )
+    _apply_receipts(scheduler, reserve_step, events_by_rank)
+
+    # All three leases promote, but the global budget dispatches only req-0.
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"req-0": 32}
+    assert [data.req_id for data in first.scheduled_new_reqs] == ["req-0"]
+    assert scheduler._owner_pending_dispatch == {
+        "req-1": RequestStatus.WAITING,
+        "req-2": RequestStatus.WAITING,
+    }
+
+    # req-0 now needs an EXTEND.  req-1 receives its first positive budget
+    # one schedule later and must still be NewRequestData, never cached data.
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens == {"req-1": 32}
+    assert [data.req_id for data in second.scheduled_new_reqs] == ["req-1"]
+    assert second.scheduled_cached_reqs.req_ids == []
+    assert [command.key.request_id for command in second.owner_commands] == ["req-0"]
+    assert scheduler._owner_pending_dispatch == {
+        "req-2": RequestStatus.WAITING,
+    }
 
 
 def test_command_only_extend_step_excludes_payload_and_leases() -> None:

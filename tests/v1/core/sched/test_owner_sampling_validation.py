@@ -180,7 +180,7 @@ def _make_scheduler(
     scheduler._owner_emitted_command_seq = {}
     scheduler._owner_outbox = []
     scheduler._owner_token_plans = {}
-    scheduler._owner_promoted = {}
+    scheduler._owner_pending_dispatch = {}
     scheduler._init_request_owned_control_plane()
     return scheduler
 

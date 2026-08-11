@@ -396,10 +396,12 @@ class Scheduler(SchedulerInterface):
         # Internal per-step RUNNING token plans (never dispatched for
         # execution; see _schedule_request_owned).
         self._owner_token_plans: dict[str, int] = {}
-        # request_id -> status BEFORE promotion this step (WAITING = first
-        # dispatch, PREEMPTED = resumed); filled by the admission pass so
-        # the payload can classify first dispatch vs cached/resumed.
-        self._owner_promoted: dict[str, RequestStatus] = {}
+        # request_id -> status before promotion whose corresponding worker
+        # dispatch has not happened yet (WAITING = first dispatch,
+        # PREEMPTED = resumed).  This is deliberately persistent across
+        # schedule() calls: admission can promote more requests than the
+        # global token budget can dispatch in that step.
+        self._owner_pending_dispatch: dict[str, RequestStatus] = {}
         # Global rank -> latest worker-confirmed physical pool snapshot
         # (block-ID-free), empty until the first non-None receipt envelope.
         self._owner_pool_snapshots: dict[int, OwnerCachePoolSnapshot] = {}
@@ -2501,8 +2503,6 @@ class Scheduler(SchedulerInterface):
 
         scheduled_timestamp = time.monotonic()
         self._owner_token_plans = {}
-        self._owner_promoted = {}
-
         if self._pause_state != PauseState.PAUSED_ALL:
             self._owner_admission_pass(scheduled_timestamp)
             self._owner_running_pass()
@@ -2519,18 +2519,21 @@ class Scheduler(SchedulerInterface):
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
-        # Classify first dispatch vs cached/resumed exactly: requests
-        # promoted this step from WAITING are first dispatch, from PREEMPTED
-        # are resumed; the remaining scheduled RUNNING requests are ordinary
-        # continuations.
+        # Classify first dispatch vs cached/resumed exactly.  A promotion is
+        # not a dispatch: when the global token budget is exhausted, the
+        # pending marker survives until a later positive-token step.
         first_dispatch: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
-        for request_id, prior_status in self._owner_promoted.items():
+        dispatched_pending_ids: set[str] = set()
+        for request_id, prior_status in self._owner_pending_dispatch.items():
             if self._owner_token_plans.get(request_id, 0) <= 0:
                 continue
             request = self.requests.get(request_id)
-            if request is None:
-                continue
+            if request is None or request.status is not RequestStatus.RUNNING:
+                raise RuntimeError(
+                    "request-owned pending dispatch must name a live RUNNING "
+                    f"request, got {request_id!r}."
+                )
             if prior_status is RequestStatus.WAITING:
                 first_dispatch.append(request)
             elif prior_status is RequestStatus.PREEMPTED:
@@ -2540,10 +2543,11 @@ class Scheduler(SchedulerInterface):
                     "request-owned promotion requires WAITING or PREEMPTED "
                     f"prior status, got {prior_status}"
                 )
+            dispatched_pending_ids.add(request_id)
         scheduled_running_reqs = [
             request
             for request in self.running
-            if request.request_id not in self._owner_promoted
+            if request.request_id not in self._owner_pending_dispatch
             and num_scheduled_tokens.get(request.request_id, 0) > 0
         ]
 
@@ -2564,6 +2568,8 @@ class Scheduler(SchedulerInterface):
             scheduled_resumed_reqs,
             num_scheduled_tokens,
         )
+        for request_id in dispatched_pending_ids:
+            del self._owner_pending_dispatch[request_id]
 
         # Record the request ids scheduled in this step (MRV1-only), so the
         # worker-side persistent batch can skip re-propagating their full
@@ -2974,9 +2980,13 @@ class Scheduler(SchedulerInterface):
         assert coordinator is not None
         request.attention_owner = coordinator.owner_of(key)
         request.attention_owner_epoch = key.owner_epoch
-        # G3: remember whether this promotion is a first dispatch (WAITING)
-        # or a resume (PREEMPTED) so the payload classifies exactly.
-        self._owner_promoted[request.request_id] = request.status
+        # G3: remember whether this promotion still owes its first dispatch
+        # or resume payload.  Preserve a pending WAITING marker if an
+        # undispatched request was preempted before receiving token budget:
+        # no worker has state for it yet, so it still needs NewRequestData.
+        prior = self._owner_pending_dispatch.get(request.request_id)
+        if prior is not RequestStatus.WAITING:
+            self._owner_pending_dispatch[request.request_id] = request.status
         request.status = RequestStatus.RUNNING
         self.running.append(request)
         self._inflight_prefills.discard(request)
@@ -3033,6 +3043,7 @@ class Scheduler(SchedulerInterface):
         if coordinator is None:
             return
         request_id = request.request_id
+        self._owner_pending_dispatch.pop(request_id, None)
         key = self._owner_key.get(request_id)
         if key is None or coordinator.owner_of(key) is None:
             return
