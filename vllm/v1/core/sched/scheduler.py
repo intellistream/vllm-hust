@@ -49,6 +49,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.owner_layout import GlobalRowId
+from vllm.v1.core.sched.owner_layout_probe import OwnerLayoutProbe
 from vllm.v1.core.sched.ownership import (
     EpochFenceError,
     OwnerAdmissionStatus,
@@ -405,8 +406,20 @@ class Scheduler(SchedulerInterface):
         # True once any rank published a physical snapshot; afterwards every
         # step must re-publish one per rank (no silent stale physical facts).
         self._owner_pool_snapshot_seen = False
+        self._owner_layout_probe: OwnerLayoutProbe | None = None
+        if (
+            OwnerLayoutProbe.requested()
+            and not self.scheduler_config.enable_request_owned_attention
+        ):
+            raise RuntimeError(
+                "request-owner layout probe requires "
+                "enable_request_owned_attention=true"
+            )
         if self.scheduler_config.enable_request_owned_attention:
             self._init_request_owned_control_plane()
+            self._owner_layout_probe = OwnerLayoutProbe.from_env(
+                world_size=self.parallel_config.world_size
+            )
 
     def _should_get_num_common_prefix_blocks(self) -> bool:
         device_config = getattr(self.vllm_config, "device_config", None)
@@ -2564,6 +2577,13 @@ class Scheduler(SchedulerInterface):
         # un-receipted grants for a scheduled key fail closed here.
         scheduled_keys = {self._owner_key[req_id] for req_id in num_scheduled_tokens}
         scheduled_owner_leases = coordinator.publish(self.current_step, scheduled_keys)
+        owner_layout_probe = getattr(self, "_owner_layout_probe", None)
+        if owner_layout_probe is not None:
+            owner_layout_probe.record_step(
+                step_seq=self.current_step,
+                leases=scheduled_owner_leases,
+                num_scheduled_tokens=num_scheduled_tokens,
+            )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
