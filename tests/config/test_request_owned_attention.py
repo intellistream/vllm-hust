@@ -64,6 +64,7 @@ def _active_kv_transfer_config() -> KVTransferConfig:
 def _vllm_config(
     *,
     enable_request_owned_attention: bool = True,
+    enable_request_owned_q_wkv_fanin: bool = False,
     enable_request_owned_graph: bool = False,
     scheduler_config: SchedulerConfig | None = None,
     compilation_config: CompilationConfig | None = None,
@@ -85,6 +86,7 @@ def _vllm_config(
         scheduler_config=scheduler_config
         or SchedulerConfig.default_factory(
             enable_request_owned_attention=enable_request_owned_attention,
+            enable_request_owned_q_wkv_fanin=enable_request_owned_q_wkv_fanin,
             enable_request_owned_graph=enable_request_owned_graph,
             async_scheduling=async_scheduling,
         ),
@@ -99,8 +101,10 @@ def _vllm_config(
 
 def test_request_owned_attention_defaults_off():
     assert SchedulerConfig.default_factory().enable_request_owned_attention is False
+    assert SchedulerConfig.default_factory().enable_request_owned_q_wkv_fanin is False
     assert SchedulerConfig.default_factory().enable_request_owned_graph is False
     assert VllmConfig().scheduler_config.enable_request_owned_attention is False
+    assert VllmConfig().scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert VllmConfig().scheduler_config.enable_request_owned_graph is False
 
 
@@ -225,6 +229,29 @@ def test_graph_opt_in_requires_request_owned_attention():
                 cudagraph_mode=CUDAGraphMode.PIECEWISE,
             ),
         )
+
+
+def test_q_wkv_fanin_opt_in_requires_request_owned_attention():
+    with pytest.raises(
+        ValueError, match="requires enable_request_owned_attention=True"
+    ):
+        _vllm_config(
+            enable_request_owned_attention=False,
+            enable_request_owned_q_wkv_fanin=True,
+        )
+
+
+def test_q_wkv_fanin_opt_in_constructs_in_request_owned_envelope():
+    vllm_config = _vllm_config(enable_request_owned_q_wkv_fanin=True)
+    assert vllm_config.scheduler_config.enable_request_owned_q_wkv_fanin is True
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_request_owned_q_wkv_fanin_gate_is_strict_bool(value):
+    with pytest.raises(
+        ValueError, match="enable_request_owned_q_wkv_fanin must be a bool"
+    ):
+        SchedulerConfig.default_factory(enable_request_owned_q_wkv_fanin=value)
 
 
 def test_graph_opt_in_accepts_only_piecewise_compile_lane():

@@ -175,6 +175,16 @@ class SchedulerConfig:
     Q/KV/O routing path is connected; unsupported features are rejected by
     ``VllmConfig`` validation."""
 
+    enable_request_owned_q_wkv_fanin: bool = False
+    """Experimental fused Q/latent-KV owner fan-in for request-owned attention.
+
+    Defaults to False. When enabled, the Ascend request-owned DSA leaf
+    replaces its separate E1 Q and E2 latent-KV all-to-owner exchanges plus
+    owner-side concatenations with one native fused communication operator.
+    ``VllmConfig`` requires ``enable_request_owned_attention=True``. The flag
+    changes the attention execution path and is therefore included in
+    :meth:`compute_hash`."""
+
     enable_request_owned_sampling: bool = False
     """Experimental request-owned sampling transport (G3).
 
@@ -265,6 +275,7 @@ class SchedulerConfig:
         # (per-request attention) when enabled, which changes the structure of
         # the computation graph (attention kernel selection and shapes).
         factors.append(self.enable_request_owned_attention)
+        factors.append(self.enable_request_owned_q_wkv_fanin)
         factors.append(self.enable_request_owned_graph)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
@@ -300,6 +311,17 @@ class SchedulerConfig:
             return value
         raise ValueError(
             "enable_request_owned_graph must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
+
+    @field_validator("enable_request_owned_q_wkv_fanin", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_q_wkv_fanin(cls, value: Any) -> Any:
+        """Keep the native fused fan-in behind an exact bool opt-in."""
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_q_wkv_fanin must be a bool, got "
             f"{type(value).__name__} ({value!r})."
         )
 

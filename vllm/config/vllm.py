@@ -2182,6 +2182,17 @@ class VllmConfig:
         relaxed here.
         """
         request_owned_graph = self.scheduler_config.enable_request_owned_graph
+        request_owned_q_wkv_fanin = (
+            self.scheduler_config.enable_request_owned_q_wkv_fanin
+        )
+        if (
+            request_owned_q_wkv_fanin
+            and not self.scheduler_config.enable_request_owned_attention
+        ):
+            raise ValueError(
+                "enable_request_owned_q_wkv_fanin=True requires "
+                "enable_request_owned_attention=True."
+            )
         if (
             request_owned_graph
             and not self.scheduler_config.enable_request_owned_attention

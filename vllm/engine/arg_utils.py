@@ -713,6 +713,9 @@ class EngineArgs:
     enable_request_owned_attention: bool = (
         SchedulerConfig.enable_request_owned_attention
     )
+    enable_request_owned_q_wkv_fanin: bool = (
+        SchedulerConfig.enable_request_owned_q_wkv_fanin
+    )
     enable_request_owned_sampling: bool = SchedulerConfig.enable_request_owned_sampling
     enable_request_owned_graph: bool = SchedulerConfig.enable_request_owned_graph
 
@@ -1474,6 +1477,10 @@ class EngineArgs:
             **scheduler_kwargs["enable_request_owned_attention"],
         )
         scheduler_group.add_argument(
+            "--enable-request-owned-q-wkv-fanin",
+            **scheduler_kwargs["enable_request_owned_q_wkv_fanin"],
+        )
+        scheduler_group.add_argument(
             "--enable-request-owned-sampling",
             **scheduler_kwargs["enable_request_owned_sampling"],
         )
@@ -2182,6 +2189,7 @@ class EngineArgs:
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
             enable_request_owned_attention=self.enable_request_owned_attention,
+            enable_request_owned_q_wkv_fanin=self.enable_request_owned_q_wkv_fanin,
             enable_request_owned_sampling=self.enable_request_owned_sampling,
             enable_request_owned_graph=self.enable_request_owned_graph,
         )

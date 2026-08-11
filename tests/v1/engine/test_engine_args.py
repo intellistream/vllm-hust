@@ -152,11 +152,13 @@ def test_request_owned_flags_default_false():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     engine_args = EngineArgs.from_cli_args(args=parser.parse_args([]))
     assert engine_args.enable_request_owned_attention is False
+    assert engine_args.enable_request_owned_q_wkv_fanin is False
     assert engine_args.enable_request_owned_sampling is False
     assert engine_args.enable_request_owned_graph is False
 
     vllm_config = engine_args.create_engine_config()
     assert vllm_config.scheduler_config.enable_request_owned_attention is False
+    assert vllm_config.scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert vllm_config.scheduler_config.enable_request_owned_sampling is False
     assert vllm_config.scheduler_config.enable_request_owned_graph is False
 
@@ -178,11 +180,13 @@ def test_request_owned_attention_flag_propagates_independently(monkeypatch):
     )
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_request_owned_attention is True
+    assert engine_args.enable_request_owned_q_wkv_fanin is False
     assert engine_args.enable_request_owned_sampling is False
     assert engine_args.enable_request_owned_graph is False
 
     vllm_config = engine_args.create_engine_config()
     assert vllm_config.scheduler_config.enable_request_owned_attention is True
+    assert vllm_config.scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert vllm_config.scheduler_config.enable_request_owned_sampling is False
     assert vllm_config.scheduler_config.enable_request_owned_graph is False
 
@@ -205,6 +209,29 @@ def test_request_owned_sampling_flag_propagates_independently():
 
     with pytest.raises(ValueError, match="enable_request_owned_attention=True"):
         engine_args.create_engine_config()
+
+
+def test_request_owned_q_wkv_fanin_cli_reaches_scheduler_config(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--enforce-eager",
+            "--no-enable-prefix-caching",
+            "--no-async-scheduling",
+            "--enable-request-owned-attention",
+            "--enable-request-owned-q-wkv-fanin",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_attention is True
+    assert engine_args.enable_request_owned_q_wkv_fanin is True
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_attention is True
+    assert vllm_config.scheduler_config.enable_request_owned_q_wkv_fanin is True
 
 
 def test_request_owned_flags_together_reach_scheduler_config(monkeypatch):
