@@ -7,10 +7,13 @@ CURRENT_SUBMISSION_DIR=${CURRENT_SUBMISSION_DIR:?CURRENT_SUBMISSION_DIR is requi
 VLLM_HUST_REPO_DIR=${VLLM_HUST_REPO_DIR:-${VLLM_HUST_REPO:-$BENCHMARK_REPO_DIR/../vllm-hust}}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 SNAPSHOT_TARGET_BRANCH=${SNAPSHOT_TARGET_BRANCH:-main}
+SNAPSHOT_EXPECTED_BASE_SHA=${SNAPSHOT_EXPECTED_BASE_SHA:-}
 SNAPSHOT_OUTPUT_DIR=${SNAPSHOT_OUTPUT_DIR:-$BENCHMARK_REPO_DIR/leaderboard-data/snapshots}
 LOCAL_SNAPSHOT_OUTPUT_DIR=${LOCAL_SNAPSHOT_OUTPUT_DIR:-}
 SNAPSHOT_MAX_PUSH_ATTEMPTS=${SNAPSHOT_MAX_PUSH_ATTEMPTS:-4}
 SNAPSHOT_PUSH_RETRY_SECONDS=${SNAPSHOT_PUSH_RETRY_SECONDS:-5}
+SNAPSHOT_MAX_FETCH_ATTEMPTS=${SNAPSHOT_MAX_FETCH_ATTEMPTS:-4}
+SNAPSHOT_FETCH_RETRY_SECONDS=${SNAPSHOT_FETCH_RETRY_SECONDS:-5}
 SNAPSHOT_COMMIT_MESSAGE=${SNAPSHOT_COMMIT_MESSAGE:-chore(data): sync benchmark publication}
 GIT_COMMITTER_NAME=${GIT_COMMITTER_NAME:-vLLM-HUST Benchmark Bot}
 GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL:-benchmark-bot@vllm-hust.local}
@@ -19,7 +22,14 @@ BENCHMARK_REPO_SLUG=${BENCHMARK_REPO_SLUG:-vLLM-HUST/vllm-hust-benchmark}
 BENCHMARK_REPO_GH_TOKEN=${BENCHMARK_REPO_GH_TOKEN:-}
 BENCHMARK_REPO_SSH_KEY=${BENCHMARK_REPO_SSH_KEY:-}
 
-required_submission_files=(leaderboard_manifest.json run_leaderboard.json STATUS)
+required_submission_files=(
+  leaderboard_manifest.json
+  run_leaderboard.json
+  env-manifest.json
+  pip-packages.json
+  checksums.sha256
+  STATUS
+)
 required_snapshot_files=(
   leaderboard_single.json
   leaderboard_multi.json
@@ -34,6 +44,48 @@ write_github_env() {
     printf '%s=%s\n' "$key" "$value" >>"$GITHUB_ENV"
   fi
 }
+
+validate_fetch_retry_configuration() {
+  case "$SNAPSHOT_MAX_FETCH_ATTEMPTS" in
+    ''|*[!0-9]*|0*)
+      echo "SNAPSHOT_MAX_FETCH_ATTEMPTS must be a positive integer" >&2
+      return 2
+      ;;
+  esac
+  case "$SNAPSHOT_FETCH_RETRY_SECONDS" in
+    ''|*[!0-9]*)
+      echo "SNAPSHOT_FETCH_RETRY_SECONDS must be a non-negative integer" >&2
+      return 2
+      ;;
+  esac
+}
+
+fetch_target_branch_with_retry() {
+  local phase=$1
+  local attempt=1
+
+  while (( attempt <= SNAPSHOT_MAX_FETCH_ATTEMPTS )); do
+    if git -C "$BENCHMARK_REPO_DIR" fetch \
+      "$BENCHMARK_REPO_REMOTE" "$SNAPSHOT_TARGET_BRANCH"; then
+      return 0
+    fi
+    if (( attempt == SNAPSHOT_MAX_FETCH_ATTEMPTS )); then
+      echo "benchmark publication ${phase} fetch failed after ${SNAPSHOT_MAX_FETCH_ATTEMPTS} attempts" >&2
+      return 1
+    fi
+    echo "benchmark publication ${phase} fetch failed; retrying ${BENCHMARK_REPO_REMOTE}/${SNAPSHOT_TARGET_BRANCH} in ${SNAPSHOT_FETCH_RETRY_SECONDS}s (attempt $attempt/$SNAPSHOT_MAX_FETCH_ATTEMPTS)" >&2
+    sleep "$SNAPSHOT_FETCH_RETRY_SECONDS"
+    attempt=$((attempt + 1))
+  done
+}
+
+validate_fetch_retry_configuration
+
+if [[ -n "$SNAPSHOT_EXPECTED_BASE_SHA" \
+  && ! "$SNAPSHOT_EXPECTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "SNAPSHOT_EXPECTED_BASE_SHA must be a full lowercase Git SHA" >&2
+  exit 2
+fi
 
 configure_push_remote() {
   local remote_url=
@@ -100,9 +152,9 @@ publication_staging_dir=$(mktemp -d "$BENCHMARK_REPO_DIR/.snapshot-publication.X
 staged_submission_dir="$publication_staging_dir/submissions"
 staged_snapshot_dir="$publication_staging_dir/snapshots"
 
+# Invoked indirectly by the EXIT trap below.
+# shellcheck disable=SC2317,SC2329
 cleanup_publication_staging() {
-  # Invoked indirectly by the EXIT trap below.
-  # shellcheck disable=SC2317
   rm -rf "$publication_staging_dir"
 }
 trap cleanup_publication_staging EXIT
@@ -121,8 +173,18 @@ export VLLM_HUST_WEBSITE_REPO="$WEBSITE_REPO_DIR"
 export VLLM_HUST_REPO="$VLLM_HUST_REPO_DIR"
 
 prepare_publication_commit() {
+  local fetched_target_sha
+
   reset_publication_staging || return $?
-  git -C "$BENCHMARK_REPO_DIR" fetch "$BENCHMARK_REPO_REMOTE" "$SNAPSHOT_TARGET_BRANCH" || return $?
+  fetch_target_branch_with_retry prepare || return $?
+  if [[ -n "$SNAPSHOT_EXPECTED_BASE_SHA" ]]; then
+    fetched_target_sha=$(git -C "$BENCHMARK_REPO_DIR" rev-parse \
+      "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH") || return $?
+    if [[ "$fetched_target_sha" != "$SNAPSHOT_EXPECTED_BASE_SHA" ]]; then
+      echo "benchmark publication base moved: expected $SNAPSHOT_EXPECTED_BASE_SHA, got $fetched_target_sha" >&2
+      return 2
+    fi
+  fi
   git -C "$BENCHMARK_REPO_DIR" checkout -B "$SNAPSHOT_TARGET_BRANCH" "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH" || return $?
 
   mkdir -p "$staged_submission_dir" || return $?
@@ -151,7 +213,15 @@ prepare_publication_commit() {
     return 2
   fi
   if ! PYTHONPATH="$BENCHMARK_REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
-    "$PYTHON_BIN" -m vllm_hust_benchmark.cli validate-trend --input "$staged_snapshot_dir"; then
+    "$PYTHON_BIN" - "$staged_snapshot_dir" <<'PY'
+import sys
+from pathlib import Path
+
+from vllm_hust_benchmark.integration import validate_public_snapshot_trend_admission
+
+validate_public_snapshot_trend_admission(Path(sys.argv[1]))
+PY
+  then
     echo "publication admission failed at trend validation" >&2
     return 2
   fi
@@ -189,7 +259,7 @@ verify_published_benchmark_repo_state() {
   local verified_commit
   local file_name
 
-  git -C "$BENCHMARK_REPO_DIR" fetch "$BENCHMARK_REPO_REMOTE" "$SNAPSHOT_TARGET_BRANCH" || return $?
+  fetch_target_branch_with_retry verify || return $?
   verified_commit=$(git -C "$BENCHMARK_REPO_DIR" rev-parse "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH") || return $?
   if [[ "$verified_commit" != "$expected_commit" ]]; then
     echo "benchmark publication verification failed: expected $expected_commit, got $verified_commit" >&2
@@ -221,16 +291,22 @@ for attempt in $(seq 1 "$SNAPSHOT_MAX_PUSH_ATTEMPTS"); do
   if prepare_publication_commit; then
     snapshot_commit=$(git -C "$BENCHMARK_REPO_DIR" rev-parse HEAD)
     if git -C "$BENCHMARK_REPO_DIR" push "$BENCHMARK_REPO_REMOTE" "HEAD:$SNAPSHOT_TARGET_BRANCH"; then
-      verify_published_benchmark_repo_state "$snapshot_commit"
-      echo "Pushed benchmark publication to ${BENCHMARK_REPO_SLUG}@${SNAPSHOT_TARGET_BRANCH}: $snapshot_commit"
-      echo "Submission path: $relative_submission_dir"
-      echo "Snapshot path: $relative_snapshot_dir"
       write_github_env GITHUB_SNAPSHOT_SYNC_STATUS pushed
       write_github_env GITHUB_SNAPSHOT_SYNC_COMMIT "$snapshot_commit"
       write_github_env GITHUB_SNAPSHOT_SYNC_REPO "$BENCHMARK_REPO_SLUG"
       write_github_env GITHUB_SNAPSHOT_SYNC_BRANCH "$SNAPSHOT_TARGET_BRANCH"
       write_github_env GITHUB_SNAPSHOT_SYNC_SUBMISSION_PATH "$relative_submission_dir"
       write_github_env GITHUB_SNAPSHOT_SYNC_SNAPSHOT_PATH "$relative_snapshot_dir"
+      if verify_published_benchmark_repo_state "$snapshot_commit"; then
+        echo "Pushed benchmark publication to ${BENCHMARK_REPO_SLUG}@${SNAPSHOT_TARGET_BRANCH}: $snapshot_commit"
+        echo "Submission path: $relative_submission_dir"
+        echo "Snapshot path: $relative_snapshot_dir"
+      else
+        verification_status=$?
+        write_github_env GITHUB_SNAPSHOT_SYNC_VERIFICATION failed
+        echo "benchmark publication push succeeded, but verification failed for $snapshot_commit" >&2
+        exit "$verification_status"
+      fi
       exit 0
     fi
 
