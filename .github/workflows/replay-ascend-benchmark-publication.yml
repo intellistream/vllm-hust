@@ -26,6 +26,7 @@ jobs:
       # operator-supplied; changing any identity requires a new reviewed commit.
       SOURCE_RUN_ID: "31004708110"
       SOURCE_RUN_ATTEMPT: "1"
+      EXPECTED_SOURCE_JOB_ID: "92301693209"
       EXPECTED_TARGET_SHA: "4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0"
       EXPECTED_BENCHMARK_MAIN_SHA: "734f3fc3cc7a809889ac1780a1fd980e98226cef"
       REPLAY_CONFIRMATION: ${{ inputs.confirmation }}
@@ -53,27 +54,46 @@ jobs:
           path: vllm-hust-benchmark
           persist-credentials: false
 
-      - name: Verify approved source run metadata
+      - name: Set up validation Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify approved source run, job, and artifact metadata
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_json=$(curl --fail --silent --show-error \
+          source_metadata_dir=$(mktemp -d "${RUNNER_TEMP}/replay-source.XXXXXX")
+          trap 'rm -rf "$source_metadata_dir"' EXIT
+          curl --fail --silent --show-error \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")
-          jq -e \
-            --arg expected_sha "$EXPECTED_TARGET_SHA" \
-            --arg expected_attempt "$SOURCE_RUN_ATTEMPT" \
-            '(.path == ".github/workflows/ascend-benchmark-leaderboard.yml")
-             and (.event == "push")
-             and (.head_branch == "main")
-             and (.head_sha == $expected_sha)
-             and ((.run_attempt | tostring) == $expected_attempt)
-             and (.status == "completed")
-             and (.conclusion == "success")' \
-            <<<"$run_json" >/dev/null
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+            > "$source_metadata_dir/run.json"
+          curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100" \
+            > "$source_metadata_dir/jobs.json"
+          curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" \
+            > "$source_metadata_dir/artifacts.json"
+          env -u GH_TOKEN python3 \
+            .github/workflows/scripts/verify_replay_source_run.py \
+            --run-json "$source_metadata_dir/run.json" \
+            --jobs-json "$source_metadata_dir/jobs.json" \
+            --artifacts-json "$source_metadata_dir/artifacts.json" \
+            --source-run-id "$SOURCE_RUN_ID" \
+            --source-run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --source-job-id "$EXPECTED_SOURCE_JOB_ID" \
+            --expected-target-sha "$EXPECTED_TARGET_SHA" \
+            --expected-artifact-name "ascend-benchmark-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
 
       - name: Checkout pinned website aggregator
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -91,11 +111,6 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: 31004708110
-
-      - name: Set up validation Python
-        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
-        with:
-          python-version: "3.12"
 
       - name: Install publication validation dependency
         run: python -m pip install --disable-pip-version-check jsonschema==4.23.0

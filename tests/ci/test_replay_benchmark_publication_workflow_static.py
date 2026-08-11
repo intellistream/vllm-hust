@@ -48,6 +48,7 @@ def test_replay_workflow_downloads_exact_source_run_artifact() -> None:
     assert "confirmation:" in text
     assert 'SOURCE_RUN_ID: "31004708110"' in text
     assert 'SOURCE_RUN_ATTEMPT: "1"' in text
+    assert 'EXPECTED_SOURCE_JOB_ID: "92301693209"' in text
     assert 'EXPECTED_TARGET_SHA: "4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0"' in text
     assert (
         'EXPECTED_BENCHMARK_MAIN_SHA: "734f3fc3cc7a809889ac1780a1fd980e98226cef"'
@@ -61,21 +62,22 @@ def test_replay_workflow_downloads_exact_source_run_artifact() -> None:
     assert "repository: ${{ github.repository }}" in text
 
 
-def test_replay_workflow_verifies_source_run_before_download() -> None:
+def test_replay_workflow_verifies_source_run_job_and_artifact_before_download() -> None:
     text = workflow_text()
 
-    verify_start = text.index("      - name: Verify approved source run metadata")
+    verify_start = text.index(
+        "      - name: Verify approved source run, job, and artifact metadata"
+    )
     download_start = text.index("      - name: Download immutable source artifact")
     verify_block = text[verify_start:download_start]
 
     assert "actions/runs/${SOURCE_RUN_ID}" in verify_block
-    assert '".github/workflows/ascend-benchmark-leaderboard.yml"' in verify_block
-    assert '"push"' in verify_block
-    assert '"main"' in verify_block
-    assert ".head_sha == $expected_sha" in verify_block
-    assert ".run_attempt | tostring" in verify_block
-    assert '.status == "completed"' in verify_block
-    assert '.conclusion == "success"' in verify_block
+    assert "actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100" in verify_block
+    assert "actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" in verify_block
+    assert "verify_replay_source_run.py" in verify_block
+    assert '--source-job-id "$EXPECTED_SOURCE_JOB_ID"' in verify_block
+    assert "env -u GH_TOKEN python3" in verify_block
+    assert '.conclusion == "success"' not in verify_block
 
 
 def test_writer_secret_is_scoped_to_publish_step() -> None:
