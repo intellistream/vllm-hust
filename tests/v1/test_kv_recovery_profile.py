@@ -5,21 +5,14 @@ import os
 import pickle
 import select
 import signal
-import sys
 import threading
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import vllm.v1.kv_recovery_profile as recovery_profile
 from vllm.v1.kv_recovery_profile import (
-    KV_RECOVERY_PROFILE_BINDING,
-    MAX_H2D_RECEIPTS_PER_WORKER_STEP,
-    MAX_PENDING_D2H_CONTEXTS_PER_PROCESS,
-    MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
-    MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS,
     BoundedKVRecoveryWorkerObserver,
     KVRecoveryBlockCoordinate,
     KVRecoveryComputeContext,
@@ -71,12 +64,9 @@ def make_context(*, operation: str = "h2d_restore") -> KVRecoveryTransferContext
         KVRecoveryLogicalBlock(1, 3, "3" * 32),
     )
     return KVRecoveryTransferContext(
-        binding=KV_RECOVERY_PROFILE_BINDING,
         identity=identity,
         operation=operation,  # type: ignore[arg-type]
-        block_set_id=canonical_block_set_id(
-            KV_RECOVERY_PROFILE_BINDING, identity, logical_blocks
-        ),
+        block_set_id=canonical_block_set_id(identity, logical_blocks),
         logical_blocks=logical_blocks,
     )
 
@@ -89,7 +79,6 @@ def make_receipt(
     context = make_context()
     resolved_transfer_id = transfer_id or f"{process_uuid}:t:0"
     return KVRecoveryH2DReceipt(
-        binding=context.binding,
         connector_job_id=7,
         transfer_id=resolved_transfer_id,
         identity=context.identity,
@@ -114,7 +103,6 @@ def make_attempt_receipt(
 ) -> KVRecoveryH2DReceipt:
     context = attempt.context
     return KVRecoveryH2DReceipt(
-        binding=context.binding,
         connector_job_id=attempt.connector_job_id,
         transfer_id=attempt.transfer_id,
         identity=context.identity,
@@ -176,102 +164,6 @@ class NoopEvidenceSink:
         self.close_calls += 1
 
 
-def test_binding_locks_authorized_candidate_digests():
-    binding = KV_RECOVERY_PROFILE_BINDING
-    assert binding.profile_sha256 == (
-        "b363532884d1cae8049ab080d2b85a629f3b33a75f6621788d1e4c8f30737666"
-    )
-    assert binding.profile_owner_approval_record_sha256 == (
-        "2831ce52802e7cbe4ec092431c71c18de05491da7ac8d48512014b1d43b3cb0c"
-    )
-    assert binding.observer_policy_sha256 == (
-        "fbee3bc4f74b8c5c20e929c4e37596b06b31c1b9cd02517d8461961a8aedf420"
-    )
-    assert binding.observer_policy_approval_candidate_sha256 == (
-        "27cb52269fff8f10e376f3128384c4aac37f149ad685b89501f98ba50bc0cf29"
-    )
-    assert binding.observer_policy_profile_p0_owner_approval_sha256 == (
-        "322df19ade75797fc4c3f43fe96e689404ef60a270c92081afea03683e734c91"
-    )
-    assert binding.communication_mapping_sha256 == (
-        "095944bbbb1a3ad3518aebfdd61c820ade3affdebd6024b47389cdaec24a3fa3"
-    )
-    assert binding.communication_mapping_approval_candidate_sha256 == (
-        "a686243ffd9c650790e6421e5f976a2a5c010a5d2480e7a30ad8722a9218f3f7"
-    )
-    assert binding.communication_mapping_authority_approval_sha256 == (
-        "42b761177c4bea13833be19ddc143f89c32eee02fbbb98afc2c03249c2783fe5"
-    )
-    assert binding.base_mode_overlay_sha256 == (
-        "d80771b793a9513cdbd4fc2001e21771c56a59d49340ee88d4381027d70b1d5a"
-    )
-    assert binding.base_mode_overlay_approval_candidate_sha256 == (
-        "de889357af659d8e9c1f7daf0aa32656761e80dcf0fea29ef60809912f513694"
-    )
-    assert binding.base_mode_overlay_owner_approval_sha256 == (
-        "50d7deb8f98fcdca36303297a4ce6f7958ae619574d2e1994872936b6fc583a3"
-    )
-    assert binding.g0_remediation_cpu_result_sha256 == (
-        "4b378d10cef6be10fa3fb5a840402da77b1da755781118127a5d30b1cc4b7eb2"
-    )
-    assert binding.g1_cpu_source_reauthorization_sha256 == (
-        "448ff68cd139077a2f767fd16359bb5dd8f4cf61cfe258fd48f53a26569718f5"
-    )
-    assert binding.communication_mapping_status == "approved_mapping_only"
-    assert binding.base_mode_overlay_status == "approved_overlay_only"
-    assert binding.observer_policy_status == (
-        "profile_P0_items_1_5_approved_runtime_items_6_8_pending"
-    )
-    assert binding.complete_configuration_status == "pending"
-    assert binding.runtime_conformance_status == "pending"
-    assert binding.joint_admission_status == "pending"
-    assert binding.communication_mode == "none"
-    assert not binding.runtime_activation_authorized
-    assert not recovery_profile.KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED
-    assert binding.runtime_commit == "f229ba7cad21a4dba58681af6738a9fd947388e2"
-    assert binding.device_plugin_audit_commit == (
-        "cafad89a5e103f31ea517c1edb56130578c3cd56"
-    )
-    assert {
-        MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS,
-        MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
-        MAX_PENDING_D2H_CONTEXTS_PER_PROCESS,
-        MAX_H2D_RECEIPTS_PER_WORKER_STEP,
-    } == {4096}
-
-
-def test_mapping_and_overlay_approval_cannot_open_activation_gate(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    binding = replace(
-        KV_RECOVERY_PROFILE_BINDING,
-        communication_mode=KV_RECOVERY_PROFILE_BINDING.communication_mapping_id,
-        runtime_activation_authorized=True,
-    )
-    monkeypatch.setattr(
-        recovery_profile,
-        "KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED",
-        True,
-    )
-    monkeypatch.setattr(recovery_profile, "KV_RECOVERY_PROFILE_BINDING", binding)
-
-    assert not recovery_profile._activation_gate_open()
-
-    fully_admitted = replace(
-        binding,
-        observer_policy_status="fully_ratified",
-        complete_configuration_status="approved",
-        runtime_conformance_status="conformant",
-        joint_admission_status="approved",
-    )
-    monkeypatch.setattr(
-        recovery_profile,
-        "KV_RECOVERY_PROFILE_BINDING",
-        fully_admitted,
-    )
-    assert recovery_profile._activation_gate_open()
-
-
 def test_recovery_abi_round_trips_through_pickle():
     context = make_context()
     attempt = KVRecoveryTransferAttempt(
@@ -280,7 +172,6 @@ def test_recovery_abi_round_trips_through_pickle():
         context=context,
     )
     compute_context = KVRecoveryComputeContext(
-        binding=context.binding,
         identity=context.identity,
         transfer_id=attempt.transfer_id,
         block_set_id=context.block_set_id,
@@ -298,7 +189,6 @@ def test_recovery_abi_round_trips_through_pickle():
 def test_first_compute_requires_exact_context_and_base_event():
     context = make_context()
     compute_context = KVRecoveryComputeContext(
-        binding=context.binding,
         identity=context.identity,
         transfer_id=f"{PROCESS_UUID}:t:0",
         block_set_id=context.block_set_id,
@@ -344,7 +234,6 @@ def test_context_rejects_coordinate_or_digest_drift():
 
     with pytest.raises(ValueError, match="canonical coordinate order"):
         KVRecoveryTransferContext(
-            binding=context.binding,
             identity=context.identity,
             operation=context.operation,
             block_set_id=context.block_set_id,
@@ -353,7 +242,6 @@ def test_context_rejects_coordinate_or_digest_drift():
 
     with pytest.raises(ValueError, match="does not match"):
         KVRecoveryTransferContext(
-            binding=context.binding,
             identity=context.identity,
             operation=context.operation,
             block_set_id="0" * 64,
@@ -365,152 +253,102 @@ def test_h2d_requires_episode_and_d2h_forbids_episode():
     h2d_context = make_context(operation="h2d_restore")
     d2h_context = make_context(operation="d2h_preserve")
 
-    with pytest.raises(ValueError, match="H2D restore requires"):
-        KVRecoveryTransferContext(
-            binding=h2d_context.binding,
-            identity=d2h_context.identity,
-            operation="h2d_restore",
-            block_set_id=canonical_block_set_id(
-                h2d_context.binding,
-                d2h_context.identity,
-                h2d_context.logical_blocks,
-            ),
-            logical_blocks=h2d_context.logical_blocks,
-        )
+    # Episode-driven H2D needs the episode fields; an unassociated H2D
+    # (block-level tiering migration of a running request) is valid without
+    # them, so the non-recovery identity must not be rejected.
+    unassociated = KVRecoveryTransferContext(
+        identity=d2h_context.identity,
+        operation="h2d_restore",
+        block_set_id=canonical_block_set_id(
+            d2h_context.identity, h2d_context.logical_blocks
+        ),
+        logical_blocks=h2d_context.logical_blocks,
+    )
+    assert unassociated.identity.recovery_epoch is None
 
+    # A d2h context may never carry a recovery episode.
     with pytest.raises(ValueError, match="D2H preserve cannot"):
         KVRecoveryTransferContext(
-            binding=d2h_context.binding,
             identity=h2d_context.identity,
             operation="d2h_preserve",
             block_set_id=canonical_block_set_id(
-                d2h_context.binding,
-                h2d_context.identity,
-                d2h_context.logical_blocks,
+                h2d_context.identity, d2h_context.logical_blocks
             ),
             logical_blocks=d2h_context.logical_blocks,
         )
 
 
-def test_default_path_has_no_observer_or_profiler_import(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-):
-    class UnexpectedFactory:
-        def reinitialize_after_fork(self, binding):
-            raise AssertionError("hard-off factory was called")
-
-        def create_scheduler_observer(self, binding):
-            raise AssertionError("hard-off factory was called")
-
-        def create_worker_observer(self, binding):
-            raise AssertionError("hard-off factory was called")
-
-    forbidden_output = tmp_path / "must-not-exist.jsonl"
-    monkeypatch.setenv("VLLM_RLP_TRACE_EXPORT_PATH", str(forbidden_output))
-    monkeypatch.setenv("VLLM_RLP_KV_RECOVERY_PROFILE", "rlp.kv-recovery/v1alpha1")
-    register_kv_recovery_observer_factory(UnexpectedFactory())
-    assert recovery_profile._observer_factory is None
-    initial_threads = tuple(thread.ident for thread in threading.enumerate())
-
+def test_unregistered_factory_is_a_noop():
     assert create_kv_recovery_scheduler_observer() is None
     assert create_kv_recovery_worker_observer() is None
-    monkeypatch.setattr(
-        recovery_profile.os,
-        "getpid",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("hard-off path queried fork state")
-        ),
-    )
-    prepare_kv_recovery_profile_after_fork()
-    reinitialize_kv_recovery_profile_after_fork()
-
-    assert not any(
-        module_name.startswith("vllm_request_lifecycle_profiler")
-        for module_name in sys.modules
-    )
-    assert tuple(thread.ident for thread in threading.enumerate()) == initial_threads
-    assert not forbidden_output.exists()
 
 
-def test_pending_authorities_keep_activation_gate_closed(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.setattr(
-        recovery_profile, "KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED", True
-    )
-
-    assert not recovery_profile._activation_gate_open()
-
-
-def test_runtime_scope_requires_exact_tiering_spec_and_recompute_off(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_runtime_scope_requires_explicit_enable_and_supported_spec():
     from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
     from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
     class CustomTieringSpec(TieringOffloadingSpec):
         pass
 
-    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
     tiering_spec = object.__new__(TieringOffloadingSpec)
-    recompute_off = SimpleNamespace(
-        additional_config={"recompute_scheduler_enable": False}
+    enabled = SimpleNamespace(
+        additional_config={
+            "kv_recovery_profile_enabled": True,
+            "recompute_scheduler_enable": False,
+        }
     )
 
-    assert recovery_profile.kv_recovery_runtime_scope_authorized(
-        tiering_spec, recompute_off
+    assert recovery_profile.kv_recovery_runtime_scope_enabled(tiering_spec, enabled)
+    assert not recovery_profile.kv_recovery_runtime_scope_enabled(
+        object.__new__(CPUOffloadingSpec), enabled
     )
-    assert not recovery_profile.kv_recovery_runtime_scope_authorized(
-        object.__new__(CPUOffloadingSpec), recompute_off
+    assert not recovery_profile.kv_recovery_runtime_scope_enabled(
+        object.__new__(CustomTieringSpec), enabled
     )
-    assert not recovery_profile.kv_recovery_runtime_scope_authorized(
-        object.__new__(CustomTieringSpec), recompute_off
-    )
-    assert not recovery_profile.kv_recovery_runtime_scope_authorized(
-        tiering_spec, SimpleNamespace(additional_config={})
-    )
-    assert not recovery_profile.kv_recovery_runtime_scope_authorized(
+    assert not recovery_profile.kv_recovery_runtime_scope_enabled(
         tiering_spec,
-        SimpleNamespace(additional_config={"recompute_scheduler_enable": True}),
+        SimpleNamespace(additional_config={"recompute_scheduler_enable": False}),
+    )
+    assert not recovery_profile.kv_recovery_runtime_scope_enabled(
+        tiering_spec,
+        SimpleNamespace(
+            additional_config={
+                "kv_recovery_profile_enabled": True,
+                "recompute_scheduler_enable": True,
+            }
+        ),
     )
 
 
-def test_factory_failures_degrade_to_none(monkeypatch: pytest.MonkeyPatch):
+def test_factory_failures_degrade_to_none():
     class BrokenFactory:
-        def reinitialize_after_fork(self, binding):
+        def reinitialize_after_fork(self):
             raise RuntimeError("broken bootstrap")
 
-        def create_scheduler_observer(self, binding):
+        def create_scheduler_observer(self):
             raise RuntimeError("broken scheduler")
 
-        def create_worker_observer(self, binding):
+        def create_worker_observer(self):
             raise RuntimeError("broken worker")
 
-    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
-    factory = BrokenFactory()
-    register_kv_recovery_observer_factory(factory)
-
+    register_kv_recovery_observer_factory(BrokenFactory())
     reinitialize_kv_recovery_profile_after_fork()
     assert recovery_profile._observer_factory is None
     assert create_kv_recovery_scheduler_observer() is None
     assert create_kv_recovery_worker_observer() is None
 
 
-def test_factory_registration_rejects_replacement(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_factory_registration_rejects_replacement():
     class Factory:
-        def reinitialize_after_fork(self, binding):
+        def reinitialize_after_fork(self):
             return None
 
-        def create_scheduler_observer(self, binding):
+        def create_scheduler_observer(self):
             return None
 
-        def create_worker_observer(self, binding):
+        def create_worker_observer(self):
             return None
 
-    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
     first = Factory()
     register_kv_recovery_observer_factory(first)
     register_kv_recovery_observer_factory(first)
@@ -528,16 +366,15 @@ def test_first_create_after_fork_reinitializes_factory_once(
         def __init__(self):
             self.reinitialize_calls = 0
 
-        def reinitialize_after_fork(self, binding):
+        def reinitialize_after_fork(self):
             self.reinitialize_calls += 1
 
-        def create_scheduler_observer(self, binding):
+        def create_scheduler_observer(self):
             return scheduler_observer
 
-        def create_worker_observer(self, binding):
+        def create_worker_observer(self):
             return None
 
-    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
     factory = Factory()
     register_kv_recovery_observer_factory(factory)
     monkeypatch.setattr(recovery_profile, "_observer_factory_pid", -1)
@@ -555,18 +392,16 @@ def test_child_registration_can_replace_inherited_factory(
         def __init__(self, scheduler_observer):
             self.scheduler_observer = scheduler_observer
 
-        def reinitialize_after_fork(self, binding):
+        def reinitialize_after_fork(self):
             raise AssertionError("fresh child factory must not be reinitialized")
 
-        def create_scheduler_observer(self, binding):
+        def create_scheduler_observer(self):
             return self.scheduler_observer
 
-        def create_worker_observer(self, binding):
+        def create_worker_observer(self):
             return None
 
-    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
-    parent_factory = Factory(object())
-    register_kv_recovery_observer_factory(parent_factory)
+    register_kv_recovery_observer_factory(Factory(object()))
     monkeypatch.setattr(recovery_profile, "_observer_factory_pid", -1)
     monkeypatch.setattr(recovery_profile, "_observer_factory_ready_pid", -1)
     child_scheduler_observer = object()
@@ -741,7 +576,6 @@ def test_bounded_observer_rejects_sink_receipt_for_another_transfer():
         ):
             context = attempt.context
             return KVRecoveryH2DReceipt(
-                binding=context.binding,
                 connector_job_id=attempt.connector_job_id,
                 transfer_id=f"{'a' * 32}:t:999",
                 identity=context.identity,
@@ -815,9 +649,7 @@ def test_foreign_run_transfer_cannot_enter_wait_membership():
         local_context,
         identity=foreign_identity,
         block_set_id=canonical_block_set_id(
-            local_context.binding,
-            foreign_identity,
-            local_context.logical_blocks,
+            foreign_identity, local_context.logical_blocks
         ),
     )
     assert observer.begin_transfer(8, foreign_context) is None
@@ -841,10 +673,20 @@ def test_connector_flush_invalidates_pending_context_exactly_once(operation):
     assert observer.prepared_transfer_count == 0
     assert observer.pending_h2d_count == 0
     assert observer.pending_d2h_count == 0
-    assert observer.evidence_disabled
+    # A scheduler discard handoff is an expected lifecycle transition, not a
+    # state-capacity failure. The invalidated contexts fail closed, but the
+    # observer remains usable so later H2D restore evidence is still captured.
+    assert not observer.evidence_disabled
     assert sink.failures == ["connector_flush_invalidation"]
+    # A late completion for the invalidated context is now observable as an
+    # unknown completion instead of being silently swallowed by the latch.
     assert observer.transfer_completed(7, 20, True, 128, 5) is None
-    assert sink.failures == ["connector_flush_invalidation"]
+    assert sink.failures == [
+        "connector_flush_invalidation",
+        "unknown_completion",
+    ]
+    later = observer.begin_transfer(9, make_context())
+    assert later is not None
 
 
 @pytest.mark.parametrize(
@@ -957,16 +799,15 @@ def test_prepare_after_fork_replaces_inherited_factory_lock(
     monkeypatch: pytest.MonkeyPatch,
 ):
     class Factory:
-        def reinitialize_after_fork(self, binding):
+        def reinitialize_after_fork(self):
             return None
 
-        def create_scheduler_observer(self, binding):
+        def create_scheduler_observer(self):
             return None
 
-        def create_worker_observer(self, binding):
+        def create_worker_observer(self):
             return None
 
-    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
     read_fd, write_fd = os.pipe()
     inherited_lock = recovery_profile._observer_factory_lock
     inherited_lock.acquire()

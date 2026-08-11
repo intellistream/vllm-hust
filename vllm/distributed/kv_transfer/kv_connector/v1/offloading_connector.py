@@ -43,7 +43,7 @@ from vllm.v1.kv_recovery_profile import (
     KVRecoveryRequeueReason,
     create_kv_recovery_scheduler_observer,
     create_kv_recovery_worker_observer,
-    kv_recovery_runtime_scope_authorized,
+    kv_recovery_runtime_scope_enabled,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -63,9 +63,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
 
         spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
-        kv_recovery_scope_authorized = kv_recovery_runtime_scope_authorized(
-            spec, vllm_config
-        )
+        kv_recovery_scope_enabled = kv_recovery_runtime_scope_enabled(spec, vllm_config)
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
@@ -74,7 +72,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                 spec,
                 kv_recovery_observer=(
                     create_kv_recovery_scheduler_observer()
-                    if kv_recovery_scope_authorized
+                    if kv_recovery_scope_enabled
                     else None
                 ),
             )
@@ -83,7 +81,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                 spec,
                 kv_recovery_observer=(
                     create_kv_recovery_worker_observer()
-                    if kv_recovery_scope_authorized
+                    if kv_recovery_scope_enabled
                     else None
                 ),
             )

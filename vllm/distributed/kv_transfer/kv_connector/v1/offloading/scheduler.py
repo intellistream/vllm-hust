@@ -422,6 +422,13 @@ class OffloadingConnectorScheduler:
     ) -> KVRecoveryTransferContext | None:
         observer = self._kv_recovery_observer
         if observer is None or not coordinates:
+            logger.debug(
+                "KV-recovery %s context skipped for %s (observer=%s, coordinates=%s)",
+                operation,
+                req_id,
+                observer is not None,
+                None if coordinates is None else len(coordinates),
+            )
             return None
         canonical_coordinates = tuple(sorted(coordinates))
         try:
@@ -741,6 +748,10 @@ class OffloadingConnectorScheduler:
             offloading_context=offloading_context,
         )
         self._req_status[request.request_id] = req_status
+        observer = self._kv_recovery_observer
+        if observer is not None:
+            with suppress(Exception):
+                observer.request_started(request.request_id)
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -1227,8 +1238,15 @@ class OffloadingConnectorScheduler:
                     assert (
                         self._current_batch_kv_recovery_jobs_to_invalidate is not None
                     )
+                    # A preemption abandons in-flight loads, but in-flight
+                    # stores are the D2H evidence that makes a later H2D
+                    # restore observable. Preserve store contexts so the
+                    # recovery chain that follows the preemption stays intact.
                     self._current_batch_kv_recovery_jobs_to_invalidate.update(
-                        req_status.transfer_jobs
+                        job_id
+                        for job_id in req_status.transfer_jobs
+                        if not (job_status := self._jobs.get(job_id))
+                        or not job_status.is_store
                     )
                     with suppress(Exception):
                         observer.request_preempted(
@@ -1238,6 +1256,7 @@ class OffloadingConnectorScheduler:
 
         admitted_recovery_epochs: dict[ReqId, int] = {}
         admitted_compute_kinds: dict[ReqId, KVRecoveryComputeKind] = {}
+        admitted_prompt_counts: dict[ReqId, tuple[int, int]] = {}
         if observer is not None:
             resumed_req_ids = set(
                 scheduler_output.scheduled_cached_reqs.resumed_req_ids
@@ -1265,11 +1284,39 @@ class OffloadingConnectorScheduler:
                         < req_status.req.num_prompt_tokens
                         else "decode"
                     )
+                    admitted_prompt_counts[req_id] = (
+                        req_status.req.num_prompt_tokens,
+                        req_status.req.num_computed_tokens,
+                    )
                     with suppress(Exception):
                         observer.request_admission_started(
                             req_id,
                             recovery_epoch,
                         )
+
+            for (
+                req_id,
+                scheduled_tokens,
+            ) in scheduler_output.num_scheduled_tokens.items():
+                if req_id in admitted_recovery_epochs:
+                    continue
+                req_status = self._req_status.get(req_id)
+                if req_status is None:
+                    continue
+                compute_kind: KVRecoveryComputeKind = (
+                    "prefill"
+                    if req_status.req.num_computed_tokens
+                    < req_status.req.num_prompt_tokens
+                    else "decode"
+                )
+                with suppress(Exception):
+                    observer.request_scheduled(
+                        req_id,
+                        compute_kind,
+                        scheduled_tokens,
+                        req_status.req.num_prompt_tokens,
+                        req_status.req.num_computed_tokens,
+                    )
 
         self._update_req_states(scheduler_output)
 
@@ -1283,6 +1330,7 @@ class OffloadingConnectorScheduler:
                         req_id,
                         recovery_epoch,
                         admitted_compute_kinds[req_id],
+                        *admitted_prompt_counts[req_id],
                     )
                     if (
                         isinstance(context, KVRecoveryComputeContext)

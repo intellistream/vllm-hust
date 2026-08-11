@@ -21,7 +21,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingWorkerMetadata,
 )
 from vllm.v1.kv_recovery_profile import (
-    KV_RECOVERY_PROFILE_BINDING,
     KVRecoveryComputeContext,
     KVRecoveryH2DReceipt,
     KVRecoveryIdentity,
@@ -52,6 +51,20 @@ class RecordingSchedulerObserver:
         self.receipt_ready_request_ids: set[str] = set()
         self.reset_thresholds: list[int] = []
         self.closed = False
+
+    def request_started(self, runtime_request_id):
+        return None
+
+    def request_scheduled(
+        self,
+        runtime_request_id,
+        compute_kind,
+        scheduled_tokens,
+        prompt_tokens_total,
+        prompt_tokens_cached,
+    ):
+        del prompt_tokens_cached
+        return None
 
     def request_preempted(self, runtime_request_id, recovery_epoch):
         self.preemptions.append((runtime_request_id, recovery_epoch))
@@ -95,12 +108,9 @@ class RecordingSchedulerObserver:
             for coordinate in coordinates
         )
         context = KVRecoveryTransferContext(
-            binding=KV_RECOVERY_PROFILE_BINDING,
             identity=identity,
             operation=operation,
-            block_set_id=canonical_block_set_id(
-                KV_RECOVERY_PROFILE_BINDING, identity, logical_blocks
-            ),
+            block_set_id=canonical_block_set_id(identity, logical_blocks),
             logical_blocks=logical_blocks,
         )
         self.contexts.append(context)
@@ -124,7 +134,15 @@ class RecordingSchedulerObserver:
             ("admission_started", runtime_request_id, recovery_epoch)
         )
 
-    def request_admitted(self, runtime_request_id, recovery_epoch, compute_kind):
+    def request_admitted(
+        self,
+        runtime_request_id,
+        recovery_epoch,
+        compute_kind,
+        prompt_tokens_total,
+        prompt_tokens_cached,
+    ):
+        del prompt_tokens_total, prompt_tokens_cached
         self.admissions.append((runtime_request_id, recovery_epoch, compute_kind))
         self.runtime_events.append(("admitted", runtime_request_id, recovery_epoch))
         receipt = next(
@@ -134,7 +152,6 @@ class RecordingSchedulerObserver:
             if receipt.identity.runtime_request_id == runtime_request_id
         )
         return KVRecoveryComputeContext(
-            binding=receipt.binding,
             identity=receipt.identity,
             transfer_id=receipt.transfer_id,
             block_set_id=receipt.block_set_id,
@@ -205,7 +222,6 @@ class RecordingWorkerObserver:
         ):
             return None
         return KVRecoveryH2DReceipt(
-            binding=attempt.context.binding,
             connector_job_id=connector_job_id,
             transfer_id=attempt.transfer_id,
             identity=attempt.context.identity,
@@ -257,15 +273,13 @@ class RecordingFactory:
         self.scheduler = RecordingSchedulerObserver()
         self.worker = RecordingWorkerObserver()
 
-    def reinitialize_after_fork(self, binding):
-        assert binding == KV_RECOVERY_PROFILE_BINDING
+    def reinitialize_after_fork(self):
+        return None
 
-    def create_scheduler_observer(self, binding):
-        assert binding == KV_RECOVERY_PROFILE_BINDING
+    def create_scheduler_observer(self):
         return self.scheduler
 
-    def create_worker_observer(self, binding):
-        assert binding == KV_RECOVERY_PROFILE_BINDING
+    def create_worker_observer(self):
         return self.worker
 
 
@@ -273,10 +287,9 @@ def enable_test_observer_factory(
     monkeypatch: pytest.MonkeyPatch,
     factory: RecordingFactory,
 ) -> None:
-    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
     monkeypatch.setattr(
         offloading_connector_module,
-        "kv_recovery_runtime_scope_authorized",
+        "kv_recovery_runtime_scope_enabled",
         lambda *args: True,
     )
     monkeypatch.setattr(recovery_profile, "_observer_factory", factory)
@@ -287,7 +300,6 @@ def make_receipt(
     connector_job_id: int,
 ) -> KVRecoveryH2DReceipt:
     return KVRecoveryH2DReceipt(
-        binding=context.binding,
         connector_job_id=connector_job_id,
         transfer_id=f"{'a' * 32}:t:{connector_job_id}",
         identity=context.identity,
@@ -401,15 +413,17 @@ def test_pressure_preemption_preserves_identity_through_real_connector_path(
     assert factory.scheduler.preemptions == [(runtime_request_id, 1)]
     assert factory.scheduler.admission_starts == [(runtime_request_id, 1)]
     assert factory.scheduler.admissions == [(runtime_request_id, 1, "decode")]
+    # In-flight stores are the D2H evidence for the recovery that follows a
+    # preemption, so the scheduler preserves them (only abandoned loads are
+    # discarded). The flush fence still waits for the store data to land.
     flushed_transfer_job_ids = frozenset({0, 1})
-    assert factory.worker.invalidations == [flushed_transfer_job_ids]
+    assert factory.worker.invalidations == []
     assert factory.worker.wait_invalidation_events == [
         ("prepare_wait", flushed_transfer_job_ids),
         (
             "wait_completed",
             tuple(f"{'a' * 32}:t:{transfer_seq}" for transfer_seq in range(2)),
         ),
-        ("invalidate", flushed_transfer_job_ids),
     ]
     connector_worker = runner.worker_connector.connector_worker
     assert connector_worker is not None

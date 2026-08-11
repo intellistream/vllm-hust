@@ -84,6 +84,13 @@ class ActiveKVConnector(KVConnector):
     ) -> None:
         if self._disabled:
             return
+        from vllm.logger import init_logger
+
+        logger = init_logger(__name__)
+        logger.debug(
+            "KV-recovery model-runner observe called, scheduled=%s",
+            sorted(scheduler_output.num_scheduled_tokens),
+        )
         self.kv_connector.observe_kv_recovery_first_compute(
             scheduler_output.num_scheduled_tokens,
         )

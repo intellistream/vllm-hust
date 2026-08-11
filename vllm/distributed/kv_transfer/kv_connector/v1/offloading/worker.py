@@ -255,7 +255,6 @@ class OffloadingConnectorWorker:
                 context.operation != "h2d_restore"
                 or receipt.connector_job_id != job_id
                 or receipt.transfer_id != attempt.transfer_id
-                or receipt.binding != context.binding
                 or receipt.identity != context.identity
                 or receipt.block_set_id != context.block_set_id
                 or receipt.timestamp_ns != timestamp_ns
@@ -548,6 +547,10 @@ class OffloadingConnectorWorker:
             self._kv_recovery_compute_contexts = dict(
                 metadata.kv_recovery_compute_contexts or {}
             )
+            logger.debug(
+                "KV-recovery start_kv_transfers compute_contexts=%s",
+                sorted(self._kv_recovery_compute_contexts),
+            )
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
@@ -594,14 +597,27 @@ class OffloadingConnectorWorker:
             return
         pending = tuple(contexts.items())
         contexts.clear()
+        logger.debug(
+            "KV-recovery first_compute observe: contexts=%s scheduled=%s",
+            sorted(k for k, _ in pending),
+            sorted(scheduled_request_ids),
+        )
         for runtime_request_id, context in pending:
             if (
                 runtime_request_id not in scheduled_request_ids
                 or context.identity.runtime_request_id != runtime_request_id
             ):
+                logger.debug(
+                    "KV-recovery first_compute NOT observed for %s (in_scheduled=%s)",
+                    runtime_request_id,
+                    runtime_request_id in scheduled_request_ids,
+                )
                 with suppress(Exception):
                     observer.first_compute_not_observed(context)
                 continue
+            logger.debug(
+                "KV-recovery first_compute observed for %s", runtime_request_id
+            )
             with suppress(Exception):
                 observer.first_compute(context, timestamp_ns)
 

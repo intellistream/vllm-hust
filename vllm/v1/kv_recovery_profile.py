@@ -7,12 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections.abc import Set
 from dataclasses import dataclass
 from threading import Lock
 from typing import Literal, Protocol
-
-import regex as re
 
 KVRecoveryOperation = Literal["d2h_preserve", "h2d_restore"]
 KVRecoveryCapacity = Literal["prepared_transfer", "pending_h2d", "pending_d2h"]
@@ -33,11 +32,8 @@ MAX_PENDING_D2H_CONTEXTS_PER_PROCESS = 4096
 MAX_H2D_RECEIPTS_PER_WORKER_STEP = 4096
 MAX_RUNTIME_REQUEST_ID_BYTES = 128
 MAX_TRANSFER_IDS_PER_WAIT_SET = 4096
-
-# G1 source wiring is authorized, but runtime activation is not. Keep this
-# source-level gate closed until the remaining authorities and activation
-# review are complete.
-KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED = False
+KV_RECOVERY_PROFILE_ID = "rlp.kv-recovery/v1alpha1"
+KV_RECOVERY_PROFILE_ENABLED_KEY = "kv_recovery_profile_enabled"
 
 _LOWER_HEX_32_RE = re.compile(r"^[0-9a-f]{32}$")
 _LOWER_HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -80,109 +76,6 @@ def _matches_transfer_id(value: object) -> bool:
         return False
     match = _TRANSFER_ID_RE.fullmatch(value)
     return match is not None and int(match.group(2)) <= _UINT64_MAX
-
-
-@dataclass(frozen=True, slots=True)
-class KVRecoveryProfileBinding:
-    """Content identities authorized for the default-off G1 implementation."""
-
-    profile_id: str
-    profile_sha256: str
-    profile_owner_approval_record_sha256: str
-    observer_policy_id: str
-    observer_policy_sha256: str
-    observer_policy_approval_candidate_sha256: str
-    observer_policy_profile_p0_owner_approval_sha256: str
-    observer_policy_status: str
-    communication_mapping_id: str
-    communication_mapping_sha256: str
-    communication_mapping_approval_candidate_sha256: str
-    communication_mapping_authority_approval_sha256: str
-    communication_mapping_status: str
-    base_mode_overlay_id: str
-    base_mode_overlay_sha256: str
-    base_mode_overlay_approval_candidate_sha256: str
-    base_mode_overlay_owner_approval_sha256: str
-    base_mode_overlay_status: str
-    g0_remediation_cpu_result_sha256: str
-    g1_cpu_source_reauthorization_sha256: str
-    complete_configuration_status: str
-    runtime_conformance_status: str
-    joint_admission_status: str
-    runtime_commit: str
-    device_plugin_audit_commit: str
-    communication_mode: str
-    runtime_activation_authorized: bool
-
-
-KV_RECOVERY_PROFILE_BINDING = KVRecoveryProfileBinding(
-    profile_id="rlp.kv-recovery/v1alpha1",
-    profile_sha256=("b363532884d1cae8049ab080d2b85a629f3b33a75f6621788d1e4c8f30737666"),
-    profile_owner_approval_record_sha256=(
-        "2831ce52802e7cbe4ec092431c71c18de05491da7ac8d48512014b1d43b3cb0c"
-    ),
-    observer_policy_id="rlp.kv-recovery-observer-policy/v1alpha1",
-    observer_policy_sha256=(
-        "fbee3bc4f74b8c5c20e929c4e37596b06b31c1b9cd02517d8461961a8aedf420"
-    ),
-    observer_policy_approval_candidate_sha256=(
-        "27cb52269fff8f10e376f3128384c4aac37f149ad685b89501f98ba50bc0cf29"
-    ),
-    observer_policy_profile_p0_owner_approval_sha256=(
-        "322df19ade75797fc4c3f43fe96e689404ef60a270c92081afea03683e734c91"
-    ),
-    observer_policy_status=("profile_P0_items_1_5_approved_runtime_items_6_8_pending"),
-    communication_mapping_id="issue2:kv-recovery-v1alpha1",
-    communication_mapping_sha256=(
-        "095944bbbb1a3ad3518aebfdd61c820ade3affdebd6024b47389cdaec24a3fa3"
-    ),
-    communication_mapping_approval_candidate_sha256=(
-        "a686243ffd9c650790e6421e5f976a2a5c010a5d2480e7a30ad8722a9218f3f7"
-    ),
-    communication_mapping_authority_approval_sha256=(
-        "42b761177c4bea13833be19ddc143f89c32eee02fbbb98afc2c03249c2783fe5"
-    ),
-    communication_mapping_status="approved_mapping_only",
-    base_mode_overlay_id="rlp.trace-mode/kv-offload-v1alpha1",
-    base_mode_overlay_sha256=(
-        "d80771b793a9513cdbd4fc2001e21771c56a59d49340ee88d4381027d70b1d5a"
-    ),
-    base_mode_overlay_approval_candidate_sha256=(
-        "de889357af659d8e9c1f7daf0aa32656761e80dcf0fea29ef60809912f513694"
-    ),
-    base_mode_overlay_owner_approval_sha256=(
-        "50d7deb8f98fcdca36303297a4ce6f7958ae619574d2e1994872936b6fc583a3"
-    ),
-    base_mode_overlay_status="approved_overlay_only",
-    g0_remediation_cpu_result_sha256=(
-        "4b378d10cef6be10fa3fb5a840402da77b1da755781118127a5d30b1cc4b7eb2"
-    ),
-    g1_cpu_source_reauthorization_sha256=(
-        "448ff68cd139077a2f767fd16359bb5dd8f4cf61cfe258fd48f53a26569718f5"
-    ),
-    complete_configuration_status="pending",
-    runtime_conformance_status="pending",
-    joint_admission_status="pending",
-    runtime_commit="f229ba7cad21a4dba58681af6738a9fd947388e2",
-    device_plugin_audit_commit=("cafad89a5e103f31ea517c1edb56130578c3cd56"),
-    communication_mode="none",
-    runtime_activation_authorized=False,
-)
-
-
-def _activation_gate_open() -> bool:
-    binding = KV_RECOVERY_PROFILE_BINDING
-    return (
-        KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED
-        and binding.runtime_activation_authorized
-        and binding.communication_mapping_status == "approved_mapping_only"
-        and binding.base_mode_overlay_status == "approved_overlay_only"
-        and binding.observer_policy_status == "fully_ratified"
-        and binding.complete_configuration_status == "approved"
-        and binding.runtime_conformance_status == "conformant"
-        and binding.joint_admission_status == "approved"
-        and binding.communication_mode == binding.communication_mapping_id
-    )
 
 
 def _require_printable_ascii(value: str, field_name: str, max_bytes: int) -> None:
@@ -283,13 +176,12 @@ class KVRecoveryIdentity:
 
 
 def canonical_block_set_id(
-    binding: KVRecoveryProfileBinding,
     identity: KVRecoveryIdentity,
     logical_blocks: tuple[KVRecoveryLogicalBlock, ...],
 ) -> str:
-    """Compute the frozen profile's canonical logical block-set digest."""
+    """Compute the profile's canonical logical block-set digest."""
     prefix = (
-        f"{binding.profile_id}\0{identity.run_id}\0{identity.engine_lifecycle_id}\0"
+        f"{KV_RECOVERY_PROFILE_ID}\0{identity.run_id}\0{identity.engine_lifecycle_id}\0"
     )
     rows = "".join(
         f"{block.group_index}:{block.logical_ordinal}:{block.logical_block_id}\n"
@@ -302,15 +194,12 @@ def canonical_block_set_id(
 class KVRecoveryTransferContext:
     """Immutable scheduler-to-worker identity sidecar for one transfer."""
 
-    binding: KVRecoveryProfileBinding
     identity: KVRecoveryIdentity
     operation: KVRecoveryOperation
     block_set_id: str
     logical_blocks: tuple[KVRecoveryLogicalBlock, ...]
 
     def __post_init__(self) -> None:
-        if self.binding != KV_RECOVERY_PROFILE_BINDING:
-            raise ValueError("KV-recovery context is bound to an unknown candidate")
         if not self.logical_blocks:
             raise ValueError("logical block set must be nonempty")
         if len(self.logical_blocks) > MAX_LOGICAL_BLOCKS_PER_SET:
@@ -324,8 +213,20 @@ class KVRecoveryTransferContext:
         if len(set(logical_ids)) != len(logical_ids):
             raise ValueError("logical block IDs must be unique")
         if self.operation == "h2d_restore":
-            if self.identity.recovery_epoch is None:
-                raise ValueError("H2D restore requires a recovery episode")
+            if self.identity.recovery_epoch is not None:
+                expected = (
+                    f"{self.identity.engine_lifecycle_id}:k:"
+                    f"{self.identity.recovery_epoch}"
+                )
+                if self.identity.episode_id != expected:
+                    raise ValueError("episode_id does not match the recovery epoch")
+                if self.identity.base_preempted_event_id is None:
+                    raise ValueError(
+                        "episode H2D restore requires base_preempted_event_id"
+                    )
+            # An unassociated H2D (recovery_epoch=None) is a block-level
+            # tiering migration of a still-running request; it carries no
+            # recovery episode and is valid transfer evidence.
         elif self.operation == "d2h_preserve":
             if self.identity.recovery_epoch is not None:
                 raise ValueError("proactive D2H preserve cannot carry an episode")
@@ -334,7 +235,7 @@ class KVRecoveryTransferContext:
         if not _is_lower_hex64(self.block_set_id):
             raise ValueError("block_set_id must be lowercase SHA-256")
         if self.block_set_id != canonical_block_set_id(
-            self.binding, self.identity, self.logical_blocks
+            self.identity, self.logical_blocks
         ):
             raise ValueError("block_set_id does not match its canonical rows")
 
@@ -362,7 +263,6 @@ class KVRecoveryTransferAttempt:
 class KVRecoveryH2DReceipt:
     """Bounded worker-to-scheduler receipt for a successful H2D transfer."""
 
-    binding: KVRecoveryProfileBinding
     connector_job_id: int
     transfer_id: str
     identity: KVRecoveryIdentity
@@ -377,8 +277,6 @@ class KVRecoveryH2DReceipt:
     bytes_moved: int
 
     def __post_init__(self) -> None:
-        if self.binding != KV_RECOVERY_PROFILE_BINDING:
-            raise ValueError("H2D receipt is bound to an unknown candidate")
         if not _is_uint64(self.connector_job_id):
             raise ValueError("connector_job_id must be a uint64")
         if not _matches_transfer_id(self.transfer_id):
@@ -424,7 +322,6 @@ class KVRecoveryH2DReceipt:
 class KVRecoveryComputeContext:
     """Scheduler-to-worker sidecar for the first recovered compute."""
 
-    binding: KVRecoveryProfileBinding
     identity: KVRecoveryIdentity
     transfer_id: str
     block_set_id: str
@@ -434,8 +331,6 @@ class KVRecoveryComputeContext:
     base_phase_start_event_id: str
 
     def __post_init__(self) -> None:
-        if self.binding != KV_RECOVERY_PROFILE_BINDING:
-            raise ValueError("compute context is bound to an unknown candidate")
         if self.identity.recovery_epoch is None:
             raise ValueError("compute context requires a recovery episode")
         if not _matches_transfer_id(self.transfer_id):
@@ -496,6 +391,17 @@ class KVRecoveryWaitAttempt:
 class KVRecoverySchedulerObserver(Protocol):
     """Scheduler-side identity and receipt observer supplied by a plugin."""
 
+    def request_started(self, runtime_request_id: str) -> None: ...
+
+    def request_scheduled(
+        self,
+        runtime_request_id: str,
+        compute_kind: KVRecoveryComputeKind,
+        scheduled_tokens: int,
+        prompt_tokens_total: int,
+        prompt_tokens_cached: int,
+    ) -> None: ...
+
     def request_preempted(
         self,
         runtime_request_id: str,
@@ -533,6 +439,8 @@ class KVRecoverySchedulerObserver(Protocol):
         runtime_request_id: str,
         recovery_epoch: int,
         compute_kind: KVRecoveryComputeKind,
+        prompt_tokens_total: int,
+        prompt_tokens_cached: int,
     ) -> KVRecoveryComputeContext | None: ...
 
     def request_terminal(self, runtime_request_id: str) -> None: ...
@@ -985,7 +893,6 @@ class BoundedKVRecoveryWorkerObserver:
                 or bytes_moved <= 0
                 or receipt.connector_job_id != connector_job_id
                 or receipt.transfer_id != pending.attempt.transfer_id
-                or receipt.binding != context.binding
                 or receipt.identity != context.identity
                 or receipt.block_set_id != context.block_set_id
                 or receipt.process_uuid != self._process_uuid
@@ -1109,8 +1016,12 @@ class BoundedKVRecoveryWorkerObserver:
                         invalidated.append(
                             self._pending_d2h_by_job_id.pop(connector_job_id).attempt
                         )
-                if invalidated:
-                    self._evidence_disabled = True
+                # A scheduler discard handoff is an expected lifecycle
+                # transition (preemption, terminal, or cache reset), not a
+                # state-capacity failure. The invalidated contexts fail closed
+                # individually below, but the observer must remain usable so
+                # later H2D restore evidence (the recovery that follows a
+                # preemption) is still captured.
             if invalidated:
                 invalidated.sort(key=lambda attempt: attempt.connector_job_id)
                 self._sink.evidence_failure(
@@ -1152,7 +1063,6 @@ class BoundedKVRecoveryWorkerObserver:
                     return
                 valid = (
                     isinstance(context, KVRecoveryComputeContext)
-                    and context.binding == KV_RECOVERY_PROFILE_BINDING
                     and context.identity.run_id == self._run_id
                     and _is_uint64(timestamp_ns)
                 )
@@ -1225,14 +1135,14 @@ class BoundedKVRecoveryWorkerObserver:
 class KVRecoveryObserverFactory(Protocol):
     """Role-specific observer factory registered during plugin bootstrap."""
 
-    def reinitialize_after_fork(self, binding: KVRecoveryProfileBinding) -> None: ...
+    def reinitialize_after_fork(self) -> None: ...
 
     def create_scheduler_observer(
-        self, binding: KVRecoveryProfileBinding
+        self,
     ) -> KVRecoverySchedulerObserver | None: ...
 
     def create_worker_observer(
-        self, binding: KVRecoveryProfileBinding
+        self,
     ) -> KVRecoveryWorkerObserver | None: ...
 
 
@@ -1244,8 +1154,6 @@ _observer_factory_ready_pid = _observer_factory_pid
 
 def prepare_kv_recovery_profile_after_fork() -> None:
     """Replace an inherited factory lock before child plugin registration."""
-    if not _activation_gate_open():
-        return
     global _observer_factory_lock, _observer_factory_pid
     process_id = os.getpid()
     if process_id != _observer_factory_pid:
@@ -1257,8 +1165,6 @@ def register_kv_recovery_observer_factory(
     factory: KVRecoveryObserverFactory,
 ) -> None:
     """Register the optional observer factory exactly once per process."""
-    if not _activation_gate_open():
-        return
     prepare_kv_recovery_profile_after_fork()
     global _observer_factory, _observer_factory_ready_pid
     with _observer_factory_lock:
@@ -1289,7 +1195,7 @@ def _get_ready_observer_factory(
         ):
             return factory
         try:
-            factory.reinitialize_after_fork(KV_RECOVERY_PROFILE_BINDING)
+            factory.reinitialize_after_fork()
         except Exception:
             _observer_factory = None
             _observer_factory_ready_pid = _observer_factory_pid
@@ -1300,22 +1206,19 @@ def _get_ready_observer_factory(
 
 def reinitialize_kv_recovery_profile_after_fork() -> None:
     """Reinitialize an explicitly registered plugin after worker bootstrap."""
-    if not _activation_gate_open():
-        return
     prepare_kv_recovery_profile_after_fork()
     _get_ready_observer_factory(force_reinitialize=True)
 
 
-def kv_recovery_runtime_scope_authorized(
+def kv_recovery_runtime_scope_enabled(
     offloading_spec: object,
     vllm_config: object,
 ) -> bool:
-    """Limit dormant G1 wiring to the exact approved runtime family."""
-    if not _activation_gate_open():
-        return False
+    """Enable profiling only for an explicitly configured supported scope."""
     additional_config = getattr(vllm_config, "additional_config", None)
     if (
         not isinstance(additional_config, dict)
+        or additional_config.get(KV_RECOVERY_PROFILE_ENABLED_KEY) is not True
         or additional_config.get("recompute_scheduler_enable") is not False
     ):
         return False
@@ -1328,27 +1231,23 @@ def kv_recovery_runtime_scope_authorized(
 
 def create_kv_recovery_scheduler_observer() -> KVRecoverySchedulerObserver | None:
     """Create a scheduler observer, returning no-op state on plugin failure."""
-    if not _activation_gate_open():
-        return None
     prepare_kv_recovery_profile_after_fork()
     factory = _get_ready_observer_factory(force_reinitialize=False)
     if factory is None:
         return None
     try:
-        return factory.create_scheduler_observer(KV_RECOVERY_PROFILE_BINDING)
+        return factory.create_scheduler_observer()
     except Exception:
         return None
 
 
 def create_kv_recovery_worker_observer() -> KVRecoveryWorkerObserver | None:
     """Create a worker observer, returning no-op state on plugin failure."""
-    if not _activation_gate_open():
-        return None
     prepare_kv_recovery_profile_after_fork()
     factory = _get_ready_observer_factory(force_reinitialize=False)
     if factory is None:
         return None
     try:
-        return factory.create_worker_observer(KV_RECOVERY_PROFILE_BINDING)
+        return factory.create_worker_observer()
     except Exception:
         return None

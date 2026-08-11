@@ -9,7 +9,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     TransferStats,
 )
 from vllm.v1.kv_recovery_profile import (
-    KV_RECOVERY_PROFILE_BINDING,
     MAX_H2D_RECEIPTS_PER_WORKER_STEP,
     KVRecoveryH2DReceipt,
     KVRecoveryIdentity,
@@ -32,7 +31,6 @@ def make_receipt(job_id: int = 42) -> KVRecoveryH2DReceipt:
         preempt_profile_record_id=f"{'b' * 32}:k:0",
     )
     return KVRecoveryH2DReceipt(
-        binding=KV_RECOVERY_PROFILE_BINDING,
         connector_job_id=job_id,
         transfer_id=f"{'a' * 32}:t:{job_id}",
         identity=identity,

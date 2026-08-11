@@ -22,7 +22,6 @@ from vllm.v1.kv_offload.base import (
     TransferResult,
 )
 from vllm.v1.kv_recovery_profile import (
-    KV_RECOVERY_PROFILE_BINDING,
     MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
     MAX_TRANSFER_IDS_PER_WAIT_SET,
     BoundedKVRecoveryWorkerObserver,
@@ -146,7 +145,6 @@ class RecordingObserver:
         ):
             return None
         return KVRecoveryH2DReceipt(
-            binding=attempt.context.binding,
             connector_job_id=connector_job_id,
             transfer_id=attempt.transfer_id,
             identity=attempt.context.identity,
@@ -237,7 +235,6 @@ class RecordingEvidenceSink:
         ):
             return None
         return KVRecoveryH2DReceipt(
-            binding=attempt.context.binding,
             connector_job_id=attempt.connector_job_id,
             transfer_id=attempt.transfer_id,
             identity=attempt.context.identity,
@@ -301,12 +298,9 @@ def make_context(operation: str) -> KVRecoveryTransferContext:
     )
     logical_blocks = (KVRecoveryLogicalBlock(0, 0, "b" * 32),)
     return KVRecoveryTransferContext(
-        binding=KV_RECOVERY_PROFILE_BINDING,
         identity=identity,
         operation=operation,  # type: ignore[arg-type]
-        block_set_id=canonical_block_set_id(
-            KV_RECOVERY_PROFILE_BINDING, identity, logical_blocks
-        ),
+        block_set_id=canonical_block_set_id(identity, logical_blocks),
         logical_blocks=logical_blocks,
     )
 
@@ -322,7 +316,6 @@ def make_load_job() -> TransferJob:
 def make_compute_context() -> KVRecoveryComputeContext:
     transfer_context = make_context("h2d_restore")
     return KVRecoveryComputeContext(
-        binding=transfer_context.binding,
         identity=transfer_context.identity,
         transfer_id=f"{'a' * 32}:t:0",
         block_set_id=transfer_context.block_set_id,
@@ -965,7 +958,14 @@ def test_bounded_observer_wait_precedes_explicit_discard_invalidation():
     ]
     assert sink.completions == []
     assert observer.pending_d2h_count == 0
-    assert observer.evidence_disabled
+    # The discard handoff invalidates the named context but must not disable
+    # the observer: the H2D restore that follows a preemption still needs to
+    # produce evidence.
+    assert not observer.evidence_disabled
+    later = observer.begin_transfer(9, make_context("h2d_restore"))
+    assert later is not None
+    observer.transfer_submitted(later, 15)
+    assert observer.pending_h2d_count == 1
 
 
 def test_bounded_observer_wait_failure_keeps_transfer_pending():
