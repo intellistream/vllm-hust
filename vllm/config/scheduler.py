@@ -191,6 +191,17 @@ class SchedulerConfig:
     The flag changes no computation graph structure, so it is deliberately
     not part of :meth:`compute_hash`."""
 
+    enable_request_owned_graph: bool = False
+    """Experimental graph pilot for request-owned execution.
+
+    Defaults to False.  The first graph lane uses PIECEWISE compilation and
+    keeps the dynamic request-owned DSA and MoE regions as explicit eager
+    split islands.  ``VllmConfig`` accepts only that exact graph envelope;
+    full graphs remain fail-closed because their ordinary batch descriptor
+    cannot represent owner-local row layouts or shadow KV metadata.
+    The flag changes the compiled graph partition and is therefore included
+    in :meth:`compute_hash`."""
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -254,6 +265,7 @@ class SchedulerConfig:
         # (per-request attention) when enabled, which changes the structure of
         # the computation graph (attention kernel selection and shapes).
         factors.append(self.enable_request_owned_attention)
+        factors.append(self.enable_request_owned_graph)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -277,6 +289,17 @@ class SchedulerConfig:
             return value
         raise ValueError(
             "enable_request_owned_sampling must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
+
+    @field_validator("enable_request_owned_graph", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_graph(cls, value: Any) -> Any:
+        """Keep the experimental graph lane behind an exact bool opt-in."""
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_graph must be a bool, got "
             f"{type(value).__name__} ({value!r})."
         )
 

@@ -714,6 +714,7 @@ class EngineArgs:
         SchedulerConfig.enable_request_owned_attention
     )
     enable_request_owned_sampling: bool = SchedulerConfig.enable_request_owned_sampling
+    enable_request_owned_graph: bool = SchedulerConfig.enable_request_owned_graph
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
@@ -1476,6 +1477,10 @@ class EngineArgs:
             "--enable-request-owned-sampling",
             **scheduler_kwargs["enable_request_owned_sampling"],
         )
+        scheduler_group.add_argument(
+            "--enable-request-owned-graph",
+            **scheduler_kwargs["enable_request_owned_graph"],
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -2178,6 +2183,7 @@ class EngineArgs:
             stream_interval=self.stream_interval,
             enable_request_owned_attention=self.enable_request_owned_attention,
             enable_request_owned_sampling=self.enable_request_owned_sampling,
+            enable_request_owned_graph=self.enable_request_owned_graph,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

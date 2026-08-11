@@ -5,7 +5,7 @@ from argparse import ArgumentError
 
 import pytest
 
-from vllm.config import VllmConfig
+from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms.hardware_defaults import (
     get_current_accelerator_scheduling_defaults,
@@ -147,16 +147,18 @@ def test_mm_prefix_lm_raises_batched_tokens_floor():
 
 
 def test_request_owned_flags_default_false():
-    """Both experimental request-owned flags default to False and never
+    """All experimental request-owned flags default to False and never
     change the scheduler config unless explicitly enabled."""
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     engine_args = EngineArgs.from_cli_args(args=parser.parse_args([]))
     assert engine_args.enable_request_owned_attention is False
     assert engine_args.enable_request_owned_sampling is False
+    assert engine_args.enable_request_owned_graph is False
 
     vllm_config = engine_args.create_engine_config()
     assert vllm_config.scheduler_config.enable_request_owned_attention is False
     assert vllm_config.scheduler_config.enable_request_owned_sampling is False
+    assert vllm_config.scheduler_config.enable_request_owned_graph is False
 
 
 def test_request_owned_attention_flag_propagates_independently(monkeypatch):
@@ -177,10 +179,12 @@ def test_request_owned_attention_flag_propagates_independently(monkeypatch):
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_request_owned_attention is True
     assert engine_args.enable_request_owned_sampling is False
+    assert engine_args.enable_request_owned_graph is False
 
     vllm_config = engine_args.create_engine_config()
     assert vllm_config.scheduler_config.enable_request_owned_attention is True
     assert vllm_config.scheduler_config.enable_request_owned_sampling is False
+    assert vllm_config.scheduler_config.enable_request_owned_graph is False
 
 
 def test_request_owned_sampling_flag_propagates_independently():
@@ -222,10 +226,37 @@ def test_request_owned_flags_together_reach_scheduler_config(monkeypatch):
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_request_owned_attention is True
     assert engine_args.enable_request_owned_sampling is True
+    assert engine_args.enable_request_owned_graph is False
 
     vllm_config = engine_args.create_engine_config()
     assert vllm_config.scheduler_config.enable_request_owned_attention is True
     assert vllm_config.scheduler_config.enable_request_owned_sampling is True
+    assert vllm_config.scheduler_config.enable_request_owned_graph is False
+
+
+def test_request_owned_graph_cli_reaches_exact_piecewise_lane(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--no-enable-prefix-caching",
+            "--no-async-scheduling",
+            "--enable-request-owned-attention",
+            "--enable-request-owned-sampling",
+            "--enable-request-owned-graph",
+            "--compilation-config",
+            '{"mode":3,"cudagraph_mode":"PIECEWISE"}',
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_graph is True
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_graph is True
+    assert vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
 
 
 def test_request_owned_invalid_envelope_still_rejected():

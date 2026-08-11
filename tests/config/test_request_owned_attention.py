@@ -64,6 +64,7 @@ def _active_kv_transfer_config() -> KVTransferConfig:
 def _vllm_config(
     *,
     enable_request_owned_attention: bool = True,
+    enable_request_owned_graph: bool = False,
     scheduler_config: SchedulerConfig | None = None,
     compilation_config: CompilationConfig | None = None,
     parallel_config: ParallelConfig | None = None,
@@ -84,6 +85,7 @@ def _vllm_config(
         scheduler_config=scheduler_config
         or SchedulerConfig.default_factory(
             enable_request_owned_attention=enable_request_owned_attention,
+            enable_request_owned_graph=enable_request_owned_graph,
             async_scheduling=async_scheduling,
         ),
         compilation_config=compilation_config or _eager_compilation_config(),
@@ -97,7 +99,9 @@ def _vllm_config(
 
 def test_request_owned_attention_defaults_off():
     assert SchedulerConfig.default_factory().enable_request_owned_attention is False
+    assert SchedulerConfig.default_factory().enable_request_owned_graph is False
     assert VllmConfig().scheduler_config.enable_request_owned_attention is False
+    assert VllmConfig().scheduler_config.enable_request_owned_graph is False
 
 
 def test_disabled_leaves_existing_validation_unchanged():
@@ -207,6 +211,59 @@ def test_enabled_rejects_cudagraph_execution(cudagraph_mode):
                 cudagraph_mode=cudagraph_mode,
             )
         )
+
+
+def test_graph_opt_in_requires_request_owned_attention():
+    with pytest.raises(
+        ValueError, match="requires enable_request_owned_attention=True"
+    ):
+        _vllm_config(
+            enable_request_owned_attention=False,
+            enable_request_owned_graph=True,
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            ),
+        )
+
+
+def test_graph_opt_in_accepts_only_piecewise_compile_lane():
+    vllm_config = _vllm_config(
+        enable_request_owned_graph=True,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        ),
+    )
+    assert vllm_config.scheduler_config.enable_request_owned_graph is True
+    assert vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
+
+@pytest.mark.parametrize(
+    "mode,cudagraph_mode",
+    [
+        (CompilationMode.NONE, CUDAGraphMode.NONE),
+        (CompilationMode.VLLM_COMPILE, CUDAGraphMode.NONE),
+        (CompilationMode.VLLM_COMPILE, CUDAGraphMode.FULL),
+        (CompilationMode.VLLM_COMPILE, CUDAGraphMode.FULL_DECODE_ONLY),
+    ],
+)
+def test_graph_opt_in_rejects_every_other_compile_envelope(mode, cudagraph_mode):
+    with pytest.raises(ValueError, match="PIECEWISE-only"):
+        _vllm_config(
+            enable_request_owned_graph=True,
+            compilation_config=CompilationConfig(
+                mode=mode,
+                cudagraph_mode=cudagraph_mode,
+            ),
+        )
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_request_owned_graph_gate_is_strict_bool(value):
+    with pytest.raises(ValueError, match="enable_request_owned_graph must be a bool"):
+        SchedulerConfig.default_factory(enable_request_owned_graph=value)
 
 
 def test_enabled_rejects_kv_cache_cpu_offload():

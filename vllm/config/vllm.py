@@ -2181,6 +2181,15 @@ class VllmConfig:
         token execution paths retain their own independent gates and are not
         relaxed here.
         """
+        request_owned_graph = self.scheduler_config.enable_request_owned_graph
+        if (
+            request_owned_graph
+            and not self.scheduler_config.enable_request_owned_attention
+        ):
+            raise ValueError(
+                "enable_request_owned_graph=True requires "
+                "enable_request_owned_attention=True."
+            )
         if not self.scheduler_config.enable_request_owned_attention:
             return
 
@@ -2246,20 +2255,43 @@ class VllmConfig:
             )
 
         compilation_config = self.compilation_config
-        if compilation_config.mode != CompilationMode.NONE:
-            mode_name = getattr(compilation_config.mode, "name", None)
-            raise ValueError(
-                "Request-owned attention is experimental and requires "
-                "eager execution (CompilationMode.NONE), but got "
-                f"compilation_config.mode={mode_name}."
-            )
-        if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            cudagraph_name = getattr(compilation_config.cudagraph_mode, "name", None)
-            raise ValueError(
-                "Request-owned attention is experimental and does not "
-                "support CUDA graphs, but got compilation_config."
-                f"cudagraph_mode={cudagraph_name}."
-            )
+        if request_owned_graph:
+            if (
+                compilation_config.mode != CompilationMode.VLLM_COMPILE
+                or compilation_config.cudagraph_mode != CUDAGraphMode.PIECEWISE
+            ):
+                mode_name = getattr(compilation_config.mode, "name", None)
+                cudagraph_name = getattr(
+                    compilation_config.cudagraph_mode, "name", None
+                )
+                raise ValueError(
+                    "enable_request_owned_graph=True is an experimental "
+                    "PIECEWISE-only lane and requires "
+                    "compilation_config.mode=VLLM_COMPILE with "
+                    "cudagraph_mode=PIECEWISE, but got mode="
+                    f"{mode_name} and cudagraph_mode={cudagraph_name}. "
+                    "FULL/FULL_DECODE_ONLY cannot safely key or stage "
+                    "owner-local row layouts and shadow KV metadata."
+                )
+        else:
+            if compilation_config.mode != CompilationMode.NONE:
+                mode_name = getattr(compilation_config.mode, "name", None)
+                raise ValueError(
+                    "Request-owned attention is experimental and requires "
+                    "eager execution (CompilationMode.NONE) unless the "
+                    "explicit request-owned graph pilot is enabled, but got "
+                    f"compilation_config.mode={mode_name}."
+                )
+            if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                cudagraph_name = getattr(
+                    compilation_config.cudagraph_mode, "name", None
+                )
+                raise ValueError(
+                    "Request-owned attention is experimental and does not "
+                    "support graphs unless enable_request_owned_graph=True, "
+                    "but got compilation_config.cudagraph_mode="
+                    f"{cudagraph_name}."
+                )
 
         if self.cache_config.kv_offloading_size is not None:
             raise ValueError(
