@@ -49,7 +49,7 @@ def test_probe_records_mixed_and_zero_owner_rows(tmp_path, monkeypatch) -> None:
     assert records[0] == {
         "kind": "header",
         "run_id": "owner-cell",
-        "schema": "g4-request-owner-layout-observation/v2",
+        "schema": "g4-request-owner-layout-observation/v3",
         "world_size": 4,
     }
     step = records[1]

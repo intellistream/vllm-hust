@@ -1648,6 +1648,22 @@ class Scheduler(SchedulerInterface):
             # G2: apply structurally valid receipts before any ordinary
             # output or request mutation below.
             self._apply_request_owned_receipts(scheduler_output, model_runner_output)
+            # Evidence must bind the executed layout to the worker-confirmed
+            # post-step pool state.  Recording during schedule() would lag
+            # physical capacity by one step and could not directly prove the
+            # final RELEASE returned every owner-local block.
+            owner_layout_probe = getattr(self, "_owner_layout_probe", None)
+            if owner_layout_probe is not None:
+                owner_layout_probe.record_step(
+                    step_seq=scheduler_output.step_seq,
+                    leases=scheduler_output.scheduled_owner_leases,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    cache_pool_snapshots=(
+                        self._owner_pool_snapshots
+                        if self._owner_pool_snapshot_seen
+                        else None
+                    ),
+                )
         else:
             self._validate_request_owned_receipt_ingress(
                 scheduler_output, model_runner_output
@@ -2583,19 +2599,6 @@ class Scheduler(SchedulerInterface):
         # un-receipted grants for a scheduled key fail closed here.
         scheduled_keys = {self._owner_key[req_id] for req_id in num_scheduled_tokens}
         scheduled_owner_leases = coordinator.publish(self.current_step, scheduled_keys)
-        owner_layout_probe = getattr(self, "_owner_layout_probe", None)
-        if owner_layout_probe is not None:
-            owner_layout_probe.record_step(
-                step_seq=self.current_step,
-                leases=scheduled_owner_leases,
-                num_scheduled_tokens=num_scheduled_tokens,
-                cache_pool_snapshots=(
-                    self._owner_pool_snapshots
-                    if self._owner_pool_snapshot_seen
-                    else None
-                ),
-            )
-
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,

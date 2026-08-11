@@ -11,12 +11,14 @@ harness (a real Scheduler needs a full engine stack), mirroring
 ``test_owner_step_seq.py``.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.owner_layout_probe import OwnerLayoutProbe
 from vllm.v1.core.sched.ownership import (
     OwnerAdmissionStatus,
     OwnerAllocationDescriptor,
@@ -248,6 +250,53 @@ def test_empty_control_step_is_valid_and_stamps_step() -> None:
     assert [o.owner_id for o in out.owner_assignment_observations] == [0, 1]
     # The empty envelope round-trips.
     _apply_receipts(scheduler, out, {})
+
+
+def test_layout_probe_records_worker_confirmed_post_step_capacity(tmp_path) -> None:
+    scheduler = _make_scheduler()
+    scheduler._owner_layout_probe = OwnerLayoutProbe(
+        path=tmp_path / "layout.jsonl",
+        run_id="post-step-cell",
+        world_size=2,
+        max_records=4,
+        max_bytes=4096,
+    )
+    request = _request("req-0")
+    scheduler.add_request(request)
+
+    reserve_step = scheduler.schedule()
+    # schedule() only freezes the plan; it must not pair that plan with the
+    # stale pool snapshot from the preceding worker step.
+    assert len((tmp_path / "layout.jsonl").read_text().splitlines()) == 1
+    (command,) = reserve_step.owner_commands
+    _apply_pool_receipts(
+        scheduler,
+        reserve_step,
+        {
+            0: _pool(0, total_blocks=1000, free_blocks=900),
+            1: _pool(1, total_blocks=1000, free_blocks=800),
+        },
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=32,
+                )
+            ]
+        },
+    )
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "layout.jsonl").read_text().splitlines()
+    ]
+    assert records[1]["step_seq"] == reserve_step.step_seq
+    assert records[1]["total_scheduled_tokens"] == 0
+    assert [pool["free_blocks"] for pool in records[1]["owner_cache_pools"]] == [
+        900,
+        800,
+    ]
 
 
 def test_two_step_admission_reserves_then_promotes_and_publishes() -> None:
