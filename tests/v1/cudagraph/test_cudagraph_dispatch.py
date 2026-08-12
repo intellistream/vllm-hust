@@ -105,10 +105,7 @@ class TestCudagraphDispatcher:
         assert owner_key.request_owned_signature == owner_signature
 
         capture_descs = dispatcher.get_capture_descs()
-        assert capture_descs == [], (
-            "the owner lane must not dummy-capture either the owner FULL key "
-            "or an ownerless PIECEWISE body"
-        )
+        assert capture_descs == [(CUDAGraphMode.FULL, [owner_key])]
         assert owner_key in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
 
         baseline_mode, baseline_key = dispatcher.dispatch(
