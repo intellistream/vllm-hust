@@ -46,12 +46,6 @@ PAD_SLOT_ID = -1
 NULL_BLOCK_ID = 0
 
 
-def _first_true_index(mask: torch.Tensor) -> torch.Tensor:
-    """Return the first true index, or len(mask) when the mask is all false."""
-    prefix_counts = torch.cumsum(mask.to(torch.int64), dim=0)
-    return torch.searchsorted(prefix_counts, prefix_counts.new_tensor(1))
-
-
 def _split_decode_prefill_boundary(
     query_start_loc: torch.Tensor,
     num_reqs: int,
@@ -82,23 +76,15 @@ def _split_decode_prefill_boundary(
         if query_lens.device != query_start_loc.device:
             query_lens = query_lens.to(query_start_loc.device)
 
-    force_all_decode = torch.tensor(False, device=query_start_loc.device)
+    if query_lens[0].item() > decode_threshold:
+        return 0, num_reqs, 0, num_tokens
+
     if require_uniform:
         first_query_len = query_lens[0]
         uniform_or_pad = (query_lens == first_query_len) | (query_lens == 0)
-        first_is_prefill = first_query_len > decode_threshold
-        force_all_decode = torch.all(uniform_or_pad) & ~first_is_prefill
+        if torch.all(uniform_or_pad):
+            return num_reqs, 0, num_tokens, 0
         is_prefill = query_lens != first_query_len
-        is_prefill = torch.where(
-            force_all_decode,
-            torch.zeros_like(is_prefill),
-            is_prefill,
-        )
-        is_prefill = torch.where(
-            first_is_prefill,
-            torch.ones_like(is_prefill),
-            is_prefill,
-        )
     else:
         is_prefill = query_lens > decode_threshold
 
@@ -107,37 +93,19 @@ def _split_decode_prefill_boundary(
         short_extend_prefills = is_prefilling[:num_reqs].to(
             device=query_start_loc.device, dtype=torch.bool
         )
-        short_extend_prefills = torch.where(
-            force_all_decode,
-            torch.zeros_like(short_extend_prefills),
-            short_extend_prefills,
-        )
         is_prefill |= short_extend_prefills
 
-    first_prefill = _first_true_index(is_prefill)
-    num_reqs_t = first_prefill.new_tensor(num_reqs)
-    num_tokens_t = torch.tensor(
-        num_tokens, dtype=torch.int64, device=query_start_loc.device
-    )
-    num_decodes = first_prefill
-    num_prefills = num_reqs_t - num_decodes
-    num_decode_tokens = torch.where(
-        first_prefill < num_reqs_t,
-        query_start_loc[first_prefill].to(torch.int64),
-        num_tokens_t,
-    )
-    num_prefill_tokens = num_tokens_t - num_decode_tokens
+    if not torch.any(is_prefill):
+        return num_reqs, 0, num_tokens, 0
 
-    result = torch.stack(
-        [
-            num_decodes.to(torch.int64),
-            num_prefills.to(torch.int64),
-            num_decode_tokens,
-            num_prefill_tokens,
-        ]
-    ).cpu()
-    result_list = result.tolist()
-    return result_list[0], result_list[1], result_list[2], result_list[3]
+    num_decodes = is_prefill.int().argmax(dim=-1).item()
+    num_decode_tokens = query_start_loc[num_decodes].item()
+    return (
+        num_decodes,
+        num_reqs - num_decodes,
+        num_decode_tokens,
+        num_tokens - num_decode_tokens,
+    )
 
 
 def _split_decode_extend_prefill_boundary(
@@ -162,48 +130,35 @@ def _split_decode_extend_prefill_boundary(
 
     is_prefill_or_extend = query_lens > decode_threshold
     is_prefill = (seq_lens == query_lens) & is_prefill_or_extend
-    first_extend = _first_true_index(is_prefill_or_extend)
-    first_prefill = _first_true_index(is_prefill)
+    if not torch.any(is_prefill_or_extend):
+        return num_reqs, 0, 0, num_tokens, 0, 0
 
-    num_reqs_t = first_extend.new_tensor(num_reqs)
-    num_tokens_t = torch.tensor(
-        num_tokens, dtype=torch.int64, device=query_start_loc.device
-    )
-    num_decodes = first_extend
-    num_extends = first_prefill - first_extend
-    num_prefills = num_reqs_t - first_prefill
-    num_decode_tokens = torch.where(
-        first_extend < num_reqs_t,
-        query_start_loc[first_extend].to(torch.int64),
-        num_tokens_t,
-    )
-    prefill_start = torch.where(
-        first_prefill < num_reqs_t,
-        query_start_loc[first_prefill].to(torch.int64),
-        num_tokens_t,
-    )
-    num_extend_tokens = prefill_start - num_decode_tokens
-    num_prefill_tokens = num_tokens_t - prefill_start
-
-    result = torch.stack(
-        [
-            num_decodes.to(torch.int64),
-            num_extends.to(torch.int64),
-            num_prefills.to(torch.int64),
+    first_extend = is_prefill_or_extend.int().argmax(dim=-1).item()
+    num_decode_tokens = query_start_loc[first_extend].item()
+    num_prefills_or_extends = num_reqs - first_extend
+    num_prefill_or_extend_tokens = num_tokens - num_decode_tokens
+    if not torch.any(is_prefill):
+        return (
+            first_extend,
+            num_prefills_or_extends,
+            0,
             num_decode_tokens,
-            num_extend_tokens,
-            num_prefill_tokens,
-        ]
-    ).cpu()
-    result_list = result.tolist()
+            num_prefill_or_extend_tokens,
+            0,
+        )
+
+    first_prefill = is_prefill.int().argmax(dim=-1).item()
+    num_prefill_tokens = num_tokens - query_start_loc[first_prefill].item()
+    num_extends = first_prefill - first_extend
     return (
-        result_list[0],
-        result_list[1],
-        result_list[2],
-        result_list[3],
-        result_list[4],
-        result_list[5],
+        first_extend,
+        num_extends,
+        num_reqs - first_prefill,
+        num_decode_tokens,
+        num_prefill_or_extend_tokens - num_prefill_tokens,
+        num_prefill_tokens,
     )
+
 
 def compute_mm_prefix_range_tensor(
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
