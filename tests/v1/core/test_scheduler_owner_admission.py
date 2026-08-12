@@ -22,6 +22,7 @@ from vllm.v1.core.sched.owner_layout_probe import OwnerLayoutProbe
 from vllm.v1.core.sched.ownership import (
     OwnerAdmissionStatus,
     OwnerAllocationDescriptor,
+    OwnerCacheGroupSnapshot,
     OwnerCachePoolSnapshot,
     OwnerCommandKind,
     OwnerLeaseKey,
@@ -157,11 +158,22 @@ def _pool(
     owner_rank: int,
     total_blocks: int = 1000,
     free_blocks: int = 300,
+    effective_tokens_per_block: tuple[int, ...] = (),
 ) -> OwnerCachePoolSnapshot:
     return OwnerCachePoolSnapshot(
         owner_rank=owner_rank,
         total_blocks=total_blocks,
         free_blocks=free_blocks,
+        groups=tuple(
+            OwnerCacheGroupSnapshot(
+                group_index=index,
+                spec_kind=f"test-{index}",
+                effective_tokens_per_block=capacity,
+                allocated_blocks=0,
+                resident_blocks=0,
+            )
+            for index, capacity in enumerate(effective_tokens_per_block)
+        ),
     )
 
 
@@ -820,6 +832,36 @@ def test_same_step_admissions_balance_on_provisional_count_under_equal_free() ->
     # per-owner command order, so assert the assignment map itself.
     assert [c.owner_id for c in out1.owner_commands] == [0, 0, 1, 2]
     for request_id, owner in (("req-a", 0), ("req-b", 1), ("req-c", 2), ("req-d", 0)):
+        assert (
+            scheduler.owner_coordinator.owner_of(OwnerLeaseKey(request_id, 0)) == owner
+        )
+
+
+def test_same_step_admissions_charge_projected_blocks_under_small_free_skew() -> None:
+    scheduler = _make_scheduler(world_size=2)
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(0, free_blocks=100, effective_tokens_per_block=(16,)),
+            1: _pool(1, free_blocks=101, effective_tokens_per_block=(16,)),
+        },
+    )
+    for request_id in ("req-a", "req-b", "req-c", "req-d"):
+        scheduler.add_request(_request(request_id, num_prompt_tokens=32))
+    scheduler.schedule()
+
+    # Every 32-token RESERVE projects two blocks.  Rank 1 starts one block
+    # emptier, but after the first provisional choice its post-admission
+    # capacity is lower than rank 0's, so the wave alternates instead of
+    # repeatedly spending the same stale snapshot advantage.
+    for request_id, owner in (
+        ("req-a", 1),
+        ("req-b", 0),
+        ("req-c", 1),
+        ("req-d", 0),
+    ):
         assert (
             scheduler.owner_coordinator.owner_of(OwnerLeaseKey(request_id, 0)) == owner
         )

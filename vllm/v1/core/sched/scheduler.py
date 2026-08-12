@@ -2539,6 +2539,13 @@ class Scheduler(SchedulerInterface):
 
         scheduled_timestamp = time.monotonic()
         self._owner_token_plans = {}
+        # Pool snapshots describe the worker-confirmed state after the prior
+        # step.  Several fresh requests may be admitted before another worker
+        # snapshot can arrive, so account for the block demand selected in
+        # this pass instead of repeatedly spending the same free-block fact.
+        self._owner_admission_projected_blocks = {
+            owner_id: 0 for owner_id in range(self.parallel_config.world_size)
+        }
         if self._pause_state != PauseState.PAUSED_ALL:
             self._owner_admission_pass(scheduled_timestamp)
             self._owner_running_pass()
@@ -2891,7 +2898,7 @@ class Scheduler(SchedulerInterface):
         coordinator = self.owner_coordinator
         assert coordinator is not None
         required = self._owner_reserve_required(request)
-        owner = self._select_owner_for_admission()
+        owner, projected_blocks = self._select_owner_for_admission(required)
         try:
             coordinator.assign(
                 key,
@@ -2908,37 +2915,78 @@ class Scheduler(SchedulerInterface):
                 explicit_owner=owner,
                 projected_work=0,
             )
+        self._owner_admission_projected_blocks[owner] += projected_blocks
         self._issue_owner_reserve(request, key)
 
-    def _select_owner_for_admission(self) -> int:
+    @staticmethod
+    def _owner_projected_block_demand(
+        snapshot: OwnerCachePoolSnapshot,
+        required_num_tokens: int,
+    ) -> int:
+        """Conservatively project unified-pool blocks for a fresh horizon.
+
+        Every request owns one table in every KV group, while the groups use
+        heterogeneous effective token capacities.  Their block allocations
+        all consume the same physical pool, so the projected pool demand is
+        the sum of each group's ceiling.  Empty group metadata is retained
+        for compatibility with early/host-only protocol snapshots and still
+        charges one block for a nonempty reservation.
+        """
+        if required_num_tokens <= 0:
+            return 0
+        if not snapshot.groups:
+            return 1
+        return sum(
+            (required_num_tokens + group.effective_tokens_per_block - 1)
+            // group.effective_tokens_per_block
+            for group in snapshot.groups
+        )
+
+    def _select_owner_for_admission(
+        self,
+        required_num_tokens: int,
+    ) -> tuple[int, int]:
         """Pick the owner for a fresh G2 first admission.
 
-        With physical pool snapshots present, the emptiest pool (greatest
-        ``free_blocks``) wins; ties break by fewest live/sticky leases plus
-        provisional choices already made in this admission pass (the
-        coordinator counts them as soon as they are assigned), then by
-        stable global rank.  Without snapshots the choice falls back to
-        lease-count balance then rank.  No request tokens are converted to
-        blocks and no block/pool IDs are consulted.
+        With physical pool snapshots present, the owner with the greatest
+        post-admission projected free capacity wins.  The projection charges
+        every provisional choice already made in this scheduler pass, so a
+        small stale free-block advantage cannot funnel an entire admission
+        wave onto one rank.  Ties break by live/sticky lease count and stable
+        global rank.  Without snapshots the choice falls back to lease-count
+        balance then rank.  No block or pool IDs are consulted.
         """
         coordinator = self.owner_coordinator
         assert coordinator is not None
         ranks = range(self.parallel_config.world_size)
         if self._owner_pool_snapshots:
             snapshots = self._owner_pool_snapshots
+            projected = self._owner_admission_projected_blocks
+            demands = {
+                owner_id: self._owner_projected_block_demand(
+                    snapshots[owner_id], required_num_tokens
+                )
+                for owner_id in ranks
+            }
 
             def score(owner_id: int) -> tuple[int, int, int]:
                 return (
-                    -snapshots[owner_id].free_blocks,
+                    -(
+                        snapshots[owner_id].free_blocks
+                        - projected[owner_id]
+                        - demands[owner_id]
+                    ),
                     coordinator.live_lease_count(owner_id),
                     owner_id,
                 )
         else:
+            demands = {owner_id: 0 for owner_id in ranks}
 
             def score(owner_id: int) -> tuple[int, int]:
                 return (coordinator.live_lease_count(owner_id), owner_id)
 
-        return min(ranks, key=score)
+        owner = min(ranks, key=score)
+        return owner, demands[owner]
 
     def _issue_owner_reserve(self, request: Request, key: OwnerLeaseKey) -> None:
         """Issue RESERVE (first admission) or RESUME (PREEMPTED) with the
