@@ -182,11 +182,12 @@ class CudagraphDispatcher:
         if request_owned_full_signature is not None and not (
             cudagraph_mode.separate_routine()
             and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-            and cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE
+            and cudagraph_mode.mixed_mode()
+            in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
         ):
             raise ValueError(
-                "request-owned FULL graphs require a FULL decode / PIECEWISE "
-                "mixed-batch cudagraph mode"
+                "request-owned FULL graphs require FULL decode with a NONE "
+                "or PIECEWISE mixed-batch fallback"
             )
 
         # Early exit if cudagraphs are disabled

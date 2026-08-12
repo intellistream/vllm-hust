@@ -2272,6 +2272,7 @@ class VllmConfig:
                 or compilation_config.cudagraph_mode
                 not in (
                     CUDAGraphMode.PIECEWISE,
+                    CUDAGraphMode.FULL_DECODE_ONLY,
                     CUDAGraphMode.FULL_AND_PIECEWISE,
                 )
             ):
@@ -2281,13 +2282,14 @@ class VllmConfig:
                 )
                 raise ValueError(
                     "enable_request_owned_graph=True is an experimental "
-                    "PIECEWISE or isolated FULL-decode/PIECEWISE-mixed lane "
+                    "PIECEWISE or isolated FULL-decode lane "
                     "and requires "
                     "compilation_config.mode=VLLM_COMPILE with "
-                    "cudagraph_mode=PIECEWISE or FULL_AND_PIECEWISE, but got mode="
+                    "cudagraph_mode=PIECEWISE, FULL_DECODE_ONLY, or "
+                    "FULL_AND_PIECEWISE, but got mode="
                     f"{mode_name} and cudagraph_mode={cudagraph_name}. "
-                    "FULL/FULL_DECODE_ONLY have no safe PIECEWISE fallback "
-                    "for owner layouts outside the fixed decode envelope."
+                    "FULL has no safe non-graph fallback for prefill or owner "
+                    "layouts outside the fixed decode envelope."
                 )
         else:
             if compilation_config.mode != CompilationMode.NONE:
