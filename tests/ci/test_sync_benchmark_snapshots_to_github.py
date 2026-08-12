@@ -177,6 +177,26 @@ exec "$REAL_GIT" "$@"
     return fake_git
 
 
+def write_mismatched_verify_git(tmp_path: Path) -> Path:
+    fake_git = tmp_path / "fake-verify-bin" / "git"
+    fake_git.parent.mkdir()
+    fake_git.write_text(
+        """#!/bin/bash
+set -euo pipefail
+
+if [[ "$*" == *"rev-parse origin/main"* ]]; then
+  printf '0000000000000000000000000000000000000000\n'
+  exit 0
+fi
+
+exec "$REAL_GIT" "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    return fake_git
+
+
 def prepare_sync_environment(
     tmp_path: Path, run_id: str
 ) -> tuple[dict[str, str], Path, Path, Path]:
@@ -369,6 +389,38 @@ def test_invalid_snapshot_does_not_change_benchmark_remote(
     )
     assert not (benchmark_repo / "submissions" / "invalid-ci-test").exists()
     assert not (benchmark_repo / "leaderboard-data" / "snapshots").exists()
+    assert "GITHUB_SNAPSHOT_SYNC_STATUS=rejected" in github_env.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_expected_base_mismatch_rejects_before_publication(tmp_path):
+    env, remote, benchmark_repo, github_env = prepare_sync_environment(
+        tmp_path, "expected-base-mismatch"
+    )
+    remote_head = run(
+        ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
+    ).stdout.strip()
+    env["SNAPSHOT_EXPECTED_BASE_SHA"] = "0" * 40
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT_PATH)],
+        cwd=tmp_path,
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "benchmark publication base moved" in result.stderr
+    assert (
+        run(
+            ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
+        ).stdout.strip()
+        == remote_head
+    )
+    assert not (benchmark_repo / "submissions" / "expected-base-mismatch").exists()
     assert "GITHUB_SNAPSHOT_SYNC_STATUS=rejected" in github_env.read_text(
         encoding="utf-8"
     )
@@ -579,6 +631,55 @@ def test_verify_fetch_retry_exhaustion_records_pushed_unverified_state(tmp_path)
                 str(remote),
                 "show",
                 "main:submissions/verify-fetch-exhausted/STATUS",
+            ],
+            tmp_path,
+        ).stdout.strip()
+        == "OK"
+    )
+
+
+def test_verify_commit_mismatch_preserves_pushed_state(tmp_path):
+    env, remote, _benchmark_repo, github_env = prepare_sync_environment(
+        tmp_path, "verify-commit-mismatch"
+    )
+    fake_git = write_mismatched_verify_git(tmp_path)
+    env.update(
+        {
+            "PATH": f"{fake_git.parent}:{env['PATH']}",
+            "REAL_GIT": shutil.which("git") or "git",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT_PATH)],
+        cwd=tmp_path,
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    env_text = github_env.read_text(encoding="utf-8")
+    sync_statuses = [
+        line
+        for line in env_text.splitlines()
+        if line.startswith("GITHUB_SNAPSHOT_SYNC_STATUS=")
+    ]
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "benchmark publication verification failed: expected" in result.stderr
+    assert "push succeeded, but verification failed" in result.stderr
+    assert sync_statuses[-1] == "GITHUB_SNAPSHOT_SYNC_STATUS=pushed"
+    assert "GITHUB_SNAPSHOT_SYNC_COMMIT=" in env_text
+    assert "GITHUB_SNAPSHOT_SYNC_VERIFICATION=failed" in env_text
+    assert "GITHUB_SNAPSHOT_SYNC_VERIFIED_COMMIT=" not in env_text
+    assert (
+        run(
+            [
+                "git",
+                "--git-dir",
+                str(remote),
+                "show",
+                "main:submissions/verify-commit-mismatch/STATUS",
             ],
             tmp_path,
         ).stdout.strip()
