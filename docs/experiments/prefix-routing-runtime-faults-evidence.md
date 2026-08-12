@@ -9,17 +9,27 @@ reliability claims while the Ascend benchmark gate is unstable.
 
 ## Ascend Benchmark Gate Status
 
-Public PR and check metadata for commit
-`1d4c7924fcc489d62d52299be9fead8fbe6aae4a` show:
+Current PR head and latest Ascend benchmark status:
 
-| Check | Status |
+| Field | Value |
 | --- | --- |
-| `pre-commit` | success |
-| `linux-ascend-inference-smoke` | success |
-| `linux-ascend-inference-regression` | success |
-| `ascend-benchmark` | failure |
+| Current PR head | `cea6c2a7d6d1b504beb9b09de0144eeeaa518618` |
+| Base branch head | `e4ce33646f2ef1781289e6dc651fad0d00177c55` |
+| Latest Ascend benchmark workflow run | `31490771716` |
+| Workflow | `ascend-benchmark-leaderboard.yml` |
+| Trigger | `pull_request` |
+| Status | failure |
+| Failing job | `ascend-benchmark` |
+| Failure annotation | `Process completed with exit code 2` |
+| Artifact | `ascend-benchmark-31490771716-1` |
 
-The benchmark bot comment reported:
+This current-head CI status is an unstable benchmark-gate result. It is not
+performance evidence and does not validate or invalidate the local
+correctness/recovery fault matrix below. Until the benchmark gate is stable,
+this PR only claims host/runtime fail-closed correctness test coverage.
+
+Historical benchmark bot comment for earlier PR head
+`1d4c7924fcc489d62d52299be9fead8fbe6aae4a`:
 
 | Field | Value |
 | --- | --- |
@@ -32,11 +42,13 @@ The benchmark bot comment reported:
 | Stage 1 baseline | `e4ce33646f2ef1781289e6dc651fad0d00177c55`, source `unavailable` |
 | Failed requests | `0` |
 
-Failure reason: the Ascend benchmark gate did not have an available baseline
-source and stayed in an unstable artifact-preview/report state. Therefore the
-benchmark output is not a stable comparison gate and must not be used to claim
-performance or reliability. The runtime correctness checks below are separate
-host/runtime evidence and do not close the benchmark gate.
+Historical failure reason: the earlier Ascend benchmark gate did not have an
+available baseline source and stayed in an unstable artifact-preview/report
+state. That older benchmark output is retained only as historical context for a
+prior PR head. It must not be read as current-head evidence and must not be
+used to claim performance or deployment reliability. The runtime correctness
+checks below are separate host/runtime evidence and do not close the current
+benchmark gate.
 
 ## Runtime Mapping Under Test
 
@@ -55,7 +67,8 @@ HIT routing.
 
 ## Correctness And Recovery Evidence
 
-Validated locally on the PR head with:
+Validated locally on current PR head
+`cea6c2a7d6d1b504beb9b09de0144eeeaa518618` with:
 
 ```bash
 VLLM_PLUGINS= python -m ruff check \
@@ -70,11 +83,11 @@ VLLM_PLUGINS= python -m pytest -q \
   tests/distributed/test_prefix_routing_e2e.py
 ```
 
-Result on 2026-08-11 UTC:
+Result on 2026-08-12 UTC:
 
 ```text
 ruff: All checks passed.
-pytest: 81 passed.
+pytest: 81 passed in 7.13s.
 ```
 
 Fault matrix:
