@@ -182,12 +182,11 @@ class CudagraphDispatcher:
         if request_owned_full_signature is not None and not (
             cudagraph_mode.separate_routine()
             and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-            and cudagraph_mode.mixed_mode()
-            in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
+            and cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE
         ):
             raise ValueError(
-                "request-owned FULL graphs require FULL decode with a NONE "
-                "or PIECEWISE mixed-batch fallback"
+                "request-owned FULL graphs require a FULL decode / PIECEWISE "
+                "mixed-batch compile mode"
             )
 
         # Early exit if cudagraphs are disabled
@@ -206,7 +205,10 @@ class CudagraphDispatcher:
         # Note: we create all valid keys for cudagraph here but do not
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
-        if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
+        if (
+            cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE
+            and request_owned_full_signature is None
+        ):
             assert self.compilation_config.cudagraph_capture_sizes is not None, (
                 "Cudagraph capture sizes must be set when mixed mode is enabled."
             )

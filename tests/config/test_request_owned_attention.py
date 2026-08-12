@@ -258,7 +258,6 @@ def test_request_owned_q_wkv_fanin_gate_is_strict_bool(value):
     "cudagraph_mode",
     [
         CUDAGraphMode.PIECEWISE,
-        CUDAGraphMode.FULL_DECODE_ONLY,
         CUDAGraphMode.FULL_AND_PIECEWISE,
     ],
 )
@@ -283,6 +282,7 @@ def test_graph_opt_in_accepts_piecewise_and_isolated_full_compile_lanes(
         (CompilationMode.NONE, CUDAGraphMode.NONE),
         (CompilationMode.VLLM_COMPILE, CUDAGraphMode.NONE),
         (CompilationMode.VLLM_COMPILE, CUDAGraphMode.FULL),
+        (CompilationMode.VLLM_COMPILE, CUDAGraphMode.FULL_DECODE_ONLY),
     ],
 )
 def test_graph_opt_in_rejects_every_other_compile_envelope(mode, cudagraph_mode):
