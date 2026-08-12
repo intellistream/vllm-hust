@@ -18,7 +18,10 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.owner_layout import OwnerRowLayout
+    from vllm.v1.core.sched.owner_layout import (
+        OwnerRowLayout,
+        RequestOwnedGraphSignature,
+    )
 
 logger = init_logger(__name__)
 
@@ -58,6 +61,12 @@ class BatchDescriptor:
     are captured for each num_active_loras value. This allows kernels
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
+    """
+    request_owned_signature: "RequestOwnedGraphSignature | None" = None
+    """
+    Step-invariant owner layout signature for request-owned FULL graphs.
+    ``None`` is the baseline/non-owner key. PIECEWISE keys deliberately omit
+    this value because their eager islands consume the live layout each step.
     """
 
 

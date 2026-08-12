@@ -140,7 +140,12 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.core.sched.owner_layout import OwnerRowLayout, build_owner_row_layout
+from vllm.v1.core.sched.owner_layout import (
+    OwnerRowLayout,
+    RequestOwnedGraphSignature,
+    balanced_decode_graph_signature,
+    build_owner_row_layout,
+)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -3936,6 +3941,20 @@ class GPUModelRunner(
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
 
+        request_owned_signature = None
+        request_owned_full_ineligible = False
+        if self.scheduler_config.enable_request_owned_attention:
+            if self._request_owner_layout is None:
+                request_owned_full_ineligible = True
+            else:
+                request_owned_signature = balanced_decode_graph_signature(
+                    self._request_owner_layout,
+                    num_reqs=num_reqs,
+                    num_tokens=num_tokens,
+                    uniform_decode=uniform_decode,
+                )
+                request_owned_full_ineligible = request_owned_signature is None
+
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
@@ -3943,7 +3962,12 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes=(
+                    {CUDAGraphMode.FULL}
+                    if disable_full or request_owned_full_ineligible
+                    else None
+                ),
+                request_owned_signature=request_owned_signature,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -7028,8 +7052,20 @@ class GPUModelRunner(
         )
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
+        request_owned_full_signature = None
+        if (
+            self.scheduler_config.enable_request_owned_attention
+            and cudagraph_mode.has_full_cudagraphs()
+        ):
+            world_size = self.parallel_config.tensor_parallel_size
+            request_owned_full_signature = RequestOwnedGraphSignature(
+                owner_counts=(1,) * world_size,
+                canonical_to_owner=tuple(range(world_size)),
+            )
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode,
+            self.uniform_decode_query_len,
+            request_owned_full_signature=request_owned_full_signature,
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.

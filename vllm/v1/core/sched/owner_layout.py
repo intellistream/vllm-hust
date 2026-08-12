@@ -58,6 +58,39 @@ class OwnerLayoutError(Exception):
 _MISSING = object()
 
 
+@dataclass(frozen=True)
+class RequestOwnedGraphSignature:
+    """Step-invariant owner layout identity for a full decode graph.
+
+    The execution fence and logical row identities deliberately do not belong
+    in this key: both change every step while the captured data-plane envelope
+    remains the same. Counts and the canonical-to-owner permutation do belong
+    in the key because either can change collective geometry or row meaning.
+    """
+
+    owner_counts: tuple[int, ...]
+    canonical_to_owner: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        counts = tuple(self.owner_counts)
+        permutation = tuple(self.canonical_to_owner)
+        object.__setattr__(self, "owner_counts", counts)
+        object.__setattr__(self, "canonical_to_owner", permutation)
+        if not counts:
+            raise OwnerLayoutError("graph signature owner_counts must not be empty")
+        for count in counts:
+            _require_nonneg_int(count, "graph signature owner count")
+        if sum(counts) != len(permutation):
+            raise OwnerLayoutError(
+                "graph signature owner counts do not cover its permutation"
+            )
+        expected = tuple(range(len(permutation)))
+        if tuple(sorted(permutation)) != expected:
+            raise OwnerLayoutError(
+                "graph signature canonical_to_owner must be a permutation"
+            )
+
+
 def _require_nonneg_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise OwnerLayoutError(f"{name} must be a nonnegative integer, got {value!r}")
@@ -400,6 +433,44 @@ class OwnerRowLayout:
                 f"tensor leading axis {leading} < logical length {logical_len}"
             )
         return list(permutation) + list(range(logical_len, leading))
+
+
+def balanced_decode_graph_signature(
+    layout: OwnerRowLayout,
+    *,
+    num_reqs: int,
+    num_tokens: int,
+    uniform_decode: bool,
+) -> RequestOwnedGraphSignature | None:
+    """Return the first request-owned FULL-decode signature, or ``None``.
+
+    The initial graphable envelope is intentionally narrow: one decode row per
+    request, one request per owner, and identity canonical/owner order. A
+    caller must treat ``None`` as "FULL forbidden" and fall back to PIECEWISE;
+    it must never reinterpret it as the baseline (non-owner) graph key.
+    """
+
+    if not isinstance(layout, OwnerRowLayout):
+        raise OwnerLayoutError(f"layout must be an OwnerRowLayout, got {layout!r}")
+    reqs = _require_nonneg_int(num_reqs, "num_reqs")
+    tokens = _require_nonneg_int(num_tokens, "num_tokens")
+    if not isinstance(uniform_decode, bool):
+        raise OwnerLayoutError(
+            f"uniform_decode must be a bool, got {uniform_decode!r}"
+        )
+    if not uniform_decode or reqs == 0 or tokens != reqs:
+        return None
+    if layout.logical_len != tokens or layout.world_size != reqs:
+        return None
+    expected_identity = tuple(range(tokens))
+    if layout.owner_counts != (1,) * layout.world_size:
+        return None
+    if layout.forward_permutation != expected_identity:
+        return None
+    return RequestOwnedGraphSignature(
+        owner_counts=layout.owner_counts,
+        canonical_to_owner=layout.forward_permutation,
+    )
 
 
 class OwnerCollectivePlan:

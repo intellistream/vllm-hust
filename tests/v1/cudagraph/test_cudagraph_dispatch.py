@@ -21,6 +21,7 @@ from vllm.config import (
 from vllm.config.lora import LoRAConfig
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.platforms import current_platform
+from vllm.v1.core.sched.owner_layout import RequestOwnedGraphSignature
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 
 DEVICE_TYPE = current_platform.device_type
@@ -77,6 +78,61 @@ def _create_vllm_config(
 
 
 class TestCudagraphDispatcher:
+    def test_request_owned_full_key_isolated_and_falls_back_piecewise(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_capture_sizes=[8],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=8)
+        dispatcher = CudagraphDispatcher(config)
+        owner_signature = RequestOwnedGraphSignature(
+            owner_counts=(1,) * 8,
+            canonical_to_owner=tuple(range(8)),
+        )
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+            request_owned_full_signature=owner_signature,
+        )
+
+        owner_mode, owner_key = dispatcher.dispatch(
+            num_tokens=8,
+            uniform_decode=True,
+            request_owned_signature=owner_signature,
+        )
+        assert owner_mode == CUDAGraphMode.FULL
+        assert owner_key.request_owned_signature == owner_signature
+
+        baseline_mode, baseline_key = dispatcher.dispatch(
+            num_tokens=8,
+            uniform_decode=True,
+        )
+        assert baseline_mode == CUDAGraphMode.PIECEWISE
+        assert baseline_key.request_owned_signature is None
+        assert baseline_key != owner_key
+
+        changed_signature = RequestOwnedGraphSignature(
+            owner_counts=(1,) * 8,
+            canonical_to_owner=(1, 0, 2, 3, 4, 5, 6, 7),
+        )
+        changed_mode, changed_key = dispatcher.dispatch(
+            num_tokens=8,
+            uniform_decode=True,
+            request_owned_signature=changed_signature,
+        )
+        assert changed_mode == CUDAGraphMode.PIECEWISE
+        assert changed_key.request_owned_signature is None
+
+        prefill_mode, prefill_key = dispatcher.dispatch(
+            num_tokens=8,
+            uniform_decode=False,
+            request_owned_signature=owner_signature,
+            invalid_modes={CUDAGraphMode.FULL},
+        )
+        assert prefill_mode == CUDAGraphMode.PIECEWISE
+        assert prefill_key.request_owned_signature is None
+
     @pytest.mark.parametrize(
         "cudagraph_mode_str,compilation_mode,lora_config",
         [

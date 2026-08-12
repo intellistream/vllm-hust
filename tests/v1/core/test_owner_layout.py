@@ -19,6 +19,8 @@ from vllm.v1.core.sched.owner_layout import (
     OwnerCollectivePlan,
     OwnerLayoutError,
     OwnerRowLayout,
+    RequestOwnedGraphSignature,
+    balanced_decode_graph_signature,
     build_owner_row_layout,
 )
 from vllm.v1.core.sched.ownership import (
@@ -107,6 +109,62 @@ def test_epoch_distinct_request_uids_are_distinct_rows() -> None:
         (7, 2, 11),
     )
     assert layout.logical_len == 2
+
+
+def test_balanced_decode_graph_signature_accepts_only_fixed_identity_envelope() -> None:
+    group = (7, 2, 11)
+    rows = _rows(["a", "b", "c"], [4, 8, 12])
+    identity = OwnerRowLayout.build(
+        5,
+        rows,
+        _owners(["a", "b", "c"], {"a": 7, "b": 2, "c": 11}),
+        group,
+    )
+    assert balanced_decode_graph_signature(
+        identity, num_reqs=3, num_tokens=3, uniform_decode=True
+    ) == RequestOwnedGraphSignature(
+        owner_counts=(1, 1, 1), canonical_to_owner=(0, 1, 2)
+    )
+
+    nonidentity = OwnerRowLayout.build(
+        6,
+        rows,
+        _owners(["a", "b", "c"], {"a": 2, "b": 11, "c": 7}),
+        group,
+    )
+    ragged = OwnerRowLayout.build(
+        7,
+        rows,
+        _owners(["a", "b", "c"], {"a": 7, "b": 7, "c": 11}),
+        group,
+    )
+    assert (
+        balanced_decode_graph_signature(
+            nonidentity, num_reqs=3, num_tokens=3, uniform_decode=True
+        )
+        is None
+    )
+    assert (
+        balanced_decode_graph_signature(
+            ragged, num_reqs=3, num_tokens=3, uniform_decode=True
+        )
+        is None
+    )
+    assert (
+        balanced_decode_graph_signature(
+            identity, num_reqs=3, num_tokens=4, uniform_decode=False
+        )
+        is None
+    )
+
+
+def test_request_owned_graph_signature_rejects_invalid_key_material() -> None:
+    with pytest.raises(OwnerLayoutError, match="must not be empty"):
+        RequestOwnedGraphSignature((), ())
+    with pytest.raises(OwnerLayoutError, match="do not cover"):
+        RequestOwnedGraphSignature((1, 1), (0,))
+    with pytest.raises(OwnerLayoutError, match="must be a permutation"):
+        RequestOwnedGraphSignature((1, 1), (0, 0))
 
 
 # -- basic layout and rank mapping -------------------------------------------
