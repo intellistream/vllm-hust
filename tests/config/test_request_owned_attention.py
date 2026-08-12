@@ -254,17 +254,23 @@ def test_request_owned_q_wkv_fanin_gate_is_strict_bool(value):
         SchedulerConfig.default_factory(enable_request_owned_q_wkv_fanin=value)
 
 
-def test_graph_opt_in_accepts_only_piecewise_compile_lane():
+@pytest.mark.parametrize(
+    "cudagraph_mode",
+    [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE],
+)
+def test_graph_opt_in_accepts_piecewise_and_isolated_full_compile_lanes(
+    cudagraph_mode,
+):
     vllm_config = _vllm_config(
         enable_request_owned_graph=True,
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            cudagraph_mode=cudagraph_mode,
         ),
     )
     assert vllm_config.scheduler_config.enable_request_owned_graph is True
     assert vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
-    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+    assert vllm_config.compilation_config.cudagraph_mode == cudagraph_mode
 
 
 @pytest.mark.parametrize(
@@ -277,7 +283,7 @@ def test_graph_opt_in_accepts_only_piecewise_compile_lane():
     ],
 )
 def test_graph_opt_in_rejects_every_other_compile_envelope(mode, cudagraph_mode):
-    with pytest.raises(ValueError, match="PIECEWISE-only"):
+    with pytest.raises(ValueError, match="PIECEWISE or isolated FULL"):
         _vllm_config(
             enable_request_owned_graph=True,
             compilation_config=CompilationConfig(

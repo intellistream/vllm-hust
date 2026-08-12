@@ -393,7 +393,16 @@ class CudagraphDispatcher:
         result = []
         # Return in order: PIECEWISE first, then FULL
         for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
-            descs = list(self.cudagraph_keys[mode])
+            # Request-owned FULL entries cannot be captured by the ordinary
+            # ownerless dummy run: doing so would store the baseline model
+            # body under an owner graph key and silently replay it later.
+            # Keep the key dispatchable, but let the Ascend runner capture it
+            # on the first real, fully staged owner step.
+            descs = [
+                desc
+                for desc in self.cudagraph_keys[mode]
+                if desc.request_owned_signature is None
+            ]
             if descs:
                 # Sort by (num_tokens, num_active_loras) descending
                 descs.sort(

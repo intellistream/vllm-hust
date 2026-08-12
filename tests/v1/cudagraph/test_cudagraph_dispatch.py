@@ -104,6 +104,14 @@ class TestCudagraphDispatcher:
         assert owner_mode == CUDAGraphMode.FULL
         assert owner_key.request_owned_signature == owner_signature
 
+        capture_descs = dispatcher.get_capture_descs()
+        assert all(
+            desc.request_owned_signature is None
+            for _, descs in capture_descs
+            for desc in descs
+        ), "owner FULL keys must not be captured by ownerless dummy runs"
+        assert owner_key in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+
         baseline_mode, baseline_key = dispatcher.dispatch(
             num_tokens=8,
             uniform_decode=True,

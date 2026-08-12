@@ -2269,7 +2269,11 @@ class VllmConfig:
         if request_owned_graph:
             if (
                 compilation_config.mode != CompilationMode.VLLM_COMPILE
-                or compilation_config.cudagraph_mode != CUDAGraphMode.PIECEWISE
+                or compilation_config.cudagraph_mode
+                not in (
+                    CUDAGraphMode.PIECEWISE,
+                    CUDAGraphMode.FULL_AND_PIECEWISE,
+                )
             ):
                 mode_name = getattr(compilation_config.mode, "name", None)
                 cudagraph_name = getattr(
@@ -2277,12 +2281,13 @@ class VllmConfig:
                 )
                 raise ValueError(
                     "enable_request_owned_graph=True is an experimental "
-                    "PIECEWISE-only lane and requires "
+                    "PIECEWISE or isolated FULL-decode/PIECEWISE-mixed lane "
+                    "and requires "
                     "compilation_config.mode=VLLM_COMPILE with "
-                    "cudagraph_mode=PIECEWISE, but got mode="
+                    "cudagraph_mode=PIECEWISE or FULL_AND_PIECEWISE, but got mode="
                     f"{mode_name} and cudagraph_mode={cudagraph_name}. "
-                    "FULL/FULL_DECODE_ONLY cannot safely key or stage "
-                    "owner-local row layouts and shadow KV metadata."
+                    "FULL/FULL_DECODE_ONLY have no safe PIECEWISE fallback "
+                    "for owner layouts outside the fixed decode envelope."
                 )
         else:
             if compilation_config.mode != CompilationMode.NONE:
