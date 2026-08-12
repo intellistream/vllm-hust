@@ -1077,7 +1077,7 @@ def test_owner_graph_balanced_prefill_chunks_exact_cohort_in_lockstep() -> None:
                     command.key,
                     command.owner_id,
                     command.command_seq,
-                    runnable=64,
+                    runnable=command.required_num_tokens,
                 )
             ]
             for command in commands.values()
@@ -1097,6 +1097,48 @@ def test_owner_graph_balanced_prefill_chunks_exact_cohort_in_lockstep() -> None:
     }
     assert second_chunk.total_num_scheduled_tokens == 256
     assert [request.num_computed_tokens for request in requests] == [64] * 8
+
+
+def test_owner_graph_reserves_bounded_lifetime_and_decode_needs_no_extend() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=8,
+        max_num_running_reqs=1,
+        enable_request_owned_graph=True,
+    )
+    request = _request("req-0", num_prompt_tokens=8, max_tokens=4)
+    scheduler.add_request(request)
+
+    reserve_step = scheduler.schedule()
+    (reserve,) = reserve_step.owner_commands
+    assert reserve.required_num_tokens == 12
+    assert reserve.allocation is not None
+    assert reserve.allocation.num_tokens == 12
+    _apply_receipts(
+        scheduler,
+        reserve_step,
+        {
+            0: [
+                _receipt(
+                    reserve.key,
+                    0,
+                    reserve.command_seq,
+                    runnable=12,
+                )
+            ]
+        },
+    )
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"req-0": 8}
+    assert prefill.owner_commands == []
+    for token_id in (41, 42, 43):
+        request.append_output_token_ids([token_id])
+        decode = scheduler.schedule()
+        assert decode.num_scheduled_tokens == {"req-0": 1}
+        assert decode.owner_commands == []
+        (lease,) = decode.scheduled_owner_leases
+        assert lease.runnable_num_tokens == 12
 
 
 def test_owner_graph_ragged_prefill_keeps_running_order_policy() -> None:

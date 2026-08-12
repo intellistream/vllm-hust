@@ -2932,10 +2932,21 @@ class Scheduler(SchedulerInterface):
         return key
 
     def _owner_reserve_required(self, request: Request) -> int:
-        """Small chunk-scaled exact required count for a fresh RESERVE.
+        """Exact required count for a fresh RESERVE.
 
-        Scaled to the scheduling chunk, never the full request length.
+        The isolated owner-graph path reserves the request's already-known
+        bounded lifetime (prompt plus maximum generated tokens).  Decode can
+        then advance under the original authorization instead of alternating
+        every token-bearing graph replay with an EXTEND control heartbeat.
+        The non-graph control-plane path retains its earlier chunk-scaled
+        semantics.
         """
+        if getattr(
+            self.scheduler_config,
+            "enable_request_owned_graph",
+            False,
+        ):
+            return request.num_prompt_tokens + request.max_tokens
         remaining = request.num_tokens - request.num_computed_tokens
         return min(self.max_num_scheduled_tokens, remaining)
 
@@ -2950,6 +2961,15 @@ class Scheduler(SchedulerInterface):
         published = coordinator.published_num_tokens(
             self._owner_key[request.request_id]
         )
+        if getattr(
+            self.scheduler_config,
+            "enable_request_owned_graph",
+            False,
+        ):
+            return max(
+                published,
+                request.num_prompt_tokens + request.max_tokens,
+            )
         return min(
             request.num_tokens,
             max(published, self.max_num_scheduled_tokens),
