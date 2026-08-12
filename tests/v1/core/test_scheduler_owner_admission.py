@@ -80,9 +80,13 @@ def _make_scheduler(
     world_size: int = 2,
     max_num_scheduled_tokens: int = 64,
     max_num_running_reqs: int = 16,
+    enable_request_owned_graph: bool = False,
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.scheduler_config = SimpleNamespace(enable_request_owned_attention=True)
+    scheduler.scheduler_config = SimpleNamespace(
+        enable_request_owned_attention=True,
+        enable_request_owned_graph=enable_request_owned_graph,
+    )
     scheduler.parallel_config = SimpleNamespace(world_size=world_size)
     scheduler.current_step = 0
     scheduler.max_num_scheduled_tokens = max_num_scheduled_tokens
@@ -1045,6 +1049,87 @@ def test_aggregate_budget_freezes_plan_in_running_order() -> None:
         (t.key.request_id, t.runnable_num_tokens) for t in out3.scheduled_owner_leases
     ] == [("req-b", 32)]
     assert scheduler.prev_step_scheduled_req_ids == {"req-b"}
+
+
+def test_owner_graph_balanced_prefill_chunks_exact_cohort_in_lockstep() -> None:
+    scheduler = _make_scheduler(
+        world_size=8,
+        max_num_scheduled_tokens=256,
+        max_num_running_reqs=8,
+        enable_request_owned_graph=True,
+    )
+    requests = [_request(f"req-{owner}", num_prompt_tokens=64) for owner in range(8)]
+    for request in requests:
+        scheduler.add_request(request)
+
+    reserve_step = scheduler.schedule()
+    commands = {
+        command.key.request_id: command
+        for command in reserve_step.owner_commands
+    }
+    assert {command.owner_id for command in commands.values()} == set(range(8))
+    _apply_receipts(
+        scheduler,
+        reserve_step,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=64,
+                )
+            ]
+            for command in commands.values()
+        },
+    )
+
+    first_chunk = scheduler.schedule()
+    assert first_chunk.num_scheduled_tokens == {
+        f"req-{owner}": 32 for owner in range(8)
+    }
+    assert first_chunk.total_num_scheduled_tokens == 256
+    assert [request.num_computed_tokens for request in requests] == [32] * 8
+
+    second_chunk = scheduler.schedule()
+    assert second_chunk.num_scheduled_tokens == {
+        f"req-{owner}": 32 for owner in range(8)
+    }
+    assert second_chunk.total_num_scheduled_tokens == 256
+    assert [request.num_computed_tokens for request in requests] == [64] * 8
+
+
+def test_owner_graph_ragged_prefill_keeps_running_order_policy() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=48,
+        max_num_running_reqs=2,
+        enable_request_owned_graph=True,
+    )
+    a = _request("req-a", num_prompt_tokens=32)
+    b = _request("req-b", num_prompt_tokens=64)
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+    reserve_step = scheduler.schedule()
+    commands = list(reserve_step.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve_step,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+            for command in commands
+        },
+    )
+
+    scheduled = scheduler.schedule()
+    assert scheduled.num_scheduled_tokens == {"req-a": 32, "req-b": 16}
 
 
 def test_zero_budget_promotion_remains_new_until_first_dispatch() -> None:

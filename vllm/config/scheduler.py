@@ -204,11 +204,11 @@ class SchedulerConfig:
     enable_request_owned_graph: bool = False
     """Experimental graph pilot for request-owned execution.
 
-    Defaults to False.  The first graph lane uses PIECEWISE compilation and
-    keeps the dynamic request-owned DSA and MoE regions as explicit eager
-    split islands.  ``VllmConfig`` accepts only that exact graph envelope;
-    full graphs remain fail-closed because their ordinary batch descriptor
-    cannot represent owner-local row layouts or shadow KV metadata.
+    Defaults to False.  Mixed and prefill shapes reuse PIECEWISE compilation
+    but execute without a request-owned graph key.  The first FULL lane is a
+    finite, startup-captured pure-decode signature with exactly one row per
+    owner; its runner-owned metadata arena and ACL graph entry are sealed
+    before service.  Other FULL shapes remain fail-closed.
     The flag changes the compiled graph partition and is therefore included
     in :meth:`compute_hash`."""
 

@@ -2788,16 +2788,25 @@ class Scheduler(SchedulerInterface):
         """Plan RUNNING token counts capped by the horizon and global budget.
 
         Per-request plans are strictly capped by the granted horizon; the
-        global step budget (``max_num_scheduled_tokens``) freezes the plan
-        in RUNNING order: earlier requests keep their full per-request plan,
-        the first request that would overflow takes the remainder, and later
-        requests are left unscheduled until budget frees.  At the horizon
+        global step budget (``max_num_scheduled_tokens``) normally freezes
+        the plan in RUNNING order.  The isolated owner-FULL experiment has
+        one additional, deliberately narrow rule: an exact one-request-per-
+        owner prefill cohort at the same logical position advances in equal
+        chunks.  This prevents an undersized global token budget from
+        splitting one balanced wave into permanently phase-shifted owner
+        subsets before decode.  Ragged, mixed, incomplete, and non-graph
+        batches retain ordinary RUNNING-order semantics.  At the horizon
         with work remaining, EXTEND is issued and the request stalls until
         its receipt is applied.  Plans are logical payload only: nothing is
         dispatched for execution by this slice.
         """
         coordinator = self.owner_coordinator
         assert coordinator is not None
+        balanced_prefill = self._owner_balanced_prefill_plans()
+        if balanced_prefill is not None:
+            self._owner_token_plans.update(balanced_prefill)
+            return
+
         budget = self.max_num_scheduled_tokens
         for request in self.running:
             if request.is_finished():
@@ -2830,6 +2839,77 @@ class Scheduler(SchedulerInterface):
             plan = min(plan, budget)
             self._owner_token_plans[request_id] = plan
             budget -= plan
+
+    def _owner_balanced_prefill_plans(self) -> dict[str, int] | None:
+        """Return one lockstep prefill chunk for the exact owner FULL cohort.
+
+        The first FULL decode key is finite: exactly one row per process-
+        global owner.  With equal-length prompts, greedily consuming the
+        global token budget in request order can turn that future decode lane
+        into two phase-shifted subsets even though every NPU has useful
+        prefill work.  When *all* active RUNNING requests form that exact
+        cohort and have equal positive prefill work at the same position,
+        divide the budget evenly and intentionally leave any indivisible
+        remainder unused.  This is scheduler-level wave formation, not
+        owner-side token-budget coordination.
+
+        Returning ``None`` preserves the ordinary policy for every other
+        shape.  In particular, a budget smaller than the owner count falls
+        back rather than stalling the engine with an all-zero plan.
+        """
+        if not getattr(
+            self.scheduler_config,
+            "enable_request_owned_graph",
+            False,
+        ):
+            return None
+
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        cohort = [request for request in self.running if not request.is_finished()]
+        world_size = self.parallel_config.world_size
+        if len(cohort) != world_size or self.max_num_scheduled_tokens < world_size:
+            return None
+
+        owners: list[int] = []
+        positions: list[int] = []
+        plans: list[int] = []
+        for request in cohort:
+            request_id = request.request_id
+            key = self._owner_key.get(request_id)
+            if (
+                key is None
+                or self._owner_pending_command.get(request_id) is not None
+                or coordinator.is_release_pending(key)
+                or coordinator.is_released(key)
+                or coordinator.is_preempted(key)
+                or request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                return None
+            owner = coordinator.owner_of(key)
+            if owner is None:
+                return None
+            plan = self._owner_plan_num_new_tokens(request)
+            if plan <= 0:
+                return None
+            owners.append(owner)
+            positions.append(request.num_computed_tokens)
+            plans.append(plan)
+
+        if (
+            sorted(owners) != list(range(world_size))
+            or len(set(positions)) != 1
+            or len(set(plans)) != 1
+        ):
+            return None
+
+        per_request = min(
+            plans[0],
+            self.max_num_scheduled_tokens // world_size,
+        )
+        if per_request <= 0:
+            return None
+        return {request.request_id: per_request for request in cohort}
 
     def _owner_key_for(self, request: Request) -> OwnerLeaseKey:
         """Return (and remember) the lease key for a request incarnation."""
