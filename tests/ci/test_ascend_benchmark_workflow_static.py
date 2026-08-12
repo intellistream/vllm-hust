@@ -294,6 +294,45 @@ def test_multi_scenario_runner_prints_failure_diagnostics():
     assert 'print_file_tail "runner preflight failure"' in text
 
 
+def test_structured_nightly_diagnostics_capture_steps_scenarios_and_four_states():
+    text = workflow_text()
+    diagnostics_step = text.index("      - name: Build structured Nightly diagnostics")
+    upload_step = text.index("      - name: Upload benchmark artifacts")
+    diagnostics_block = text[diagnostics_step:upload_step]
+
+    assert diagnostics_step < upload_step
+    assert "ASCEND_BENCHMARK_STEP_RESULTS_JSON" in diagnostics_block
+    assert '"id":"formal-benchmark"' in diagnostics_block
+    assert "steps.formal-benchmark.outputs.exit_code" in diagnostics_block
+    assert "build_ascend_benchmark_diagnostics.py" in diagnostics_block
+    assert "nightly-diagnostics.json" in diagnostics_block
+    for state in (
+        "benchmark_execution_status",
+        "publication_status",
+        "data_quality_status",
+        "release_visibility_status",
+    ):
+        assert state in diagnostics_block
+    assert "BENCHMARK_REPO_GH_TOKEN" not in diagnostics_block
+    assert "BENCHMARK_REPO_SSH_KEY" not in diagnostics_block
+
+
+def test_plugin_checkout_and_installed_preflights_run_before_benchmark():
+    text = workflow_text()
+    checkout = text.index("      - name: Checkout vllm-ascend-hust repo")
+    checkout_preflight = text.index("      - name: Preflight vllm-ascend-hust checkout")
+    install = text.index("      - name: Prepare Ascend runtime and install repos")
+    installed_preflight = text.index("      - name: Verify installation")
+    benchmark = text.index("      - name: Run benchmark CI and optional formal publish")
+
+    assert checkout < checkout_preflight < install < installed_preflight < benchmark
+    assert "verify_ascend_benchmark_plugin.py checkout" in text
+    assert '--expected-sha "$VLLM_ASCEND_HUST_REPO_REF"' in text
+    assert "verify_ascend_benchmark_plugin.py installed" in text
+    assert "plugin-checkout.json" in text
+    assert "plugin-installed.json" in text
+
+
 def test_benchmark_script_does_not_force_max_model_len():
     script = (
         Path(__file__).resolve().parents[2]
@@ -665,7 +704,7 @@ def test_store_baseline_step_expects_measurement_policy():
     assert 'PERFGATE_EXPECTED_AGGREGATION: "primary-median-run"' in store_block
 
 
-def test_pr_stage1_and_stage2_emit_provenance_with_repeated_measurements():
+def test_pr_stage1_and_stage2_keep_single_measurement_policy():
     text = workflow_text()
 
     formal_step = text.index("- name: Run benchmark CI and optional formal publish")
@@ -680,12 +719,17 @@ def test_pr_stage1_and_stage2_emit_provenance_with_repeated_measurements():
     pr_block = text[formal_step:stage1_step]
     stage2_block = text[stage2_step:final_compare_step]
 
-    assert "PERFGATE_WARMUP_RUNS:" in pr_block
-    assert "PERFGATE_MEASURED_RUNS:" in pr_block
+    assert 'PERFGATE_WARMUP_RUNS: "0"' in pr_block
+    assert 'PERFGATE_MEASURED_RUNS: "1"' in pr_block
     assert 'PERFGATE_AGGREGATION: "primary-median-run"' in pr_block
-    assert 'PERFGATE_WARMUP_RUNS: "1"' in stage2_block
-    assert 'PERFGATE_MEASURED_RUNS: "3"' in stage2_block
+    assert "PERFGATE_REQUIRE_PROVENANCE:" in pr_block
+    assert "&& '1' || '0'" in pr_block
+    assert 'PERFGATE_WARMUP_RUNS: "0"' in stage2_block
+    assert 'PERFGATE_MEASURED_RUNS: "1"' in stage2_block
     assert 'PERFGATE_AGGREGATION: "primary-median-run"' in stage2_block
+    assert 'PERFGATE_REQUIRE_PROVENANCE: "1"' in stage2_block
+    assert 'PERFGATE_WARMUP_RUNS: "1"' not in pr_block + stage2_block
+    assert 'PERFGATE_MEASURED_RUNS: "3"' not in pr_block + stage2_block
 
 
 def test_runner_script_forwards_perfgate_measurement_env():
@@ -694,6 +738,7 @@ def test_runner_script_forwards_perfgate_measurement_env():
     for name in (
         "PERFGATE_AGGREGATION",
         "PERFGATE_MEASURED_RUNS",
+        "PERFGATE_REQUIRE_PROVENANCE",
         "PERFGATE_WARMUP_RUNS",
     ):
         assert f"\n  {name}\n" in text, f"{name} missing from SUDO_PRESERVE_ENV_VARS"
@@ -714,6 +759,7 @@ def test_runner_script_copies_measurement_json_fail_closed():
     assert '"${PERFGATE_WARMUP_RUNS:-0}" -gt 0' in text
     assert '"${PERFGATE_MEASURED_RUNS:-1}" -gt 1' in text
     assert "perfgate-provenance.json" in text
+    assert '"${PERFGATE_REQUIRE_PROVENANCE:-0}" == "1"' in text
     assert '"schema_version": "perfgate-runtime-provenance/v1"' in text
     assert 'PERFGATE_CANN_VERSION="${HUST_ASCEND_RUNTIME_VERSION:-}"' in text
     assert 'git -C "${HUST_ASCEND_MANAGER_REPO:-}" rev-parse HEAD' in text
@@ -781,3 +827,38 @@ def test_perfgate_producer_and_store_survive_formal_benchmark_failure():
     )
     assert "  store-main-perfgate-baseline:" not in text
     assert text.count("secrets.VLLM_HUST_CENTRAL_BASELINE_WRITER_TOKEN") == 1
+
+
+def test_structured_diagnostics_cover_critical_operational_failures():
+    text = workflow_text()
+    diagnostics_start = text.index("- name: Build structured Nightly diagnostics")
+    diagnostics_end = text.index(
+        "- name: Upload benchmark artifacts", diagnostics_start
+    )
+    diagnostics_block = text[diagnostics_start:diagnostics_end]
+
+    critical_step_ids = (
+        "pre-clean-workspace",
+        "resolve-trusted-shas",
+        "configure-github-ssh",
+        "resolve-main-spec",
+        "checkout-website",
+        "preflight-root-helper",
+        "checkout-runtime-manager",
+        "verify-trusted-shas",
+        "prepare-hf-cache",
+        "acquire-hardware-lock",
+        "perfgate-producer",
+        "sanitize-before-baseline-publish",
+        "publish-central-baseline",
+        "cleanup-ascend-processes",
+        "release-hardware-lock",
+        "build-benchmark-summary",
+    )
+    for step_id in critical_step_ids:
+        assert f"id: {step_id}" in text
+        assert f'"id":"{step_id}"' in diagnostics_block
+        assert f"steps.{step_id}.outcome" in diagnostics_block
+        assert f"steps.{step_id}.outputs.exit_code" in diagnostics_block
+
+    assert "toJson(steps)" not in diagnostics_block

@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parents[2] / ".github/workflows/scripts"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_DIR = REPO_ROOT / ".github/workflows/scripts"
+WORKFLOW = REPO_ROOT / ".github/workflows/ascend-benchmark-leaderboard.yml"
 
 
 def script_text(name: str) -> str:
     return (SCRIPT_DIR / name).read_text(encoding="utf-8")
+
+
+def workflow_text() -> str:
+    return WORKFLOW.read_text(encoding="utf-8")
 
 
 def test_run_ascend_benchmark_propagates_benchmark_repo_publish_env():
@@ -32,6 +38,21 @@ def test_perfgate_store_baseline_cleans_scoped_writer_credentials_on_exit():
     assert "trap cleanup EXIT" in text
 
 
+def test_perfgate_store_baseline_retries_target_main_fetch():
+    text = script_text("perfgate_store_baseline.sh")
+    fetch_start = text.index("fetch_target_main_with_retry() {")
+    fetch_end = text.index("\nfetch_target_main_with_retry\n", fetch_start)
+    fetch_block = text[fetch_start:fetch_end]
+
+    assert "PERFGATE_TARGET_FETCH_MAX_ATTEMPTS:-4" in fetch_block
+    assert "PERFGATE_TARGET_FETCH_INITIAL_DELAY_SECONDS:-15" in fetch_block
+    assert 'git -C "$TARGET_GIT_REPOSITORY" fetch --quiet' in fetch_block
+    assert "origin main:refs/remotes/origin/main" in fetch_block
+    assert 'sleep "$delay_seconds"' in fetch_block
+    assert "delay_seconds=$((delay_seconds * 2))" in fetch_block
+    assert "Failed to fetch target main after" in fetch_block
+
+
 def test_benchmark_snapshot_sync_explains_missing_write_credentials():
     text = script_text("sync_benchmark_snapshots_to_github.sh")
     runner_text = script_text("run_ascend_benchmark_ci.sh")
@@ -43,24 +64,55 @@ def test_benchmark_snapshot_sync_explains_missing_write_credentials():
     assert "Benchmark repo publish target:" in text
     staging_index = text.index("publication_staging_dir=$(mktemp -d")
     public_validator_index = text.index("validate_public_leaderboard_snapshots.py")
-    trend_validator_index = text.index("validate-trend --input")
+    trend_validator_index = text.index(
+        'PYTHONPATH="$BENCHMARK_REPO_DIR/src', public_validator_index
+    )
     git_add_index = text.index('git -C "$BENCHMARK_REPO_DIR" add')
     git_commit_index = text.index('git -C "$BENCHMARK_REPO_DIR" commit')
     git_push_index = text.index('git -C "$BENCHMARK_REPO_DIR" push')
     assert staging_index < public_validator_index < trend_validator_index
     assert trend_validator_index < git_add_index
+    trend_validator_block = text[trend_validator_index:git_add_index]
+    assert "from vllm_hust_benchmark.integration import" in trend_validator_block
+    assert "validate_public_snapshot_trend_admission" in trend_validator_block
+    assert "Path(sys.argv[1])" in trend_validator_block
     assert git_add_index < git_commit_index < git_push_index
     assert "write_github_env GITHUB_SNAPSHOT_SYNC_STATUS rejected" in text
+    assert "write_github_env GITHUB_SNAPSHOT_SYNC_STATUS attempting" in text
+    assert "write_github_env GITHUB_SNAPSHOT_SYNC_STATUS failed" in text
+    assert "write_github_env GITHUB_SNAPSHOT_SYNC_VERIFICATION failed" in text
     assert (
-        "required_submission_files=(leaderboard_manifest.json "
-        "run_leaderboard.json STATUS)" in text
+        "required_submission_files=(" in text
+        and "env-manifest.json" in text
+        and "checksums.sha256" in text
     )
     assert "reset_publication_staging()" in text
     assert "reset_publication_staging || return $?" in text
     submit_index = runner_text.index('"$PYTHON_BIN" -m vllm_hust_benchmark.cli submit')
-    status_index = runner_text.index("printf 'OK\\n' > \"$SUBMISSION_DIR/STATUS\"")
-    sync_index = runner_text.index("sync_benchmark_publication_to_github", status_index)
-    assert submit_index < status_index < sync_index
+    finalize_index = runner_text.index("\nfinalize_submission_artifact\n", submit_index)
+    sync_index = runner_text.index(
+        "sync_benchmark_publication_to_github", finalize_index
+    )
+    assert submit_index < finalize_index < sync_index
+
+
+def test_runner_collects_submission_evidence_before_admission():
+    text = script_text("run_ascend_benchmark_ci.sh")
+
+    collector_index = text.index("collect_submission_evidence() {")
+    finalize_index = text.index("\nfinalize_submission_artifact\n", collector_index)
+    status_index = text.index('cat "$SUBMISSION_DIR/STATUS"', finalize_index)
+    aggregation_index = text.index(
+        '"$PYTHON_BIN" -m vllm_hust_benchmark.cli publish-website'
+    )
+
+    assert "collect-run-artifact.sh" in text[collector_index:status_index]
+    assert 'CURRENT_RUNTIME_PYTHON="$PYTHON_BIN"' in text[collector_index:status_index]
+    assert (
+        text.index("collect_submission_evidence", collector_index + 1) < finalize_index
+    )
+    assert finalize_index < status_index
+    assert status_index < aggregation_index
 
 
 def test_same_spec_benchmark_failure_prints_server_log_tail():
@@ -137,6 +189,35 @@ def test_ascend_server_readiness_windows_allow_cold_start():
     assert (
         "SAME_SPEC_READY_TIMEOUT_SECONDS=${SAME_SPEC_READY_TIMEOUT_SECONDS:-1200}"
     ) in benchmark_text
+
+
+def test_same_spec_readiness_timeout_reaches_runner_in_both_execution_modes():
+    workflow = workflow_text()
+    benchmark_text = script_text("run_ascend_benchmark_ci.sh")
+    same_spec_block = benchmark_text[
+        benchmark_text.index("run_same_spec_current_benchmark() {") :
+    ]
+    preserve_block = benchmark_text[
+        benchmark_text.index("SUDO_PRESERVE_ENV_VARS=(") : benchmark_text.index(
+            "build_sudo_env_preserve_list()"
+        )
+    ]
+
+    assert 'SAME_SPEC_READY_TIMEOUT_SECONDS: "2400"' in workflow
+    assert (
+        "local same_spec_ready_timeout_seconds=${SAME_SPEC_READY_TIMEOUT_SECONDS:-1200}"
+    ) in same_spec_block
+    assert (
+        same_spec_block.count(
+            'READY_TIMEOUT_SECONDS="$same_spec_ready_timeout_seconds" \\'
+        )
+        == 2
+    )
+    assert "READY_TIMEOUT_SECONDS" in preserve_block
+    assert (
+        'echo "[same-spec-current] effective readiness timeout: '
+        '${same_spec_ready_timeout_seconds}s"'
+    ) in same_spec_block
 
 
 def test_benchmark_pins_named_runner_to_its_npu():
