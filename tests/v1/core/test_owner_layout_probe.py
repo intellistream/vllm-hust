@@ -14,8 +14,12 @@ from vllm.v1.core.sched.owner_layout_probe import (
 from vllm.v1.core.sched.ownership import (
     OwnerCacheGroupSnapshot,
     OwnerCachePoolSnapshot,
+    OwnerCommand,
+    OwnerCommandKind,
     OwnerLeaseKey,
     OwnerLeaseToken,
+    OwnerReceipt,
+    OwnerReceiptBatch,
 )
 
 
@@ -49,7 +53,7 @@ def test_probe_records_mixed_and_zero_owner_rows(tmp_path, monkeypatch) -> None:
     assert records[0] == {
         "kind": "header",
         "run_id": "owner-cell",
-        "schema": "g4-request-owner-layout-observation/v3",
+        "schema": "g5-request-owner-lifecycle-observation/v4",
         "world_size": 4,
     }
     step = records[1]
@@ -63,6 +67,66 @@ def test_probe_records_mixed_and_zero_owner_rows(tmp_path, monkeypatch) -> None:
     assert step["total_scheduled_tokens"] == 7
     assert step["zero_row_owner_ranks"] == [1, 3]
     assert step["owner_cache_pools"] is None
+    assert step["commands"] == []
+    assert step["receipts"] == []
+
+
+def test_probe_records_matching_command_and_receipt(tmp_path) -> None:
+    probe = OwnerLayoutProbe(
+        path=tmp_path / "probe.jsonl",
+        run_id="extend-cell",
+        world_size=2,
+        max_records=4,
+        max_bytes=4096,
+    )
+    key = OwnerLeaseKey(request_id="req", owner_epoch=1)
+    command = OwnerCommand(
+        key=key,
+        owner_id=0,
+        command_seq=5,
+        kind=OwnerCommandKind.EXTEND,
+        required_num_tokens=10,
+    )
+    receipt = OwnerReceipt(
+        key=key,
+        owner_id=0,
+        command_seq=5,
+        accepted=True,
+        runnable_num_tokens=10,
+    )
+    probe.record_step(
+        step_seq=7,
+        leases=[],
+        num_scheduled_tokens={},
+        commands=[command],
+        receipt_batches=[
+            OwnerReceiptBatch(owner_rank=0, emitted_step_seq=7, events=(receipt,)),
+            OwnerReceiptBatch(owner_rank=1, emitted_step_seq=7, events=()),
+        ],
+    )
+    record = json.loads((tmp_path / "probe.jsonl").read_text().splitlines()[1])
+    assert record["commands"] == [
+        {
+            "command_seq": 5,
+            "kind": "EXTEND",
+            "owner_epoch": 1,
+            "owner_rank": 0,
+            "request_id": "req",
+            "required_num_tokens": 10,
+        }
+    ]
+    assert record["receipts"] == [
+        {
+            "accepted": True,
+            "command_seq": 5,
+            "error": None,
+            "owner_epoch": 1,
+            "owner_rank": 0,
+            "released": False,
+            "request_id": "req",
+            "runnable_num_tokens": 10,
+        }
+    ]
 
 
 def _pool(rank: int, *, free_blocks: int) -> OwnerCachePoolSnapshot:

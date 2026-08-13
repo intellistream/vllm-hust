@@ -232,6 +232,16 @@ class SchedulerConfig:
     a useful FULL-graph run while bounding queueing delay; it is ignored unless
     ``enable_request_owned_windows`` is true."""
 
+    request_owned_decode_reservation_tokens: int | None = Field(default=None, ge=1)
+    """Optional decode-token chunk for request-owned physical reservations.
+
+    ``None`` preserves the optimized graph lane's existing behavior: reserve
+    the request's complete known prompt-plus-generation lifetime on first
+    admission. A positive value instead reserves the full prompt plus at most
+    this many decode tokens, then grows the exclusive runnable horizon through
+    receipt-gated command-only EXTEND steps. This is an experimental capacity
+    policy and does not change model computation or graph structure."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

@@ -10,13 +10,18 @@ import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from vllm.v1.core.sched.ownership import OwnerCachePoolSnapshot, OwnerLeaseToken
+from vllm.v1.core.sched.ownership import (
+    OwnerCachePoolSnapshot,
+    OwnerCommand,
+    OwnerLeaseToken,
+    OwnerReceiptBatch,
+)
 
 PROBE_DIR_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_DIR"
 RUN_ID_ENV = "VLLM_TELEMETRY_RUN_ID"
 MAX_RECORDS_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_MAX_RECORDS"
 MAX_BYTES_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_MAX_BYTES"
-SCHEMA = "g4-request-owner-layout-observation/v3"
+SCHEMA = "g5-request-owner-lifecycle-observation/v4"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 
@@ -123,6 +128,8 @@ class OwnerLayoutProbe:
         step_seq: int,
         leases: Sequence[OwnerLeaseToken],
         num_scheduled_tokens: Mapping[str, int],
+        commands: Sequence[OwnerCommand] = (),
+        receipt_batches: Sequence[OwnerReceiptBatch] = (),
         cache_pool_snapshots: Mapping[int, OwnerCachePoolSnapshot] | None = None,
     ) -> None:
         if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
@@ -229,6 +236,31 @@ class OwnerLayoutProbe:
                         ],
                     }
                 )
+        command_records = [
+            {
+                "request_id": command.key.request_id,
+                "owner_epoch": command.key.owner_epoch,
+                "owner_rank": command.owner_id,
+                "command_seq": command.command_seq,
+                "kind": command.kind.value,
+                "required_num_tokens": command.required_num_tokens,
+            }
+            for command in commands
+        ]
+        receipt_records = [
+            {
+                "request_id": event.key.request_id,
+                "owner_epoch": event.key.owner_epoch,
+                "owner_rank": event.owner_id,
+                "command_seq": event.command_seq,
+                "accepted": event.accepted,
+                "runnable_num_tokens": event.runnable_num_tokens,
+                "released": event.released,
+                "error": event.error,
+            }
+            for batch in receipt_batches
+            for event in batch.events
+        ]
         self._write(
             {
                 "schema": SCHEMA,
@@ -236,6 +268,8 @@ class OwnerLayoutProbe:
                 "run_id": self.run_id,
                 "step_seq": step_seq,
                 "assignments": assignments,
+                "commands": command_records,
+                "receipts": receipt_records,
                 "scheduled_request_count": len(assignments),
                 "total_scheduled_tokens": sum(owner_row_counts),
                 "owner_request_counts": owner_request_counts,

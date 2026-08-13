@@ -109,11 +109,18 @@ def test_request_owned_attention_defaults_off():
     assert SchedulerConfig.default_factory().enable_request_owned_graph is False
     assert SchedulerConfig.default_factory().enable_request_owned_windows is False
     assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 32
+    assert (
+        SchedulerConfig.default_factory().request_owned_decode_reservation_tokens
+        is None
+    )
     assert VllmConfig().scheduler_config.enable_request_owned_attention is False
     assert VllmConfig().scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert VllmConfig().scheduler_config.enable_request_owned_graph is False
     assert VllmConfig().scheduler_config.enable_request_owned_windows is False
     assert VllmConfig().scheduler_config.request_owned_decode_window_steps == 32
+    assert (
+        VllmConfig().scheduler_config.request_owned_decode_reservation_tokens is None
+    )
 
 
 @pytest.mark.parametrize("value", [1, "true", None])
@@ -150,6 +157,16 @@ def test_request_owned_windows_construct_with_graph_and_quantum():
 def test_request_owned_window_quantum_must_be_positive(value):
     with pytest.raises(ValueError, match="request_owned_decode_window_steps"):
         SchedulerConfig.default_factory(request_owned_decode_window_steps=value)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_request_owned_decode_reservation_tokens_must_be_positive(value):
+    with pytest.raises(
+        ValueError, match="request_owned_decode_reservation_tokens"
+    ):
+        SchedulerConfig.default_factory(
+            request_owned_decode_reservation_tokens=value
+        )
 
 
 def test_disabled_leaves_existing_validation_unchanged():

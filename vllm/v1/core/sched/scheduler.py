@@ -1705,6 +1705,8 @@ class Scheduler(SchedulerInterface):
                     step_seq=scheduler_output.step_seq,
                     leases=scheduler_output.scheduled_owner_leases,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    commands=scheduler_output.owner_commands,
+                    receipt_batches=model_runner_output.owner_receipt_batches or (),
                     cache_pool_snapshots=(
                         self._owner_pool_snapshots
                         if self._owner_pool_snapshot_seen
@@ -3386,6 +3388,16 @@ class Scheduler(SchedulerInterface):
         The non-graph control-plane path retains its earlier chunk-scaled
         semantics.
         """
+        decode_chunk = getattr(
+            self.scheduler_config,
+            "request_owned_decode_reservation_tokens",
+            None,
+        )
+        if decode_chunk is not None:
+            return min(
+                request.num_prompt_tokens + request.max_tokens,
+                request.num_prompt_tokens + decode_chunk,
+            )
         if getattr(
             self.scheduler_config,
             "enable_request_owned_graph",
@@ -3406,6 +3418,16 @@ class Scheduler(SchedulerInterface):
         published = coordinator.published_num_tokens(
             self._owner_key[request.request_id]
         )
+        decode_chunk = getattr(
+            self.scheduler_config,
+            "request_owned_decode_reservation_tokens",
+            None,
+        )
+        if decode_chunk is not None:
+            return min(
+                request.num_prompt_tokens + request.max_tokens,
+                max(published, request.num_prompt_tokens + decode_chunk),
+            )
         if getattr(
             self.scheduler_config,
             "enable_request_owned_graph",
@@ -3427,9 +3449,24 @@ class Scheduler(SchedulerInterface):
         asks the worker to honor, so the next chunk starts at the current
         computed position (which equals the granted horizon when extending).
         """
+        decode_chunk = getattr(
+            self.scheduler_config,
+            "request_owned_decode_reservation_tokens",
+            None,
+        )
+        increment = (
+            decode_chunk
+            if decode_chunk is not None
+            else self.max_num_scheduled_tokens
+        )
+        upper_bound = (
+            request.num_prompt_tokens + request.max_tokens
+            if decode_chunk is not None
+            else request.num_tokens
+        )
         return min(
-            request.num_tokens,
-            request.num_computed_tokens + self.max_num_scheduled_tokens,
+            upper_bound,
+            request.num_computed_tokens + increment,
         )
 
     def _assign_owner_and_reserve(self, request: Request, key: OwnerLeaseKey) -> None:

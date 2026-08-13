@@ -83,6 +83,7 @@ def _make_scheduler(
     enable_request_owned_graph: bool = False,
     enable_request_owned_windows: bool = False,
     request_owned_decode_window_steps: int = 32,
+    request_owned_decode_reservation_tokens: int | None = None,
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.scheduler_config = SimpleNamespace(
@@ -90,6 +91,9 @@ def _make_scheduler(
         enable_request_owned_graph=enable_request_owned_graph,
         enable_request_owned_windows=enable_request_owned_windows,
         request_owned_decode_window_steps=request_owned_decode_window_steps,
+        request_owned_decode_reservation_tokens=(
+            request_owned_decode_reservation_tokens
+        ),
     )
     scheduler.parallel_config = SimpleNamespace(world_size=world_size)
     scheduler.current_step = 0
@@ -1542,6 +1546,52 @@ def test_prefill_window_extends_partial_worker_horizon_then_continues() -> None:
 
     second_token = scheduler.schedule()
     assert second_token.num_scheduled_tokens == {"pressure": 1}
+
+
+def test_graph_window_decode_reservation_chunk_extends_command_only() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_reservation_tokens=2,
+    )
+    request = _request("chunked", num_prompt_tokens=8, max_tokens=4)
+    scheduler.add_request(request)
+
+    reserve_step = scheduler.schedule()
+    (reserve,) = reserve_step.owner_commands
+    assert reserve.required_num_tokens == 10
+    _apply_receipts(
+        scheduler,
+        reserve_step,
+        {0: [_receipt(reserve.key, 0, reserve.command_seq, runnable=10)]},
+    )
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"chunked": 8}
+    _ack_window_step(scheduler, prefill)
+
+    for _ in range(2):
+        decode = scheduler.schedule()
+        assert decode.num_scheduled_tokens == {"chunked": 1}
+        _ack_window_step(scheduler, decode)
+
+    extend_step = scheduler.schedule()
+    assert extend_step.num_scheduled_tokens == {}
+    assert extend_step.scheduled_owner_leases == []
+    (extend,) = extend_step.owner_commands
+    assert extend.kind is OwnerCommandKind.EXTEND
+    assert extend.required_num_tokens == 12
+    _apply_receipts(
+        scheduler,
+        extend_step,
+        {0: [_receipt(extend.key, 0, extend.command_seq, runnable=12)]},
+    )
+
+    resumed = scheduler.schedule()
+    assert resumed.num_scheduled_tokens == {"chunked": 1}
 
 
 def test_decode_quantum_rotates_same_owner_ready_requests() -> None:

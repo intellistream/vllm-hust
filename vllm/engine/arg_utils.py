@@ -724,6 +724,9 @@ class EngineArgs:
     request_owned_decode_window_steps: int = (
         SchedulerConfig.request_owned_decode_window_steps
     )
+    request_owned_decode_reservation_tokens: int | None = (
+        SchedulerConfig.request_owned_decode_reservation_tokens
+    )
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
@@ -1502,6 +1505,10 @@ class EngineArgs:
             "--request-owned-decode-window-steps",
             **scheduler_kwargs["request_owned_decode_window_steps"],
         )
+        scheduler_group.add_argument(
+            "--request-owned-decode-reservation-tokens",
+            **scheduler_kwargs["request_owned_decode_reservation_tokens"],
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -2209,6 +2216,9 @@ class EngineArgs:
             enable_request_owned_windows=self.enable_request_owned_windows,
             request_owned_decode_window_steps=(
                 self.request_owned_decode_window_steps
+            ),
+            request_owned_decode_reservation_tokens=(
+                self.request_owned_decode_reservation_tokens
             ),
         )
 
