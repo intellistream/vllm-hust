@@ -304,6 +304,11 @@ def _run_rank(rank: int, args: argparse.Namespace) -> dict[str, Any]:
     torch.npu.set_device(rank)
     device = torch.device(f"npu:{rank}")
     free_before, total_memory = torch.npu.mem_get_info(rank)
+    from vllm_ascend.ops.triton.triton_utils import (
+        init_device_properties_triton,
+    )
+
+    init_device_properties_triton()
 
     raw = torch.full(
         (PACKED_PREFIX_BYTES + NUM_DEVICE_BLOCKS * PAGE_BYTES + PACKED_SUFFIX_BYTES,),
