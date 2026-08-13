@@ -419,6 +419,27 @@ def test_worker_first_compute_consumes_exact_admitted_roster_once(monkeypatch):
     assert observer.first_compute_observations == [(context, 200)]
 
 
+def test_worker_debug_disabled_does_not_sort_log_arguments(monkeypatch):
+    events: list[tuple] = []
+    observer = RecordingObserver(events)
+    worker, _backend, _events = make_worker(observer)
+    context = make_compute_context()
+    monkeypatch.setattr(worker_module.logger, "isEnabledFor", lambda _level: False)
+
+    def unexpected_sort(_value):
+        raise AssertionError("DEBUG-disabled worker sorted its log argument")
+
+    monkeypatch.setattr(worker_module, "sorted", unexpected_sort, raising=False)
+    worker.start_kv_transfers(
+        metadata(kv_recovery_compute_contexts=(("request-0", context),))
+    )
+    monkeypatch.setattr(worker_module.time, "monotonic_ns", lambda: 200)
+
+    worker.observe_kv_recovery_first_compute({"request-0"})
+
+    assert observer.first_compute_observations == [(context, 200)]
+
+
 def test_worker_first_compute_fails_closed_for_roster_mismatch(monkeypatch):
     events: list[tuple] = []
     observer = RecordingObserver(events)

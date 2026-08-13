@@ -58,6 +58,29 @@ def test_mrv2_forward_observer_passes_exact_scheduler_roster(monkeypatch):
     assert connector.observations == [frozenset({"request-0"})]
 
 
+def test_mrv2_debug_disabled_does_not_sort_scheduler_roster(monkeypatch):
+    connector = RecordingConnector()
+    active = v2_connector_module.ActiveKVConnector.__new__(
+        v2_connector_module.ActiveKVConnector
+    )
+    active._disabled = False
+    active.kv_connector = connector
+    monkeypatch.setattr(
+        v2_connector_module.logger, "isEnabledFor", lambda _level: False
+    )
+
+    def unexpected_sort(_value):
+        raise AssertionError("DEBUG-disabled observer sorted its log argument")
+
+    monkeypatch.setattr(v2_connector_module, "sorted", unexpected_sort, raising=False)
+
+    active.observe_kv_recovery_first_compute(
+        SimpleNamespace(num_scheduled_tokens={"request-0": 1})
+    )
+
+    assert connector.observations == [frozenset({"request-0"})]
+
+
 def test_mrv2_forward_observer_is_noop_when_disabled(monkeypatch):
     connector = RecordingConnector()
     active = v2_connector_module.ActiveKVConnector.__new__(

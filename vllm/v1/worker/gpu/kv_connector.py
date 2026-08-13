@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,6 +17,7 @@ from vllm.forward_context import (
     is_forward_context_available,
     set_forward_context,
 )
+from vllm.logger import init_logger
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     KVConnectorOutput,
@@ -24,6 +26,8 @@ from vllm.v1.outputs import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+logger = init_logger(__name__)
 
 
 class KVConnector:
@@ -84,13 +88,11 @@ class ActiveKVConnector(KVConnector):
     ) -> None:
         if self._disabled:
             return
-        from vllm.logger import init_logger
-
-        logger = init_logger(__name__)
-        logger.debug(
-            "KV-recovery model-runner observe called, scheduled=%s",
-            sorted(scheduler_output.num_scheduled_tokens),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KV-recovery model-runner observe called, scheduled=%s",
+                sorted(scheduler_output.num_scheduled_tokens),
+            )
         self.kv_connector.observe_kv_recovery_first_compute(
             scheduler_output.num_scheduled_tokens,
         )

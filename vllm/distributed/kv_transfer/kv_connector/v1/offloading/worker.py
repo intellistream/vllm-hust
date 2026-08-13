@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 import math
 import time
 from collections import defaultdict
@@ -547,10 +548,11 @@ class OffloadingConnectorWorker:
             self._kv_recovery_compute_contexts = dict(
                 metadata.kv_recovery_compute_contexts or {}
             )
-            logger.debug(
-                "KV-recovery start_kv_transfers compute_contexts=%s",
-                sorted(self._kv_recovery_compute_contexts),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "KV-recovery start_kv_transfers compute_contexts=%s",
+                    sorted(self._kv_recovery_compute_contexts),
+                )
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
@@ -597,11 +599,12 @@ class OffloadingConnectorWorker:
             return
         pending = tuple(contexts.items())
         contexts.clear()
-        logger.debug(
-            "KV-recovery first_compute observe: contexts=%s scheduled=%s",
-            sorted(k for k, _ in pending),
-            sorted(scheduled_request_ids),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KV-recovery first_compute observe: contexts=%s scheduled=%s",
+                sorted(k for k, _ in pending),
+                sorted(scheduled_request_ids),
+            )
         for runtime_request_id, context in pending:
             if (
                 runtime_request_id not in scheduled_request_ids
