@@ -72,6 +72,26 @@ class _FakeWorker:
         self.metadata_handoffs.append(metadata)
 
 
+class _ScriptedDeferredWorker(_FakeWorker):
+    """Real-store integration worker for one deferred speculative step."""
+
+    def __init__(self, sample_output: ModelRunnerOutput) -> None:
+        super().__init__(output=EMPTY_MODEL_RUNNER_OUTPUT)
+        self.sample_output = sample_output
+        self.sample_calls = 0
+
+    def execute_model(self, scheduler_output):
+        self.calls += 1
+        # The RESERVE heartbeat completes synchronously.  The following
+        # token-bearing target verification defers its terminal output to
+        # sample_tokens, matching the production split-sampling lifecycle.
+        return EMPTY_MODEL_RUNNER_OUTPUT if self.calls == 1 else None
+
+    def sample_tokens(self, grammar_output):
+        self.sample_calls += 1
+        return self.sample_output
+
+
 class _NoHookWorker:
     """A worker that does not implement the G3 handoff hook."""
 
@@ -322,6 +342,14 @@ def _real_wrapper(worker: _FakeWorker, num_blocks: int = 32) -> WorkerWrapperBas
     wrapper.worker = worker
     wrapper.mm_receiver_cache = None
     wrapper.initialize_from_config([_kv_cache_config(num_blocks=num_blocks)])
+    return wrapper
+
+
+def _speculative_real_wrapper(
+    worker: _ScriptedDeferredWorker, num_blocks: int = 32
+) -> WorkerWrapperBase:
+    wrapper = _real_wrapper(worker, num_blocks=num_blocks)
+    wrapper.vllm_config.scheduler_config.enable_request_owned_sampling = True
     return wrapper
 
 
@@ -909,6 +937,75 @@ def test_default_off_path_is_unchanged() -> None:
 
 
 # -- G3 step metadata seam ----------------------------------------------------
+
+
+@pytest.mark.parametrize("accepted_draft_count", range(8))
+def test_real_store_deferred_dspark_transaction_commits_verified_prefix(
+    accepted_draft_count: int,
+) -> None:
+    """Compose the public worker seam with the real owner-local KV store.
+
+    A K=7 target verification physically executes all K+1 positions, while
+    the deferred sampler emits each possible accepted prefix A plus its one
+    terminal correction/bonus token.  The wrapper must carry that evidence
+    through the exact metadata handoff and atomically commit only A+1 logical
+    positions without discarding or reallocating the provisional tail.
+    """
+    emitted = list(range(accepted_draft_count)) + [99]
+    worker = _ScriptedDeferredWorker(
+        ModelRunnerOutput(
+            req_ids=["spec"],
+            req_id_to_index={"spec": 0},
+            sampled_token_ids=[emitted],
+        )
+    )
+    wrapper = _speculative_real_wrapper(worker)
+    key = OwnerLeaseKey("spec", 0)
+
+    reserve = _output(step_seq=1)
+    reserve.owner_commands = [
+        _real_reserve(
+            owner_id=0,
+            command_seq=1,
+            required=16,
+            request_id="spec",
+        )
+    ]
+    reserve_result = wrapper.execute_model(reserve)
+    assert reserve_result.owner_receipt_batches[0].events[0].accepted
+
+    verify = _output(step_seq=2)
+    verify.total_num_scheduled_tokens = 8
+    verify.num_scheduled_tokens = {"spec": 8}
+    verify.scheduled_spec_decode_tokens = {"spec": list(range(7))}
+    verify.scheduled_owner_leases = [
+        OwnerLeaseToken(
+            key=key,
+            owner_id=0,
+            step_seq=2,
+            command_seq=1,
+            runnable_num_tokens=16,
+        )
+    ]
+
+    assert wrapper.execute_model(verify) is None
+    metadata = worker.metadata_handoffs[-1]
+    (entry,) = metadata.entries
+    assert entry.pre_step_num_computed_tokens == 0
+    assert entry.post_step_num_tokens == 8
+    assert entry.num_speculative_tokens == 7
+    provisional_tables = entry.tables
+
+    result = wrapper.sample_tokens(object())
+    assert result.sampled_token_ids == [emitted]
+    assert result.owner_receipt_batches[0].emitted_step_seq == 2
+    assert worker.sample_calls == 1
+    store = wrapper._request_owned_kv_store
+    assert store is not None
+    assert store._records[key].num_computed_tokens == accepted_draft_count + 1
+    assert store._records[key].reserved_num_tokens == 16
+    assert store.get_block_table(key) == provisional_tables
+    assert store._pending_marks == {}
 
 
 def test_g3_seam_builds_step_metadata_after_command_publication_validation() -> None:
