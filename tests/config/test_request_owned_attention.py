@@ -237,6 +237,28 @@ def test_enabled_accepts_linear_dspark_on_v1_owner_sampling_lane():
     assert vllm_config.use_v2_model_runner is False
 
 
+def test_enabled_accepts_dspark_target_full_graph_lane():
+    vllm_config = _vllm_config(
+        enable_request_owned_sampling=True,
+        enable_request_owned_graph=True,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=2,
+        ),
+    )
+    vllm_config.speculative_config = types.SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+        enforce_eager=True,
+    )
+    vllm_config._validate_request_owned_attention()
+    assert vllm_config.scheduler_config.enable_request_owned_graph is True
+
+
 def test_enabled_dspark_requires_owner_sampling_transport():
     vllm_config = _vllm_config()
     vllm_config.speculative_config = types.SimpleNamespace(

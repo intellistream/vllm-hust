@@ -2278,13 +2278,6 @@ class VllmConfig:
                     "enable_request_owned_sampling=True so accepted token "
                     "prefixes return through the owner-identity envelope."
                 )
-            if request_owned_graph:
-                raise ValueError(
-                    "Request-owned DSpark currently requires eager execution: "
-                    "the existing owner FULL graph signature is one row per "
-                    "request and does not yet represent a K+1 verify step."
-                )
-
         compilation_config = self.compilation_config
         if request_owned_graph:
             if (
