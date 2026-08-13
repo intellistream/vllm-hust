@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "group": "B2",
+  "comparison_id": "qwen15_formula_device_prefetch_w4",
+  "model": {
+    "path": "/root/models/Qwen1.5-1.8B-Chat",
+    "served_name": "qwen15-formula-device-prefetch-w4",
+    "revision": "e482ee3f73c375a627a16fdf66fd0c8279743ca6",
+    "dtype": "bfloat16"
+  },
+  "runtime": {
+    "conda_env": "/usr/local/python3.12.13",
+    "host": "127.0.0.1",
+    "port": 18081,
+    "visible_device": null,
+    "block_size": 128,
+    "max_model_len": 17408,
+    "max_num_batched_tokens": 17408,
+    "max_num_seqs": 1,
+    "gpu_memory_utilization": 0.30,
+    "tensor_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "data_parallel_size": 1,
+    "enforce_eager": true,
+    "enable_chunked_prefill": false,
+    "generation_config": "vllm",
+    "shutdown_timeout_seconds": 20,
+    "npu_cleanup_timeout_seconds": 240,
+    "profiler_config": {
+      "profiler": "torch",
+      "torch_profiler_dir": "/root/kv-materialization-scheduling/results/formula_reuse_validation/device_prefetch_w4/traces",
+      "torch_profiler_with_stack": false,
+      "torch_profiler_use_gzip": false,
+      "torch_profiler_dump_cuda_time_total": false,
+      "ignore_frontend": true
+    }
+  },
+  "cache": {
+    "enable_prefix_caching": true,
+    "enable_knorm": false,
+    "connector": "FormulaLMCacheConnector",
+    "connector_module_path": "kv_materialization_plugin.lmcache_formula_connector",
+    "connector_extra_config": {
+      "lmcache.local_cpu": true,
+      "lmcache.max_local_cpu_size": 1.0,
+      "lmcache.local_disk": null,
+      "lmcache.remote_url": null,
+      "lmcache.enable_blending": false,
+      "lmcache.enable_async_loading": false,
+      "lmcache.use_layerwise": true,
+      "lmcache.chunk_size": 128,
+      "formula_block_size": 128,
+      "formula_lmcache_chunk_size": 128,
+      "formula_layer_count": 24,
+      "formula_copy_fixed_ms": 1.058769054878092,
+      "formula_copy_per_token_ms": 0.009721907080673584,
+      "formula_prefill_fixed_ms": 8.85512586947587,
+      "formula_prefill_per_token_ms": 0.007009970208182733,
+      "formula_prefill_token_context_ms": 1.2829906283732969e-06,
+      "formula_min_predicted_improvement_ms": 0.0,
+      "formula_device_prefetch_window": 4,
+      "formula_prefetch_audit_path": "/root/kv-materialization-scheduling/results/formula_reuse_validation/device_prefetch_w4/prefetch_runtime_audit.jsonl",
+      "formula_audit_output_path": "/root/kv-materialization-scheduling/results/formula_reuse_validation/device_prefetch_w4/formula_decisions.jsonl"
+    },
+    "logical_kv_bytes_per_token": 196608,
+    "external_capacity_bytes": 1073741824
+  },
+  "request": {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 0,
+    "max_tokens": 4,
+    "stream": true,
+    "return_token_ids": true
+  },
+  "measurement": {
+    "startup_timeout_seconds": 420,
+    "request_timeout_seconds": 420,
+    "correctness_trials": 1,
+    "warmup_trials": 0,
+    "measured_trials": 1,
+    "fresh_service_per_sample": true
+  }
+}
