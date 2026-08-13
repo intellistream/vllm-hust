@@ -179,7 +179,12 @@ def _ack_window_step(scheduler, scheduler_output) -> None:
     _apply_window_step(scheduler, scheduler_output, {})
 
 
-def _apply_window_step(scheduler, scheduler_output, events_by_rank) -> None:
+def _apply_window_step(
+    scheduler,
+    scheduler_output,
+    events_by_rank,
+    sampled_token_ids: dict[str, list[int]] | None = None,
+) -> None:
     """Apply worker receipts and samples only for prompt-complete rows."""
     req_ids = list(scheduler_output.num_scheduled_tokens)
     batches = [
@@ -198,7 +203,11 @@ def _apply_window_step(scheduler, scheduler_output, events_by_rank) -> None:
                 request_id: index for index, request_id in enumerate(req_ids)
             },
             sampled_token_ids=[
-                [100 + index]
+                (
+                    sampled_token_ids[request_id]
+                    if sampled_token_ids is not None and request_id in sampled_token_ids
+                    else [100 + index]
+                )
                 if (request := scheduler.requests.get(request_id)) is None
                 or request.num_computed_tokens >= request.num_prompt_tokens
                 else []
@@ -510,7 +519,10 @@ def test_horizon_cap_extend_stall_and_refused_extend_retry() -> None:
     assert token.runnable_num_tokens == 16
 
 
-def test_request_owned_scheduler_publishes_complete_dspark_target_step() -> None:
+@pytest.mark.parametrize("accepted_draft_count", range(4))
+def test_request_owned_scheduler_publishes_and_commits_each_dspark_prefix(
+    accepted_draft_count: int,
+) -> None:
     scheduler = _make_scheduler(
         max_num_scheduled_tokens=16,
         request_owned_decode_reservation_tokens=16,
@@ -528,12 +540,13 @@ def test_request_owned_scheduler_publishes_complete_dspark_target_step() -> None
     assert verify.scheduled_spec_decode_tokens == {"spec": [41, 42, 43]}
     assert request.spec_token_ids == []
 
-    # Rejecting every draft still commits the ordinary correction token;
-    # the existing scheduler output path rolls optimistic K+1 progress back
-    # to the verified logical prefix.
+    # A accepted drafts plus the terminal correction/bonus token advance the
+    # same logical horizon that the owner KV transaction commits.
     pre_step = request.num_computed_tokens - 4
-    _apply_window_step(scheduler, verify, {})
-    assert request.num_computed_tokens == pre_step + 1
+    emitted = [41, 42, 43][:accepted_draft_count] + [99]
+    _apply_window_step(scheduler, verify, {}, {"spec": emitted})
+    assert request.num_computed_tokens == pre_step + accepted_draft_count + 1
+    assert request.output_token_ids[-len(emitted) :] == emitted
 
 
 def test_preempt_receipt_resume_keeps_sticky_owner_and_restarts_prefill() -> None:
