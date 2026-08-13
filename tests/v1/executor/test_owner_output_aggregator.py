@@ -17,8 +17,10 @@ from vllm.v1.core.sched.ownership import (
     OwnerCacheGroupSnapshot,
     OwnerCachePoolSnapshot,
     OwnerLeaseKey,
+    OwnerReadinessReceipt,
     OwnerReceipt,
     OwnerReceiptBatch,
+    OwnerResidencyState,
 )
 from vllm.v1.executor.output_aggregator import ModelRunnerOutputAggregator
 from vllm.v1.outputs import (
@@ -166,6 +168,26 @@ def test_cache_pool_survives_aggregation_round_trip():
     # Pickle round-trip of the aggregated output keeps the snapshot.
     restored = pickle.loads(pickle.dumps(result))
     assert restored.owner_receipt_batches[1].cache_pool == pool
+
+
+def test_readiness_snapshot_survives_aggregation_round_trip() -> None:
+    readiness = (
+        OwnerReadinessReceipt(
+            key=OwnerLeaseKey("hot", 3),
+            owner_id=1,
+            state=OwnerResidencyState.HOT,
+            hot_for_decode=True,
+        ),
+    )
+    outputs = [
+        _output(0, [_batch(0)], empty=True),
+        _output(1, [_batch(1, readiness=readiness)], empty=True),
+        _output(2, [_batch(2)], empty=True),
+    ]
+    result = _aggregator(0, 1, 2).aggregate(outputs)
+    assert result.owner_receipt_batches[1].readiness == readiness
+    restored = pickle.loads(pickle.dumps(result))
+    assert restored.owner_receipt_batches[1].readiness == readiness
 
 
 def test_authenticated_transport_slots_preserve_event_order():

@@ -29,6 +29,7 @@ from vllm.v1.core.sched.ownership import (
     OwnerLeaseKey,
     OwnerReceipt,
     OwnerReceiptBatch,
+    OwnerResidencyState,
     OwnershipError,
     PublicationViolationError,
 )
@@ -453,6 +454,31 @@ def test_preempt_releases_capacity_and_resume_reacquires_on_same_owner() -> None
     tokens = _publish(coordinator, manager, step_seq=3)
     assert [t.runnable_num_tokens for t in tokens] == [80]
     assert manager.free_capacity() == 1000 - 80
+
+
+def test_worker_readiness_snapshot_tracks_hot_cold_and_restoring() -> None:
+    coordinator = OwnerLeaseCoordinator()
+    manager = AttentionLeaseManager(owner_rank=0, capacity=100)
+    coordinator.observe(
+        OwnerAssignmentObservation(owner_id=0, observation_seq=1, work=0)
+    )
+    key = _key()
+    coordinator.assign(key)
+    _grant(coordinator, manager, coordinator.reserve(key, required_num_tokens=8))
+    hot = manager.emit_batch(1).readiness
+    assert len(hot) == 1
+    assert hot[0].state is OwnerResidencyState.HOT
+    assert hot[0].hot_for_decode and hot[0].hot_for_prefill
+
+    _grant(coordinator, manager, coordinator.preempt(key))
+    cold = manager.emit_batch(2).readiness
+    assert cold[0].state is OwnerResidencyState.COLD
+    assert not cold[0].hot_for_decode
+
+    _grant(coordinator, manager, coordinator.restore(key, required_num_tokens=8))
+    restoring = manager.emit_batch(3).readiness
+    assert restoring[0].state is OwnerResidencyState.RESTORING
+    assert not restoring[0].hot_for_decode
 
 
 def test_published_tokens_cannot_be_refused() -> None:

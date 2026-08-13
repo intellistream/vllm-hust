@@ -162,8 +162,7 @@ class ModelRunnerOutputAggregator:
             for rank in expected_sampling_owner_ranks
         ):
             raise TypeError(
-                "expected_sampling_owner_ranks must contain nonnegative "
-                "non-bool ints."
+                "expected_sampling_owner_ranks must contain nonnegative non-bool ints."
             )
         if expected_sampling_owner_ranks is not None and len(
             set(expected_sampling_owner_ranks)
@@ -466,6 +465,7 @@ class ModelRunnerOutputAggregator:
                         owner_rank=batch.owner_rank,
                         emitted_step_seq=batch.emitted_step_seq,
                         events=tuple(deduped_events),
+                        readiness=getattr(batch, "readiness", ()),
                         free_capacity=batch.free_capacity,
                         resident_pages=batch.resident_pages,
                         pending_dma=batch.pending_dma,
@@ -473,7 +473,6 @@ class ModelRunnerOutputAggregator:
                     )
                 )
         return aggregated
-
 
     def _reject_unexpected_sampling_batches(
         self, outputs: list[ModelRunnerOutput | None]
@@ -701,10 +700,7 @@ class ModelRunnerOutputAggregator:
                     f"{sampling_batches[slot].owner_rank}); refusing to "
                     "silently select a fixed carrier."
                 )
-            if (
-                output.kv_connector_output is not None
-                and self._kv_aggregator is None
-            ):
+            if output.kv_connector_output is not None and self._kv_aggregator is None:
                 raise RuntimeError(
                     "ModelRunnerOutputAggregator: kv_connector_output on "
                     f"slot {slot} without a KV aggregator is unsupported; "
@@ -829,13 +825,9 @@ class ModelRunnerOutputAggregator:
                         "to misalign merged logprobs."
                     )
             merged_logprobs: LogprobsLists | None = LogprobsLists(
-                np.concatenate(
-                    [part.logprob_token_ids for part in logprobs_parts]
-                ),
+                np.concatenate([part.logprob_token_ids for part in logprobs_parts]),
                 np.concatenate([part.logprobs for part in logprobs_parts]),
-                np.concatenate(
-                    [part.sampled_token_ranks for part in logprobs_parts]
-                ),
+                np.concatenate([part.sampled_token_ranks for part in logprobs_parts]),
                 None,
             )
         else:

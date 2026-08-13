@@ -67,7 +67,7 @@ def _vllm_config(
     enable_request_owned_q_wkv_fanin: bool = False,
     enable_request_owned_graph: bool = False,
     enable_request_owned_windows: bool = False,
-    request_owned_decode_window_steps: int = 1,
+    request_owned_decode_window_steps: int = 32,
     scheduler_config: SchedulerConfig | None = None,
     compilation_config: CompilationConfig | None = None,
     parallel_config: ParallelConfig | None = None,
@@ -108,7 +108,11 @@ def test_request_owned_attention_defaults_off():
     assert SchedulerConfig.default_factory().enable_request_owned_q_wkv_fanin is False
     assert SchedulerConfig.default_factory().enable_request_owned_graph is False
     assert SchedulerConfig.default_factory().enable_request_owned_windows is False
-    assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 1
+    assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 32
+    assert SchedulerConfig.default_factory().request_owned_hot_low_watermark == 1
+    assert SchedulerConfig.default_factory().request_owned_hot_high_watermark == 2
+    assert SchedulerConfig.default_factory().request_owned_prefill_wave_steps == 1
+    assert SchedulerConfig.default_factory().request_owned_prefill_max_wait_steps == 32
     assert (
         SchedulerConfig.default_factory().request_owned_decode_reservation_tokens
         is None
@@ -117,24 +121,18 @@ def test_request_owned_attention_defaults_off():
     assert VllmConfig().scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert VllmConfig().scheduler_config.enable_request_owned_graph is False
     assert VllmConfig().scheduler_config.enable_request_owned_windows is False
-    assert VllmConfig().scheduler_config.request_owned_decode_window_steps == 1
-    assert (
-        VllmConfig().scheduler_config.request_owned_decode_reservation_tokens is None
-    )
+    assert VllmConfig().scheduler_config.request_owned_decode_window_steps == 32
+    assert VllmConfig().scheduler_config.request_owned_decode_reservation_tokens is None
 
 
 @pytest.mark.parametrize("value", [1, "true", None])
 def test_request_owned_windows_gate_is_strict_bool(value):
-    with pytest.raises(
-        ValueError, match="enable_request_owned_windows must be a bool"
-    ):
+    with pytest.raises(ValueError, match="enable_request_owned_windows must be a bool"):
         SchedulerConfig.default_factory(enable_request_owned_windows=value)
 
 
 def test_request_owned_windows_require_graph_opt_in():
-    with pytest.raises(
-        ValueError, match="requires enable_request_owned_graph=True"
-    ):
+    with pytest.raises(ValueError, match="requires enable_request_owned_graph=True"):
         _vllm_config(enable_request_owned_windows=True)
 
 
@@ -159,14 +157,29 @@ def test_request_owned_window_quantum_must_be_positive(value):
         SchedulerConfig.default_factory(request_owned_decode_window_steps=value)
 
 
+def test_request_owned_windows_require_ordered_hot_watermarks():
+    with pytest.raises(ValueError, match="HOT watermarks"):
+        _vllm_config(
+            enable_request_owned_graph=True,
+            enable_request_owned_windows=True,
+            scheduler_config=SchedulerConfig.default_factory(
+                enable_request_owned_attention=True,
+                enable_request_owned_graph=True,
+                enable_request_owned_windows=True,
+                request_owned_hot_low_watermark=2,
+                request_owned_hot_high_watermark=2,
+            ),
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            ),
+        )
+
+
 @pytest.mark.parametrize("value", [0, -1])
 def test_request_owned_decode_reservation_tokens_must_be_positive(value):
-    with pytest.raises(
-        ValueError, match="request_owned_decode_reservation_tokens"
-    ):
-        SchedulerConfig.default_factory(
-            request_owned_decode_reservation_tokens=value
-        )
+    with pytest.raises(ValueError, match="request_owned_decode_reservation_tokens"):
+        SchedulerConfig.default_factory(request_owned_decode_reservation_tokens=value)
 
 
 def test_disabled_leaves_existing_validation_unchanged():

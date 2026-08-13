@@ -31,8 +31,9 @@ rejected (``0`` is a real value, never a stand-in for a missing count).
 Commands to a given owner are delivered reliably and in order: the per-owner
 ``command_seq`` fence increases monotonically across all request keys and
 the worker consumes that stream without reordering or buffering.
-Nothing here is wired into the scheduler; consumers (G1+) integrate through
-the public types below.
+Consumers integrate through the public types below. The residency snapshot is
+block-ID-free and advisory to scheduler policy; it grants workers no admission
+or phase authority.
 
 G2 physical capacity vocabulary: :class:`OwnerCacheGroupSnapshot` and
 :class:`OwnerCachePoolSnapshot` describe the single unified per-rank KV block
@@ -92,6 +93,14 @@ class OwnerAdmissionStatus(enum.Enum):
 
     WAITING = "WAITING"
     PREEMPTED = "PREEMPTED"
+
+
+class OwnerResidencyState(enum.Enum):
+    """Worker-observed residency of one request incarnation."""
+
+    COLD = "COLD"
+    RESTORING = "RESTORING"
+    HOT = "HOT"
 
 
 @dataclass(frozen=True)
@@ -242,6 +251,47 @@ class OwnerReceipt:
     #: as physical admission; see :class:`OwnerCachePoolSnapshot`.
     free_capacity: int | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class OwnerReadinessReceipt:
+    """Block-ID-free residency fact reported by one owner worker.
+
+    A HOT fact is an abstract certificate for the named wave classes. The
+    first implementation derives it from the reference lease manager; a DMA
+    implementation may publish HOT only after its landing/capacity contract
+    is satisfied.
+    """
+
+    key: OwnerLeaseKey
+    owner_id: int
+    state: OwnerResidencyState
+    hot_for_decode: bool = False
+    hot_for_prefill: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, OwnerLeaseKey):
+            raise TypeError(f"key must be an OwnerLeaseKey, got {self.key!r}.")
+        if (
+            isinstance(self.owner_id, bool)
+            or not isinstance(self.owner_id, int)
+            or self.owner_id < 0
+        ):
+            raise TypeError(
+                f"owner_id must be a nonnegative non-bool int, got {self.owner_id!r}."
+            )
+        if not isinstance(self.state, OwnerResidencyState):
+            raise TypeError(
+                f"state must be an OwnerResidencyState, got {self.state!r}."
+            )
+        if not isinstance(self.hot_for_decode, bool) or not isinstance(
+            self.hot_for_prefill, bool
+        ):
+            raise TypeError("HOT certificate fields must be bools.")
+        if self.state is not OwnerResidencyState.HOT and (
+            self.hot_for_decode or self.hot_for_prefill
+        ):
+            raise ValueError("only HOT readiness may carry wave certificates")
 
 
 @dataclass(frozen=True)
@@ -406,8 +456,27 @@ class OwnerReceiptBatch:
     #: always emits ``None``).  When present, its ``owner_rank`` must match
     #: this batch's ``owner_rank``.
     cache_pool: OwnerCachePoolSnapshot | None = None
+    #: Complete block-ID-free readiness snapshot for this owner's live leases.
+    #: Kept last so existing positional construction remains compatible.
+    readiness: tuple[OwnerReadinessReceipt, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.readiness, tuple):
+            raise TypeError(f"readiness must be a tuple, got {self.readiness!r}.")
+        for fact in self.readiness:
+            if not isinstance(fact, OwnerReadinessReceipt):
+                raise TypeError(
+                    "readiness must contain OwnerReadinessReceipt values, got "
+                    f"{fact!r}."
+                )
+            if fact.owner_id != self.owner_rank:
+                raise ValueError(
+                    "readiness owner_id must match batch owner_rank, got "
+                    f"{fact.owner_id} != {self.owner_rank}."
+                )
+        readiness_keys = [fact.key for fact in self.readiness]
+        if len(set(readiness_keys)) != len(readiness_keys):
+            raise ValueError("readiness contains duplicate owner lease keys")
         if self.cache_pool is not None and not isinstance(
             self.cache_pool, OwnerCachePoolSnapshot
         ):
@@ -1459,6 +1528,31 @@ class AttentionLeaseManager:
             owner_rank=self.owner_rank,
             emitted_step_seq=emitted_step_seq,
             events=events,
+            readiness=tuple(
+                OwnerReadinessReceipt(
+                    key=key,
+                    owner_id=self.owner_rank,
+                    state=(
+                        OwnerResidencyState.RESTORING
+                        if lease.restoring
+                        else (
+                            OwnerResidencyState.COLD
+                            if lease.preempted
+                            else OwnerResidencyState.HOT
+                        )
+                    ),
+                    hot_for_decode=not lease.preempted,
+                    hot_for_prefill=not lease.preempted,
+                )
+                for key, lease in sorted(
+                    self._leases.items(),
+                    key=lambda item: (
+                        item[0].request_id,
+                        item[0].owner_epoch,
+                    ),
+                )
+                if not lease.released and not lease.superseded
+            ),
             free_capacity=self.free_capacity(),
             resident_pages=sum(
                 lease.resident_pages
