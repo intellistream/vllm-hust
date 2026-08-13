@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import random
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 import pytest
 
 from vllm import LLM
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.engine.core_client import InprocClient
 from vllm.v1.metrics.reader import Counter, Gauge, Histogram, Metric, Vector
 
 if TYPE_CHECKING:
@@ -16,6 +19,20 @@ else:
 
 MODEL = "facebook/opt-125m"
 DTYPE = "half"
+
+
+def test_inproc_client_reports_internal_scheduler_liveness() -> None:
+    """Control-plane work can outlive the final user-visible output."""
+    scheduler = MagicMock()
+    client = object.__new__(InprocClient)
+    client.engine_core = SimpleNamespace(scheduler=scheduler)
+
+    scheduler.has_requests.return_value = True
+    assert client.dp_engines_running() is True
+
+    scheduler.has_requests.return_value = False
+    assert client.dp_engines_running() is False
+    assert scheduler.has_requests.call_count == 2
 
 
 def _vllm_model(
