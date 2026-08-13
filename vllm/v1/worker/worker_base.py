@@ -33,7 +33,16 @@ from vllm.v1.worker.request_owned_kv import (
     AllocationResult,
     DeferredFreeResult,
     RequestOwnedKVStore,
+    RequestOwnedStepBuildCheckpoint,
     RequestOwnedStepMetadata,
+)
+from vllm.v1.worker.request_owned_offload import (
+    OwnerOffloadIdentity,
+    OwnerOffloadPlan,
+    RequestOwnedBulkOffloadAdapter,
+    RequestOwnedBulkRestoreWork,
+    RequestOwnedOffloadError,
+    make_request_owned_offload_keys,
 )
 
 if TYPE_CHECKING:
@@ -351,6 +360,9 @@ class WorkerWrapperBase:
         self.vllm_config: VllmConfig
         self._request_owned_control_manager: AttentionLeaseManager | None = None
         self._request_owned_kv_store: RequestOwnedKVStore | None = None
+        self._request_owned_offload_adapter: RequestOwnedBulkOffloadAdapter | None = (
+            None
+        )
         #: Immutable worker-local G3 execution metadata of the last step
         #: whose command+publication validation succeeded.  Cleared at the
         #: start of every request-owned call (the concrete worker is
@@ -374,6 +386,20 @@ class WorkerWrapperBase:
         #: request-owned call fails closed instead of risking a duplicate
         #: mark.
         self._request_owned_fail_stop: str | None = None
+
+        #: Exact destinations of a bulk RESTORE whose H2D has completed but
+        #: whose control step has not committed yet.  The public wrapper
+        #: rolls these destinations back on *any* later step failure, leaving
+        #: the durable cold image intact so the same RESTORE can be retried.
+        self._request_owned_restore_guard: (
+            tuple[
+                tuple[RequestOwnedBulkRestoreWork, ...],
+                RequestOwnedKVStore,
+                RequestOwnedStepBuildCheckpoint,
+                int,
+            ]
+            | None
+        ) = None
 
     def shutdown(self) -> None:
         if self.worker is not None:
@@ -494,6 +520,37 @@ class WorkerWrapperBase:
                 self._request_owned_kv_store = self._create_request_owned_kv_store(
                     kv_cache_config
                 )
+            if getattr(
+                self.vllm_config.scheduler_config,
+                "enable_request_owned_kv_offload",
+                False,
+            ):
+                self._request_owned_offload_adapter = (
+                    self._create_request_owned_offload_adapter()
+                )
+
+    def _create_request_owned_offload_adapter(
+        self,
+    ) -> RequestOwnedBulkOffloadAdapter:
+        """Take exclusive ownership of the registered offload substrate."""
+
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            request_owned_offloading_connector,
+        )
+
+        RequestOwnedOffloadingConnector = (
+            request_owned_offloading_connector.RequestOwnedOffloadingConnector
+        )
+
+        connector = get_kv_transfer_group()
+        if not isinstance(connector, RequestOwnedOffloadingConnector):
+            raise RuntimeError(
+                "enable_request_owned_kv_offload requires the exclusive "
+                "RequestOwnedOffloadingConnector worker, got "
+                f"{type(connector).__name__}."
+            )
+        return connector.build_request_owned_adapter(self.global_rank)
 
     def _create_request_owned_kv_store(
         self, kv_cache_config: KVCacheConfig
@@ -579,6 +636,31 @@ class WorkerWrapperBase:
         return self.worker.execute_model(scheduler_output)
 
     def _execute_request_owned_control_step(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | None:
+        """Run one strict control step with whole-step RESTORE rollback."""
+
+        if self._request_owned_restore_guard is not None:
+            raise RuntimeError(
+                "request-owned attention found an unclosed RESTORE guard "
+                "before starting the next control step"
+            )
+        try:
+            result = self._execute_request_owned_control_step_impl(scheduler_output)
+        except BaseException:
+            self._rollback_request_owned_restore_guard()
+            raise
+        if self._request_owned_restore_guard is not None:
+            # A RESTORE may not escape into deferred sampling or any other
+            # path that has not durably committed the control manager.
+            self._rollback_request_owned_restore_guard()
+            raise RuntimeError(
+                "request-owned RESTORE control step returned before its "
+                "terminal receipt committed"
+            )
+        return result
+
+    def _execute_request_owned_control_step_impl(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
         """Execute the G2 worker boundary over the rank-local physical store.
@@ -701,6 +783,32 @@ class WorkerWrapperBase:
                 capacity=self._request_owned_logical_capacity(),
             )
         trial_manager = deepcopy(manager)
+        restore_work: list[RequestOwnedBulkRestoreWork] = []
+        restore_commands: list[OwnerCommand] = []
+        restore_build_checkpoint: RequestOwnedStepBuildCheckpoint | None = None
+
+        own_commands = tuple(
+            command
+            for command in scheduler_output.owner_commands
+            if command.owner_id == self.global_rank
+        )
+        if any(
+            command.kind is OwnerCommandKind.RESTORE for command in own_commands
+        ) and (
+            any(
+                command.kind is not OwnerCommandKind.RESTORE for command in own_commands
+            )
+            or total_tokens != 0
+            or any(count != 0 for count in per_request_tokens.values())
+            or any(
+                token.owner_id == self.global_rank
+                for token in scheduler_output.scheduled_owner_leases
+            )
+        ):
+            raise RuntimeError(
+                "request-owned bulk RESTORE requires an exclusive zero-token "
+                "owner control step"
+            )
 
         # Commands form one reliable in-order stream per owner.  Every worker
         # receives the global envelope but consumes only its own commands.
@@ -720,14 +828,39 @@ class WorkerWrapperBase:
             if not preflight.accepted:
                 trial_manager = candidate
                 continue
-            physical = self._apply_request_owned_physical(command, store)
+            physical, pending_restore = self._apply_request_owned_physical(
+                command, store, step_seq
+            )
             if physical.accepted:
+                if pending_restore is not None:
+                    restore_work.append(pending_restore)
+                    restore_commands.append(command)
+                    if restore_build_checkpoint is None:
+                        restore_build_checkpoint = store.checkpoint_step_build()
+                    # Arm immediately: a later command in the same owner
+                    # batch can still fail before the H2D hook runs.
+                    self._request_owned_restore_guard = (
+                        tuple(restore_work),
+                        store,
+                        restore_build_checkpoint,
+                        step_seq,
+                    )
                 trial_manager = candidate
                 continue
             reject_error = physical.error or (
                 "physical request-owned KV store rejected the command without an error"
             )
             trial_manager.apply(command, external_reject_error=reject_error)
+
+        if restore_work:
+            self._execute_request_owned_bulk_restore(tuple(restore_work), store)
+            # H2D and destination readiness are now real, but the logical
+            # RESTORE receipt is not durable until this whole control step
+            # commits.  Arm the rollback guard *before* completing the trial
+            # manager so metadata delivery, model execution, output checks,
+            # flush, receipt emission, and commit are all covered.
+            for command in restore_commands:
+                trial_manager.complete_restore(command.key, command.command_seq)
 
         for token in scheduler_output.scheduled_owner_leases:
             if token.owner_id == self.global_rank:
@@ -754,6 +887,12 @@ class WorkerWrapperBase:
         from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
         if sampling_enabled and output is None:
+            if self._request_owned_restore_guard is not None:
+                raise RuntimeError(
+                    "request-owned bulk RESTORE requires a synchronous "
+                    "terminal control-step receipt and cannot enter deferred "
+                    "sampling"
+                )
             # Deferred sampling: keep the trial manager and the exact
             # metadata in one pending record keyed by step_seq.  Nothing is
             # marked, flushed, emitted, or committed until sample_tokens
@@ -788,9 +927,11 @@ class WorkerWrapperBase:
         if sampling_enabled:
             # Synchronous token output: same terminal path as the deferred
             # sample_tokens completion (mark -> flush -> emit -> commit).
-            return self._complete_request_owned_step(
+            result = self._complete_request_owned_step(
                 step_seq, trial_manager, metadata, output
             )
+            self._request_owned_restore_guard = None
+            return result
 
         # Never mutate a worker-owned output or EMPTY_MODEL_RUNNER_OUTPUT.
         result = copy(output)
@@ -804,7 +945,43 @@ class WorkerWrapperBase:
             replace(batch, cache_pool=store.pool_snapshot())
         ]
         self._request_owned_control_manager = trial_manager
+        self._request_owned_restore_guard = None
         return result
+
+    def _rollback_request_owned_restore_guard(self) -> None:
+        """Discard every uncommitted restored destination, retaining host KV."""
+
+        guard = self._request_owned_restore_guard
+        self._request_owned_restore_guard = None
+        if guard is None:
+            return
+        work, store, build_checkpoint, step_seq = guard
+        errors: list[str] = []
+        try:
+            store.rollback_empty_step_build(build_checkpoint, step_seq)
+        except BaseException as exc:
+            errors.append(f"step-build rollback for {step_seq}: {exc!r}")
+        for item in work:
+            identity = item.plan.identity
+            try:
+                item.adapter.abort(identity)
+            except BaseException as exc:
+                errors.append(f"adapter abort for {identity.key!r}: {exc!r}")
+            try:
+                if not store.abort_restore(
+                    identity.key, identity.allocation_generation
+                ):
+                    errors.append(
+                        "physical destination did not match "
+                        f"{identity.key!r} generation "
+                        f"{identity.allocation_generation}"
+                    )
+            except BaseException as exc:
+                errors.append(f"store abort for {identity.key!r}: {exc!r}")
+        if errors:
+            raise RuntimeError(
+                "request-owned RESTORE rollback failed: " + "; ".join(errors)
+            )
 
     def _request_owned_sampling_enabled(self) -> bool:
         """G3 sampling gate, default off.
@@ -842,24 +1019,166 @@ class WorkerWrapperBase:
                 f"state: {self._request_owned_fail_stop}"
             )
 
-    @staticmethod
     def _apply_request_owned_physical(
-        command: OwnerCommand, store: RequestOwnedKVStore
-    ) -> AllocationResult | DeferredFreeResult:
+        self,
+        command: OwnerCommand,
+        store: RequestOwnedKVStore,
+        step_seq: int,
+    ) -> tuple[
+        AllocationResult | DeferredFreeResult,
+        RequestOwnedBulkRestoreWork | None,
+    ]:
         """Dispatch one own-rank command to the corresponding physical
         store operation.  The store rejects any kind/state mismatch itself,
         so this seam never duplicates the logical state machine."""
         if command.kind is OwnerCommandKind.RESERVE:
-            return store.reserve(command)
+            restored = bool(
+                self._request_owned_offload_adapter is not None
+                and store.is_restore_ready(command.key)
+            )
+            result = store.reserve(command)
+            if result.accepted and restored:
+                adapter = self._require_request_owned_offload_adapter()
+                snapshot = store.snapshot(command.key)
+                if snapshot is None:
+                    raise RuntimeError("restored RESERVE lost its physical record")
+                identity = OwnerOffloadIdentity.from_snapshot(snapshot)
+                adapter.activate(identity)
+                if not store.mark_reactivated(
+                    command.key, snapshot.allocation_generation
+                ):
+                    raise RuntimeError(
+                        "restored RESERVE could not close its physical HOT state"
+                    )
+            return result, None
         if command.kind is OwnerCommandKind.EXTEND:
-            return store.extend(command)
+            return store.extend(command), None
         if command.kind is OwnerCommandKind.PREEMPT:
-            return store.preempt(command)
+            if self._request_owned_offload_adapter is None:
+                return store.preempt(command), None
+            return self._store_request_owned_preempt(command, store), None
         if command.kind is OwnerCommandKind.RELEASE:
-            return store.release(command)
+            snapshot = (
+                store.snapshot(command.key)
+                if self._request_owned_offload_adapter is not None
+                else None
+            )
+            result = store.release(command)
+            if (
+                result.accepted
+                and snapshot is not None
+                and self._request_owned_offload_adapter is not None
+            ):
+                self._request_owned_offload_adapter.release(snapshot)
+            if result.accepted and self._request_owned_offload_adapter is not None:
+                self._request_owned_offload_adapter.evict_owned_host_keys(command.key)
+            return result, None
         if command.kind is OwnerCommandKind.RESTORE:
-            return store.restore(command)
+            result = store.restore(command)
+            if not result.accepted:
+                return result, None
+            snapshot = store.snapshot(command.key)
+            computed = store.computed_prefix_snapshot(command.key)
+            if snapshot is None or computed is None:
+                raise RuntimeError("accepted RESTORE did not create a destination")
+            adapter = self._require_request_owned_offload_adapter()
+            identity = OwnerOffloadIdentity.from_snapshot(computed)
+            bound = False
+            try:
+                adapter.bind(computed, active=False)
+                bound = True
+                keys = make_request_owned_offload_keys(
+                    computed, store.group_block_sizes
+                )
+                plan = OwnerOffloadPlan.from_snapshot(computed, keys)
+                work = RequestOwnedBulkRestoreWork(
+                    step_seq=step_seq,
+                    adapter=adapter,
+                    plan=plan,
+                    zero_block_ids=snapshot.tables,
+                )
+            except BaseException:
+                if bound:
+                    adapter.abort(identity)
+                store.abort_restore(command.key, snapshot.allocation_generation)
+                raise
+            return result, work
         raise RuntimeError(f"unknown owner command kind {command.kind}")
+
+    def _require_request_owned_offload_adapter(
+        self,
+    ) -> RequestOwnedBulkOffloadAdapter:
+        adapter = self._request_owned_offload_adapter
+        if adapter is None:
+            raise RuntimeError(
+                "request-owned KV offload command requires the exclusive adapter"
+            )
+        return adapter
+
+    def _store_request_owned_preempt(
+        self, command: OwnerCommand, store: RequestOwnedKVStore
+    ) -> DeferredFreeResult:
+        adapter = self._require_request_owned_offload_adapter()
+        snapshot = store.computed_prefix_snapshot(command.key)
+        if snapshot is None:
+            return DeferredFreeResult(
+                accepted=False,
+                key=command.key,
+                error="PREEMPT has no owner-local computed-prefix source",
+            )
+        identity = adapter.bind(snapshot, active=True)
+        adapter.retire(identity)
+        plan = OwnerOffloadPlan.from_snapshot(
+            snapshot,
+            make_request_owned_offload_keys(snapshot, store.group_block_sizes),
+        )
+        job = adapter.submit_store(plan)
+        adapter.wait((job,))
+        receipts = adapter.poll()
+        matching = tuple(item for item in receipts if item.job_id == job.job_id)
+        if len(matching) != 1 or len(receipts) != 1:
+            adapter.abort(identity)
+            raise RequestOwnedOffloadError(
+                f"PREEMPT store produced {len(matching)} exact and "
+                f"{len(receipts)} total completion receipts"
+            )
+        receipt = matching[0]
+        if not receipt.success:
+            # The GPU source is still intact. Reopen the retired ledger state
+            # so a later PREEMPT retry can submit the same generation again.
+            adapter.activate(identity)
+            return DeferredFreeResult(
+                accepted=False,
+                key=command.key,
+                error=receipt.error,
+            )
+        reclaimable = adapter.take_reclaimable(identity)
+        if reclaimable != snapshot.tables:
+            raise RequestOwnedOffloadError(
+                "PREEMPT durable receipt named the wrong physical source"
+            )
+        return store.preempt(command)
+
+    def _execute_request_owned_bulk_restore(
+        self,
+        work: tuple[RequestOwnedBulkRestoreWork, ...],
+        store: RequestOwnedKVStore,
+    ) -> None:
+        hook = getattr(self.worker, "execute_request_owned_bulk_restore", None)
+        if not callable(hook):
+            raise RuntimeError(
+                "request-owned bulk RESTORE requires the worker's post-zero "
+                "pre-forward restore hook"
+            )
+        hook(work)
+        for item in work:
+            identity = item.plan.identity
+            if not store.mark_restore_ready(
+                identity.key, identity.allocation_generation
+            ):
+                raise RuntimeError(
+                    "bulk RESTORE completion did not match its destination generation"
+                )
 
     def _build_request_owned_step_metadata(
         self,
@@ -1016,10 +1335,11 @@ class WorkerWrapperBase:
         with the post-flush pool snapshot is attached before the trial
         logical manager is committed.  A rejection of the mark fails
         atomically: the logical manager stays uncommitted and (for the
-        deferred path) the pending record stays intact.  A failure after
-        the mark is irreversible -- the step is already marked in the
-        store and cannot be retried -- so the wrapper latches a fail-stop
-        state that rejects every further request-owned call."""
+        deferred path) the pending record stays intact.  A failure after a
+        real computed mark is irreversible and latches fail-stop.  The sole
+        exception is an exclusive zero-token RESTORE heartbeat: its empty
+        mark/build fences and physical destination are jointly reversible
+        under the armed whole-step restore guard."""
         store = self._request_owned_kv_store
         if store is None:
             raise RuntimeError(
@@ -1053,17 +1373,16 @@ class WorkerWrapperBase:
                 replace(batch, cache_pool=store.pool_snapshot())
             ]
         except BaseException as exc:
-            # The computed-batch mark already succeeded and is irreversible:
-            # a retry would hit a duplicate mark, so the step can never be
-            # retried.  Latch the wrapper fail-stop and re-raise; the
-            # pending record (if any) is not cleared, but the fail-stop
-            # guard rejects every further request-owned call before it can
-            # be touched.
-            self._request_owned_fail_stop = (
-                "computed batch mark succeeded but the irreversible "
-                f"terminal completion failed ({exc!r}); the step is "
-                "already marked and cannot be retried."
-            )
+            # A real computed batch is irreversible and must latch fail-stop.
+            # An armed RESTORE guard necessarily covers an exclusive empty
+            # heartbeat; its scalar empty-mark/build fences are rolled back
+            # with the physical destination by the outer wrapper.
+            if self._request_owned_restore_guard is None:
+                self._request_owned_fail_stop = (
+                    "computed batch mark succeeded but the irreversible "
+                    f"terminal completion failed ({exc!r}); the step is "
+                    "already marked and cannot be retried."
+                )
             raise
         self._request_owned_control_manager = trial_manager
         return result

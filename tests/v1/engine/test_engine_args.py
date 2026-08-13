@@ -155,6 +155,7 @@ def test_request_owned_flags_default_false():
     assert engine_args.enable_request_owned_q_wkv_fanin is False
     assert engine_args.enable_request_owned_sampling is False
     assert engine_args.enable_request_owned_graph is False
+    assert engine_args.enable_request_owned_kv_offload is False
     assert engine_args.enable_request_owned_windows is False
     assert engine_args.request_owned_decode_window_steps == 1
     assert engine_args.request_owned_decode_reservation_tokens is None
@@ -164,9 +165,17 @@ def test_request_owned_flags_default_false():
     assert vllm_config.scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert vllm_config.scheduler_config.enable_request_owned_sampling is False
     assert vllm_config.scheduler_config.enable_request_owned_graph is False
+    assert vllm_config.scheduler_config.enable_request_owned_kv_offload is False
     assert vllm_config.scheduler_config.enable_request_owned_windows is False
     assert vllm_config.scheduler_config.request_owned_decode_window_steps == 1
     assert vllm_config.scheduler_config.request_owned_decode_reservation_tokens is None
+
+
+def test_request_owned_kv_offload_cli_is_explicit_opt_in():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--enable-request-owned-kv-offload"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_kv_offload is True
 
 
 def test_request_owned_windows_cli_parses_quantum_without_model_loading():

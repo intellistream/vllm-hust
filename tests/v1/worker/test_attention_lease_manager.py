@@ -21,6 +21,7 @@ from vllm.v1.core.sched.ownership import (
     OwnerLeaseToken,
     OwnerReceipt,
     OwnerReceiptBatch,
+    OwnershipError,
     PublicationViolationError,
 )
 
@@ -660,6 +661,30 @@ def test_release_clears_dma_and_residency_facts() -> None:
     assert batch.resident_pages == 0
     assert batch.free_capacity == 200
     assert [r.released for r in batch.events] == [True]
+
+
+def test_restore_completion_replaces_intent_with_terminal_receipt() -> None:
+    manager = _manager(capacity=200, ceiling=40)
+    key = _key()
+    manager.apply(
+        _command(key, 1, 1, OwnerCommandKind.RESERVE, required_num_tokens=100)
+    )
+    manager.emit_batch(emitted_step_seq=1)
+    manager.apply(_command(key, 1, 2, OwnerCommandKind.PREEMPT, required_num_tokens=40))
+    manager.emit_batch(emitted_step_seq=2)
+
+    intent = manager.apply(
+        _command(key, 1, 3, OwnerCommandKind.RESTORE, required_num_tokens=100)
+    )
+    assert intent.pending_dma == 1
+    terminal = manager.complete_restore(key, command_seq=3)
+    assert terminal.pending_dma == 0
+    batch = manager.emit_batch(emitted_step_seq=3)
+    assert batch.events == (terminal,)
+    assert batch.pending_dma == 0
+
+    with pytest.raises(OwnershipError, match="no in-flight RESTORE"):
+        manager.complete_restore(key, command_seq=3)
 
 
 # -- allocation descriptor and command validation ---------------------------------

@@ -43,7 +43,7 @@ the G1 protocol only; they must not be used as G2 physical admission.
 """
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # ---------------------------------------------------------------------------
 # Protocol types
@@ -806,6 +806,7 @@ class OwnerLeaseCoordinator:
             lease.restored = True
         elif lease.command_kind is OwnerCommandKind.RESERVE:
             lease.preempted = False
+            lease.restored = False
         if (
             receipt.released
             and lease.command_kind is OwnerCommandKind.RELEASE
@@ -1342,6 +1343,45 @@ class AttentionLeaseManager:
             runnable_num_tokens=lease.runnable_num_tokens,
             pending_dma=1,
         )
+
+    def complete_restore(self, key: OwnerLeaseKey, command_seq: int) -> OwnerReceipt:
+        """Close one synchronously completed RESTORE before batch emission.
+
+        ``_on_restore`` records an in-flight intent first so a caller cannot
+        manufacture completion before the physical H2D seam.  This method
+        replaces the buffered intent with its terminal receipt only after
+        the exact bulk load has completed.  An already-emitted, stale,
+        duplicate, or otherwise mismatched completion fails closed.
+        """
+        lease = self._leases.get(key)
+        if lease is None or lease.released:
+            raise OwnershipError(f"cannot complete RESTORE without lease {key}")
+        if not lease.preempted or not lease.restoring or lease.pending_dma != 1:
+            raise OwnershipError(f"no in-flight RESTORE for {key}")
+
+        matches = [
+            index
+            for index, receipt in enumerate(self._outbox)
+            if receipt.key == key
+            and receipt.command_seq == command_seq
+            and receipt.accepted
+        ]
+        if len(matches) != 1:
+            raise OwnershipError(
+                "RESTORE completion requires exactly one buffered accepted "
+                f"receipt for {key} command {command_seq}, got {len(matches)}"
+            )
+
+        lease.restoring = False
+        lease.pending_dma = 0
+        index = matches[0]
+        terminal = replace(
+            self._outbox[index],
+            pending_dma=0,
+            free_capacity=self.free_capacity(),
+        )
+        self._outbox[index] = terminal
+        return terminal
 
     def _on_release(
         self, command: OwnerCommand, lease: _WorkerLease | None

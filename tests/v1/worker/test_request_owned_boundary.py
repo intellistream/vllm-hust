@@ -36,6 +36,13 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec,
+    LoadStoreSpec,
+    OffloadingWorker,
+    TransferResult,
+)
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -46,6 +53,7 @@ from vllm.v1.worker.request_owned_kv import (
     DeferredFreeResult,
     RequestOwnedStepMetadata,
 )
+from vllm.v1.worker.request_owned_offload import RequestOwnedBulkOffloadAdapter
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 pytestmark = pytest.mark.cpu_test
@@ -70,6 +78,49 @@ class _FakeWorker:
 
     def set_request_owned_step_metadata(self, metadata):
         self.metadata_handoffs.append(metadata)
+
+
+class _BulkRestoreWorker(_FakeWorker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.restore_zero_plans: list[tuple[tuple[int, ...], ...]] = []
+
+    def execute_request_owned_bulk_restore(self, work) -> None:
+        for item in work:
+            self.restore_zero_plans.append(item.zero_block_ids)
+            item.execute_after_zero()
+
+
+class _SyncOffloadingWorker(OffloadingWorker):
+    """Synchronous transfer receipt fixture for the wrapper lifecycle."""
+
+    def __init__(self) -> None:
+        self.finished: list[TransferResult] = []
+
+    def submit_store(
+        self,
+        job_id: int,
+        src_spec: GPULoadStoreSpec,
+        dst_spec: LoadStoreSpec,
+    ) -> bool:
+        self.finished.append(TransferResult(job_id=job_id, success=True))
+        return True
+
+    def submit_load(
+        self,
+        job_id: int,
+        src_spec: LoadStoreSpec,
+        dst_spec: GPULoadStoreSpec,
+    ) -> bool:
+        self.finished.append(TransferResult(job_id=job_id, success=True))
+        return True
+
+    def get_finished(self) -> list[TransferResult]:
+        finished, self.finished = self.finished, []
+        return finished
+
+    def wait(self, job_ids: set[int]) -> None:
+        return
 
 
 class _NoHookWorker:
@@ -363,6 +414,30 @@ def test_store_constructed_after_worker_init_with_correct_config(
     assert kwargs["log_stats"] is False
     assert kwargs["enable_kv_cache_events"] is False
     assert kwargs.get("metrics_collector") is None
+
+
+def test_exclusive_offload_adapter_constructed_after_worker_cache_init(
+    monkeypatch,
+) -> None:
+    worker = _FakeWorker()
+    wrapper = WorkerWrapperBase(global_rank=2)
+    wrapper.vllm_config = _real_vllm_config()
+    wrapper.vllm_config.scheduler_config.enable_request_owned_kv_offload = True
+    wrapper.worker = worker
+    wrapper.mm_receiver_cache = None
+    sentinel = object()
+    build_calls: list[int] = []
+
+    def build_adapter():
+        build_calls.append(worker.calls)
+        assert worker.initialized_config is not None
+        return sentinel
+
+    monkeypatch.setattr(wrapper, "_create_request_owned_offload_adapter", build_adapter)
+    wrapper.initialize_from_config([_kv_cache_config()] * 3)
+
+    assert wrapper._request_owned_offload_adapter is sentinel
+    assert build_calls == [0]
 
 
 def test_store_not_constructed_when_feature_disabled(monkeypatch) -> None:
@@ -677,6 +752,161 @@ def test_restore_rejected_even_after_preempt() -> None:
     receipt = result.owner_receipt_batches[0].events[0]
     assert not receipt.accepted
     assert receipt.error == "RESTORE is out of scope for the physical KV store"
+
+
+def test_exclusive_bulk_preempt_restore_resume_emits_terminal_receipt() -> None:
+    worker = _BulkRestoreWorker()
+    wrapper = _real_wrapper(worker)
+    wrapper.vllm_config.scheduler_config.enable_request_owned_kv_offload = True
+    wrapper._request_owned_offload_adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=0,
+        manager=CPUOffloadingManager(num_blocks=8),
+        worker=_SyncOffloadingWorker(),
+    )
+    store = wrapper._request_owned_kv_store
+    assert store is not None
+    key = OwnerLeaseKey("req", 0)
+
+    reserve_step = _output(step_seq=1)
+    reserve_step.owner_commands = [_real_reserve(owner_id=0, command_seq=1)]
+    assert (
+        wrapper.execute_model(reserve_step).owner_receipt_batches[0].events[0].accepted
+    )
+    assert store.mark_computed(key, 6)
+
+    preempt_step = _output(step_seq=2)
+    preempt_step.owner_commands = [
+        OwnerCommand(
+            key=key,
+            owner_id=0,
+            command_seq=2,
+            kind=OwnerCommandKind.PREEMPT,
+            required_num_tokens=10,
+        )
+    ]
+    preempt_receipt = wrapper.execute_model(preempt_step).owner_receipt_batches[0]
+    assert preempt_receipt.events[0].accepted
+    assert store.snapshot(key) is None
+
+    restore_step = _output(step_seq=3)
+    restore_step.owner_commands = [
+        OwnerCommand(
+            key=key,
+            owner_id=0,
+            command_seq=3,
+            kind=OwnerCommandKind.RESTORE,
+            required_num_tokens=10,
+        )
+    ]
+    restore_batch = wrapper.execute_model(restore_step).owner_receipt_batches[0]
+    assert restore_batch.events[0].accepted
+    assert restore_batch.events[0].pending_dma == 0
+    assert restore_batch.pending_dma == 0
+    restored = store.snapshot(key)
+    assert restored is not None
+    assert restored.num_computed_tokens == 6
+    assert worker.restore_zero_plans == [restored.tables]
+    assert store.is_restore_ready(key)
+
+    resume_step = _output(step_seq=4)
+    resume_step.owner_commands = [
+        OwnerCommand(
+            key=key,
+            owner_id=0,
+            command_seq=4,
+            kind=OwnerCommandKind.RESERVE,
+            required_num_tokens=10,
+            allocation=OwnerAllocationDescriptor(
+                key=key,
+                num_prompt_tokens=10,
+                num_computed_tokens=6,
+                num_tokens=10,
+                status=OwnerAdmissionStatus.PREEMPTED,
+            ),
+        )
+    ]
+    resume_batch = wrapper.execute_model(resume_step).owner_receipt_batches[0]
+    assert resume_batch.events[0].accepted
+    assert not store.is_restore_ready(key)
+
+
+def test_bulk_restore_rolls_back_on_late_step_failure_and_is_retryable() -> None:
+    worker = _BulkRestoreWorker()
+    wrapper = _real_wrapper(worker)
+    wrapper.vllm_config.scheduler_config.enable_request_owned_kv_offload = True
+    wrapper._request_owned_offload_adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=0,
+        manager=CPUOffloadingManager(num_blocks=8),
+        worker=_SyncOffloadingWorker(),
+    )
+    store = wrapper._request_owned_kv_store
+    assert store is not None
+    key = OwnerLeaseKey("req", 0)
+
+    reserve_step = _output(step_seq=1)
+    reserve_step.owner_commands = [_real_reserve(owner_id=0, command_seq=1)]
+    assert (
+        wrapper.execute_model(reserve_step).owner_receipt_batches[0].events[0].accepted
+    )
+    assert store.mark_computed(key, 6)
+
+    preempt_step = _output(step_seq=2)
+    preempt_step.owner_commands = [
+        OwnerCommand(
+            key=key,
+            owner_id=0,
+            command_seq=2,
+            kind=OwnerCommandKind.PREEMPT,
+            required_num_tokens=10,
+        )
+    ]
+    assert (
+        wrapper.execute_model(preempt_step).owner_receipt_batches[0].events[0].accepted
+    )
+
+    restore_step = _output(step_seq=3)
+    restore_step.owner_commands = [
+        OwnerCommand(
+            key=key,
+            owner_id=0,
+            command_seq=3,
+            kind=OwnerCommandKind.RESTORE,
+            required_num_tokens=10,
+        )
+    ]
+
+    def fail_after_restore(_scheduler_output) -> None:
+        raise RuntimeError("late model failure")
+
+    worker.before_return = fail_after_restore
+    with pytest.raises(RuntimeError, match="late model failure"):
+        wrapper.execute_model(restore_step)
+
+    # H2D completed, but no terminal receipt committed.  The exact final
+    # destination is gone while the cold host image remains retryable.
+    assert store.snapshot(key) is None
+    assert wrapper._request_owned_restore_guard is None
+
+    worker.before_return = None
+    wrapper.vllm_config.scheduler_config.enable_request_owned_sampling = True
+    original_pool_snapshot = store.pool_snapshot
+
+    def fail_terminal_snapshot():
+        raise RuntimeError("late receipt failure")
+
+    store.pool_snapshot = fail_terminal_snapshot
+    with pytest.raises(RuntimeError, match="late receipt failure"):
+        wrapper.execute_model(restore_step)
+    assert store.snapshot(key) is None
+    assert wrapper._request_owned_restore_guard is None
+    assert wrapper._request_owned_fail_stop is None
+
+    store.pool_snapshot = original_pool_snapshot
+    retry_batch = wrapper.execute_model(restore_step).owner_receipt_batches[0]
+    assert retry_batch.events[0].accepted
+    assert retry_batch.events[0].pending_dma == 0
+    assert store.is_restore_ready(key)
+    assert len(worker.restore_zero_plans) == 3
 
 
 # -- flush ordering ----------------------------------------------------------

@@ -2213,9 +2213,7 @@ class Scheduler(SchedulerInterface):
                 "unexpected sampling authority path."
             )
 
-        if not getattr(
-            scheduler_config, "enable_request_owned_attention", False
-        ):
+        if not getattr(scheduler_config, "enable_request_owned_attention", False):
             raise RuntimeError(
                 "owner-sampling envelope ingress requires "
                 "enable_request_owned_attention; the scheduler is not "
@@ -2230,11 +2228,7 @@ class Scheduler(SchedulerInterface):
             )
 
         step_seq = scheduler_output.step_seq
-        if (
-            isinstance(step_seq, bool)
-            or not isinstance(step_seq, int)
-            or step_seq <= 0
-        ):
+        if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
             raise RuntimeError(
                 "owner-sampling envelope ingress requires a positive "
                 f"non-bool step_seq, got {step_seq!r}."
@@ -2321,9 +2315,7 @@ class Scheduler(SchedulerInterface):
                 f"({len(cached.num_computed_tokens)} counts vs "
                 f"{len(cached.req_ids)} ids)."
             )
-        for req_id, num_computed in zip(
-            cached.req_ids, cached.num_computed_tokens
-        ):
+        for req_id, num_computed in zip(cached.req_ids, cached.num_computed_tokens):
             prev = pre_step.get(req_id)
             if prev is not None and prev != num_computed:
                 raise RuntimeError(
@@ -2354,9 +2346,7 @@ class Scheduler(SchedulerInterface):
         all-worker envelope cardinality and transport-slot checks.
         """
         scheduled_req_ids = {
-            req_id
-            for req_id, count in num_scheduled_tokens.items()
-            if count > 0
+            req_id for req_id, count in num_scheduled_tokens.items() if count > 0
         }
 
         rows: list[tuple[OwnerSamplingBatch, GlobalRowId]] = []
@@ -2580,11 +2570,14 @@ class Scheduler(SchedulerInterface):
         coordinator = self.owner_coordinator
         assert coordinator is not None
 
-        if getattr(
-            self.scheduler_config,
-            "enable_request_owned_windows",
-            False,
-        ) and self._owner_window_state.inflight is not None:
+        if (
+            getattr(
+                self.scheduler_config,
+                "enable_request_owned_windows",
+                False,
+            )
+            and self._owner_window_state.inflight is not None
+        ):
             raise RuntimeError(
                 "request-owned window requires completed model output before "
                 "the next schedule call."
@@ -2861,8 +2854,20 @@ class Scheduler(SchedulerInterface):
                 # Defensive: RESERVE in flight without a tracked pending.
                 pass
             elif coordinator.is_preempted(key):
-                # PREEMPT receipt applied: reacquire on the sticky owner.
-                self._issue_owner_reserve(request, key)
+                if getattr(
+                    self.scheduler_config,
+                    "enable_request_owned_kv_offload",
+                    False,
+                ) and not coordinator.is_restored(key):
+                    # A cold lease first reserves/restores its final device
+                    # destination. The accepted RESTORE receipt is emitted
+                    # only after full H2D completion; RESERVE then reacquires
+                    # runnable capacity on the following control step.
+                    self._issue_owner_restore(request, key)
+                else:
+                    # PREEMPT receipt applied (and, in offload mode, the full
+                    # restore completed): reacquire on the sticky owner.
+                    self._issue_owner_reserve(request, key)
             else:
                 # Accepted lease: promote to RUNNING.
                 self._promote_owner_request(request, key, scheduled_timestamp)
@@ -2952,9 +2957,7 @@ class Scheduler(SchedulerInterface):
         self._owner_window_reconcile()
         if state.phase is None:
             prefill_wave = (
-                self._owner_window_form_prefill_wave()
-                if state.prefer_prefill
-                else ()
+                self._owner_window_form_prefill_wave() if state.prefer_prefill else ()
             )
             if prefill_wave:
                 state.prefer_prefill = False
@@ -3455,9 +3458,7 @@ class Scheduler(SchedulerInterface):
             None,
         )
         increment = (
-            decode_chunk
-            if decode_chunk is not None
-            else self.max_num_scheduled_tokens
+            decode_chunk if decode_chunk is not None else self.max_num_scheduled_tokens
         )
         upper_bound = (
             request.num_prompt_tokens + request.max_tokens
@@ -3578,7 +3579,15 @@ class Scheduler(SchedulerInterface):
         if request.status == RequestStatus.PREEMPTED:
             command = coordinator.resume(key, self._owner_resume_required(request))
             status = OwnerAdmissionStatus.PREEMPTED
-            num_computed_tokens = 0
+            num_computed_tokens = (
+                request.num_computed_tokens
+                if getattr(
+                    self.scheduler_config,
+                    "enable_request_owned_kv_offload",
+                    False,
+                )
+                else 0
+            )
         else:
             command = coordinator.reserve(key, self._owner_reserve_required(request))
             status = OwnerAdmissionStatus.WAITING
@@ -3601,6 +3610,18 @@ class Scheduler(SchedulerInterface):
         coordinator = self.owner_coordinator
         assert coordinator is not None
         command = coordinator.extend(key, self._owner_extend_required(request))
+        self._owner_outbox.append(command)
+        self._owner_pending_command[request.request_id] = (
+            command.command_seq,
+            command.kind,
+        )
+
+    def _issue_owner_restore(self, request: Request, key: OwnerLeaseKey) -> None:
+        """Issue one synchronous bulk RESTORE before resume admission."""
+
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        command = coordinator.restore(key, self._owner_resume_required(request))
         self._owner_outbox.append(command)
         self._owner_pending_command[request.request_id] = (
             command.command_seq,
@@ -3660,8 +3681,7 @@ class Scheduler(SchedulerInterface):
         return commands
 
     def _preempt_request_owned(self, request: Request, timestamp: float) -> None:
-        """Preempt with the owner protocol: sticky owner+epoch, zero
-        recompute, PREEMPT command instead of freeing scheduler KV blocks."""
+        """Preempt with sticky ownership and optional durable host KV."""
         assert request.status == RequestStatus.RUNNING
         coordinator = self.owner_coordinator
         assert coordinator is not None
@@ -3675,7 +3695,13 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
-        request.num_computed_tokens = 0
+        if not getattr(
+            self.scheduler_config,
+            "enable_request_owned_kv_offload",
+            False,
+        ):
+            # Without durable host KV the resumed request must recompute.
+            request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -3855,6 +3881,21 @@ class Scheduler(SchedulerInterface):
             coordinator.apply_receipt(event)
             return
         pending = self._owner_pending_command.get(request_id)
+        if (
+            getattr(
+                self.scheduler_config,
+                "enable_request_owned_kv_offload",
+                False,
+            )
+            and pending is not None
+            and pending == (event.command_seq, OwnerCommandKind.RESTORE)
+            and event.accepted
+            and event.pending_dma != 0
+        ):
+            raise RuntimeError(
+                "request-owned bulk RESTORE requires a terminal receipt with "
+                f"pending_dma=0, got {event.pending_dma!r} for {event.key}."
+            )
         if pending is not None and pending[0] == event.command_seq:
             self._owner_pending_command.pop(request_id, None)
         applied = coordinator.apply_receipt(event)

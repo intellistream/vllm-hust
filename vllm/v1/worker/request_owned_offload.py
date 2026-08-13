@@ -59,13 +59,51 @@ def make_request_owned_offload_keys(
         raise TypeError(
             f"snapshot must be a RequestOwnedKVSnapshot, got {type(snapshot).__name__}."
         )
+    return make_request_owned_offload_keys_for_prefix(
+        key=snapshot.key,
+        owner_rank=snapshot.owner_rank,
+        num_computed_tokens=snapshot.num_computed_tokens,
+        group_block_counts=tuple(len(table) for table in snapshot.tables),
+        group_block_sizes=group_block_sizes,
+    )
+
+
+def make_request_owned_offload_keys_for_prefix(
+    *,
+    key: OwnerLeaseKey,
+    owner_rank: int,
+    num_computed_tokens: int,
+    group_block_counts: tuple[int, ...],
+    group_block_sizes: tuple[int, ...],
+) -> tuple[tuple[OffloadKey, ...], ...]:
+    """Build stable host keys from block-ID-free computed-prefix facts."""
+
+    if not isinstance(key, OwnerLeaseKey):
+        raise TypeError(f"key must be an OwnerLeaseKey, got {key!r}.")
+    if (
+        isinstance(owner_rank, bool)
+        or not isinstance(owner_rank, int)
+        or owner_rank < 0
+    ):
+        raise TypeError(
+            f"owner_rank must be a nonnegative non-bool int, got {owner_rank!r}."
+        )
+    if (
+        isinstance(num_computed_tokens, bool)
+        or not isinstance(num_computed_tokens, int)
+        or num_computed_tokens < 0
+    ):
+        raise TypeError(
+            "num_computed_tokens must be a nonnegative non-bool int, got "
+            f"{num_computed_tokens!r}."
+        )
+    if not isinstance(group_block_counts, tuple):
+        raise TypeError("group_block_counts must be a tuple")
     if not isinstance(group_block_sizes, tuple):
         raise TypeError("group_block_sizes must be a tuple")
-    if len(group_block_sizes) != len(snapshot.tables):
-        raise ValueError(
-            "group block sizes and snapshot tables must cover the same groups"
-        )
-    request_bytes = snapshot.key.request_id.encode("utf-8")
+    if len(group_block_sizes) != len(group_block_counts):
+        raise ValueError("group block sizes and counts must cover the same groups")
+    request_bytes = key.request_id.encode("utf-8")
 
     def frame(value: bytes) -> bytes:
         return len(value).to_bytes(8, "big") + value
@@ -73,13 +111,13 @@ def make_request_owned_offload_keys(
     prefix = b"vllm-request-owned-kv-v1\0" + b"".join(
         (
             frame(request_bytes),
-            frame(str(snapshot.key.owner_epoch).encode()),
-            frame(str(snapshot.owner_rank).encode()),
+            frame(str(key.owner_epoch).encode()),
+            frame(str(owner_rank).encode()),
         )
     )
     groups: list[tuple[OffloadKey, ...]] = []
-    for group_index, (table, block_size) in enumerate(
-        zip(snapshot.tables, group_block_sizes)
+    for group_index, (block_count, block_size) in enumerate(
+        zip(group_block_counts, group_block_sizes)
     ):
         if (
             isinstance(block_size, bool)
@@ -89,11 +127,20 @@ def make_request_owned_offload_keys(
             raise TypeError(
                 f"group block sizes must be positive non-bool ints, got {block_size!r}."
             )
+        if (
+            isinstance(block_count, bool)
+            or not isinstance(block_count, int)
+            or block_count < 0
+        ):
+            raise TypeError(
+                "group block counts must be nonnegative non-bool ints, got "
+                f"{block_count!r}."
+            )
         keys: list[OffloadKey] = []
-        for block_index in range(len(table)):
+        for block_index in range(block_count):
             valid_tokens = min(
                 block_size,
-                max(0, snapshot.num_computed_tokens - block_index * block_size),
+                max(0, num_computed_tokens - block_index * block_size),
             )
             if valid_tokens <= 0:
                 raise ValueError(
@@ -537,6 +584,18 @@ class RequestOwnedBulkOffloadLedger:
         state.hot = False
         state.closed = True
 
+    def is_current(self, identity: OwnerOffloadIdentity) -> bool:
+        """Return whether ``identity`` is the exact current bound generation."""
+
+        if not isinstance(identity, OwnerOffloadIdentity):
+            raise TypeError(
+                "identity must be an OwnerOffloadIdentity, got "
+                f"{type(identity).__name__}."
+            )
+        if identity.owner_rank != self.owner_rank:
+            return False
+        return self._current.get(identity.key) == identity
+
     def is_hot(self, identity: OwnerOffloadIdentity) -> bool:
         return self._require_current(identity).hot
 
@@ -653,11 +712,21 @@ class RequestOwnedBulkOffloadAdapter:
             raise TypeError(f"manager must be an OffloadingManager, got {manager!r}.")
         if not isinstance(worker, OffloadingWorker):
             raise TypeError(f"worker must be an OffloadingWorker, got {worker!r}.")
+        if not callable(getattr(manager, "evict_keys", None)):
+            raise TypeError(
+                "request-owned bulk offload requires an exact-key-evictable "
+                "CPU offloading manager"
+            )
+        if getattr(manager, "capacity_blocks", 0) <= 0:
+            raise ValueError(
+                "request-owned bulk offload requires at least one host block"
+            )
         self.manager = manager
         self.worker = worker
         self.ledger = RequestOwnedBulkOffloadLedger(owner_rank)
         self._submissions: dict[int, _AdapterSubmission] = {}
         self._ready_receipts: deque[OwnerBulkTransferReceipt] = deque()
+        self._owned_host_keys: dict[OwnerLeaseKey, set[OffloadKey]] = {}
 
     def bind(
         self, snapshot: RequestOwnedKVSnapshot, *, active: bool
@@ -685,7 +754,7 @@ class RequestOwnedBulkOffloadAdapter:
             return job
 
         manager_keys = tuple(prepared.keys_to_store)
-        self.ledger.forget_host_keys(tuple(prepared.evicted_keys))
+        self._forget_host_keys(tuple(prepared.evicted_keys))
         error = self._validate_store_selection(plan, manager_keys, lookup)
         if error is not None:
             self.manager.complete_store(manager_keys, req_context, success=False)
@@ -724,6 +793,9 @@ class RequestOwnedBulkOffloadAdapter:
         job = self.ledger.begin_restore(plan)
         req_context = self._req_context(job)
         flat_keys = self._flat_keys(plan)
+        if not flat_keys:
+            self._finish_immediate(job)
+            return job
         misses = [
             key
             for key in flat_keys
@@ -803,6 +875,12 @@ class RequestOwnedBulkOffloadAdapter:
             if not submission.aborted:
                 self.ledger.complete(receipt)
             receipts.append(receipt)
+        for receipt in receipts:
+            if (
+                receipt.success
+                and receipt.direction is OwnerBulkTransferDirection.STORE
+            ):
+                self._record_store_image(receipt)
         return tuple(receipts)
 
     def wait(self, jobs: tuple[OwnerBulkTransferJob, ...]) -> None:
@@ -832,6 +910,31 @@ class RequestOwnedBulkOffloadAdapter:
                 submission.aborted = True
         self.ledger.abort(identity)
 
+    def release(self, snapshot: RequestOwnedKVSnapshot) -> None:
+        """Close a bound generation on request RELEASE, if one exists."""
+
+        identity = OwnerOffloadIdentity.from_snapshot(snapshot)
+        if self.ledger.is_current(identity):
+            self.abort(identity)
+
+    def evict_owned_host_keys(self, key: OwnerLeaseKey) -> None:
+        """Forget and evict all durable host images owned by one lease."""
+
+        keys = tuple(self._owned_host_keys.get(key, ()))
+        if not keys:
+            return
+        evict = getattr(self.manager, "evict_keys", None)
+        if not callable(evict):
+            raise RequestOwnedOffloadError(
+                "exclusive request-owned offload manager cannot evict host keys"
+            )
+        evicted = tuple(evict(keys))
+        if set(evicted) != set(keys):
+            raise RequestOwnedOffloadError(
+                "request-owned RELEASE could not evict its exact durable host image"
+            )
+        self._forget_host_keys(keys)
+
     def shutdown(self) -> None:
         self.worker.shutdown()
         self.manager.shutdown()
@@ -849,6 +952,31 @@ class RequestOwnedBulkOffloadAdapter:
         )
         self.ledger.complete(receipt)
         self._ready_receipts.append(receipt)
+
+    def _record_store_image(self, receipt: OwnerBulkTransferReceipt) -> None:
+        """Track the exact latest image and retire stale partial-tail keys."""
+
+        key = receipt.identity.key
+        current = {item for group in receipt.offload_keys for item in group}
+        stale = self._owned_host_keys.get(key, set()) - current
+        if stale:
+            evict = getattr(self.manager, "evict_keys", None)
+            if not callable(evict) or set(evict(tuple(stale))) != stale:
+                raise RequestOwnedOffloadError(
+                    "request-owned store could not retire its stale host image"
+                )
+            self._forget_host_keys(tuple(stale))
+        self._owned_host_keys[key] = current
+
+    def _forget_host_keys(self, keys: tuple[OffloadKey, ...]) -> None:
+        if not keys:
+            return
+        forgotten = set(keys)
+        self.ledger.forget_host_keys(keys)
+        for owner_key, owned in tuple(self._owned_host_keys.items()):
+            owned.difference_update(forgotten)
+            if not owned:
+                self._owned_host_keys.pop(owner_key, None)
 
     @staticmethod
     def _req_context(job: OwnerBulkTransferJob) -> ReqContext:
@@ -906,3 +1034,69 @@ class RequestOwnedBulkOffloadAdapter:
             block_indices.append(positions[0] if positions else 0)
             block_ids.extend(group_blocks[index] for index in positions)
         return GPULoadStoreSpec(block_ids, group_sizes, block_indices)
+
+
+@dataclass(slots=True)
+class RequestOwnedBulkRestoreWork:
+    """One exact post-zero, pre-forward full-restore action.
+
+    The object stays worker-private.  The device-specific runner owns the
+    zeroing seam, then calls :meth:`execute_after_zero`; the method is
+    replay-fenced and returns only after the upstream offloading worker has
+    produced the exact completion receipt.
+    """
+
+    step_seq: int
+    adapter: RequestOwnedBulkOffloadAdapter
+    plan: OwnerOffloadPlan
+    zero_block_ids: tuple[tuple[int, ...], ...]
+    executed: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.step_seq, bool)
+            or not isinstance(self.step_seq, int)
+            or self.step_seq <= 0
+        ):
+            raise TypeError(
+                f"step_seq must be a positive non-bool int, got {self.step_seq!r}."
+            )
+        if not isinstance(self.adapter, RequestOwnedBulkOffloadAdapter):
+            raise TypeError("adapter must be a RequestOwnedBulkOffloadAdapter")
+        if not isinstance(self.plan, OwnerOffloadPlan):
+            raise TypeError("plan must be an OwnerOffloadPlan")
+        if not isinstance(self.zero_block_ids, tuple):
+            raise TypeError("zero_block_ids must be a tuple of group tuples")
+        if len(self.zero_block_ids) != len(self.plan.device_block_ids):
+            raise ValueError("zero and restore plans must cover the same groups")
+        for restore_ids, zero_ids in zip(
+            self.plan.device_block_ids, self.zero_block_ids
+        ):
+            if not set(restore_ids).issubset(zero_ids):
+                raise ValueError(
+                    "every restore destination must be covered by the zero plan"
+                )
+
+    def execute_after_zero(self) -> OwnerBulkTransferReceipt:
+        if self.executed:
+            raise RequestOwnedOffloadError(
+                f"restore work for step {self.step_seq} was already executed"
+            )
+        self.executed = True
+        job = self.adapter.submit_restore(self.plan)
+        self.adapter.wait((job,))
+        receipts = self.adapter.poll()
+        matching = tuple(
+            receipt for receipt in receipts if receipt.job_id == job.job_id
+        )
+        if len(matching) != 1 or len(receipts) != 1:
+            raise RequestOwnedOffloadError(
+                f"bulk restore job {job.job_id} produced {len(matching)} exact "
+                f"and {len(receipts)} total receipts"
+            )
+        receipt = matching[0]
+        if not receipt.success:
+            raise RequestOwnedOffloadError(
+                receipt.error or f"bulk restore job {job.job_id} failed"
+            )
+        return receipt

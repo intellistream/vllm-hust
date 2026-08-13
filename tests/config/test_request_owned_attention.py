@@ -66,6 +66,7 @@ def _vllm_config(
     enable_request_owned_attention: bool = True,
     enable_request_owned_q_wkv_fanin: bool = False,
     enable_request_owned_graph: bool = False,
+    enable_request_owned_kv_offload: bool = False,
     enable_request_owned_windows: bool = False,
     request_owned_decode_window_steps: int = 1,
     scheduler_config: SchedulerConfig | None = None,
@@ -90,6 +91,7 @@ def _vllm_config(
             enable_request_owned_attention=enable_request_owned_attention,
             enable_request_owned_q_wkv_fanin=enable_request_owned_q_wkv_fanin,
             enable_request_owned_graph=enable_request_owned_graph,
+            enable_request_owned_kv_offload=enable_request_owned_kv_offload,
             enable_request_owned_windows=enable_request_owned_windows,
             request_owned_decode_window_steps=request_owned_decode_window_steps,
             async_scheduling=async_scheduling,
@@ -107,6 +109,7 @@ def test_request_owned_attention_defaults_off():
     assert SchedulerConfig.default_factory().enable_request_owned_attention is False
     assert SchedulerConfig.default_factory().enable_request_owned_q_wkv_fanin is False
     assert SchedulerConfig.default_factory().enable_request_owned_graph is False
+    assert SchedulerConfig.default_factory().enable_request_owned_kv_offload is False
     assert SchedulerConfig.default_factory().enable_request_owned_windows is False
     assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 1
     assert (
@@ -116,25 +119,20 @@ def test_request_owned_attention_defaults_off():
     assert VllmConfig().scheduler_config.enable_request_owned_attention is False
     assert VllmConfig().scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert VllmConfig().scheduler_config.enable_request_owned_graph is False
+    assert VllmConfig().scheduler_config.enable_request_owned_kv_offload is False
     assert VllmConfig().scheduler_config.enable_request_owned_windows is False
     assert VllmConfig().scheduler_config.request_owned_decode_window_steps == 1
-    assert (
-        VllmConfig().scheduler_config.request_owned_decode_reservation_tokens is None
-    )
+    assert VllmConfig().scheduler_config.request_owned_decode_reservation_tokens is None
 
 
 @pytest.mark.parametrize("value", [1, "true", None])
 def test_request_owned_windows_gate_is_strict_bool(value):
-    with pytest.raises(
-        ValueError, match="enable_request_owned_windows must be a bool"
-    ):
+    with pytest.raises(ValueError, match="enable_request_owned_windows must be a bool"):
         SchedulerConfig.default_factory(enable_request_owned_windows=value)
 
 
 def test_request_owned_windows_require_graph_opt_in():
-    with pytest.raises(
-        ValueError, match="requires enable_request_owned_graph=True"
-    ):
+    with pytest.raises(ValueError, match="requires enable_request_owned_graph=True"):
         _vllm_config(enable_request_owned_windows=True)
 
 
@@ -161,12 +159,8 @@ def test_request_owned_window_quantum_must_be_positive(value):
 
 @pytest.mark.parametrize("value", [0, -1])
 def test_request_owned_decode_reservation_tokens_must_be_positive(value):
-    with pytest.raises(
-        ValueError, match="request_owned_decode_reservation_tokens"
-    ):
-        SchedulerConfig.default_factory(
-            request_owned_decode_reservation_tokens=value
-        )
+    with pytest.raises(ValueError, match="request_owned_decode_reservation_tokens"):
+        SchedulerConfig.default_factory(request_owned_decode_reservation_tokens=value)
 
 
 def test_disabled_leaves_existing_validation_unchanged():
@@ -363,6 +357,72 @@ def test_graph_opt_in_rejects_every_other_compile_envelope(mode, cudagraph_mode)
 def test_request_owned_graph_gate_is_strict_bool(value):
     with pytest.raises(ValueError, match="enable_request_owned_graph must be a bool"):
         SchedulerConfig.default_factory(enable_request_owned_graph=value)
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_request_owned_kv_offload_gate_is_strict_bool(value):
+    with pytest.raises(
+        ValueError, match="enable_request_owned_kv_offload must be a bool"
+    ):
+        SchedulerConfig.default_factory(enable_request_owned_kv_offload=value)
+
+
+def test_request_owned_kv_offload_requires_request_owned_attention():
+    with pytest.raises(
+        ValueError, match="requires enable_request_owned_attention=True"
+    ):
+        _vllm_config(
+            enable_request_owned_attention=False,
+            enable_request_owned_kv_offload=True,
+            cache_config=CacheConfig(
+                kv_offloading_size=1.0,
+                enable_prefix_caching=False,
+            ),
+        )
+
+
+def test_request_owned_kv_offload_selects_exclusive_native_connector():
+    config = _vllm_config(
+        enable_request_owned_kv_offload=True,
+        cache_config=CacheConfig(
+            kv_offloading_size=1.0,
+            enable_prefix_caching=False,
+        ),
+    )
+    assert config.kv_transfer_config is not None
+    assert config.kv_transfer_config.kv_connector == "RequestOwnedOffloadingConnector"
+    assert config.kv_transfer_config.kv_role == "kv_both"
+
+
+@pytest.mark.parametrize("capacity", [None, 0.0, -1.0, float("nan")])
+def test_request_owned_kv_offload_requires_configured_capacity(capacity):
+    with pytest.raises(ValueError, match="requires a positive"):
+        _vllm_config(
+            enable_request_owned_kv_offload=True,
+            cache_config=CacheConfig(kv_offloading_size=capacity),
+        )
+
+
+@pytest.mark.parametrize(
+    "extra_config, match",
+    [
+        ({"block_size": 32}, "1:1"),
+        ({"spec_name": "TieringOffloadingSpec"}, "CPUOffloadingSpec"),
+        ({"store_threshold": 2}, "first PREEMPT"),
+    ],
+)
+def test_request_owned_kv_offload_rejects_nonexact_substrate(extra_config, match):
+    with pytest.raises(ValueError, match=match):
+        _vllm_config(
+            enable_request_owned_kv_offload=True,
+            cache_config=CacheConfig(
+                kv_offloading_size=1.0,
+                enable_prefix_caching=False,
+            ),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector_extra_config=extra_config,
+            ),
+        )
 
 
 def test_enabled_rejects_kv_cache_cpu_offload():

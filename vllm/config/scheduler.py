@@ -201,6 +201,15 @@ class SchedulerConfig:
     The flag changes no computation graph structure, so it is deliberately
     not part of :meth:`compute_hash`."""
 
+    enable_request_owned_kv_offload: bool = False
+    """Experimental exclusive bulk host-KV oracle for request ownership.
+
+    Defaults to False.  When enabled, the native CPU offload medium is owned
+    exclusively by the request-owned worker adapter; the generic scheduler
+    connector must not submit jobs into the same manager/worker or job-id
+    namespace.  This is a correctness gate, not the streaming restore path.
+    """
+
     enable_request_owned_graph: bool = False
     """Experimental graph pilot for request-owned execution.
 
@@ -331,6 +340,17 @@ class SchedulerConfig:
             return value
         raise ValueError(
             "enable_request_owned_sampling must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
+
+    @field_validator("enable_request_owned_kv_offload", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_kv_offload(cls, value: Any) -> Any:
+        """Keep owner-local host KV behind an exact exclusive opt-in."""
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_kv_offload must be a bool, got "
             f"{type(value).__name__} ({value!r})."
         )
 

@@ -210,6 +210,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "RequestOwnedOffloadingConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.request_owned_offloading_connector",
+    "RequestOwnedOffloadingConnector",
+)
+
+KVConnectorFactory.register_connector(
     "DecodeBenchConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector",
     "DecodeBenchConnector",

@@ -802,7 +802,9 @@ class VllmConfig:
             self.kv_transfer_config = KVTransferConfig()
 
         if kv_offloading_backend == "native":
-            if envs.VLLM_USE_SIMPLE_KV_OFFLOAD:
+            if self.scheduler_config.enable_request_owned_kv_offload:
+                config_connector = "RequestOwnedOffloadingConnector"
+            elif envs.VLLM_USE_SIMPLE_KV_OFFLOAD:
                 config_connector = "SimpleCPUOffloadConnector"
             else:
                 config_connector = "OffloadingConnector"
@@ -2182,12 +2184,19 @@ class VllmConfig:
         relaxed here.
         """
         request_owned_graph = self.scheduler_config.enable_request_owned_graph
-        request_owned_windows = (
-            self.scheduler_config.enable_request_owned_windows
-        )
+        request_owned_windows = self.scheduler_config.enable_request_owned_windows
         request_owned_q_wkv_fanin = (
             self.scheduler_config.enable_request_owned_q_wkv_fanin
         )
+        request_owned_kv_offload = self.scheduler_config.enable_request_owned_kv_offload
+        if (
+            request_owned_kv_offload
+            and not self.scheduler_config.enable_request_owned_attention
+        ):
+            raise ValueError(
+                "enable_request_owned_kv_offload=True requires "
+                "enable_request_owned_attention=True."
+            )
         if (
             request_owned_q_wkv_fanin
             and not self.scheduler_config.enable_request_owned_attention
@@ -2318,7 +2327,10 @@ class VllmConfig:
                     f"{cudagraph_name}."
                 )
 
-        if self.cache_config.kv_offloading_size is not None:
+        if (
+            self.cache_config.kv_offloading_size is not None
+            and not request_owned_kv_offload
+        ):
             raise ValueError(
                 "Request-owned attention is experimental and does not "
                 "support KV cache CPU offloading, but got "
@@ -2326,9 +2338,59 @@ class VllmConfig:
                 f"{self.cache_config.kv_offloading_size}."
             )
 
+        if request_owned_kv_offload:
+            if not (
+                self.cache_config.kv_offloading_size is not None
+                and self.cache_config.kv_offloading_size > 0
+            ):
+                raise ValueError(
+                    "enable_request_owned_kv_offload=True requires a positive "
+                    "cache_config.kv_offloading_size."
+                )
+            if self.cache_config.kv_offloading_backend != "native":
+                raise ValueError(
+                    "enable_request_owned_kv_offload=True supports only the "
+                    "native CPU offload backend."
+                )
+            connector_name = (
+                self.kv_transfer_config.kv_connector
+                if self.kv_transfer_config is not None
+                else None
+            )
+            if connector_name not in (None, "RequestOwnedOffloadingConnector"):
+                raise ValueError(
+                    "enable_request_owned_kv_offload=True requires the exclusive "
+                    "RequestOwnedOffloadingConnector, got "
+                    f"{connector_name!r}."
+                )
+            extra_config = (
+                self.kv_transfer_config.kv_connector_extra_config
+                if self.kv_transfer_config is not None
+                else {}
+            )
+            if "block_size" in extra_config:
+                raise ValueError(
+                    "request-owned bulk offload requires 1:1 host/device block "
+                    "geometry; remove kv_connector_extra_config['block_size']."
+                )
+            if extra_config.get("spec_name", "CPUOffloadingSpec") != (
+                "CPUOffloadingSpec"
+            ):
+                raise ValueError(
+                    "request-owned bulk offload requires CPUOffloadingSpec; "
+                    f"got {extra_config.get('spec_name')!r}."
+                )
+            store_threshold = int(extra_config.get("store_threshold", 0))
+            if store_threshold >= 2:
+                raise ValueError(
+                    "request-owned bulk offload requires store_threshold < 2 "
+                    "so the first PREEMPT cannot be filtered."
+                )
+
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            and not request_owned_kv_offload
         ):
             raise ValueError(
                 "Request-owned attention is experimental and does not "

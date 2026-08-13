@@ -77,6 +77,7 @@ def _command(
     prompt: int | None = None,
     seq: int = 0,
     owner_id: int = 0,
+    status: OwnerAdmissionStatus = OwnerAdmissionStatus.WAITING,
 ) -> OwnerCommand:
     allocation = None
     if kind is OwnerCommandKind.RESERVE:
@@ -85,7 +86,7 @@ def _command(
             num_prompt_tokens=max(required, computed) if prompt is None else prompt,
             num_computed_tokens=computed,
             num_tokens=required,
-            status=OwnerAdmissionStatus.WAITING,
+            status=status,
         )
     return OwnerCommand(
         key=key,
@@ -512,15 +513,52 @@ def test_owner_kv_snapshot_binds_generation_and_survives_pending_free():
     assert store.snapshot(key) is None
 
 
-def test_restore_and_prefix_paths_rejected():
+def test_restore_requires_cold_lease_and_reactivates_exact_destination():
     manager = _make_manager()
     store = RequestOwnedKVStore(manager, owner_rank=0)
     key = _key("r")
 
     restore = store.restore(_command(key, OwnerCommandKind.RESTORE, required=10, seq=1))
     assert not restore.accepted
-    assert "out of scope" in restore.error
+    assert "no durable cold lease" in restore.error
     assert store.get_block_table(key) is None
+
+    assert store.reserve(
+        _command(
+            key,
+            OwnerCommandKind.RESERVE,
+            required=10,
+            computed=6,
+            seq=2,
+        )
+    ).accepted
+    assert store.preempt(
+        _command(key, OwnerCommandKind.PREEMPT, required=10, seq=3)
+    ).accepted
+    store.flush()
+
+    restored = store.restore(
+        _command(key, OwnerCommandKind.RESTORE, required=10, seq=4)
+    )
+    assert restored.accepted
+    snapshot = store.snapshot(key)
+    assert snapshot is not None
+    assert snapshot.num_computed_tokens == 6
+    assert not store.is_restore_ready(key)
+    reserve = _command(
+        key,
+        OwnerCommandKind.RESERVE,
+        required=10,
+        computed=6,
+        seq=5,
+        status=OwnerAdmissionStatus.PREEMPTED,
+    )
+    assert not store.reserve(reserve).accepted
+    assert store.mark_restore_ready(key, snapshot.allocation_generation)
+    assert store.is_restore_ready(key)
+    assert store.reserve(reserve).accepted
+    assert store.mark_reactivated(key, snapshot.allocation_generation)
+    assert not store.is_restore_ready(key)
 
     # Prefix caching / computed-block APIs are out of scope: absent.
     assert not hasattr(store, "get_prefix_cache_snapshot")
@@ -566,6 +604,28 @@ def _make_dsv4_manager(
         hash_block_size=4,
         enable_caching=False,
     )
+
+
+def test_compressed_prefix_uses_effective_physical_block_extent():
+    store = RequestOwnedKVStore(_make_dsv4_manager(), owner_rank=0)
+    key = _key("compressed")
+    assert store.reserve(
+        _command(
+            key,
+            OwnerCommandKind.RESERVE,
+            required=20,
+            computed=0,
+            seq=1,
+        )
+    ).accepted
+    assert store.mark_computed(key, 6)
+
+    snapshot = store.snapshot(key)
+    computed = store.computed_prefix_snapshot(key)
+    assert snapshot is not None and computed is not None
+    assert store.group_block_sizes == (16, 4)
+    assert computed.tables[0] == snapshot.tables[0][:1]
+    assert computed.tables[1] == snapshot.tables[1][:2]
 
 
 def test_dsv4_shaped_heterogeneous_groups():

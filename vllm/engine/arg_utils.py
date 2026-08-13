@@ -718,9 +718,10 @@ class EngineArgs:
     )
     enable_request_owned_sampling: bool = SchedulerConfig.enable_request_owned_sampling
     enable_request_owned_graph: bool = SchedulerConfig.enable_request_owned_graph
-    enable_request_owned_windows: bool = (
-        SchedulerConfig.enable_request_owned_windows
+    enable_request_owned_kv_offload: bool = (
+        SchedulerConfig.enable_request_owned_kv_offload
     )
+    enable_request_owned_windows: bool = SchedulerConfig.enable_request_owned_windows
     request_owned_decode_window_steps: int = (
         SchedulerConfig.request_owned_decode_window_steps
     )
@@ -1498,6 +1499,10 @@ class EngineArgs:
             **scheduler_kwargs["enable_request_owned_graph"],
         )
         scheduler_group.add_argument(
+            "--enable-request-owned-kv-offload",
+            **scheduler_kwargs["enable_request_owned_kv_offload"],
+        )
+        scheduler_group.add_argument(
             "--enable-request-owned-windows",
             **scheduler_kwargs["enable_request_owned_windows"],
         )
@@ -2213,10 +2218,9 @@ class EngineArgs:
             enable_request_owned_q_wkv_fanin=self.enable_request_owned_q_wkv_fanin,
             enable_request_owned_sampling=self.enable_request_owned_sampling,
             enable_request_owned_graph=self.enable_request_owned_graph,
+            enable_request_owned_kv_offload=self.enable_request_owned_kv_offload,
             enable_request_owned_windows=self.enable_request_owned_windows,
-            request_owned_decode_window_steps=(
-                self.request_owned_decode_window_steps
-            ),
+            request_owned_decode_window_steps=(self.request_owned_decode_window_steps),
             request_owned_decode_reservation_tokens=(
                 self.request_owned_decode_reservation_tokens
             ),

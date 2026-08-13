@@ -18,9 +18,12 @@ PREEMPT/RELEASE released to the manager only at an explicit post-execute
 completion fence (:meth:`RequestOwnedKVStore.flush`).  It emits no
 :class:`OwnerReceipt` and performs no token/block estimation of its own.
 
-Scope (fail closed): prefix caching, KV connectors, spec decode, and
-RESTORE are out of scope; :meth:`restore` always rejects.  The store keeps
-no local epoch fence: physical records are keyed by the full
+Scope (fail closed): prefix caching and spec decode remain out of scope.
+O1 adds an exclusive host-KV lifecycle: a durable PREEMPT flush retains only
+block-ID-free cold allocation facts; RESTORE allocates the final destination,
+which cannot become runnable until the concrete worker zeros it and completes
+the exact bulk H2D.  The store keeps no local epoch fence: physical records are
+keyed by the full
 :class:`OwnerLeaseKey` (request id plus epoch), so a command whose epoch
 does not match the record simply misses the lookup and is rejected without
 touching any state.  Commands whose kind or record state the store does not
@@ -70,6 +73,7 @@ from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.ownership import (
+    OwnerAdmissionStatus,
     OwnerCacheGroupSnapshot,
     OwnerCachePoolSnapshot,
     OwnerCommand,
@@ -141,6 +145,22 @@ class _Record:
     #: successful build: the scheduler must not both allocate and authorize
     #: execution for the same key in one step.
     allocated_since_build: bool = False
+    #: True after RESTORE allocated the final destination and until the
+    #: following RESERVE reactivates it.
+    restored_from_host: bool = False
+    #: True only after the owner bulk H2D completed at the pre-forward seam.
+    restore_ready: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RequestOwnedColdSnapshot:
+    """Block-ID-free facts needed to address one durable host prefix."""
+
+    key: OwnerLeaseKey
+    owner_rank: int
+    num_prompt_tokens: int
+    num_computed_tokens: int
+    reserved_num_tokens: int
 
 
 @dataclass(frozen=True)
@@ -321,6 +341,16 @@ class RequestOwnedStepMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class RequestOwnedStepBuildCheckpoint:
+    """Private rollback facts for an uncommitted empty control-step build."""
+
+    last_built_step_seq: int | None
+    marked_step_seq: int | None
+    active_metadata: RequestOwnedStepMetadata | None
+    allocated_since_build: tuple[tuple[OwnerLeaseKey, int, bool], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RequestOwnedStepMetadataResult:
     """Outcome of :meth:`RequestOwnedKVStore.build_step_metadata`."""
 
@@ -387,6 +417,7 @@ class RequestOwnedKVStore:
         #: Exact keys physically freed by a flushed PREEMPT while the
         #: request may still be alive; consumed by RELEASE or RESERVE.
         self._tombstones: set[OwnerLeaseKey] = set()
+        self._cold_records: dict[OwnerLeaseKey, RequestOwnedColdSnapshot] = {}
         self._num_groups = kv_cache_manager.num_kv_cache_groups
         self._group_specs: tuple[KVCacheSpec, ...] = tuple(
             group.kv_cache_spec
@@ -423,6 +454,28 @@ class RequestOwnedKVStore:
             )
         existing = self._records.get(command.key)
         if existing is not None:
+            if existing.restored_from_host:
+                if not existing.restore_ready:
+                    return _reject_allocation(command, "bulk restore is not complete")
+                assert command.allocation is not None
+                if command.required_num_tokens != existing.reserved_num_tokens:
+                    return _reject_allocation(
+                        command,
+                        "RESERVE after RESTORE must match the reserved destination "
+                        "horizon",
+                    )
+                if (
+                    command.allocation.num_prompt_tokens != existing.num_prompt_tokens
+                    or command.allocation.num_computed_tokens
+                    != existing.num_computed_tokens
+                    or command.allocation.status is not OwnerAdmissionStatus.PREEMPTED
+                ):
+                    return _reject_allocation(
+                        command,
+                        "RESERVE after RESTORE must exactly describe the preserved "
+                        "preempted prefix",
+                    )
+                return self._accepted_allocation(command, existing, None)
             if existing.pending_free:
                 return _reject_allocation(
                     command, "lease held pending free until the flush fence"
@@ -461,6 +514,7 @@ class RequestOwnedKVStore:
         )
         self._records[command.key] = record
         self._tombstones.discard(command.key)
+        self._cold_records.pop(command.key, None)
         return self._accepted_allocation(command, record, blocks)
 
     def extend(self, command: OwnerCommand) -> AllocationResult:
@@ -528,18 +582,117 @@ class RequestOwnedKVStore:
             if command.key not in self._tombstones:
                 return _reject_free(command, "no lease to release")
             self._tombstones.discard(command.key)
+            self._cold_records.pop(command.key, None)
             return DeferredFreeResult(accepted=True, key=command.key, deferred=False)
         record.pending_free = True
         record.preempted = False
         return DeferredFreeResult(accepted=True, key=command.key, deferred=True)
 
-    def restore(self, command: OwnerCommand) -> DeferredFreeResult:
-        """RESTORE is out of scope: always fails closed."""
+    def restore(self, command: OwnerCommand) -> AllocationResult | DeferredFreeResult:
+        """Allocate the final destination for a cold computed prefix.
+
+        The bytes are not ready here.  The owner bulk adapter must zero the
+        exact destination and complete H2D before :meth:`mark_restore_ready`;
+        only a later RESERVE may reactivate the record.
+        """
         if command.kind is not OwnerCommandKind.RESTORE:
             return _reject_free(command, "restore() requires a RESTORE command")
-        return _reject_free(
-            command, "RESTORE is out of scope for the physical KV store"
+        if command.key in self._records:
+            return _reject_allocation(command, "restore destination already exists")
+        cold = self._cold_records.get(command.key)
+        if cold is None:
+            return _reject_allocation(command, "no durable cold lease to restore")
+        if command.required_num_tokens < cold.num_computed_tokens:
+            return _reject_allocation(
+                command, "restore destination refuses computed prefix tokens"
+            )
+        blocks = self._allocate(
+            self._allocator_id(command.key),
+            cold.num_prompt_tokens,
+            0,
+            command.required_num_tokens,
+            command.required_num_tokens,
         )
+        if blocks is None:
+            return _reject_allocation(
+                command, "insufficient KV cache for restore destination"
+            )
+        self._generation_counter += 1
+        record = _Record(
+            key=command.key,
+            allocator_id=self._allocator_id(command.key),
+            num_prompt_tokens=cold.num_prompt_tokens,
+            num_computed_tokens=cold.num_computed_tokens,
+            reserved_num_tokens=command.required_num_tokens,
+            generation=self._generation_counter,
+            pending_delta=tuple(tuple(group) for group in blocks.get_block_ids()),
+            allocated_since_build=True,
+            restored_from_host=True,
+        )
+        self._records[command.key] = record
+        self._tombstones.discard(command.key)
+        return self._accepted_allocation(command, record, blocks)
+
+    def mark_restore_ready(self, key: OwnerLeaseKey, generation: int) -> bool:
+        """Consume restore zeroing deltas after exact bulk H2D completion."""
+
+        record = self._records.get(key)
+        if (
+            record is None
+            or record.generation != generation
+            or not record.restored_from_host
+            or record.restore_ready
+            or record.pending_free
+        ):
+            return False
+        record.pending_delta = None
+        record.allocated_since_build = False
+        record.restore_ready = True
+        return True
+
+    def mark_reactivated(self, key: OwnerLeaseKey, generation: int) -> bool:
+        """Close the restored-record state after owner-ledger activation."""
+
+        record = self._records.get(key)
+        if (
+            record is None
+            or record.generation != generation
+            or not record.restored_from_host
+            or not record.restore_ready
+        ):
+            return False
+        record.restored_from_host = False
+        record.restore_ready = False
+        self._cold_records.pop(key, None)
+        return True
+
+    def is_restore_ready(self, key: OwnerLeaseKey) -> bool:
+        record = self._records.get(key)
+        return bool(
+            record is not None and record.restored_from_host and record.restore_ready
+        )
+
+    def abort_restore(self, key: OwnerLeaseKey, generation: int) -> bool:
+        """Free a failed exact restore destination while retaining cold KV."""
+
+        record = self._records.get(key)
+        if (
+            record is None
+            or record.generation != generation
+            or not record.restored_from_host
+        ):
+            return False
+        self._manager.free(
+            _AllocationRequest(
+                request_id=record.allocator_id,
+                num_tokens=0,
+                num_computed_tokens=0,
+                num_prompt_tokens=record.num_prompt_tokens,
+            )
+        )
+        del self._records[key]
+        self._tombstones.add(key)
+        return True
 
     def mark_computed(self, key: OwnerLeaseKey, num_tokens: int) -> bool:
         """Record monotonic computed progress for an active lease; False
@@ -1038,6 +1191,52 @@ class RequestOwnedKVStore:
             accepted=True, step_seq=step_seq, metadata=metadata
         )
 
+    def checkpoint_step_build(self) -> RequestOwnedStepBuildCheckpoint:
+        """Capture only the reversible fence facts touched by an empty build."""
+
+        return RequestOwnedStepBuildCheckpoint(
+            last_built_step_seq=self._last_built_step_seq,
+            marked_step_seq=self._marked_step_seq,
+            active_metadata=self._active_metadata,
+            allocated_since_build=tuple(
+                (key, record.generation, record.allocated_since_build)
+                for key, record in self._records.items()
+            ),
+        )
+
+    def rollback_empty_step_build(
+        self, checkpoint: RequestOwnedStepBuildCheckpoint, step_seq: int
+    ) -> None:
+        """Undo one uncommitted heartbeat build, or verify it never happened."""
+
+        if not isinstance(checkpoint, RequestOwnedStepBuildCheckpoint):
+            raise TypeError("checkpoint must be a RequestOwnedStepBuildCheckpoint")
+        if (
+            self._last_built_step_seq == checkpoint.last_built_step_seq
+            and self._marked_step_seq == checkpoint.marked_step_seq
+            and self._active_metadata == checkpoint.active_metadata
+        ):
+            return
+        metadata = self._active_metadata
+        if (
+            self._last_built_step_seq != step_seq
+            or metadata is None
+            or metadata.step_seq != step_seq
+            or metadata.entries
+            or self._marked_step_seq not in (checkpoint.marked_step_seq, step_seq)
+            or any(mark.step_seq == step_seq for mark in self._pending_marks.values())
+        ):
+            raise RuntimeError(
+                "cannot roll back a nonempty or nonmatching request-owned step build"
+            )
+        for key, generation, allocated in checkpoint.allocated_since_build:
+            record = self._records.get(key)
+            if record is not None and record.generation == generation:
+                record.allocated_since_build = allocated
+        self._last_built_step_seq = checkpoint.last_built_step_seq
+        self._marked_step_seq = checkpoint.marked_step_seq
+        self._active_metadata = checkpoint.active_metadata
+
     def get_block_table(self, key: OwnerLeaseKey) -> tuple[tuple[int, ...], ...] | None:
         """Private full per-group tables; readable until :meth:`flush`."""
         record = self._records.get(key)
@@ -1082,10 +1281,12 @@ class RequestOwnedKVStore:
             return None
         tables = tuple(
             table[
-                : (snapshot.num_computed_tokens + spec.block_size - 1)
-                // spec.block_size
+                : (snapshot.num_computed_tokens + effective_block_size - 1)
+                // effective_block_size
             ]
-            for table, spec in zip(snapshot.tables, self._group_specs)
+            for table, effective_block_size in zip(
+                snapshot.tables, self.group_block_sizes
+            )
         )
         return RequestOwnedKVSnapshot(
             key=snapshot.key,
@@ -1101,7 +1302,10 @@ class RequestOwnedKVStore:
     def group_block_sizes(self) -> tuple[int, ...]:
         """Worker-private logical tokens represented by each group block."""
 
-        return tuple(spec.block_size for spec in self._group_specs)
+        return tuple(
+            spec.block_size * max(1, int(getattr(spec, "compress_ratio", 1)))
+            for spec in self._group_specs
+        )
 
     def flush(self) -> tuple[OwnerLeaseKey, ...]:
         """Post-execute completion fence: free all deferred blocks now
@@ -1120,6 +1324,15 @@ class RequestOwnedKVStore:
             )
             if record.preempted:
                 self._tombstones.add(key)
+                self._cold_records[key] = RequestOwnedColdSnapshot(
+                    key=key,
+                    owner_rank=self._owner_rank,
+                    num_prompt_tokens=record.num_prompt_tokens,
+                    num_computed_tokens=record.num_computed_tokens,
+                    reserved_num_tokens=record.reserved_num_tokens,
+                )
+            else:
+                self._cold_records.pop(key, None)
             del self._records[key]
             freed.append(key)
         return tuple(freed)

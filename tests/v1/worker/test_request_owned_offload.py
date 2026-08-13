@@ -24,6 +24,7 @@ from vllm.v1.worker.request_owned_offload import (
     OwnerOffloadPlan,
     RequestOwnedBulkOffloadAdapter,
     RequestOwnedBulkOffloadLedger,
+    RequestOwnedBulkRestoreWork,
     RequestOwnedOffloadError,
     make_request_owned_offload_keys,
 )
@@ -379,6 +380,39 @@ def test_adapter_bulk_restore_is_byte_exact_at_the_named_destination() -> None:
     assert adapter.poll() == ()
 
 
+def test_restore_work_is_post_zero_completion_and_replay_fenced() -> None:
+    device = torch.arange(10 * 8, dtype=torch.int16).view(10, 8)
+    manager = CPUOffloadingManager(num_blocks=8)
+    worker = _TensorOffloadingWorker(device, num_host_blocks=8)
+    adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=3,
+        manager=manager,
+        worker=worker,
+    )
+    source = _snapshot()
+    source_id = adapter.bind(source, active=True)
+    adapter.retire(source_id)
+    plan = OwnerOffloadPlan.from_snapshot(source, _keys())
+    store_job = adapter.submit_store(plan)
+    adapter.wait((store_job,))
+    adapter.poll()
+    adapter.take_reclaimable(source_id)
+
+    destination = _snapshot(generation=2, tables=((5, 6), (7, 8)))
+    adapter.bind(destination, active=False)
+    restore_plan = OwnerOffloadPlan.from_snapshot(destination, _keys())
+    work = RequestOwnedBulkRestoreWork(
+        step_seq=9,
+        adapter=adapter,
+        plan=restore_plan,
+        zero_block_ids=((5, 6, 9), (7, 8)),
+    )
+    receipt = work.execute_after_zero()
+    assert receipt.success
+    with pytest.raises(RequestOwnedOffloadError, match="already executed"):
+        work.execute_after_zero()
+
+
 def test_adapter_failure_or_abort_never_reclaims_or_publishes_durable() -> None:
     manager = CPUOffloadingManager(num_blocks=8)
     worker = _FakeOffloadingWorker()
@@ -428,3 +462,87 @@ def test_adapter_host_capacity_rejection_is_an_immediate_failed_receipt() -> Non
     assert not receipt.success
     assert receipt.error == "host tier has no store capacity"
     assert worker.store_submissions == []
+
+
+def test_adapter_release_closes_bound_generation_for_next_epoch() -> None:
+    adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=3,
+        manager=CPUOffloadingManager(num_blocks=8),
+        worker=_FakeOffloadingWorker(),
+    )
+    source = _snapshot()
+    identity = adapter.bind(source, active=True)
+    assert adapter.ledger.is_current(identity)
+    adapter.release(source)
+
+    replacement = _snapshot(request_id="req", epoch=1, generation=2)
+    replacement_id = adapter.bind(replacement, active=True)
+    assert adapter.ledger.is_current(replacement_id)
+
+
+def test_adapter_release_evicts_exact_durable_host_image() -> None:
+    manager = CPUOffloadingManager(num_blocks=8)
+    worker = _FakeOffloadingWorker()
+    adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=3,
+        manager=manager,
+        worker=worker,
+    )
+    source = _snapshot()
+    source_id = adapter.bind(source, active=True)
+    adapter.retire(source_id)
+    plan = OwnerOffloadPlan.from_snapshot(source, _keys())
+    job = adapter.submit_store(plan)
+    worker.finish(job.job_id)
+    adapter.poll()
+    adapter.take_reclaimable(source_id)
+    assert adapter.ledger.is_host_durable(plan)
+
+    adapter.evict_owned_host_keys(source.key)
+    assert not adapter.ledger.is_host_durable(plan)
+
+
+def test_adapter_new_store_retires_stale_partial_tail_image() -> None:
+    manager = CPUOffloadingManager(num_blocks=8)
+    worker = _FakeOffloadingWorker()
+    adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=3,
+        manager=manager,
+        worker=worker,
+    )
+    partial = replace(_snapshot(), num_computed_tokens=6)
+    partial_id = adapter.bind(partial, active=True)
+    adapter.retire(partial_id)
+    partial_plan = OwnerOffloadPlan.from_snapshot(
+        partial,
+        make_request_owned_offload_keys(partial, (4, 4)),
+    )
+    first = adapter.submit_store(partial_plan)
+    worker.finish(first.job_id)
+    adapter.poll()
+    adapter.take_reclaimable(partial_id)
+
+    extended = replace(
+        partial,
+        allocation_generation=2,
+        num_computed_tokens=8,
+        tables=((5, 6), (7, 8)),
+    )
+    extended_id = adapter.bind(extended, active=True)
+    adapter.retire(extended_id)
+    extended_plan = OwnerOffloadPlan.from_snapshot(
+        extended,
+        make_request_owned_offload_keys(extended, (4, 4)),
+    )
+    second = adapter.submit_store(extended_plan)
+    worker.finish(second.job_id)
+    adapter.poll()
+    adapter.take_reclaimable(extended_id)
+
+    assert adapter.ledger.is_host_durable(extended_plan)
+    assert adapter._owned_host_keys[extended.key] == {
+        key for group in extended_plan.offload_keys for key in group
+    }
+    assert manager.resident_blocks == 4
+    adapter.evict_owned_host_keys(extended.key)
+    assert manager.resident_blocks == 0

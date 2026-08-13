@@ -81,6 +81,7 @@ def _make_scheduler(
     max_num_scheduled_tokens: int = 64,
     max_num_running_reqs: int = 16,
     enable_request_owned_graph: bool = False,
+    enable_request_owned_kv_offload: bool = False,
     enable_request_owned_windows: bool = False,
     request_owned_decode_window_steps: int = 1,
     request_owned_decode_reservation_tokens: int | None = None,
@@ -89,6 +90,7 @@ def _make_scheduler(
     scheduler.scheduler_config = SimpleNamespace(
         enable_request_owned_attention=True,
         enable_request_owned_graph=enable_request_owned_graph,
+        enable_request_owned_kv_offload=enable_request_owned_kv_offload,
         enable_request_owned_windows=enable_request_owned_windows,
         request_owned_decode_window_steps=request_owned_decode_window_steps,
         request_owned_decode_reservation_tokens=(
@@ -263,6 +265,7 @@ def _receipt(
     accepted: bool = True,
     runnable: int | None = None,
     released: bool = False,
+    pending_dma: int | None = None,
     error: str | None = None,
 ) -> OwnerReceipt:
     return OwnerReceipt(
@@ -272,6 +275,7 @@ def _receipt(
         accepted=accepted,
         runnable_num_tokens=runnable,
         released=released,
+        pending_dma=pending_dma,
         error=error,
     )
 
@@ -592,6 +596,64 @@ def test_preempt_receipt_resume_keeps_sticky_owner_and_restarts_prefill() -> Non
     assert token.key == key
     assert token.owner_id == 0
     assert token.runnable_num_tokens == 16
+
+
+def test_offloaded_preempt_requires_restore_receipt_before_resume() -> None:
+    scheduler = _make_scheduler(
+        max_num_scheduled_tokens=8,
+        enable_request_owned_kv_offload=True,
+    )
+    request = _request("req-cold")
+    scheduler.add_request(request)
+    _admit(scheduler, request, grant=8)
+    request.num_computed_tokens = 8
+    key = OwnerLeaseKey("req-cold", 0)
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert request.num_computed_tokens == 8
+    preempt_out = scheduler.schedule()
+    (preempt,) = preempt_out.owner_commands
+    _apply_receipts(
+        scheduler,
+        preempt_out,
+        {0: [_receipt(key, 0, preempt.command_seq, runnable=8)]},
+    )
+
+    restore_out = scheduler.schedule()
+    (restore,) = restore_out.owner_commands
+    assert restore.kind is OwnerCommandKind.RESTORE
+    assert restore.key == key
+    assert restore.allocation is None
+    assert request.status is RequestStatus.PREEMPTED
+    with pytest.raises(RuntimeError, match="terminal receipt"):
+        scheduler._apply_owner_receipt(
+            _receipt(
+                key,
+                0,
+                restore.command_seq,
+                runnable=8,
+                pending_dma=1,
+            )
+        )
+    _apply_receipts(
+        scheduler,
+        restore_out,
+        {0: [_receipt(key, 0, restore.command_seq, runnable=8, pending_dma=0)]},
+    )
+    assert scheduler.owner_coordinator.is_restored(key)
+
+    resume_out = scheduler.schedule()
+    (resume,) = resume_out.owner_commands
+    assert resume.kind is OwnerCommandKind.RESERVE
+    assert resume.allocation.status is OwnerAdmissionStatus.PREEMPTED
+    assert resume.allocation.num_computed_tokens == 8
+    _apply_receipts(
+        scheduler,
+        resume_out,
+        {0: [_receipt(key, 0, resume.command_seq, runnable=8)]},
+    )
+    assert not scheduler.owner_coordinator.is_preempted(key)
+    assert not scheduler.owner_coordinator.is_restored(key)
 
 
 def test_release_is_emitted_and_keeps_liveness_until_accepted_receipt() -> None:
@@ -1114,8 +1176,7 @@ def test_owner_graph_balanced_prefill_chunks_exact_cohort_in_lockstep() -> None:
 
     reserve_step = scheduler.schedule()
     commands = {
-        command.key.request_id: command
-        for command in reserve_step.owner_commands
+        command.key.request_id: command for command in reserve_step.owner_commands
     }
     assert {command.owner_id for command in commands.values()} == set(range(8))
     _apply_receipts(
@@ -1856,8 +1917,7 @@ def test_zero_budget_promotion_remains_new_until_first_dispatch() -> None:
 
     reserve_step = scheduler.schedule()
     commands = {
-        command.key.request_id: command
-        for command in reserve_step.owner_commands
+        command.key.request_id: command for command in reserve_step.owner_commands
     }
     assert set(commands) == {"req-0", "req-1", "req-2"}
     events_by_rank = {}
