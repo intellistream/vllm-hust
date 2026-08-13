@@ -259,12 +259,14 @@ def test_plan_rejects_non_exact_geometry_and_null_or_duplicate_blocks() -> None:
             identity=identity,
             device_block_ids=((0,), (3,)),
             offload_keys=((make_offload_key(b"a", 0),), (make_offload_key(b"b", 1),)),
+            logical_block_indices=((0,), (0,)),
         )
     with pytest.raises(ValueError, match="multiple plan positions"):
         OwnerOffloadPlan(
             identity=identity,
             device_block_ids=((1,), (1,)),
             offload_keys=((make_offload_key(b"a", 0),), (make_offload_key(b"b", 1),)),
+            logical_block_indices=((0,), (0,)),
         )
 
     with pytest.raises(ValueError, match="encodes group"):
@@ -272,12 +274,14 @@ def test_plan_rejects_non_exact_geometry_and_null_or_duplicate_blocks() -> None:
             identity=identity,
             device_block_ids=((1,), (3,)),
             offload_keys=((make_offload_key(b"a", 1),), (make_offload_key(b"b", 1),)),
+            logical_block_indices=((0,), (0,)),
         )
     with pytest.raises(TypeError, match="nonempty hash"):
         OwnerOffloadPlan(
             identity=identity,
             device_block_ids=((1,), (3,)),
             offload_keys=((b"\0\0\0\0",), (make_offload_key(b"b", 1),)),
+            logical_block_indices=((0,), (0,)),
         )
 
 
@@ -288,6 +292,65 @@ def test_plan_skips_null_placeholders_and_their_logical_keys() -> None:
 
     assert plan.device_block_ids == ((2,), (3,))
     assert plan.offload_keys == ((keys[0][1],), (keys[1][0],))
+    assert plan.logical_block_indices == ((1,), (0,))
+
+
+def test_ledger_rejects_wrong_logical_mapping_and_partial_store() -> None:
+    snapshot = _snapshot()
+    keys = _keys()
+    ledger = RequestOwnedBulkOffloadLedger(owner_rank=3)
+    identity = ledger.bind(snapshot, active=True)
+    ledger.retire(identity)
+
+    wrong_position = OwnerOffloadPlan(
+        identity=identity,
+        device_block_ids=((2,), (3,)),
+        offload_keys=((keys[0][0],), (keys[1][0],)),
+        logical_block_indices=((0,), (0,)),
+    )
+    with pytest.raises(RequestOwnedOffloadError, match="logical table position"):
+        ledger.begin_store(wrong_position)
+
+    partial = OwnerOffloadPlan(
+        identity=identity,
+        device_block_ids=((1,), (3,)),
+        offload_keys=((keys[0][0],), (keys[1][0],)),
+        logical_block_indices=((0,), (0,)),
+    )
+    with pytest.raises(RequestOwnedOffloadError, match="every concrete"):
+        ledger.begin_store(partial)
+
+
+def test_restore_plan_applies_source_null_mask_to_fresh_destination() -> None:
+    keys = tuple(
+        tuple(
+            make_offload_key(f"g{group}-{index}".encode(), group) for index in range(5)
+        )
+        for group in range(2)
+    )
+    source = _snapshot(tables=((0, 0, 0, 4, 5), (0, 12, 13, 14, 15)))
+    source_plan = OwnerOffloadPlan.from_snapshot(source, keys)
+    assert source_plan.device_block_ids == ((4, 5), (12, 13, 14, 15))
+
+    destination = replace(
+        source,
+        allocation_generation=2,
+        tables=((6, 7, 8, 9, 10), (16, 17, 18, 19, 20)),
+    )
+    restore_plan = OwnerOffloadPlan.from_snapshot(
+        destination,
+        keys,
+        logical_block_indices=((3, 4), (1, 2, 3, 4)),
+    )
+    assert restore_plan.device_block_ids == ((9, 10), (17, 18, 19, 20))
+    assert restore_plan.offload_keys == source_plan.offload_keys
+
+    with pytest.raises(ValueError, match="null destination"):
+        OwnerOffloadPlan.from_snapshot(
+            source,
+            keys,
+            logical_block_indices=((0, 4), (1, 2, 3, 4)),
+        )
 
 
 def test_owner_host_keys_survive_generation_but_fence_partial_extension() -> None:
@@ -393,6 +456,56 @@ def test_adapter_bulk_restore_is_byte_exact_at_the_named_destination() -> None:
     assert torch.equal(device[[1, 2, 3, 4]], torch.full_like(original, -1))
     adapter.activate(destination_id)
     assert adapter.poll() == ()
+
+
+def test_adapter_restores_only_source_concrete_positions_into_fresh_blocks() -> None:
+    device = torch.arange(12 * 8, dtype=torch.int16).view(12, 8)
+    original = device[[4, 5]].clone()
+    manager = CPUOffloadingManager(num_blocks=4)
+    worker = _TensorOffloadingWorker(device, num_host_blocks=4)
+    adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=3,
+        manager=manager,
+        worker=worker,
+    )
+    source = RequestOwnedKVSnapshot(
+        key=OwnerLeaseKey("hybrid", 0),
+        owner_rank=3,
+        allocation_generation=1,
+        num_computed_tokens=33,
+        reserved_num_tokens=34,
+        pending_free=False,
+        tables=((0, 0, 0, 4, 5),),
+    )
+    keys = make_request_owned_offload_keys(source, (8,))
+    source_id = adapter.bind(source, active=True)
+    adapter.retire(source_id)
+    source_plan = OwnerOffloadPlan.from_snapshot(source, keys)
+    store_job = adapter.submit_store(source_plan)
+    adapter.wait((store_job,))
+    (store_receipt,) = adapter.poll()
+    assert store_receipt.success
+    assert adapter.take_reclaimable(source_id) == ((4, 5),)
+
+    device[[4, 5, 6, 7, 8, 9, 10]] = -1
+    destination = replace(
+        source,
+        allocation_generation=2,
+        tables=((6, 7, 8, 9, 10),),
+    )
+    destination_id = adapter.bind(destination, active=False)
+    restore_plan = OwnerOffloadPlan.from_snapshot(
+        destination,
+        keys,
+        logical_block_indices=((3, 4),),
+    )
+    restore_job = adapter.submit_restore(restore_plan)
+    adapter.wait((restore_job,))
+    (restore_receipt,) = adapter.poll()
+    assert restore_receipt.success
+    assert torch.equal(device[[9, 10]], original)
+    assert torch.equal(device[[6, 7, 8]], torch.full((3, 8), -1, dtype=torch.int16))
+    adapter.activate(destination_id)
 
 
 def test_restore_work_is_post_zero_completion_and_replay_fenced() -> None:

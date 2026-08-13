@@ -150,6 +150,11 @@ class _Record:
     restored_from_host: bool = False
     #: True only after the owner bulk H2D completed at the pre-forward seam.
     restore_ready: bool = False
+    #: Block-ID-free logical positions that held concrete computed-prefix KV
+    #: in the preempted source. A fresh restore destination may allocate real
+    #: blocks where the source hybrid table carried null placeholders; H2D
+    #: must still address only the original concrete positions.
+    restore_source_block_indices: tuple[tuple[int, ...], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +166,7 @@ class RequestOwnedColdSnapshot:
     num_prompt_tokens: int
     num_computed_tokens: int
     reserved_num_tokens: int
+    source_block_indices: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -628,6 +634,7 @@ class RequestOwnedKVStore:
             pending_delta=tuple(tuple(group) for group in blocks.get_block_ids()),
             allocated_since_build=True,
             restored_from_host=True,
+            restore_source_block_indices=cold.source_block_indices,
         )
         self._records[command.key] = record
         self._tombstones.discard(command.key)
@@ -663,8 +670,23 @@ class RequestOwnedKVStore:
             return False
         record.restored_from_host = False
         record.restore_ready = False
+        record.restore_source_block_indices = None
         self._cold_records.pop(key, None)
         return True
+
+    def restore_source_block_indices(
+        self, key: OwnerLeaseKey, generation: int
+    ) -> tuple[tuple[int, ...], ...] | None:
+        """Return the exact logical source mask for one restore generation."""
+
+        record = self._records.get(key)
+        if (
+            record is None
+            or record.generation != generation
+            or not record.restored_from_host
+        ):
+            return None
+        return record.restore_source_block_indices
 
     def is_restore_ready(self, key: OwnerLeaseKey) -> bool:
         record = self._records.get(key)
@@ -1314,6 +1336,13 @@ class RequestOwnedKVStore:
         for key, record in list(self._records.items()):
             if not record.pending_free:
                 continue
+            source_block_indices = None
+            if record.preempted:
+                source_block_indices = self._computed_prefix_block_indices(
+                    self._tables(record),
+                    record.num_computed_tokens,
+                    self.group_block_sizes,
+                )
             self._manager.free(
                 _AllocationRequest(
                     request_id=record.allocator_id,
@@ -1323,6 +1352,7 @@ class RequestOwnedKVStore:
                 )
             )
             if record.preempted:
+                assert source_block_indices is not None
                 self._tombstones.add(key)
                 self._cold_records[key] = RequestOwnedColdSnapshot(
                     key=key,
@@ -1330,12 +1360,32 @@ class RequestOwnedKVStore:
                     num_prompt_tokens=record.num_prompt_tokens,
                     num_computed_tokens=record.num_computed_tokens,
                     reserved_num_tokens=record.reserved_num_tokens,
+                    source_block_indices=source_block_indices,
                 )
             else:
                 self._cold_records.pop(key, None)
             del self._records[key]
             freed.append(key)
         return tuple(freed)
+
+    @staticmethod
+    def _computed_prefix_block_indices(
+        tables: tuple[tuple[int, ...], ...],
+        num_computed_tokens: int,
+        group_block_sizes: tuple[int, ...],
+    ) -> tuple[tuple[int, ...], ...]:
+        """Logical positions of non-null blocks in the computed prefix."""
+
+        return tuple(
+            tuple(
+                index
+                for index, block_id in enumerate(
+                    table[: (num_computed_tokens + block_size - 1) // block_size]
+                )
+                if block_id != 0
+            )
+            for table, block_size in zip(tables, group_block_sizes)
+        )
 
     def pool_snapshot(self) -> OwnerCachePoolSnapshot:
         """Immutable, block-ID-free protocol snapshot of the shared pool.

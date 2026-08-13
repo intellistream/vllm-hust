@@ -1090,7 +1090,18 @@ class WorkerWrapperBase:
                 keys = make_request_owned_offload_keys(
                     computed, store.group_block_sizes
                 )
-                plan = OwnerOffloadPlan.from_snapshot(computed, keys)
+                source_block_indices = store.restore_source_block_indices(
+                    command.key, computed.allocation_generation
+                )
+                if source_block_indices is None:
+                    raise RuntimeError(
+                        "RESTORE destination lost its durable source block mask"
+                    )
+                plan = OwnerOffloadPlan.from_snapshot(
+                    computed,
+                    keys,
+                    logical_block_indices=source_block_indices,
+                )
                 work = RequestOwnedBulkRestoreWork(
                     step_seq=step_seq,
                     adapter=adapter,

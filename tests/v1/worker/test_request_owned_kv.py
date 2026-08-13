@@ -544,6 +544,10 @@ def test_restore_requires_cold_lease_and_reactivates_exact_destination():
     snapshot = store.snapshot(key)
     assert snapshot is not None
     assert snapshot.num_computed_tokens == 6
+    assert store.restore_source_block_indices(key, snapshot.allocation_generation) == (
+        (0, 1),
+        (0, 1),
+    )
     assert not store.is_restore_ready(key)
     reserve = _command(
         key,
@@ -559,10 +563,21 @@ def test_restore_requires_cold_lease_and_reactivates_exact_destination():
     assert store.reserve(reserve).accepted
     assert store.mark_reactivated(key, snapshot.allocation_generation)
     assert not store.is_restore_ready(key)
+    assert (
+        store.restore_source_block_indices(key, snapshot.allocation_generation) is None
+    )
 
     # Prefix caching / computed-block APIs are out of scope: absent.
     assert not hasattr(store, "get_prefix_cache_snapshot")
     assert not hasattr(store, "get_computed_blocks")
+
+
+def test_computed_prefix_block_indices_preserve_hybrid_null_positions():
+    assert RequestOwnedKVStore._computed_prefix_block_indices(
+        ((0, 0, 0, 4, 5), (6, 0, 8)),
+        num_computed_tokens=33,
+        group_block_sizes=(8, 16),
+    ) == ((3, 4), (0, 2))
 
 
 def _make_dsv4_manager(

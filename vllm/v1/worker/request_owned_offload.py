@@ -203,6 +203,7 @@ class OwnerOffloadPlan:
     identity: OwnerOffloadIdentity
     device_block_ids: tuple[tuple[int, ...], ...]
     offload_keys: tuple[tuple[OffloadKey, ...], ...]
+    logical_block_indices: tuple[tuple[int, ...], ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, OwnerOffloadIdentity):
@@ -213,23 +214,47 @@ class OwnerOffloadPlan:
             self.offload_keys, tuple
         ):
             raise TypeError("device_block_ids and offload_keys must be tuples")
-        if len(self.device_block_ids) != len(self.offload_keys):
+        if not isinstance(self.logical_block_indices, tuple):
+            raise TypeError("logical_block_indices must be a tuple")
+        if not (
+            len(self.device_block_ids)
+            == len(self.offload_keys)
+            == len(self.logical_block_indices)
+        ):
             raise ValueError(
-                "device_block_ids and offload_keys must cover the same groups, got "
-                f"{len(self.device_block_ids)} != {len(self.offload_keys)}."
+                "device_block_ids, offload_keys, and logical_block_indices "
+                "must cover the same groups"
             )
 
         seen_blocks: set[int] = set()
         seen_keys: set[OffloadKey] = set()
-        for group_index, (block_ids, keys) in enumerate(
-            zip(self.device_block_ids, self.offload_keys)
+        for group_index, (block_ids, keys, positions) in enumerate(
+            zip(
+                self.device_block_ids,
+                self.offload_keys,
+                self.logical_block_indices,
+            )
         ):
-            if not isinstance(block_ids, tuple) or not isinstance(keys, tuple):
-                raise TypeError("every device block/key group must be a tuple")
-            if len(block_ids) != len(keys):
+            if not all(
+                isinstance(group, tuple) for group in (block_ids, keys, positions)
+            ):
+                raise TypeError("every device block/key/position group must be a tuple")
+            if not len(block_ids) == len(keys) == len(positions):
                 raise ValueError(
-                    f"group {group_index} has {len(block_ids)} device blocks but "
-                    f"{len(keys)} offload keys; first-round bulk geometry is 1:1."
+                    f"group {group_index} has unequal device block, offload key, "
+                    "and logical position counts; first-round bulk geometry is 1:1."
+                )
+            if any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0
+                for index in positions
+            ):
+                raise TypeError(
+                    "logical block indices must be nonnegative non-bool ints"
+                )
+            if tuple(sorted(set(positions))) != positions:
+                raise ValueError(
+                    "logical block indices within each group must be unique "
+                    "and increasing"
                 )
             for block_id in block_ids:
                 if (
@@ -266,6 +291,8 @@ class OwnerOffloadPlan:
         cls,
         snapshot: RequestOwnedKVSnapshot,
         offload_keys: tuple[tuple[OffloadKey, ...], ...],
+        *,
+        logical_block_indices: tuple[tuple[int, ...], ...] | None = None,
     ) -> "OwnerOffloadPlan":
         """Bind logical host keys to the matching prefix of each local table."""
 
@@ -281,8 +308,16 @@ class OwnerOffloadPlan:
                 "snapshot tables and offload keys must cover the same groups, got "
                 f"{len(snapshot.tables)} != {len(offload_keys)}."
             )
+        if logical_block_indices is not None and (
+            not isinstance(logical_block_indices, tuple)
+            or len(logical_block_indices) != len(snapshot.tables)
+        ):
+            raise ValueError(
+                "logical_block_indices must be a tuple covering every KV group"
+            )
         device_block_ids: list[tuple[int, ...]] = []
         transfer_keys: list[tuple[OffloadKey, ...]] = []
+        logical_positions: list[tuple[int, ...]] = []
         for group_index, (table, keys) in enumerate(zip(snapshot.tables, offload_keys)):
             if not isinstance(keys, tuple):
                 raise TypeError(f"offload key group {group_index} must be a tuple")
@@ -291,22 +326,49 @@ class OwnerOffloadPlan:
                     f"group {group_index} requests {len(keys)} host keys but the "
                     f"owner-local table has only {len(table)} blocks."
                 )
+            positions = (
+                tuple(range(len(keys)))
+                if logical_block_indices is None
+                else logical_block_indices[group_index]
+            )
+            if not isinstance(positions, tuple) or any(
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                or index >= len(keys)
+                for index in positions
+            ):
+                raise ValueError(
+                    f"group {group_index} logical block indices are out of range"
+                )
+            if tuple(sorted(set(positions))) != positions:
+                raise ValueError(
+                    f"group {group_index} logical block indices must be unique "
+                    "and increasing"
+                )
             # Hybrid KV managers keep logical alignment by inserting the
             # pool's block-0 null sentinel for skipped sliding-window/SSM
             # states. It has no request bytes to persist and generic offload
             # skips it too. Preserve the logical key position while removing
             # the null pair from the concrete 1:1 transfer plan.
             concrete = tuple(
-                (block_id, key)
-                for block_id, key in zip(table[: len(keys)], keys)
-                if block_id != 0
+                (index, table[index], keys[index])
+                for index in positions
+                if table[index] != 0
             )
-            device_block_ids.append(tuple(block_id for block_id, _ in concrete))
-            transfer_keys.append(tuple(key for _, key in concrete))
+            if logical_block_indices is not None and len(concrete) != len(positions):
+                raise ValueError(
+                    f"group {group_index} restore source mask maps to a null "
+                    "destination block"
+                )
+            device_block_ids.append(tuple(block_id for _, block_id, _ in concrete))
+            transfer_keys.append(tuple(key for _, _, key in concrete))
+            logical_positions.append(tuple(index for index, _, _ in concrete))
         return cls(
             identity=OwnerOffloadIdentity.from_snapshot(snapshot),
             device_block_ids=tuple(device_block_ids),
             offload_keys=tuple(transfer_keys),
+            logical_block_indices=tuple(logical_positions),
         )
 
 
@@ -495,6 +557,14 @@ class RequestOwnedBulkOffloadLedger:
             raise RequestOwnedOffloadError(
                 "ACTIVE owner KV must never be stored/reclaimed"
             )
+        expected_positions = tuple(
+            tuple(index for index, block_id in enumerate(table) if block_id != 0)
+            for table in state.snapshot.tables
+        )
+        if plan.logical_block_indices != expected_positions:
+            raise RequestOwnedOffloadError(
+                "store plan must cover every concrete computed-prefix block"
+            )
         return self._begin(OwnerBulkTransferDirection.STORE, plan, state)
 
     def begin_restore(self, plan: OwnerOffloadPlan) -> OwnerBulkTransferJob:
@@ -659,15 +729,17 @@ class RequestOwnedBulkOffloadLedger:
             raise RequestOwnedOffloadError(
                 "transfer plan and bound snapshot must cover the same groups"
             )
-        for group_index, block_ids in enumerate(plan.device_block_ids):
+        for group_index, (block_ids, positions) in enumerate(
+            zip(plan.device_block_ids, plan.logical_block_indices)
+        ):
             table = state.snapshot.tables[group_index]
-            concrete_prefix = tuple(block_id for block_id in table if block_id != 0)[
-                : len(block_ids)
-            ]
-            if concrete_prefix != block_ids:
+            if any(
+                position >= len(table) or table[position] != block_id
+                for position, block_id in zip(positions, block_ids)
+            ):
                 raise RequestOwnedOffloadError(
-                    f"group {group_index} transfer blocks are not the bound "
-                    "concrete table prefix"
+                    f"group {group_index} transfer block does not match its bound "
+                    "logical table position"
                 )
         return state
 
