@@ -166,7 +166,7 @@ def test_end_to_end_prediction_is_recorded() -> None:
     )
 
     assert decision.mode == "load"
-    assert decision.estimate_source == "end_to_end_median"
+    assert decision.estimate_source == "path_completion_mean"
     assert decision.predicted_load_ms == pytest.approx(11.24)
 
 

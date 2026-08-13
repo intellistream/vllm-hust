@@ -68,6 +68,20 @@ def _advance_recompute_progress(
     return remaining_tokens, recomputed_tokens, remaining_tokens == 0
 
 
+def _completed_timing(
+    decision_at: float,
+    service_started_at: float,
+    completed_at: float,
+) -> tuple[float, float, float]:
+    """Return total, service, and pre-service queue intervals in milliseconds."""
+    if not decision_at <= service_started_at <= completed_at:
+        raise ValueError("Timing points must be monotonic")
+    total_ms = (completed_at - decision_at) * 1000.0
+    service_ms = (completed_at - service_started_at) * 1000.0
+    queue_wait_ms = (service_started_at - decision_at) * 1000.0
+    return total_ms, service_ms, queue_wait_ms
+
+
 class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
     """Choose CPU KV load or prefix recompute without changing vLLM core code."""
 
@@ -325,23 +339,20 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
             completed_request_ids = finished_recving.intersection(request_blocks)
             if not completed_request_ids:
                 continue
-            service_ms = (completed_at - started_at) * 1000.0
             for request_id in completed_request_ids:
                 block_count = request_blocks[request_id]
+                _, service_ms, queue_wait_ms = _completed_timing(
+                    decision_times.get(request_id, started_at),
+                    started_at,
+                    completed_at,
+                )
                 self._worker_copy_samples.append(
                     TimingSampleMetadata(
                         request_id=request_id,
                         size=block_count,
                         service_ms=service_ms,
                         kv_bytes=block_count * self._kv_bytes_per_block,
-                        queue_wait_ms=max(
-                            0.0,
-                            (
-                                launch_started_at
-                                - decision_times.get(request_id, launch_started_at)
-                            )
-                            * 1000.0,
-                        ),
+                        queue_wait_ms=queue_wait_ms,
                     )
                 )
             self._load_events_started.pop(event_idx, None)
@@ -405,6 +416,16 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
         )
         if self._telemetry_output_path:
             self._telemetry.save_json(self._telemetry_output_path)
+
+    def request_finished(
+        self,
+        request: Request,
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, object] | None]:
+        """Release native resources and plugin state on finish or cancellation."""
+        result = super().request_finished(request, block_ids)
+        self._clear_request_state(request.request_id)
+        return result
 
     def take_audit_records(self):
         """Return accumulated audit records for tests and diagnostics."""
@@ -482,4 +503,4 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
         return (hit_tokens + block_size - 1) // block_size
 
 
-__all__ = ["DynamicSimpleCPUOffloadConnector"]
+__all__ = ["DynamicSimpleCPUOffloadConnector", "_completed_timing"]

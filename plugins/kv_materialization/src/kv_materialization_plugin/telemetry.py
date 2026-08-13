@@ -10,7 +10,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from statistics import median
+from statistics import fmean
 from typing import Any
 
 from kv_materialization_plugin.decision import MaterializationObservation
@@ -261,14 +261,14 @@ class TelemetryWindow:
             return None, None, None, None, None, 0
         newest = max(sample.timestamp for sample in eligible)
         return (
-            float(median(sample.total_ms for sample in eligible)),
-            float(median(sample.service_ms for sample in eligible)),
+            float(fmean(sample.total_ms for sample in eligible)),
+            float(fmean(sample.service_ms for sample in eligible)),
             (
-                float(median(sample.queue_wait_ms for sample in eligible))
+                float(fmean(sample.queue_wait_ms for sample in eligible))
                 if all(sample.queue_wait_ms is not None for sample in eligible)
                 else None
             ),
-            float(median(sample.extra_wait_ms for sample in eligible)),
+            float(fmean(sample.extra_wait_ms for sample in eligible)),
             max(0.0, (now - newest) * 1000.0),
             len(eligible),
         )

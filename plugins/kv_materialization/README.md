@@ -15,8 +15,10 @@ select a mode in `kv_connector_extra_config`:
 - `load`: force the native CPU KV load path (the default and cold-start
   fallback).
 - `recompute`: force prefix recomputation.
-- `dynamic`: compare the median recent end-to-end cost of loading and
-  recomputing. A tie chooses recompute deterministically.
+- `dynamic`: compare the mean recent decision-to-path-completion latency of
+  loading and recomputing. A tie chooses recompute deterministically. Queue,
+  service, and residual fields are diagnostics; the decision does not add them
+  together again.
 
 Dynamic mode is conservative about data quality: only measurements for the
 exact same token/block-size buckets are reused. Missing, stale, or invalid

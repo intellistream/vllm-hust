@@ -7,6 +7,7 @@ from kv_materialization_plugin.audit import AuditLog
 from kv_materialization_plugin.connector import (
     DynamicSimpleCPUOffloadConnector,
     _advance_recompute_progress,
+    _completed_timing,
 )
 from kv_materialization_plugin.decision import (
     MaterializationDecision,
@@ -52,6 +53,41 @@ def test_request_completion_releases_active_materialization_state() -> None:
     assert connector._decision_times == {}
     assert connector._recompute_remaining_tokens == {}
     assert connector._new_recompute_attempts == set()
+
+
+def test_request_finished_clears_plugin_state_after_native_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot leave a recompute decision reusable by a later request."""
+    connector = object.__new__(DynamicSimpleCPUOffloadConnector)
+    connector._decisions = {"req-1": object()}
+    connector._decision_hit_tokens = {"req-1": 256}
+    connector._decision_times = {"req-1": 1.0}
+    connector._recompute_remaining_tokens = {"req-1": 256}
+    connector._new_recompute_attempts = {"req-1"}
+    connector._recompute_queue_wait_ms = {"req-1": 1.0}
+    request = type("Request", (), {"request_id": "req-1"})()
+
+    monkeypatch.setattr(
+        DynamicSimpleCPUOffloadConnector.__mro__[1],
+        "request_finished",
+        lambda self, request, block_ids: (False, None),
+    )
+    result = connector.request_finished(request, [])
+
+    assert result == (False, None)
+    assert connector._decisions == {}
+    assert connector._recompute_remaining_tokens == {}
+
+
+def test_completed_timing_uses_first_submission_for_queue_wait() -> None:
+    """Load completion polling cannot be charged as pre-service queueing."""
+    total_ms, service_ms, queue_wait_ms = _completed_timing(10.000, 10.003, 10.011)
+
+    assert total_ms == pytest.approx(11.0)
+    assert service_ms == pytest.approx(8.0)
+    assert queue_wait_ms == pytest.approx(3.0)
+    assert queue_wait_ms + service_ms == pytest.approx(total_ms)
 
 
 def test_worker_sample_returns_actual_cost_to_scheduler_telemetry() -> None:
@@ -106,3 +142,38 @@ def test_worker_sample_returns_actual_cost_to_scheduler_telemetry() -> None:
     observation = connector._telemetry.snapshot(256, 2)
     assert observation.load_service_ms == pytest.approx(4.0)
     assert observation.load_queue_wait_ms == pytest.approx(1.0)
+
+
+def test_failed_timing_is_not_reused_as_complete_kv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interrupted/invalid service evidence is audited but never calibrated."""
+    connector = object.__new__(DynamicSimpleCPUOffloadConnector)
+    connector._decision_times = {"req-failed": 10.0}
+    connector._decisions = {
+        "req-failed": MaterializationDecision(mode="load", reason="forced")
+    }
+    connector._decision_hit_tokens = {"req-failed": 256}
+    connector._recompute_remaining_tokens = {}
+    connector._new_recompute_attempts = set()
+    connector._recompute_queue_wait_ms = {}
+    connector._telemetry = TelemetryWindow()
+    connector._audit = AuditLog()
+    connector._audit.start(
+        "req-failed",
+        256,
+        2,
+        connector._decisions["req-failed"],
+    )
+    monkeypatch.setattr("kv_materialization_plugin.connector.time.monotonic", lambda: 10.001)
+
+    connector._consume_samples(
+        [TimingSampleMetadata("req-failed", 2, 5.0, 1024, 0.0)],
+        "cpu_kv_load",
+        is_load=True,
+    )
+
+    record = connector._audit.records()[0]
+    assert record.status == "invalid"
+    assert connector._telemetry.snapshot(256, 2).load_sample_count == 0
+    assert "req-failed" not in connector._decisions

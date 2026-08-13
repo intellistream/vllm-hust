@@ -64,6 +64,11 @@ def test_audit_record_contains_prediction_and_actual_branch(tmp_path) -> None:
     assert "phase_queue=admission_to_service_start" in record.timing_scope
     assert record.queue_wait_isolated is True
     assert record.queue_wait_ms == 1.0
+    assert record.token_coverage_start == 0
+    assert record.token_coverage_end == 256
+    assert record.scheduler_ownership == (
+        "scheduler_reserved_gpu_blocks_until_load_completion"
+    )
     assert record.load_queue_wait_ms == 1.0
     assert record.recompute_queue_wait_ms == 2.0
     assert record.load_service_ms == 4.0

@@ -202,12 +202,12 @@ def choose_materialization(
             reason="predicted_load_is_lower",
             predicted_load_ms=predicted_load_ms,
             predicted_recompute_ms=predicted_recompute_ms,
-            estimate_source="end_to_end_median",
+            estimate_source="path_completion_mean",
         )
     return MaterializationDecision(
         mode="recompute",
         reason="predicted_recompute_is_not_slower",
         predicted_load_ms=predicted_load_ms,
         predicted_recompute_ms=predicted_recompute_ms,
-        estimate_source="end_to_end_median",
+        estimate_source="path_completion_mean",
     )

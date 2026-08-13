@@ -50,6 +50,9 @@ class AuditRecord:
     service_ms: float | None = None
     extra_wait_ms: float | None = None
     queue_wait_ms: float | None = None
+    token_coverage_start: int = 0
+    token_coverage_end: int | None = None
+    scheduler_ownership: str | None = None
     status: str = "decided"
 
 
@@ -151,6 +154,11 @@ class AuditLog:
         record.service_ms = service_ms
         record.extra_wait_ms = extra_wait_ms
         record.queue_wait_ms = queue_wait_ms
+        record.token_coverage_end = record.hit_tokens
+        record.scheduler_ownership = {
+            "cpu_kv_load": "scheduler_reserved_gpu_blocks_until_load_completion",
+            "full_prefix_recompute": "scheduler_owned_recompute_progress",
+        }.get(actual_branch)
         record.status = status
         self._write(record)
 
