@@ -81,16 +81,21 @@ def _make_scheduler(
     max_num_scheduled_tokens: int = 64,
     max_num_running_reqs: int = 16,
     enable_request_owned_graph: bool = False,
+    enable_request_owned_windows: bool = False,
+    request_owned_decode_window_steps: int = 32,
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.scheduler_config = SimpleNamespace(
         enable_request_owned_attention=True,
         enable_request_owned_graph=enable_request_owned_graph,
+        enable_request_owned_windows=enable_request_owned_windows,
+        request_owned_decode_window_steps=request_owned_decode_window_steps,
     )
     scheduler.parallel_config = SimpleNamespace(world_size=world_size)
     scheduler.current_step = 0
     scheduler.max_num_scheduled_tokens = max_num_scheduled_tokens
     scheduler.max_num_running_reqs = max_num_running_reqs
+    scheduler.max_model_len = 8192
     scheduler.num_waiting_for_streaming_input = 0
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
@@ -100,6 +105,9 @@ def _make_scheduler(
     scheduler.log_stats = False
     scheduler.encoder_cache_manager = SimpleNamespace(
         get_freed_mm_hashes=lambda: [], free=lambda request: None
+    )
+    scheduler.structured_output_manager = SimpleNamespace(
+        should_advance=lambda request: False
     )
     scheduler.finished_req_ids = set()
     scheduler.reset_preempted_req_ids = set()
@@ -126,6 +134,9 @@ def _make_scheduler(
     scheduler._owner_outbox = []
     scheduler._owner_token_plans = {}
     scheduler._owner_pending_dispatch = {}
+    from vllm.v1.core.sched.scheduler import _OwnerWindowState
+
+    scheduler._owner_window_state = _OwnerWindowState()
     scheduler._init_request_owned_control_plane()
     return scheduler
 
@@ -154,6 +165,41 @@ def _apply_receipts(scheduler, scheduler_output, events_by_rank) -> None:
         scheduler_output,
         ModelRunnerOutput(
             req_ids=[], req_id_to_index={}, owner_receipt_batches=batches
+        ),
+    )
+
+
+def _ack_window_step(scheduler, scheduler_output) -> None:
+    """Acknowledge a token-bearing window step without sampling enabled."""
+    _apply_window_step(scheduler, scheduler_output, {})
+
+
+def _apply_window_step(scheduler, scheduler_output, events_by_rank) -> None:
+    """Apply worker receipts and samples only for prompt-complete rows."""
+    req_ids = list(scheduler_output.num_scheduled_tokens)
+    batches = [
+        OwnerReceiptBatch(
+            owner_rank=rank,
+            emitted_step_seq=scheduler_output.step_seq,
+            events=tuple(events_by_rank.get(rank, ())),
+        )
+        for rank in range(scheduler.parallel_config.world_size)
+    ]
+    scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={
+                request_id: index for index, request_id in enumerate(req_ids)
+            },
+            sampled_token_ids=[
+                [100 + index]
+                if (request := scheduler.requests.get(request_id)) is None
+                or request.num_computed_tokens >= request.num_prompt_tokens
+                else []
+                for index, request_id in enumerate(req_ids)
+            ],
+            owner_receipt_batches=batches,
         ),
     )
 
@@ -1172,6 +1218,584 @@ def test_owner_graph_ragged_prefill_keeps_running_order_policy() -> None:
 
     scheduled = scheduler.schedule()
     assert scheduled.num_scheduled_tokens == {"req-a": 32, "req-b": 16}
+
+
+def test_owner_window_does_not_transition_before_output_ack() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=64,
+        max_num_running_reqs=2,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    requests = [_request(f"req-{owner}", num_prompt_tokens=32) for owner in range(2)]
+    for request in requests:
+        scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+            for command in commands
+        },
+    )
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"req-0": 32, "req-1": 32}
+    assert scheduler._owner_window_state.inflight is not None
+    with pytest.raises(RuntimeError, match="completed model output"):
+        scheduler.schedule()
+
+    _ack_window_step(scheduler, prefill)
+    assert scheduler._owner_window_state.inflight is None
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens == {"req-0": 1, "req-1": 1}
+
+
+def test_late_prefill_never_mixes_into_active_decode_window() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=64,
+        max_num_running_reqs=4,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_window_steps=4,
+    )
+    decode_requests = [
+        _request(f"decode-{owner}", num_prompt_tokens=1, max_tokens=8)
+        for owner in range(2)
+    ]
+    for request in decode_requests:
+        scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+            for command in commands
+        },
+    )
+    first_prefill = scheduler.schedule()
+    _ack_window_step(scheduler, first_prefill)
+
+    first_decode = scheduler.schedule()
+    assert list(first_decode.num_scheduled_tokens) == ["decode-0", "decode-1"]
+    _ack_window_step(scheduler, first_decode)
+
+    late = _request("late-prefill", num_prompt_tokens=16)
+    scheduler.add_request(late)
+    reserve_late = scheduler.schedule()
+    assert reserve_late.num_scheduled_tokens == {
+        "decode-0": 1,
+        "decode-1": 1,
+    }
+    (late_command,) = reserve_late.owner_commands
+    _apply_window_step(
+        scheduler,
+        reserve_late,
+        {
+            late_command.owner_id: [
+                _receipt(
+                    late_command.key,
+                    late_command.owner_id,
+                    late_command.command_seq,
+                    runnable=late_command.required_num_tokens,
+                )
+            ]
+        },
+    )
+
+    still_decode = scheduler.schedule()
+    assert still_decode.num_scheduled_tokens == {
+        "decode-0": 1,
+        "decode-1": 1,
+    }
+    assert "late-prefill" not in still_decode.num_scheduled_tokens
+
+
+def test_decode_quantum_runs_one_bounded_prefill_wave_then_resumes() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=4,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_window_steps=2,
+    )
+    decode_requests = [
+        _request(f"decode-{owner}", num_prompt_tokens=1, max_tokens=8)
+        for owner in range(2)
+    ]
+    for request in decode_requests:
+        scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+            for command in commands
+        },
+    )
+    prefill = scheduler.schedule()
+    _ack_window_step(scheduler, prefill)
+    decode0 = scheduler.schedule()
+    _ack_window_step(scheduler, decode0)
+
+    late = _request("late", num_prompt_tokens=16)
+    scheduler.add_request(late)
+    decode1_and_reserve = scheduler.schedule()
+    (late_command,) = decode1_and_reserve.owner_commands
+    _apply_window_step(
+        scheduler,
+        decode1_and_reserve,
+        {
+            late_command.owner_id: [
+                _receipt(
+                    late_command.key,
+                    late_command.owner_id,
+                    late_command.command_seq,
+                    runnable=late_command.required_num_tokens,
+                )
+            ]
+        },
+    )
+
+    prefill_wave = scheduler.schedule()
+    assert prefill_wave.num_scheduled_tokens == {"late": 16}
+    _ack_window_step(scheduler, prefill_wave)
+
+    resumed = scheduler.schedule()
+    assert resumed.num_scheduled_tokens == {
+        "decode-0": 1,
+        "decode-1": 1,
+    }
+
+
+def test_partial_decode_window_drains_without_waiting_for_full_cohort() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=2,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    request = _request("solo", num_prompt_tokens=1, max_tokens=4)
+    scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    (command,) = reserve.owner_commands
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+        },
+    )
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"solo": 1}
+    _ack_window_step(scheduler, prefill)
+
+    # A partial cohort is not FULL-graph eligible, but it must continue via
+    # the existing non-FULL fallback rather than wait forever for owner 1.
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens == {"solo": 1}
+
+
+def test_partial_decode_yields_to_prefill_that_can_fill_missing_owner() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=2,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    first = _request("first", num_prompt_tokens=1, max_tokens=8)
+    scheduler.add_request(first)
+    reserve = scheduler.schedule()
+    (first_command,) = reserve.owner_commands
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            first_command.owner_id: [
+                _receipt(
+                    first_command.key,
+                    first_command.owner_id,
+                    first_command.command_seq,
+                    runnable=first_command.required_num_tokens,
+                )
+            ]
+        },
+    )
+    _ack_window_step(scheduler, scheduler.schedule())
+
+    partial_decode = scheduler.schedule()
+    _ack_window_step(scheduler, partial_decode)
+
+    second = _request("second", num_prompt_tokens=1, max_tokens=8)
+    scheduler.add_request(second)
+    reserve_second = scheduler.schedule()
+    assert reserve_second.num_scheduled_tokens == {"first": 1}
+    (second_command,) = reserve_second.owner_commands
+    _apply_window_step(
+        scheduler,
+        reserve_second,
+        {
+            second_command.owner_id: [
+                _receipt(
+                    second_command.key,
+                    second_command.owner_id,
+                    second_command.command_seq,
+                    runnable=second_command.required_num_tokens,
+                )
+            ]
+        },
+    )
+
+    # The partial fallback is re-formed at every ack.  Once the missing-owner
+    # prefill is runnable, it receives an isolated wave instead of starving
+    # behind the pre-existing decode request.
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"second": 1}
+    _ack_window_step(scheduler, prefill)
+
+    exact_decode = scheduler.schedule()
+    assert list(exact_decode.num_scheduled_tokens) == ["first", "second"]
+
+
+def test_prefill_window_extends_partial_worker_horizon_then_continues() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    request = _request("pressure", num_prompt_tokens=2, max_tokens=4)
+    scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    (reserve_command,) = reserve.owner_commands
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            0: [
+                _receipt(
+                    reserve_command.key,
+                    0,
+                    reserve_command.command_seq,
+                    runnable=1,
+                )
+            ]
+        },
+    )
+
+    first_token = scheduler.schedule()
+    assert first_token.num_scheduled_tokens == {"pressure": 1}
+    _ack_window_step(scheduler, first_token)
+
+    # The frozen prefill member remains eligible at its granted horizon and
+    # actively requests more capacity instead of disappearing and deadlocking.
+    extend_step = scheduler.schedule()
+    assert extend_step.num_scheduled_tokens == {}
+    (extend,) = extend_step.owner_commands
+    assert extend.kind is OwnerCommandKind.EXTEND
+    _apply_receipts(
+        scheduler,
+        extend_step,
+        {0: [_receipt(extend.key, 0, extend.command_seq, runnable=2)]},
+    )
+
+    second_token = scheduler.schedule()
+    assert second_token.num_scheduled_tokens == {"pressure": 1}
+
+
+def test_decode_quantum_rotates_same_owner_ready_requests() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=2,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_window_steps=1,
+    )
+    requests = [
+        _request(request_id, num_prompt_tokens=1, max_tokens=8)
+        for request_id in ("first", "second")
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            0: [
+                _receipt(
+                    command.key,
+                    0,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+                for command in commands
+            ]
+        },
+    )
+
+    first_prefill = scheduler.schedule()
+    assert first_prefill.num_scheduled_tokens == {"first": 1}
+    _ack_window_step(scheduler, first_prefill)
+    first_decode = scheduler.schedule()
+    assert first_decode.num_scheduled_tokens == {"first": 1}
+    _ack_window_step(scheduler, first_decode)
+
+    second_prefill = scheduler.schedule()
+    assert second_prefill.num_scheduled_tokens == {"second": 1}
+    _ack_window_step(scheduler, second_prefill)
+
+    # The interrupted window resumes once after its prefill wave.  Both
+    # requests are then decode-ready on owner 0, so the next one-step quantum
+    # boundary rotates the slot and the other request cannot starve.
+    resumed_first = scheduler.schedule()
+    assert resumed_first.num_scheduled_tokens == {"first": 1}
+    _ack_window_step(scheduler, resumed_first)
+    second_decode = scheduler.schedule()
+    assert second_decode.num_scheduled_tokens == {"second": 1}
+
+
+def test_decode_slots_and_payload_stay_in_owner_order() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=2,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    requests = [
+        _request(f"req-{owner}", num_prompt_tokens=1, max_tokens=4)
+        for owner in range(2)
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+            for command in commands
+        },
+    )
+    prefill = scheduler.schedule()
+    _ack_window_step(scheduler, prefill)
+
+    # Global queue order is not the execution row identity.  The frozen
+    # owner-indexed slots remain the payload order for every decode step.
+    scheduler.running.reverse()
+    decode = scheduler.schedule()
+    assert list(decode.num_scheduled_tokens) == ["req-0", "req-1"]
+    assert decode.scheduled_cached_reqs.req_ids == ["req-0", "req-1"]
+
+
+def test_inserted_long_prefill_yields_after_one_bounded_chunk() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=4,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_window_steps=1,
+    )
+    decode_requests = [
+        _request(f"decode-{owner}", num_prompt_tokens=1, max_tokens=8)
+        for owner in range(2)
+    ]
+    for request in decode_requests:
+        scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+            for command in commands
+        },
+    )
+    _ack_window_step(scheduler, scheduler.schedule())
+
+    late = _request("long-prefill", num_prompt_tokens=64)
+    scheduler.add_request(late)
+    decode_and_reserve = scheduler.schedule()
+    (late_command,) = decode_and_reserve.owner_commands
+    _apply_window_step(
+        scheduler,
+        decode_and_reserve,
+        {
+            late_command.owner_id: [
+                _receipt(
+                    late_command.key,
+                    late_command.owner_id,
+                    late_command.command_seq,
+                    runnable=late_command.required_num_tokens,
+                )
+            ]
+        },
+    )
+
+    first_chunk = scheduler.schedule()
+    assert first_chunk.num_scheduled_tokens == {"long-prefill": 32}
+    _ack_window_step(scheduler, first_chunk)
+    assert late.num_computed_tokens == 32
+
+    # The unfinished prompt does not monopolize the model.  It yields after
+    # one invocation and the exact decode cohort resumes.
+    resumed = scheduler.schedule()
+    assert resumed.num_scheduled_tokens == {
+        "decode-0": 1,
+        "decode-1": 1,
+    }
+
+
+def test_finished_decode_members_dissolve_window_after_ack() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=2,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    requests = [
+        _request(f"req-{owner}", num_prompt_tokens=1, max_tokens=2)
+        for owner in range(2)
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+            for command in commands
+        },
+    )
+    _ack_window_step(scheduler, scheduler.schedule())
+
+    final_decode = scheduler.schedule()
+    _ack_window_step(scheduler, final_decode)
+    assert not scheduler.requests
+
+    release_step = scheduler.schedule()
+    assert release_step.num_scheduled_tokens == {}
+    assert len(release_step.owner_commands) == 2
+    assert scheduler._owner_window_state.phase is None
+
+
+def test_abort_during_inflight_decode_acks_then_dissolves_cohort() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=2,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    requests = [
+        _request(f"req-{owner}", num_prompt_tokens=1, max_tokens=8)
+        for owner in range(2)
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+            for command in commands
+        },
+    )
+    _ack_window_step(scheduler, scheduler.schedule())
+
+    decode = scheduler.schedule()
+    assert list(decode.num_scheduled_tokens) == ["req-0", "req-1"]
+    scheduler.finish_requests(["req-0"], RequestStatus.FINISHED_ABORTED)
+    _ack_window_step(scheduler, decode)
+
+    # The completed execution step is still acknowledged exactly once.  At
+    # the next boundary the dead slot disappears and the survivor drains via
+    # the partial-cohort fallback while RELEASE is flushed independently.
+    next_step = scheduler.schedule()
+    assert next_step.num_scheduled_tokens == {"req-1": 1}
+    assert [command.kind for command in next_step.owner_commands] == [
+        OwnerCommandKind.RELEASE
+    ]
 
 
 def test_zero_budget_promotion_remains_new_until_first_dispatch() -> None:

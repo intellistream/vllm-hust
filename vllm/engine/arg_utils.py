@@ -718,6 +718,12 @@ class EngineArgs:
     )
     enable_request_owned_sampling: bool = SchedulerConfig.enable_request_owned_sampling
     enable_request_owned_graph: bool = SchedulerConfig.enable_request_owned_graph
+    enable_request_owned_windows: bool = (
+        SchedulerConfig.enable_request_owned_windows
+    )
+    request_owned_decode_window_steps: int = (
+        SchedulerConfig.request_owned_decode_window_steps
+    )
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
@@ -1488,6 +1494,14 @@ class EngineArgs:
             "--enable-request-owned-graph",
             **scheduler_kwargs["enable_request_owned_graph"],
         )
+        scheduler_group.add_argument(
+            "--enable-request-owned-windows",
+            **scheduler_kwargs["enable_request_owned_windows"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-decode-window-steps",
+            **scheduler_kwargs["request_owned_decode_window_steps"],
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -2192,6 +2206,10 @@ class EngineArgs:
             enable_request_owned_q_wkv_fanin=self.enable_request_owned_q_wkv_fanin,
             enable_request_owned_sampling=self.enable_request_owned_sampling,
             enable_request_owned_graph=self.enable_request_owned_graph,
+            enable_request_owned_windows=self.enable_request_owned_windows,
+            request_owned_decode_window_steps=(
+                self.request_owned_decode_window_steps
+            ),
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

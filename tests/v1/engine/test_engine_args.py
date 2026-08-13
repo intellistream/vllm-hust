@@ -155,12 +155,32 @@ def test_request_owned_flags_default_false():
     assert engine_args.enable_request_owned_q_wkv_fanin is False
     assert engine_args.enable_request_owned_sampling is False
     assert engine_args.enable_request_owned_graph is False
+    assert engine_args.enable_request_owned_windows is False
+    assert engine_args.request_owned_decode_window_steps == 32
 
     vllm_config = engine_args.create_engine_config()
     assert vllm_config.scheduler_config.enable_request_owned_attention is False
     assert vllm_config.scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert vllm_config.scheduler_config.enable_request_owned_sampling is False
     assert vllm_config.scheduler_config.enable_request_owned_graph is False
+    assert vllm_config.scheduler_config.enable_request_owned_windows is False
+    assert vllm_config.scheduler_config.request_owned_decode_window_steps == 32
+
+
+def test_request_owned_windows_cli_parses_quantum_without_model_loading():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--enable-request-owned-attention",
+            "--enable-request-owned-graph",
+            "--enable-request-owned-windows",
+            "--request-owned-decode-window-steps",
+            "7",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_windows is True
+    assert engine_args.request_owned_decode_window_steps == 7
 
 
 def test_request_owned_attention_flag_propagates_independently(monkeypatch):

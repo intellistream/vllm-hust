@@ -4,7 +4,8 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from enum import Enum, auto
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -90,6 +91,38 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+class _OwnerWindowPhase(Enum):
+    PREFILL = auto()
+    DECODE = auto()
+
+
+@dataclass(frozen=True)
+class _OwnerWindowStep:
+    """One immutable positive-token window step awaiting model output."""
+
+    step_seq: int
+    phase: _OwnerWindowPhase
+    members: tuple[OwnerLeaseKey, ...]
+    num_scheduled_tokens: tuple[tuple[str, int], ...]
+
+
+@dataclass
+class _OwnerWindowState:
+    """Scheduler-owned phase state for the experimental window policy."""
+
+    phase: _OwnerWindowPhase | None = None
+    # Owner-ordered and stable, but not necessarily complete: an exact
+    # world-size cohort is FULL-graph eligible, while a partial cohort must
+    # remain runnable through the ordinary non-FULL fallback.
+    decode_slots: tuple[OwnerLeaseKey, ...] = ()
+    yielded_decode_slots: tuple[OwnerLeaseKey, ...] = ()
+    suspended_decode_slots: tuple[OwnerLeaseKey, ...] = ()
+    prefill_wave: tuple[OwnerLeaseKey, ...] = ()
+    decode_steps: int = 0
+    prefer_prefill: bool = False
+    inflight: _OwnerWindowStep | None = None
 
 
 class Scheduler(SchedulerInterface):
@@ -402,6 +435,11 @@ class Scheduler(SchedulerInterface):
         # schedule() calls: admission can promote more requests than the
         # global token budget can dispatch in that step.
         self._owner_pending_dispatch: dict[str, RequestStatus] = {}
+        # Experimental scheduler-owned batch phase.  Request/coordinator
+        # objects remain authoritative for tokens, leases, and capacity; this
+        # record only selects a stable execution cohort and advances at the
+        # completed-output boundary.
+        self._owner_window_state = _OwnerWindowState()
         # Global rank -> latest worker-confirmed physical pool snapshot
         # (block-ID-free), empty until the first non-None receipt envelope.
         self._owner_pool_snapshots: dict[int, OwnerCachePoolSnapshot] = {}
@@ -2020,6 +2058,17 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        if getattr(
+            self.scheduler_config,
+            "enable_request_owned_windows",
+            False,
+        ):
+            # This is deliberately the final state mutation: sampled tokens,
+            # EOS/abort handling, queue removal, and output construction have
+            # all succeeded.  A failure above leaves the step in flight and
+            # prevents scheduling from optimistic num_computed_tokens.
+            self._owner_window_ack_step(scheduler_output)
+
         return engine_core_outputs
 
     def _validate_request_owned_receipt_ingress(
@@ -2529,6 +2578,16 @@ class Scheduler(SchedulerInterface):
         coordinator = self.owner_coordinator
         assert coordinator is not None
 
+        if getattr(
+            self.scheduler_config,
+            "enable_request_owned_windows",
+            False,
+        ) and self._owner_window_state.inflight is not None:
+            raise RuntimeError(
+                "request-owned window requires completed model output before "
+                "the next schedule call."
+            )
+
         # Deterministic observations for every process-global owner rank.
         observations = [
             self._owner_observation(owner_id)
@@ -2548,7 +2607,14 @@ class Scheduler(SchedulerInterface):
         }
         if self._pause_state != PauseState.PAUSED_ALL:
             self._owner_admission_pass(scheduled_timestamp)
-            self._owner_running_pass()
+            if getattr(
+                self.scheduler_config,
+                "enable_request_owned_windows",
+                False,
+            ):
+                self._owner_window_running_pass()
+            else:
+                self._owner_running_pass()
 
         # Drain newly issued commands, per-owner ordered, each exactly once.
         owner_commands = self._drain_owner_outbox()
@@ -2593,6 +2659,22 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self._owner_pending_dispatch
             and num_scheduled_tokens.get(request.request_id, 0) > 0
         ]
+        if getattr(
+            self.scheduler_config,
+            "enable_request_owned_windows",
+            False,
+        ):
+            plan_order = {
+                request_id: index
+                for index, request_id in enumerate(num_scheduled_tokens)
+            }
+            first_dispatch.sort(key=lambda request: plan_order[request.request_id])
+            scheduled_resumed_reqs.sort(
+                key=lambda request: plan_order[request.request_id]
+            )
+            scheduled_running_reqs.sort(
+                key=lambda request: plan_order[request.request_id]
+            )
 
         # Block-ID-free logical token payload.
         if self.use_v2_model_runner:
@@ -2645,6 +2727,13 @@ class Scheduler(SchedulerInterface):
             owner_assignment_observations=observations,
             scheduled_owner_leases=scheduled_owner_leases,
         )
+
+        if getattr(
+            self.scheduler_config,
+            "enable_request_owned_windows",
+            False,
+        ):
+            self._owner_window_record_step(scheduler_output)
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -2839,6 +2928,362 @@ class Scheduler(SchedulerInterface):
             plan = min(plan, budget)
             self._owner_token_plans[request_id] = plan
             budget -= plan
+
+    def _owner_window_running_pass(self) -> None:
+        """Plan one phase-isolated scheduler window.
+
+        Decode windows keep at most one request per owner in stable owner
+        order across acknowledged steps.  Exact world-size cohorts are FULL
+        graph eligible; partial cohorts use the existing non-FULL fallback so
+        low-load and tail traffic cannot starve.  Prefill work is frozen into
+        bounded waves and never mixed with decode in one model invocation.
+        This method only selects and plans; :meth:`update_from_output` is the
+        sole authority that commits phase transitions.
+        """
+        state = self._owner_window_state
+        if state.inflight is not None:
+            raise RuntimeError(
+                "request-owned window cannot schedule another positive-token "
+                f"step before step {state.inflight.step_seq} is acknowledged."
+            )
+
+        self._owner_window_reconcile()
+        if state.phase is None:
+            prefill_wave = (
+                self._owner_window_form_prefill_wave()
+                if state.prefer_prefill
+                else ()
+            )
+            if prefill_wave:
+                state.prefer_prefill = False
+                state.phase = _OwnerWindowPhase.PREFILL
+                state.prefill_wave = prefill_wave
+                decode_slots = ()
+            else:
+                state.prefer_prefill = False
+                decode_slots = self._owner_window_form_decode_slots()
+            if len(decode_slots) == self.parallel_config.world_size:
+                state.phase = _OwnerWindowPhase.DECODE
+                state.decode_slots = decode_slots
+                state.yielded_decode_slots = ()
+                state.suspended_decode_slots = ()
+                state.decode_steps = 0
+            elif state.phase is None:
+                # Before committing a partial fallback, give runnable prefill
+                # a separate wave: it may fill the missing owner slots and
+                # produce the exact FULL cohort on the following boundary.
+                prefill_wave = self._owner_window_form_prefill_wave()
+                if prefill_wave:
+                    state.phase = _OwnerWindowPhase.PREFILL
+                    state.prefill_wave = prefill_wave
+                elif decode_slots:
+                    state.phase = _OwnerWindowPhase.DECODE
+                    state.decode_slots = decode_slots
+                    state.yielded_decode_slots = ()
+                    state.suspended_decode_slots = ()
+                    state.decode_steps = 0
+
+        if state.phase is _OwnerWindowPhase.DECODE:
+            self._owner_window_plan_decode(state.decode_slots)
+        elif state.phase is _OwnerWindowPhase.PREFILL:
+            self._owner_window_plan_prefill(state.prefill_wave)
+
+    def _owner_window_live_request(
+        self,
+        key: OwnerLeaseKey,
+    ) -> Request | None:
+        """Return the live RUNNING request for an exact lease incarnation."""
+        request = self.requests.get(key.request_id)
+        if (
+            request is None
+            or request.is_finished()
+            or request.status is not RequestStatus.RUNNING
+            or self._owner_key.get(key.request_id) != key
+        ):
+            return None
+        return request
+
+    def _owner_window_request_available(self, request: Request) -> bool:
+        """Whether a RUNNING lease may remain in a scheduler window."""
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        request_id = request.request_id
+        key = self._owner_key.get(request_id)
+        return bool(
+            key is not None
+            and self._owner_pending_command.get(request_id) is None
+            and not coordinator.is_release_pending(key)
+            and not coordinator.is_released(key)
+            and not coordinator.is_preempted(key)
+        )
+
+    def _owner_window_reconcile(self) -> None:
+        """Discard phase membership only at an acknowledged boundary."""
+        state = self._owner_window_state
+        assert state.inflight is None
+        if state.phase is _OwnerWindowPhase.DECODE:
+            requests = [
+                self._owner_window_live_request(key) for key in state.decode_slots
+            ]
+            if any(request is None for request in requests):
+                state.phase = None
+                state.decode_slots = ()
+                state.decode_steps = 0
+                state.suspended_decode_slots = ()
+            elif any(
+                request.num_computed_tokens < request.num_prompt_tokens
+                for request in requests
+                if request is not None
+            ):
+                # Resume/preempt reset or a malformed transition: never emit a
+                # prefill token under a decode window identity.
+                state.phase = None
+                state.decode_slots = ()
+                state.decode_steps = 0
+                state.suspended_decode_slots = ()
+        elif state.phase is _OwnerWindowPhase.PREFILL:
+            live = tuple(
+                key
+                for key in state.prefill_wave
+                if (request := self._owner_window_live_request(key)) is not None
+                and request.num_computed_tokens < request.num_prompt_tokens
+            )
+            if live:
+                state.prefill_wave = live
+            else:
+                state.phase = None
+                state.prefill_wave = ()
+
+    def _owner_window_form_decode_slots(self) -> tuple[OwnerLeaseKey, ...]:
+        """Return one owner-indexed decode cohort, exact when available."""
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        world_size = self.parallel_config.world_size
+        suspended = self._owner_window_state.suspended_decode_slots
+        if len(suspended) == world_size:
+            suspended_requests = [
+                self._owner_window_live_request(key) for key in suspended
+            ]
+            if all(
+                request is not None
+                and request.num_computed_tokens >= request.num_prompt_tokens
+                and self._owner_window_request_available(request)
+                for request in suspended_requests
+            ):
+                return suspended
+        slots: list[OwnerLeaseKey | None] = [None] * world_size
+        alternates: list[OwnerLeaseKey | None] = [None] * world_size
+        yielded = set(self._owner_window_state.yielded_decode_slots)
+        for request in self.running:
+            if (
+                request.is_finished()
+                or request.num_computed_tokens < request.num_prompt_tokens
+                or not self._owner_window_request_available(request)
+            ):
+                continue
+            key = self._owner_key.get(request.request_id)
+            if key is None:
+                continue
+            owner = coordinator.owner_of(key)
+            if owner is None:
+                continue
+            if slots[owner] is None:
+                slots[owner] = key
+            if key not in yielded and alternates[owner] is None:
+                alternates[owner] = key
+        return tuple(
+            alternate if alternate is not None else slot
+            for slot, alternate in zip(slots, alternates)
+            if slot is not None
+        )
+
+    def _owner_window_form_prefill_wave(self) -> tuple[OwnerLeaseKey, ...]:
+        """Freeze at most one runnable prefill per owner in owner order."""
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        slots: list[OwnerLeaseKey | None] = [None] * self.parallel_config.world_size
+        for request in self.running:
+            if (
+                request.is_finished()
+                or request.num_computed_tokens >= request.num_prompt_tokens
+                or not self._owner_window_request_available(request)
+            ):
+                continue
+            key = self._owner_key.get(request.request_id)
+            if key is None:
+                continue
+            owner = coordinator.owner_of(key)
+            if owner is None or slots[owner] is not None:
+                continue
+            slots[owner] = key
+        return tuple(key for key in slots if key is not None)
+
+    def _owner_window_plan_decode(
+        self,
+        slots: tuple[OwnerLeaseKey, ...],
+    ) -> None:
+        """Plan exactly one decode token per fixed owner slot."""
+        if not slots or self.max_num_scheduled_tokens < len(slots):
+            return
+        requests = [self._owner_window_live_request(key) for key in slots]
+        if any(request is None for request in requests):
+            return
+        for request in requests:
+            assert request is not None
+            if (
+                request.num_computed_tokens < request.num_prompt_tokens
+                or not self._owner_window_request_available(request)
+            ):
+                return
+        plans = [self._owner_plan_num_new_tokens(request) for request in requests]
+        if any(plan <= 0 for plan in plans):
+            for request, plan in zip(requests, plans):
+                if plan <= 0 and request.num_computed_tokens < request.num_tokens:
+                    self._issue_owner_extend(
+                        request,
+                        self._owner_key[request.request_id],
+                    )
+            return
+        self._owner_token_plans.update(
+            {request.request_id: 1 for request in requests if request is not None}
+        )
+
+    def _owner_window_plan_prefill(
+        self,
+        wave: tuple[OwnerLeaseKey, ...],
+    ) -> None:
+        """Plan one bounded prefill wave without any decode request."""
+        requests = [self._owner_window_live_request(key) for key in wave]
+        requests = [
+            request
+            for request in requests
+            if request is not None
+            and request.num_computed_tokens < request.num_prompt_tokens
+            and self._owner_window_request_available(request)
+        ]
+        if not requests:
+            return
+        plans = [self._owner_plan_num_new_tokens(request) for request in requests]
+        if any(plan <= 0 for plan in plans):
+            for request, plan in zip(requests, plans):
+                if plan <= 0 and request.num_computed_tokens < request.num_tokens:
+                    self._issue_owner_extend(
+                        request,
+                        self._owner_key[request.request_id],
+                    )
+            return
+        per_request = self.max_num_scheduled_tokens // len(requests)
+        if per_request <= 0:
+            return
+        for request, runnable_plan in zip(requests, plans):
+            plan = min(
+                runnable_plan,
+                request.num_prompt_tokens - request.num_computed_tokens,
+                per_request,
+            )
+            if plan > 0:
+                self._owner_token_plans[request.request_id] = plan
+
+    def _owner_window_record_step(self, output: SchedulerOutput) -> None:
+        """Freeze one positive-token phase step before optimistic mutation."""
+        if not output.num_scheduled_tokens:
+            return
+        state = self._owner_window_state
+        if state.inflight is not None or state.phase is None:
+            raise RuntimeError("request-owned window has invalid in-flight state.")
+        expected = (
+            state.decode_slots
+            if state.phase is _OwnerWindowPhase.DECODE
+            else state.prefill_wave
+        )
+        scheduled_ids = set(output.num_scheduled_tokens)
+        members = tuple(key for key in expected if key.request_id in scheduled_ids)
+        if {key.request_id for key in members} != scheduled_ids:
+            raise RuntimeError(
+                "request-owned window scheduled requests outside its frozen "
+                f"{state.phase.name.lower()} cohort."
+            )
+        state.inflight = _OwnerWindowStep(
+            step_seq=output.step_seq,
+            phase=state.phase,
+            members=members,
+            num_scheduled_tokens=tuple(output.num_scheduled_tokens.items()),
+        )
+
+    def _owner_window_ack_step(self, output: SchedulerOutput) -> None:
+        """Commit a completed window step after output/lifecycle mutation."""
+        state = self._owner_window_state
+        inflight = state.inflight
+        if not output.num_scheduled_tokens:
+            if inflight is not None:
+                raise RuntimeError(
+                    "request-owned command-only output cannot acknowledge a "
+                    "positive-token window step."
+                )
+            return
+        if (
+            inflight is None
+            or inflight.step_seq != output.step_seq
+            or dict(inflight.num_scheduled_tokens) != output.num_scheduled_tokens
+        ):
+            raise RuntimeError(
+                "request-owned window output does not match the in-flight step."
+            )
+        state.inflight = None
+        if inflight.phase is _OwnerWindowPhase.DECODE:
+            state.decode_steps += 1
+            if len(state.decode_slots) < self.parallel_config.world_size:
+                # Partial decode is a liveness fallback, not a captured lane.
+                # Re-form it every acknowledged step so newly runnable work
+                # can fill missing owners rather than waiting for this tail
+                # cohort to finish.
+                state.yielded_decode_slots = state.decode_slots
+                state.phase = None
+                state.decode_slots = ()
+                state.decode_steps = 0
+                return
+            quantum = self.scheduler_config.request_owned_decode_window_steps
+            prefill_waits = any(
+                not request.is_finished()
+                and request.num_computed_tokens < request.num_prompt_tokens
+                and (key := self._owner_key.get(request.request_id)) is not None
+                and key not in state.decode_slots
+                and self._owner_pending_command.get(request.request_id) is None
+                and self.owner_coordinator is not None
+                and self.owner_coordinator.runnable_num_tokens_of(key) is not None
+                for request in self.requests.values()
+            )
+            decode_waits = any(
+                not request.is_finished()
+                and request.num_computed_tokens >= request.num_prompt_tokens
+                and (key := self._owner_key.get(request.request_id)) is not None
+                and key not in state.decode_slots
+                and self._owner_pending_command.get(request.request_id) is None
+                and self.owner_coordinator is not None
+                and self.owner_coordinator.runnable_num_tokens_of(key) is not None
+                for request in self.requests.values()
+            )
+            if state.decode_steps >= quantum and prefill_waits:
+                state.suspended_decode_slots = state.decode_slots
+                state.decode_slots = ()
+                state.decode_steps = 0
+                state.prefer_prefill = True
+                state.phase = None
+            elif state.decode_steps >= quantum and decode_waits:
+                state.yielded_decode_slots = state.decode_slots
+                state.decode_slots = ()
+                state.decode_steps = 0
+                state.phase = None
+        else:
+            state.decode_steps = 0
+            if state.suspended_decode_slots:
+                # A prefill inserted into an established decode lane is one
+                # bounded model invocation.  An unfinished long prompt yields
+                # back here and can receive another chunk at a later quantum.
+                # Initial prefill waves, by contrast, stay together until all
+                # members complete so they can enter decode in phase.
+                state.phase = None
+                state.prefill_wave = ()
 
     def _owner_balanced_prefill_plans(self) -> dict[str, int] | None:
         """Return one lockstep prefill chunk for the exact owner FULL cohort.

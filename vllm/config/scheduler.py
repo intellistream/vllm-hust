@@ -212,6 +212,26 @@ class SchedulerConfig:
     The flag changes the compiled graph partition and is therefore included
     in :meth:`compute_hash`."""
 
+    enable_request_owned_windows: bool = False
+    """Experimental scheduler-owned prefill/decode windows.
+
+    Defaults to False.  When enabled with request-owned attention and graph
+    execution, the scheduler keeps an owner-ordered decode cohort stable
+    across acknowledged token steps (FULL graph when the cohort is exact,
+    non-FULL fallback when partial) and schedules prefills in separate bounded
+    waves.  Window transitions are committed only from
+    ``update_from_output`` after the step has completed; owners receive no
+    scheduling or preemption authority.  This is a scheduling policy only and
+    does not change the compiled model graph."""
+
+    request_owned_decode_window_steps: int = Field(default=32, ge=1)
+    """Maximum acknowledged decode steps before a window boundary.
+
+    At the boundary, queued prefill work receives one bounded wave before the
+    scheduler reforms the next owner-ordered decode cohort.  The default keeps
+    a useful FULL-graph run while bounding queueing delay; it is ignored unless
+    ``enable_request_owned_windows`` is true."""
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -311,6 +331,17 @@ class SchedulerConfig:
             return value
         raise ValueError(
             "enable_request_owned_graph must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
+
+    @field_validator("enable_request_owned_windows", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_windows(cls, value: Any) -> Any:
+        """Keep scheduler windows behind an exact bool opt-in."""
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_windows must be a bool, got "
             f"{type(value).__name__} ({value!r})."
         )
 

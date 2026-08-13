@@ -66,6 +66,8 @@ def _vllm_config(
     enable_request_owned_attention: bool = True,
     enable_request_owned_q_wkv_fanin: bool = False,
     enable_request_owned_graph: bool = False,
+    enable_request_owned_windows: bool = False,
+    request_owned_decode_window_steps: int = 32,
     scheduler_config: SchedulerConfig | None = None,
     compilation_config: CompilationConfig | None = None,
     parallel_config: ParallelConfig | None = None,
@@ -88,6 +90,8 @@ def _vllm_config(
             enable_request_owned_attention=enable_request_owned_attention,
             enable_request_owned_q_wkv_fanin=enable_request_owned_q_wkv_fanin,
             enable_request_owned_graph=enable_request_owned_graph,
+            enable_request_owned_windows=enable_request_owned_windows,
+            request_owned_decode_window_steps=request_owned_decode_window_steps,
             async_scheduling=async_scheduling,
         ),
         compilation_config=compilation_config or _eager_compilation_config(),
@@ -103,9 +107,49 @@ def test_request_owned_attention_defaults_off():
     assert SchedulerConfig.default_factory().enable_request_owned_attention is False
     assert SchedulerConfig.default_factory().enable_request_owned_q_wkv_fanin is False
     assert SchedulerConfig.default_factory().enable_request_owned_graph is False
+    assert SchedulerConfig.default_factory().enable_request_owned_windows is False
+    assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 32
     assert VllmConfig().scheduler_config.enable_request_owned_attention is False
     assert VllmConfig().scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert VllmConfig().scheduler_config.enable_request_owned_graph is False
+    assert VllmConfig().scheduler_config.enable_request_owned_windows is False
+    assert VllmConfig().scheduler_config.request_owned_decode_window_steps == 32
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_request_owned_windows_gate_is_strict_bool(value):
+    with pytest.raises(
+        ValueError, match="enable_request_owned_windows must be a bool"
+    ):
+        SchedulerConfig.default_factory(enable_request_owned_windows=value)
+
+
+def test_request_owned_windows_require_graph_opt_in():
+    with pytest.raises(
+        ValueError, match="requires enable_request_owned_graph=True"
+    ):
+        _vllm_config(enable_request_owned_windows=True)
+
+
+def test_request_owned_windows_construct_with_graph_and_quantum():
+    vllm_config = _vllm_config(
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_window_steps=7,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+    )
+    scheduler_config = vllm_config.scheduler_config
+    assert scheduler_config.enable_request_owned_windows is True
+    assert scheduler_config.request_owned_decode_window_steps == 7
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_request_owned_window_quantum_must_be_positive(value):
+    with pytest.raises(ValueError, match="request_owned_decode_window_steps"):
+        SchedulerConfig.default_factory(request_owned_decode_window_steps=value)
 
 
 def test_disabled_leaves_existing_validation_unchanged():
