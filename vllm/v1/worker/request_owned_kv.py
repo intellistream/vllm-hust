@@ -228,6 +228,67 @@ class RequestOwnedStepEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class RequestOwnedKVSnapshot:
+    """Detached identity and physical layout of one owner-local lease.
+
+    The snapshot is worker-private because it carries rank-local block ids; it
+    must never cross the scheduler wire.  ``allocation_generation`` fences an
+    offload completion against same-key ABA after preempt/reallocation.
+
+    This is only an observation.  Holding a snapshot does not pin the backing
+    allocation or grant authority to mutate/free it.
+    """
+
+    key: OwnerLeaseKey
+    owner_rank: int
+    allocation_generation: int
+    num_computed_tokens: int
+    reserved_num_tokens: int
+    pending_free: bool
+    tables: tuple[tuple[int, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, OwnerLeaseKey):
+            raise TypeError(f"key must be an OwnerLeaseKey, got {self.key!r}.")
+        for name in (
+            "owner_rank",
+            "allocation_generation",
+            "num_computed_tokens",
+            "reserved_num_tokens",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(
+                    f"{name} must be a nonnegative non-bool int, got {value!r}."
+                )
+        if not isinstance(self.pending_free, bool):
+            raise TypeError(
+                "pending_free must be a bool, got "
+                f"{type(self.pending_free).__name__} ({self.pending_free!r})."
+            )
+        if self.num_computed_tokens > self.reserved_num_tokens:
+            raise ValueError(
+                "num_computed_tokens must not exceed reserved_num_tokens, got "
+                f"{self.num_computed_tokens} > {self.reserved_num_tokens}."
+            )
+        if not isinstance(self.tables, tuple):
+            raise TypeError("tables must be a tuple of group tables")
+        for group in self.tables:
+            if not isinstance(group, tuple):
+                raise TypeError("each group table must be a tuple of block ids")
+            for block_id in group:
+                if (
+                    isinstance(block_id, bool)
+                    or not isinstance(block_id, int)
+                    or block_id < 0
+                ):
+                    raise TypeError(
+                        "block ids must be nonnegative non-bool ints, "
+                        f"got {block_id!r}."
+                    )
+
+
+@dataclass(frozen=True, slots=True)
 class RequestOwnedStepMetadata:
     """Immutable, fully detached execution metadata batch for one step.
 
@@ -983,6 +1044,64 @@ class RequestOwnedKVStore:
         if record is None:
             return None
         return self._tables(record)
+
+    def snapshot(self, key: OwnerLeaseKey) -> RequestOwnedKVSnapshot | None:
+        """Observe an exact allocation, including a pending-free source.
+
+        Retirement needs to bind D2H to the old generation before a later free
+        fence runs.  The O-line adapter, not this snapshot, is responsible for
+        withholding that fence until a durable store receipt exists.
+        """
+
+        record = self._records.get(key)
+        if record is None:
+            return None
+        return RequestOwnedKVSnapshot(
+            key=record.key,
+            owner_rank=self._owner_rank,
+            allocation_generation=record.generation,
+            num_computed_tokens=record.num_computed_tokens,
+            reserved_num_tokens=record.reserved_num_tokens,
+            pending_free=record.pending_free,
+            tables=self._tables(record),
+        )
+
+    def computed_prefix_snapshot(
+        self, key: OwnerLeaseKey
+    ) -> RequestOwnedKVSnapshot | None:
+        """Observe only blocks containing immutable computed KV bytes.
+
+        Reserved-but-uncomputed tail blocks must never enter a durable store
+        receipt.  A partially computed final block is included; the O-line
+        host key also carries its valid-token extent so a later extension
+        cannot mistake the earlier partial image for the newer block.
+        """
+
+        snapshot = self.snapshot(key)
+        if snapshot is None:
+            return None
+        tables = tuple(
+            table[
+                : (snapshot.num_computed_tokens + spec.block_size - 1)
+                // spec.block_size
+            ]
+            for table, spec in zip(snapshot.tables, self._group_specs)
+        )
+        return RequestOwnedKVSnapshot(
+            key=snapshot.key,
+            owner_rank=snapshot.owner_rank,
+            allocation_generation=snapshot.allocation_generation,
+            num_computed_tokens=snapshot.num_computed_tokens,
+            reserved_num_tokens=snapshot.reserved_num_tokens,
+            pending_free=snapshot.pending_free,
+            tables=tables,
+        )
+
+    @property
+    def group_block_sizes(self) -> tuple[int, ...]:
+        """Worker-private logical tokens represented by each group block."""
+
+        return tuple(spec.block_size for spec in self._group_specs)
 
     def flush(self) -> tuple[OwnerLeaseKey, ...]:
         """Post-execute completion fence: free all deferred blocks now

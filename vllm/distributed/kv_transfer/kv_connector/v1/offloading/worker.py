@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -54,6 +55,84 @@ def _page_size_from_tensor(tensor: torch.Tensor, num_blocks: int) -> int:
     return total_bytes // num_blocks
 
 
+def _canonicalize_packed_kv_caches(
+    kv_cache_config: KVCacheConfig,
+    kv_caches: dict[str, torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]],
+) -> CanonicalKVCaches | None:
+    """Recover the one canonical byte view of an interleaved packed pool.
+
+    Packed model runners expose per-layer ``as_strided`` views.  Some Ascend
+    compressed layouts expose a list of such views, none of which is
+    contiguous.  Requiring or flattening an individual layer first therefore
+    loses both the interleaved bytes and (for aligned sliced allocations) the
+    actual base storage offset.
+
+    Every packed ``KVCacheTensor`` describes the same backing pool and gives
+    the byte offset of its first page inside a block.  Subtracting that offset
+    from a real layer view's storage offset recovers the exact backing base;
+    the canonical tensor can then cover every complete packed block directly.
+    """
+
+    packed_descriptors = [
+        descriptor
+        for descriptor in kv_cache_config.kv_cache_tensors
+        if descriptor.block_stride and descriptor.shared_by
+    ]
+    if not packed_descriptors:
+        return None
+    block_strides = {descriptor.block_stride for descriptor in packed_descriptors}
+    sizes = {descriptor.size for descriptor in packed_descriptors}
+    assert len(block_strides) == 1, "packed KV tensors must share one block stride"
+    assert len(sizes) == 1, "packed KV tensors must share one backing size"
+    (block_stride,) = block_strides
+    (backing_size,) = sizes
+    assert backing_size == kv_cache_config.num_blocks * block_stride
+
+    descriptor = packed_descriptors[0]
+    layer_cache = kv_caches[descriptor.shared_by[0]]
+    first_view = (
+        layer_cache[0] if isinstance(layer_cache, (tuple, list)) else layer_cache
+    )
+    assert isinstance(first_view, torch.Tensor)
+    base_offset = _byte_storage_offset(first_view) - descriptor.offset
+    assert base_offset >= 0
+    storage = first_view.untyped_storage()
+    storage_ptr = storage.data_ptr()
+    storage_bytes = storage.nbytes()
+    assert base_offset + backing_size <= storage_bytes
+    for packed_descriptor in packed_descriptors:
+        assert packed_descriptor.size == backing_size
+        for layer_name in packed_descriptor.shared_by:
+            layer_view = kv_caches[layer_name]
+            layer_first_view = (
+                layer_view[0] if isinstance(layer_view, (tuple, list)) else layer_view
+            )
+            assert isinstance(layer_first_view, torch.Tensor)
+            assert layer_first_view.untyped_storage().data_ptr() == storage_ptr, (
+                "packed KV layer views must alias one backing storage"
+            )
+            assert _byte_storage_offset(layer_first_view) == (
+                base_offset + packed_descriptor.offset
+            ), "packed KV layer view does not match its configured byte offset"
+    packed_tensor = torch.tensor(
+        [],
+        dtype=torch.int8,
+        device=first_view.device,
+    ).set_(
+        storage,
+        base_offset,
+        (kv_cache_config.num_blocks, block_stride),
+        (block_stride, 1),
+    )
+    return CanonicalKVCaches(
+        [CanonicalKVCacheTensor(packed_tensor, block_stride)],
+        [
+            [CanonicalKVCacheRef(0, block_stride)]
+            for _ in kv_cache_config.kv_cache_groups
+        ],
+    )
+
+
 class OffloadingConnectorWorker:
     """Implementation of Worker side methods"""
 
@@ -76,6 +155,11 @@ class OffloadingConnectorWorker:
     ):
         kv_cache_config = self.spec.kv_cache_config
         num_blocks = kv_cache_config.num_blocks
+
+        packed = _canonicalize_packed_kv_caches(kv_cache_config, kv_caches)
+        if packed is not None:
+            self._init_worker(packed)
+            return
 
         # Packed layouts (e.g. DSv4) set block_stride > 0; their tensors use
         # stride(0) as the manager-block stride (equals total_num_bytes_per_block).
@@ -172,33 +256,6 @@ class OffloadingConnectorWorker:
 
                 else:
                     raise NotImplementedError
-
-        packed_kv_cache_tensor = next(
-            (
-                t
-                for t in kv_cache_config.kv_cache_tensors
-                if t.block_stride and t.shared_by
-            ),
-            None,
-        )
-        if packed_kv_cache_tensor is not None:
-            (tensor,) = tensors_per_block[packed_kv_cache_tensor.shared_by[0]]
-            block_stride = tensor.stride(0)
-            packed_tensor = tensor.as_strided(
-                (num_blocks, block_stride),
-                (block_stride, 1),
-                storage_offset=0,
-            )
-            self._init_worker(
-                CanonicalKVCaches(
-                    [CanonicalKVCacheTensor(packed_tensor, block_stride)],
-                    [
-                        [CanonicalKVCacheRef(0, block_stride)]
-                        for _ in kv_cache_config.kv_cache_groups
-                    ],
-                )
-            )
-            return
 
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)

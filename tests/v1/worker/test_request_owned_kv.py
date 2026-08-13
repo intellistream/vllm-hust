@@ -473,6 +473,45 @@ def test_pool_snapshot_is_canonical_and_block_id_free():
             assert value is None or isinstance(value, (int, str))
 
 
+def test_owner_kv_snapshot_binds_generation_and_survives_pending_free():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=7)
+    key = _key("snapshot")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=10, seq=1)
+    ).accepted
+    assert store.mark_computed(key, 6)
+
+    snapshot = store.snapshot(key)
+    assert snapshot is not None
+    assert snapshot.key == key
+    assert snapshot.owner_rank == 7
+    assert snapshot.allocation_generation == 1
+    assert snapshot.num_computed_tokens == 6
+    assert snapshot.reserved_num_tokens == 10
+    assert not snapshot.pending_free
+    assert snapshot.tables == store.get_block_table(key)
+    computed = store.computed_prefix_snapshot(key)
+    assert computed is not None
+    assert computed.tables == tuple(group[:2] for group in snapshot.tables)
+    assert store.group_block_sizes == (4, 4)
+
+    assert store.preempt(
+        _command(key, OwnerCommandKind.PREEMPT, required=10, seq=2)
+    ).accepted
+    pending = store.snapshot(key)
+    assert pending is not None
+    assert pending.pending_free
+    assert pending.tables == snapshot.tables
+    pending_computed = store.computed_prefix_snapshot(key)
+    assert pending_computed is not None
+    assert pending_computed.pending_free
+    assert pending_computed.tables == computed.tables
+
+    assert store.flush() == (key,)
+    assert store.snapshot(key) is None
+
+
 def test_restore_and_prefix_paths_rejected():
     manager = _make_manager()
     store = RequestOwnedKVStore(manager, owner_rank=0)
