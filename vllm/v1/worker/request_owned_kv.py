@@ -18,8 +18,10 @@ PREEMPT/RELEASE released to the manager only at an explicit post-execute
 completion fence (:meth:`RequestOwnedKVStore.flush`).  It emits no
 :class:`OwnerReceipt` and performs no token/block estimation of its own.
 
-Scope (fail closed): prefix caching, KV connectors, spec decode, and
-RESTORE are out of scope; :meth:`restore` always rejects.  The store keeps
+Scope (fail closed): prefix caching, KV connectors, and RESTORE are out of
+scope; :meth:`restore` always rejects.  Linear speculative verification is
+represented by separate physical-reservation and logical-commit watermarks;
+branching proposal trees remain out of scope.  The store keeps
 no local epoch fence: physical records are keyed by the full
 :class:`OwnerLeaseKey` (request id plus epoch), so a command whose epoch
 does not match the record simply misses the lookup and is rejected without
@@ -185,6 +187,10 @@ class RequestOwnedStepEntry:
     post_step_num_tokens: int
     tables: tuple[tuple[int, ...], ...]
     delta: tuple[tuple[int, ...], ...]
+    #: Number of provisional draft positions in this target step.  Zero
+    #: keeps the exact-post-step mark contract; positive values allow the
+    #: terminal path to commit an accepted prefix in ``[pre + 1, post]``.
+    num_speculative_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, OwnerLeaseKey):
@@ -193,6 +199,7 @@ class RequestOwnedStepEntry:
             "allocation_generation",
             "pre_step_num_computed_tokens",
             "post_step_num_tokens",
+            "num_speculative_tokens",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -203,6 +210,13 @@ class RequestOwnedStepEntry:
             raise ValueError(
                 "post_step_num_tokens must be positive: a published lease "
                 "token is never empty, got 0."
+            )
+        scheduled = self.post_step_num_tokens - self.pre_step_num_computed_tokens
+        if self.num_speculative_tokens > max(scheduled - 1, 0):
+            raise ValueError(
+                "num_speculative_tokens must leave one ordinary target "
+                f"position: got {self.num_speculative_tokens} drafts for "
+                f"{scheduled} scheduled tokens."
             )
         if not isinstance(self.tables, tuple) or not isinstance(self.delta, tuple):
             raise TypeError("tables and delta must be tuples of group tables")
@@ -415,9 +429,13 @@ class RequestOwnedKVStore:
                 command, "lease held pending free until the flush fence"
             )
 
-        num_new = command.required_num_tokens - record.num_computed_tokens
-        if num_new <= 0:
+        if command.required_num_tokens <= record.reserved_num_tokens:
             return self._accepted_allocation(command, record, None)
+        # Keep the manager's computed watermark at the verified logical
+        # horizon.  Its existing block table prevents the provisional suffix
+        # from being allocated twice, while sliding-window groups must not
+        # retire committed context as though rejected positions were valid.
+        num_new = command.required_num_tokens - record.num_computed_tokens
         blocks = self._allocate(
             record.allocator_id,
             record.num_prompt_tokens,
@@ -516,10 +534,12 @@ class RequestOwnedKVStore:
         return True
 
     def mark_computed_batch(
-        self, metadata: RequestOwnedStepMetadata
+        self,
+        metadata: RequestOwnedStepMetadata,
+        committed_num_tokens: Mapping[OwnerLeaseKey, int] | None = None,
     ) -> RequestOwnedStepMarkResult:
         """Atomically advance every entry of a handed-in G3 step metadata
-        batch to its exact post-step target.
+        batch to its verified logical commit targets.
 
         All-or-nothing: every entry is validated (exact lease key, physical
         allocation generation, an armed pending mark expectation from the
@@ -529,8 +549,10 @@ class RequestOwnedKVStore:
         record advances; a stale (non-current or already-marked step),
         duplicate, wrong-owner, foreign, missing-entry, or partial batch
         fails with no changes.  Success consumes every expectation and
-        sets the records' computed progress to the exact post-step
-        targets."""
+        sets each record's computed progress to its verified target.  A
+        non-spec entry must commit the exact execution post target.  A spec
+        entry must provide a target in ``[pre + 1, post]``; positions above
+        it remain physically reserved and are safe to overwrite."""
         if not isinstance(metadata, RequestOwnedStepMetadata):
             return RequestOwnedStepMarkResult(
                 accepted=False,
@@ -538,6 +560,24 @@ class RequestOwnedKVStore:
                 error=f"metadata must be a RequestOwnedStepMetadata, got {metadata!r}.",
             )
         step_seq = metadata.step_seq
+        if committed_num_tokens is None:
+            committed_num_tokens = {}
+        elif not isinstance(committed_num_tokens, Mapping):
+            return RequestOwnedStepMarkResult(
+                accepted=False,
+                step_seq=step_seq,
+                error="committed_num_tokens must be a mapping keyed by OwnerLeaseKey.",
+            )
+        malformed_commit_keys = [
+            key for key in committed_num_tokens if not isinstance(key, OwnerLeaseKey)
+        ]
+        if malformed_commit_keys:
+            return RequestOwnedStepMarkResult(
+                accepted=False,
+                step_seq=step_seq,
+                error="committed_num_tokens keys must be OwnerLeaseKey "
+                f"instances, got {malformed_commit_keys!r}.",
+            )
         if metadata.owner_rank != self._owner_rank:
             return RequestOwnedStepMarkResult(
                 accepted=False,
@@ -635,6 +675,35 @@ class RequestOwnedKVStore:
                     f"record {record.num_computed_tokens} != snapshot "
                     f"{entry.pre_step_num_computed_tokens}.",
                 )
+            commit = committed_num_tokens.get(entry.key, entry.post_step_num_tokens)
+            if isinstance(commit, bool) or not isinstance(commit, int):
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"commit target for {entry.key!r} must be a "
+                    f"non-bool int, got {commit!r}.",
+                )
+            if entry.num_speculative_tokens == 0:
+                if commit != entry.post_step_num_tokens:
+                    return RequestOwnedStepMarkResult(
+                        accepted=False,
+                        step_seq=step_seq,
+                        error=f"non-spec commit for {entry.key!r} must equal "
+                        f"the post-step target {entry.post_step_num_tokens}, "
+                        f"got {commit}.",
+                    )
+            elif not (
+                entry.pre_step_num_computed_tokens + 1
+                <= commit
+                <= entry.post_step_num_tokens
+            ):
+                return RequestOwnedStepMarkResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"spec commit for {entry.key!r} must be in "
+                    f"[{entry.pre_step_num_computed_tokens + 1}, "
+                    f"{entry.post_step_num_tokens}], got {commit}.",
+                )
         # Batch completeness: the batch must cover exactly the expectations
         # armed by this step, so a metadata object missing an entry can
         # never mark a subset and strand the remainder.
@@ -644,6 +713,25 @@ class RequestOwnedKVStore:
             if expectation.step_seq == step_seq
         }
         batch_keys = {entry.key for entry in metadata.entries}
+        extra_commits = set(committed_num_tokens) - batch_keys
+        missing_spec_commits = {
+            entry.key
+            for entry in metadata.entries
+            if entry.num_speculative_tokens > 0
+            and entry.key not in committed_num_tokens
+        }
+        if extra_commits or missing_spec_commits:
+            key_order = lambda key: (key.request_id, key.owner_epoch)
+            return RequestOwnedStepMarkResult(
+                accepted=False,
+                step_seq=step_seq,
+                error=(
+                    "commit mapping mismatch: missing speculative commits "
+                    f"{sorted(missing_spec_commits, key=key_order)}, "
+                    "extra commits "
+                    f"{sorted(extra_commits, key=key_order)}."
+                ),
+            )
         if batch_keys != expected_keys:
             missing = expected_keys - batch_keys
             extra = batch_keys - expected_keys
@@ -659,7 +747,9 @@ class RequestOwnedKVStore:
             )
         for entry in metadata.entries:
             record = self._records[entry.key]
-            record.num_computed_tokens = entry.post_step_num_tokens
+            record.num_computed_tokens = committed_num_tokens.get(
+                entry.key, entry.post_step_num_tokens
+            )
             del self._pending_marks[entry.key]
         self._marked_step_seq = step_seq
         return RequestOwnedStepMarkResult(accepted=True, step_seq=step_seq)
@@ -669,6 +759,7 @@ class RequestOwnedKVStore:
         step_seq: int,
         tokens: Sequence[OwnerLeaseToken],
         request_token_counts: Mapping[str, int],
+        scheduled_spec_decode_tokens: Mapping[str, Sequence[int]] | None = None,
     ) -> RequestOwnedStepMetadataResult:
         """Freeze the immutable worker-local G3 execution metadata for one
         step from the exact own-rank lease tokens and the GLOBAL per-request
@@ -722,6 +813,15 @@ class RequestOwnedKVStore:
                 step_seq=step_seq,
                 error="tokens and request_token_counts must be the exact "
                 "own-rank lease tokens and the global per-request counts.",
+            )
+        if scheduled_spec_decode_tokens is None:
+            scheduled_spec_decode_tokens = {}
+        if not isinstance(scheduled_spec_decode_tokens, Mapping):
+            return RequestOwnedStepMetadataResult(
+                accepted=False,
+                step_seq=step_seq,
+                error="scheduled_spec_decode_tokens must be a mapping keyed "
+                "by request_id.",
             )
         if not isinstance(request_token_counts, Mapping):
             return RequestOwnedStepMetadataResult(
@@ -787,6 +887,30 @@ class RequestOwnedKVStore:
                 )
             if count > 0:
                 positive_requests.append(request_id)
+        for request_id, draft_tokens in scheduled_spec_decode_tokens.items():
+            count = request_token_counts.get(request_id)
+            if count is None or count <= 0:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"speculative tokens name unscheduled request "
+                    f"{request_id!r}.",
+                )
+            if not isinstance(draft_tokens, Sequence) or isinstance(
+                draft_tokens, (str, bytes)
+            ):
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"speculative tokens for {request_id!r} must be a sequence.",
+                )
+            if len(draft_tokens) > count - 1:
+                return RequestOwnedStepMetadataResult(
+                    accepted=False,
+                    step_seq=step_seq,
+                    error=f"{len(draft_tokens)} speculative tokens for "
+                    f"{request_id!r} exceed its {count}-token target step.",
+                )
 
         # Pre-build global live-pending fence: no new build (token-bearing
         # or heartbeat) may advance the build fence over an unconsumed
@@ -945,6 +1069,9 @@ class RequestOwnedKVStore:
                     self._records[token.key].pending_delta
                     if self._records[token.key].pending_delta is not None
                     else empty_delta
+                ),
+                num_speculative_tokens=len(
+                    scheduled_spec_decode_tokens.get(token.key.request_id, ())
                 ),
             )
             for token in lease_tokens
