@@ -47,11 +47,13 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ModelRunnerOutput,
+    OwnerSamplingBatch,
 )
 from vllm.v1.worker.request_owned_kv import (
     AllocationResult,
     DeferredFreeResult,
     RequestOwnedKVSnapshot,
+    RequestOwnedStepMarkResult,
     RequestOwnedStepMetadata,
 )
 from vllm.v1.worker.request_owned_offload import RequestOwnedBulkOffloadAdapter
@@ -90,6 +92,34 @@ class _BulkRestoreWorker(_FakeWorker):
         for item in work:
             self.restore_zero_plans.append(item.zero_block_ids)
             item.execute_after_zero()
+
+
+class _DeferredBulkRestoreWorker(_BulkRestoreWorker):
+    """Ascend-shaped zero-token owner-sampling heartbeat worker."""
+
+    def __init__(self, owner_rank: int = 0) -> None:
+        super().__init__()
+        self.owner_rank = owner_rank
+        self.output = None
+        self.sample_calls = 0
+        self.sample_grammar = object()
+        self.return_none_from_sample = False
+
+    def sample_tokens(self, grammar_output):
+        self.sample_calls += 1
+        self.sample_grammar = grammar_output
+        if self.return_none_from_sample:
+            return None
+        metadata = self.metadata_handoffs[-1]
+        output = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+        output.owner_sampling_batches = [
+            OwnerSamplingBatch(
+                owner_rank=self.owner_rank,
+                emitted_step_seq=metadata.step_seq,
+                row_ids=(),
+            )
+        ]
+        return output
 
 
 class _SyncOffloadingWorker(OffloadingWorker):
@@ -211,6 +241,13 @@ class _FakeStore:
     def flush(self):
         self.calls.append("flush")
         return ()
+
+    def mark_computed_batch(self, metadata):
+        self.calls.append("mark")
+        return RequestOwnedStepMarkResult(
+            accepted=True,
+            step_seq=metadata.step_seq,
+        )
 
     def pool_snapshot(self):
         self.calls.append("pool_snapshot")
@@ -947,6 +984,132 @@ def test_bulk_restore_rolls_back_on_late_step_failure_and_is_retryable() -> None
     assert retry_batch.events[0].pending_dma == 0
     assert store.is_restore_ready(key)
     assert len(worker.restore_zero_plans) == 3
+
+
+def test_bulk_restore_commits_deferred_sampling_heartbeat_synchronously() -> None:
+    worker = _DeferredBulkRestoreWorker()
+    wrapper = _real_wrapper(worker)
+    wrapper.vllm_config.scheduler_config.enable_request_owned_sampling = True
+    wrapper.vllm_config.scheduler_config.enable_request_owned_kv_offload = True
+    wrapper._request_owned_offload_adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=0,
+        manager=CPUOffloadingManager(num_blocks=8),
+        worker=_SyncOffloadingWorker(),
+    )
+    store = wrapper._request_owned_kv_store
+    assert store is not None
+    key = OwnerLeaseKey("req", 0)
+
+    worker.output = EMPTY_MODEL_RUNNER_OUTPUT
+    reserve_step = _output(step_seq=1)
+    reserve_step.owner_commands = [_real_reserve(owner_id=0, command_seq=1)]
+    wrapper.execute_model(reserve_step)
+    assert store.mark_computed(key, 6)
+
+    preempt_step = _output(step_seq=2)
+    preempt_step.owner_commands = [
+        OwnerCommand(
+            key=key,
+            owner_id=0,
+            command_seq=2,
+            kind=OwnerCommandKind.PREEMPT,
+            required_num_tokens=10,
+        )
+    ]
+    wrapper.execute_model(preempt_step)
+
+    worker.output = None
+    restore_step = _output(step_seq=3)
+    restore_step.owner_commands = [
+        OwnerCommand(
+            key=key,
+            owner_id=0,
+            command_seq=3,
+            kind=OwnerCommandKind.RESTORE,
+            required_num_tokens=10,
+        )
+    ]
+    worker.return_none_from_sample = True
+    with pytest.raises(RuntimeError, match="heartbeat sample_tokens returned None"):
+        wrapper.execute_model(restore_step)
+    assert store.snapshot(key) is None
+    assert wrapper._request_owned_restore_guard is None
+    assert wrapper._request_owned_deferred is None
+
+    worker.return_none_from_sample = False
+    result = wrapper.execute_model(restore_step)
+
+    assert worker.sample_calls == 2
+    assert worker.sample_grammar is None
+    assert result.owner_sampling_batches == [
+        OwnerSamplingBatch(owner_rank=0, emitted_step_seq=3, row_ids=())
+    ]
+    assert result.owner_receipt_batches is not None
+    receipt = result.owner_receipt_batches[0].events[0]
+    assert receipt.accepted
+    assert receipt.pending_dma == 0
+    assert store.is_restore_ready(key)
+    assert wrapper._request_owned_restore_guard is None
+    assert wrapper._request_owned_deferred is None
+    assert len(worker.restore_zero_plans) == 2
+
+
+def test_remote_rank_joins_global_restore_heartbeat_synchronously() -> None:
+    worker = _DeferredBulkRestoreWorker(owner_rank=1)
+    wrapper = _wrapper(1, worker)
+    wrapper.vllm_config.scheduler_config.enable_request_owned_sampling = True
+    step = _output(step_seq=7)
+    step.owner_commands = [
+        OwnerCommand(
+            key=OwnerLeaseKey("remote", 0),
+            owner_id=0,
+            command_seq=4,
+            kind=OwnerCommandKind.RESTORE,
+            required_num_tokens=10,
+        )
+    ]
+
+    result = wrapper.execute_model(step)
+
+    assert worker.sample_calls == 1
+    assert result.owner_sampling_batches == [
+        OwnerSamplingBatch(owner_rank=1, emitted_step_seq=7, row_ids=())
+    ]
+    assert result.owner_receipt_batches is not None
+    assert result.owner_receipt_batches[0].events == ()
+    assert wrapper._request_owned_restore_guard is None
+    assert wrapper._request_owned_deferred is None
+
+
+def test_global_restore_rejects_mixed_remote_command_before_execution() -> None:
+    worker = _DeferredBulkRestoreWorker(owner_rank=1)
+    store = _FakeStore(1)
+    wrapper = _wrapper(1, worker, store)
+    wrapper.vllm_config.scheduler_config.enable_request_owned_sampling = True
+    step = _output(step_seq=7)
+    step.owner_commands = [
+        OwnerCommand(
+            key=OwnerLeaseKey("remote-restore", 0),
+            owner_id=0,
+            command_seq=4,
+            kind=OwnerCommandKind.RESTORE,
+            required_num_tokens=10,
+        ),
+        OwnerCommand(
+            key=OwnerLeaseKey("remote-extend", 0),
+            owner_id=0,
+            command_seq=5,
+            kind=OwnerCommandKind.EXTEND,
+            required_num_tokens=12,
+        ),
+    ]
+
+    with pytest.raises(RuntimeError, match="exclusive zero-token global"):
+        wrapper.execute_model(step)
+
+    assert worker.calls == 0
+    assert worker.sample_calls == 0
+    assert store.calls == []
 
 
 # -- flush ordering ----------------------------------------------------------

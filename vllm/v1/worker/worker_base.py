@@ -787,27 +787,22 @@ class WorkerWrapperBase:
         restore_commands: list[OwnerCommand] = []
         restore_build_checkpoint: RequestOwnedStepBuildCheckpoint | None = None
 
-        own_commands = tuple(
-            command
+        restore_control_step = any(
+            command.kind is OwnerCommandKind.RESTORE
             for command in scheduler_output.owner_commands
-            if command.owner_id == self.global_rank
         )
-        if any(
-            command.kind is OwnerCommandKind.RESTORE for command in own_commands
-        ) and (
+        if restore_control_step and (
             any(
-                command.kind is not OwnerCommandKind.RESTORE for command in own_commands
+                command.kind is not OwnerCommandKind.RESTORE
+                for command in scheduler_output.owner_commands
             )
             or total_tokens != 0
             or any(count != 0 for count in per_request_tokens.values())
-            or any(
-                token.owner_id == self.global_rank
-                for token in scheduler_output.scheduled_owner_leases
-            )
+            or scheduler_output.scheduled_owner_leases
         ):
             raise RuntimeError(
                 "request-owned bulk RESTORE requires an exclusive zero-token "
-                "owner control step"
+                "global owner control step"
             )
 
         # Commands form one reliable in-order stream per owner.  Every worker
@@ -887,24 +882,33 @@ class WorkerWrapperBase:
         from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
         if sampling_enabled and output is None:
-            if self._request_owned_restore_guard is not None:
-                raise RuntimeError(
-                    "request-owned bulk RESTORE requires a synchronous "
-                    "terminal control-step receipt and cannot enter deferred "
-                    "sampling"
+            if restore_control_step:
+                # Ascend deliberately represents an owner-sampling zero-token
+                # heartbeat as execute_model() -> None followed by an empty
+                # sample_tokens() envelope. RESTORE must still commit in this
+                # synchronous collective RPC so the whole-step rollback guard
+                # never escapes across the executor's deferred boundary. Ask
+                # the concrete worker for that real heartbeat rather than
+                # fabricating an empty output (the sampling aggregator requires
+                # one owner-qualified empty batch from every rank).
+                output = self.worker.sample_tokens(None)
+            else:
+                # Deferred sampling: keep the trial manager and the exact
+                # metadata in one pending record keyed by step_seq.  Nothing is
+                # marked, flushed, emitted, or committed until sample_tokens
+                # completes the step.
+                self._request_owned_deferred = _RequestOwnedDeferredStep(
+                    step_seq=step_seq,
+                    trial_manager=trial_manager,
+                    metadata=metadata,
                 )
-            # Deferred sampling: keep the trial manager and the exact
-            # metadata in one pending record keyed by step_seq.  Nothing is
-            # marked, flushed, emitted, or committed until sample_tokens
-            # completes the step.
-            self._request_owned_deferred = _RequestOwnedDeferredStep(
-                step_seq=step_seq,
-                trial_manager=trial_manager,
-                metadata=metadata,
-            )
-            return None
+                return None
 
         if output is None:
+            if sampling_enabled and restore_control_step:
+                raise RuntimeError(
+                    "request-owned RESTORE heartbeat sample_tokens returned None"
+                )
             raise RuntimeError(
                 "request-owned attention G1 does not support split sampling: "
                 "execute_model returned None and no exact receipt FIFO exists."
