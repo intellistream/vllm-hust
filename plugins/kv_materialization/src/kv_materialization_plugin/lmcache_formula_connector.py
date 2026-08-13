@@ -8,11 +8,12 @@ consumed by the native worker.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generator
+from typing import TYPE_CHECKING, Any, Callable, Generator
 
 import lmcache_ascend  # noqa: F401  # activates Ascend LMCache integration
 from lmcache.logging import init_logger
@@ -35,6 +36,14 @@ from kv_materialization_plugin.lmcache_formula_reuse_policy import (
 from kv_materialization_plugin.lmcache_layer_prefetch import (
     install_layer_prefetch,
     wait_for_prefetched_layer,
+)
+from kv_materialization_plugin.lmcache_lifecycle_telemetry import (
+    LifecycleTelemetry,
+)
+from kv_materialization_plugin.store_admission_policy import (
+    StoreAdmissionConfig,
+    StoreAdmissionInput,
+    decide_store_admission,
 )
 
 logger = init_logger(__name__)
@@ -86,6 +95,160 @@ class FormulaLMCacheConnectorImpl(LMCacheAscendConnectorV1Impl):
         )
         self._formula_device_prefetch_installed = False
         self._formula_prefetch_audit_path = extra.get("formula_prefetch_audit_path")
+        lifecycle_path = extra.get("lifecycle_audit_output_path")
+        lifecycle_bytes_per_token = int(
+            extra.get(
+                "lifecycle_bytes_per_token",
+                self._logical_kv_bytes_per_token(vllm_config),
+            )
+        )
+        self._lifecycle_bytes_per_token = lifecycle_bytes_per_token
+        self._lifecycle_telemetry = (
+            LifecycleTelemetry(lifecycle_path, lifecycle_bytes_per_token)
+            if lifecycle_path
+            else None
+        )
+        self._lifecycle_wrapped_connector: Any | None = None
+        self._lifecycle_request_ids: list[str] = []
+        self._store_admission_enabled = bool(
+            extra.get("store_admission_enabled", False)
+        )
+        self._store_admission_config = StoreAdmissionConfig(
+            min_value_ms_per_gib=float(
+                extra.get("store_admission_min_value_ms_per_gib", 800.0)
+            ),
+            deadline_safety_margin_ms=float(
+                extra.get("store_admission_deadline_safety_margin_ms", 10.0)
+            ),
+            reuse_ttft_slo_ms=float(
+                extra.get("store_admission_reuse_ttft_slo_ms", 400.0)
+            ),
+            slo_rescue_bonus_ms=float(
+                extra.get("store_admission_slo_rescue_bonus_ms", 400.0)
+            ),
+            store_fixed_ms=float(
+                extra.get("store_admission_store_fixed_ms", 50.0)
+            ),
+            store_ms_per_gib=float(
+                extra.get("store_admission_store_ms_per_gib", 950.0)
+            ),
+        )
+        admission_path = extra.get("store_admission_audit_output_path")
+        self._store_admission_audit = (
+            Path(admission_path).open("a", encoding="utf-8", buffering=1)
+            if admission_path
+            else None
+        )
+
+    @staticmethod
+    def _logical_kv_bytes_per_token(vllm_config: "VllmConfig") -> int:
+        """计算当前 TP worker 的未压缩 KV 逻辑字节数。"""
+        model = vllm_config.model_config
+        parallel = vllm_config.parallel_config
+        dtype_bytes = {
+            "torch.float": 4,
+            "torch.float32": 4,
+            "torch.half": 2,
+            "torch.float16": 2,
+            "torch.bfloat16": 2,
+            "torch.float8_e4m3fn": 1,
+        }.get(str(model.dtype), 2)
+        return (
+            2
+            * model.get_num_layers(parallel)
+            * model.get_num_kv_heads(parallel)
+            * model.get_head_size()
+            * dtype_bytes
+        )
+
+    @staticmethod
+    def _transfer_tokens(args: tuple[Any, ...], kwargs: dict[str, Any]) -> int:
+        """从 LMCache 批传输参数中提取 token 区间总长度。"""
+        starts = kwargs.get("starts")
+        ends = kwargs.get("ends")
+        if starts is None or ends is None:
+            if len(args) < 2:
+                return 0
+            starts, ends = args[-2], args[-1]
+        try:
+            return sum(
+                max(0, int(end) - int(start))
+                for start, end in zip(starts, ends, strict=False)
+            )
+        except TypeError:
+            return 0
+
+    @staticmethod
+    def _transfer_batch_items(
+        args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> int:
+        """返回批传输中的 KV chunk 数，而不是 layer 数。"""
+        starts = kwargs.get("starts")
+        if starts is None and len(args) >= 2:
+            starts = args[-2]
+        try:
+            return len(starts)
+        except TypeError:
+            return 0
+
+    def _wrap_lifecycle_transfer(self, connector: Any, method_name: str) -> None:
+        """在 connector 实例上包装一次原生同步批传输调用。"""
+        telemetry = self._lifecycle_telemetry
+        native: Callable[..., Any] = getattr(connector, method_name)
+        direction = "load" if method_name == "batched_to_gpu" else "store"
+
+        is_layerwise = (
+            inspect.isgeneratorfunction(native)
+            or "Layerwise" in type(connector).__name__
+        )
+
+        def measured(*args: Any, **kwargs: Any) -> Any:
+            tokens = self._transfer_tokens(args, kwargs)
+            fields = {
+                "batch_items": self._transfer_batch_items(args, kwargs),
+                "request_ids": list(self._lifecycle_request_ids),
+            }
+            assert telemetry is not None
+            if is_layerwise:
+                generator = native(*args, **kwargs)
+                extra_advances = 2 if direction == "load" else 1
+                return telemetry.measure_generator(
+                    direction,
+                    tokens,
+                    generator,
+                    expected_advances=int(connector.num_layers) + extra_advances,
+                    fields=fields,
+                )
+            return telemetry.measure(
+                direction,
+                tokens,
+                lambda: native(*args, **kwargs),
+                fields=fields,
+            )
+
+        setattr(connector, method_name, measured)
+
+    def _install_lifecycle_telemetry(self) -> None:
+        """幂等安装实际 NPU connector 的 H2D/D2H 批次计时。"""
+        if self._lifecycle_telemetry is None or self.lmcache_engine is None:
+            return
+        connector = self.lmcache_engine.gpu_connector
+        if connector is self._lifecycle_wrapped_connector:
+            return
+        for method_name in ("batched_to_gpu", "batched_from_gpu"):
+            if hasattr(connector, method_name):
+                self._wrap_lifecycle_transfer(connector, method_name)
+        self._lifecycle_wrapped_connector = connector
+
+    def _record_lifecycle_step(self) -> None:
+        """记录本轮真实 connector metadata 中的请求计划。"""
+        telemetry = self._lifecycle_telemetry
+        if telemetry is None:
+            return
+        metadata = self._parent._get_connector_metadata()
+        requests = getattr(metadata, "requests", ())
+        self._lifecycle_request_ids = [str(request.req_id) for request in requests]
+        telemetry.record_step(requests)
 
     def _write_prefetch_audit(self, event: str, **fields: Any) -> None:
         """Low-level worker audit; avoids relying on process logger routing."""
@@ -130,6 +293,8 @@ class FormulaLMCacheConnectorImpl(LMCacheAscendConnectorV1Impl):
         self._formula_cpu_prefetch_installed = True
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        self._install_lifecycle_telemetry()
+        self._record_lifecycle_step()
         self._write_prefetch_audit(
             "start_load_enter",
             requested_window=self._formula_device_prefetch_window,
@@ -238,6 +403,46 @@ class FormulaLMCacheConnectorImpl(LMCacheAscendConnectorV1Impl):
     def build_connector_meta(self, scheduler_output):
         metadata = super().build_connector_meta(scheduler_output)
 
+        if self._store_admission_enabled:
+            for request_meta in metadata.requests:
+                save_spec = request_meta.save_spec
+                if save_spec is None or not save_spec.can_save:
+                    continue
+                configs = request_meta.request_configs or {}
+                required = (
+                    "lmcache.predicted_reuse_probability",
+                    "lmcache.predicted_reuse_delay_ms",
+                    "lmcache.predicted_recompute_ttft_ms",
+                    "lmcache.predicted_load_ttft_ms",
+                )
+                if not all(name in configs for name in required):
+                    # 兼容普通用户流量：没有预测字段时保持 LMCache 原生行为。
+                    continue
+                kv_bytes = (
+                    len(request_meta.token_ids)
+                    * self._lifecycle_bytes_per_token
+                )
+                decision = decide_store_admission(
+                    StoreAdmissionInput(
+                        predicted_reuse_probability=float(configs[required[0]]),
+                        predicted_reuse_delay_ms=float(configs[required[1]]),
+                        recompute_ttft_ms=float(configs[required[2]]),
+                        load_ttft_ms=float(configs[required[3]]),
+                        kv_bytes=kv_bytes,
+                    ),
+                    self._store_admission_config,
+                )
+                if not decision.admit:
+                    save_spec.can_save = False
+                if self._store_admission_audit is not None:
+                    self._store_admission_audit.write(json.dumps({
+                        "event": "store_admission",
+                        "request_id": request_meta.req_id,
+                        "token_count": len(request_meta.token_ids),
+                        "kv_bytes": kv_bytes,
+                        **asdict(decision),
+                    }, sort_keys=True) + "\n")
+
         # LMCache already owns the longer prefix.  Do not re-store the tail that
         # this policy deliberately recomputes merely because it was not loaded.
         # Keep this state separate from LoadSpec: LoadSpec must remain selected h
@@ -262,9 +467,14 @@ class FormulaLMCacheConnectorImpl(LMCacheAscendConnectorV1Impl):
         return metadata
 
     def shutdown(self):
+        if self._lifecycle_telemetry is not None:
+            self._lifecycle_telemetry.close()
         if self._formula_audit is not None:
             self._formula_audit.close()
             self._formula_audit = None
+        if self._store_admission_audit is not None:
+            self._store_admission_audit.close()
+            self._store_admission_audit = None
         return super().shutdown()
 
     def _write_formula_audit(self, request_id: str, decision: FormulaReuseDecision) -> None:
