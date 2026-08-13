@@ -1633,6 +1633,74 @@ def test_graph_window_decode_reservation_chunk_extends_command_only() -> None:
     assert resumed.num_scheduled_tokens == {"chunked": 1}
 
 
+def test_dspark_chunk_reservation_keeps_next_draft_tail_physical() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=64,
+        max_num_running_reqs=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_reservation_tokens=16,
+    )
+    scheduler.num_spec_tokens = 7
+    request = _request("dspark", num_prompt_tokens=32, max_tokens=32)
+    scheduler.add_request(request)
+
+    reserve_step = scheduler.schedule()
+    (reserve,) = reserve_step.owner_commands
+    # 32 prompt + 16 committed-token chunk + K=7 overwriteable draft tail.
+    assert reserve.required_num_tokens == 55
+    _apply_receipts(
+        scheduler,
+        reserve_step,
+        {0: [_receipt(reserve.key, 0, reserve.command_seq, runnable=55)]},
+    )
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"dspark": 32}
+    _ack_window_step(scheduler, prefill)
+
+    # The published physical fence stays at 55, but logical execution stops
+    # at 48 and requests an extension instead of consuming DSpark's K-slot
+    # tail.  That tail is what lets the next draft query cross a block edge.
+    request.num_computed_tokens = 48
+    request.append_output_token_ids([123] * 16)
+    extend_step = scheduler.schedule()
+    assert extend_step.num_scheduled_tokens == {}
+    assert extend_step.scheduled_owner_leases == []
+    (extend,) = extend_step.owner_commands
+    assert extend.kind is OwnerCommandKind.EXTEND
+    assert extend.required_num_tokens == 71
+
+
+def test_dspark_full_lifetime_lease_exposes_only_committable_prefix() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=64,
+        max_num_running_reqs=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    scheduler.num_spec_tokens = 7
+    request = _request("full", num_prompt_tokens=32, max_tokens=32)
+    scheduler.add_request(request)
+
+    reserve_step = scheduler.schedule()
+    (reserve,) = reserve_step.owner_commands
+    assert reserve.required_num_tokens == 71
+    _apply_receipts(
+        scheduler,
+        reserve_step,
+        {0: [_receipt(reserve.key, 0, reserve.command_seq, runnable=71)]},
+    )
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 63
+    request.append_output_token_ids([123] * 32)
+    assert scheduler._owner_plan_num_new_tokens(request) == 1
+    request.num_computed_tokens = 64
+    assert scheduler._owner_plan_num_new_tokens(request) == 0
+
+
 def test_decode_quantum_rotates_same_owner_ready_requests() -> None:
     scheduler = _make_scheduler(
         world_size=1,

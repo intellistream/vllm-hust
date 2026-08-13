@@ -3433,8 +3433,8 @@ class Scheduler(SchedulerInterface):
             None,
         )
         if decode_chunk is not None:
-            return min(
-                self._owner_lifetime_horizon(request),
+            return self._owner_physical_horizon(
+                request,
                 request.num_prompt_tokens + decode_chunk,
             )
         if getattr(
@@ -3444,7 +3444,11 @@ class Scheduler(SchedulerInterface):
         ):
             return self._owner_lifetime_horizon(request)
         remaining = request.num_tokens_with_spec - request.num_computed_tokens
-        return min(self.max_num_scheduled_tokens, remaining)
+        return self._owner_physical_horizon(
+            request,
+            request.num_computed_tokens
+            + min(self.max_num_scheduled_tokens, remaining),
+        )
 
     def _owner_resume_required(self, request: Request) -> int:
         """Chunk-scaled RESERVE required count on resume.
@@ -3463,9 +3467,12 @@ class Scheduler(SchedulerInterface):
             None,
         )
         if decode_chunk is not None:
-            return min(
-                self._owner_lifetime_horizon(request),
-                max(published, request.num_prompt_tokens + decode_chunk),
+            return max(
+                published,
+                self._owner_physical_horizon(
+                    request,
+                    request.num_prompt_tokens + decode_chunk,
+                ),
             )
         if getattr(
             self.scheduler_config,
@@ -3476,9 +3483,13 @@ class Scheduler(SchedulerInterface):
                 published,
                 self._owner_lifetime_horizon(request),
             )
-        return min(
-            max(request.num_tokens_with_spec, published),
-            max(published, self.max_num_scheduled_tokens),
+        logical_horizon = min(
+            request.num_tokens_with_spec,
+            self.max_num_scheduled_tokens,
+        )
+        return max(
+            published,
+            self._owner_physical_horizon(request, logical_horizon),
         )
 
     def _owner_extend_required(self, request: Request) -> int:
@@ -3493,17 +3504,67 @@ class Scheduler(SchedulerInterface):
             "request_owned_decode_reservation_tokens",
             None,
         )
-        increment = (
-            decode_chunk if decode_chunk is not None else self.max_num_scheduled_tokens
-        )
-        upper_bound = (
-            self._owner_lifetime_horizon(request)
+        logical_upper_bound = (
+            self._owner_logical_lifetime_horizon(request)
             if decode_chunk is not None
             else max(request.num_tokens_with_spec, request.num_computed_tokens)
         )
+        increment = (
+            decode_chunk if decode_chunk is not None else self.max_num_scheduled_tokens
+        )
+        return self._owner_physical_horizon(
+            request,
+            min(
+                logical_upper_bound,
+                request.num_computed_tokens + increment,
+            ),
+        )
+
+    def _owner_logical_runnable_horizon(
+        self,
+        request: Request,
+        physical_horizon: int,
+    ) -> int:
+        """Logical progress allowed by one physical owner reservation.
+
+        A speculative lease has two different watermarks.  The scheduler may
+        commit only through the logical horizon, while the worker must keep K
+        additional physical positions available for the *next* draft pass.
+        DSpark shifts its K-row query block after every accepted prefix, so a
+        target step ending exactly at the physical fence is not safe: even a
+        one-token commit can make the following draft touch the next block.
+
+        Prefill remains runnable through its prompt even when ``max_model_len``
+        leaves fewer than K tail positions; the ordinary scheduler/model-end
+        checks are still authoritative for the shortened terminal proposal.
+        """
+        if self.num_spec_tokens <= 0:
+            return physical_horizon
+        return max(
+            min(request.num_prompt_tokens, physical_horizon),
+            physical_horizon - self.num_spec_tokens,
+        )
+
+    def _owner_logical_lifetime_horizon(self, request: Request) -> int:
+        """Maximum committed-token horizon for one request incarnation."""
         return min(
-            upper_bound,
-            request.num_computed_tokens + increment,
+            self.max_model_len,
+            request.num_prompt_tokens + request.max_tokens,
+        )
+
+    def _owner_physical_horizon(
+        self,
+        request: Request,
+        logical_horizon: int,
+    ) -> int:
+        """Add the overwriteable K-token draft tail to a logical fence."""
+        logical_horizon = min(
+            self._owner_logical_lifetime_horizon(request),
+            logical_horizon,
+        )
+        return min(
+            self.max_model_len,
+            logical_horizon + self.num_spec_tokens,
         )
 
     def _owner_lifetime_horizon(self, request: Request) -> int:
@@ -3515,9 +3576,9 @@ class Scheduler(SchedulerInterface):
         progress; the worker's commit watermark decides which prefix
         survives verification.
         """
-        return min(
-            self.max_model_len,
-            request.num_prompt_tokens + request.max_tokens + self.num_spec_tokens,
+        return self._owner_physical_horizon(
+            request,
+            self._owner_logical_lifetime_horizon(request),
         )
 
     def _assign_owner_and_reserve(self, request: Request, key: OwnerLeaseKey) -> None:
@@ -3669,9 +3730,13 @@ class Scheduler(SchedulerInterface):
         coordinator = self.owner_coordinator
         assert coordinator is not None
         key = self._owner_key[request.request_id]
-        horizon = coordinator.runnable_num_tokens_of(key)
-        if horizon is None:
+        physical_horizon = coordinator.runnable_num_tokens_of(key)
+        if physical_horizon is None:
             return 0
+        horizon = self._owner_logical_runnable_horizon(
+            request,
+            physical_horizon,
+        )
         remaining = request.num_tokens_with_spec - request.num_computed_tokens
         desired = min(self.max_num_scheduled_tokens, remaining)
         desired = min(
