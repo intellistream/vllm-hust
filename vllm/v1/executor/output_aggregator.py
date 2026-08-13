@@ -648,8 +648,9 @@ class ModelRunnerOutputAggregator:
         Builds a fresh output (never mutating worker outputs or the
         ``EMPTY_MODEL_RUNNER_OUTPUT`` singleton).  Merging is proven only
         for: bijective ``req_ids`` / ``req_id_to_index``, one
-        ``sampled_token_ids`` entry per request (``[]`` for
-        discarded/no-token attempts), and ``logprobs`` /
+        ``sampled_token_ids`` list per request (``[]`` for
+        discarded/no-token attempts and one-or-more entries for ordinary or
+        speculative output), and ``logprobs`` /
         ``num_nans_in_logits`` under the shape invariants below.
         ``logprobs`` merge is only proven when every request has exactly one
         token, because a zero-token/discarded attempt may or may not
@@ -663,6 +664,7 @@ class ModelRunnerOutputAggregator:
         max_num_logprobs: int | None = None
         any_logprobs = False
         any_zero_token = False
+        any_multi_token = False
         merged_num_nans: dict[str, int] = {}
         any_num_nans = False
         for slot, output in enumerate(outputs):
@@ -718,14 +720,16 @@ class ModelRunnerOutputAggregator:
                     f"{len(output.req_ids)} requests)."
                 )
             for tokens in output.sampled_token_ids:
-                if not isinstance(tokens, list) or len(tokens) > 1:
+                if not isinstance(tokens, list):
                     raise RuntimeError(
-                        "ModelRunnerOutputAggregator: spec-shaped "
-                        f"multi-token sampling is unsupported (slot {slot}, "
-                        f"got {tokens!r}); refusing to merge."
+                        "ModelRunnerOutputAggregator: every sampled-token "
+                        f"entry must be a list (slot {slot}, got "
+                        f"{type(tokens).__name__}); refusing to merge."
                     )
                 if not tokens:
                     any_zero_token = True
+                elif len(tokens) > 1:
+                    any_multi_token = True
             logprobs = output.logprobs
             if logprobs is not None:
                 if not isinstance(logprobs, LogprobsLists):
@@ -817,6 +821,13 @@ class ModelRunnerOutputAggregator:
                 "zero-token/discarded requests is ambiguous (a discarded "
                 "attempt may or may not contribute a logprobs row); "
                 "refusing to merge."
+            )
+        if any_logprobs and any_multi_token:
+            raise RuntimeError(
+                "ModelRunnerOutputAggregator: merging logprobs alongside "
+                "speculative multi-token requests is unsupported until the "
+                "per-owner cu_num_generated_tokens vectors are composed; "
+                "refusing to misalign merged logprobs."
             )
 
         if any_logprobs:
