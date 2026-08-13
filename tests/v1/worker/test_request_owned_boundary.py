@@ -135,7 +135,13 @@ class _FakeStore:
             error="RESTORE is out of scope for the physical KV store",
         )
 
-    def build_step_metadata(self, step_seq, tokens, request_token_counts):
+    def build_step_metadata(
+        self,
+        step_seq,
+        tokens,
+        request_token_counts,
+        scheduled_spec_decode_tokens,
+    ):
         self.calls.append("build")
         self.last_build_step = step_seq
         self.last_build_tokens = tuple(tokens)

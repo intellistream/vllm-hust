@@ -23,6 +23,7 @@ from vllm.v1.core.sched.ownership import (
     AttentionLeaseManager,
     OwnerCommand,
     OwnerCommandKind,
+    OwnerLeaseKey,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -886,7 +887,10 @@ class WorkerWrapperBase:
             if token.owner_id == self.global_rank
         ]
         build = store.build_step_metadata(
-            step_seq, own_rank_tokens, scheduler_output.num_scheduled_tokens
+            step_seq,
+            own_rank_tokens,
+            scheduler_output.num_scheduled_tokens,
+            scheduler_output.scheduled_spec_decode_tokens,
         )
         if not build.accepted:
             raise RuntimeError(
@@ -1035,7 +1039,10 @@ class WorkerWrapperBase:
         # rejection fails closed with no partial logical commit.  Marking
         # empty execution metadata (a zero-token heartbeat step) is a valid
         # no-op accepted by the store.
-        mark = store.mark_computed_batch(metadata)
+        committed_num_tokens = self._request_owned_committed_num_tokens(
+            metadata, result
+        )
+        mark = store.mark_computed_batch(metadata, committed_num_tokens)
         if not mark.accepted:
             raise RuntimeError(
                 "request-owned computed batch mark failed: "
@@ -1067,6 +1074,46 @@ class WorkerWrapperBase:
             raise
         self._request_owned_control_manager = trial_manager
         return result
+
+    @staticmethod
+    def _request_owned_committed_num_tokens(
+        metadata: RequestOwnedStepMetadata,
+        output: ModelRunnerOutput,
+    ) -> dict[OwnerLeaseKey, int]:
+        """Derive verified logical KV commits from a terminal output.
+
+        Execution writes the complete speculative target horizon, while
+        sampling returns only the accepted prefix plus one terminal token.
+        The returned mapping advances spec entries by exactly that emitted
+        count.  Non-spec entries retain the store's exact-post contract and
+        therefore need no override.
+        """
+        commits: dict[OwnerLeaseKey, int] = {}
+        for entry in metadata.entries:
+            if entry.num_speculative_tokens == 0:
+                continue
+            req_id = entry.key.request_id
+            index = output.req_id_to_index.get(req_id)
+            if index is None or index < 0 or index >= len(output.sampled_token_ids):
+                raise RuntimeError(
+                    "request-owned speculative completion is missing the "
+                    f"terminal output for {req_id!r}."
+                )
+            tokens = output.sampled_token_ids[index]
+            if not isinstance(tokens, list):
+                raise RuntimeError(
+                    "request-owned speculative completion requires a list "
+                    f"of sampled tokens for {req_id!r}, got "
+                    f"{type(tokens).__name__}."
+                )
+            if not 1 <= len(tokens) <= entry.num_speculative_tokens + 1:
+                raise RuntimeError(
+                    "request-owned speculative completion emitted an "
+                    f"invalid token count for {req_id!r}: got {len(tokens)}, "
+                    f"expected 1..{entry.num_speculative_tokens + 1}."
+                )
+            commits[entry.key] = entry.pre_step_num_computed_tokens + len(tokens)
+        return commits
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
