@@ -247,10 +247,10 @@ class OwnerOffloadPlan:
                     )
                 seen_blocks.add(block_id)
             for key in keys:
-                if not isinstance(key, bytes) or not key:
+                if not isinstance(key, bytes) or len(key) <= 4:
                     raise TypeError(
-                        "offload keys must be nonempty bytes-compatible OffloadKey "
-                        f"values, got {key!r}."
+                        "offload keys must contain a nonempty hash plus the "
+                        f"four-byte group suffix, got {key!r}."
                     )
                 if get_offload_group_idx(key) != group_index:
                     raise ValueError(
@@ -282,6 +282,7 @@ class OwnerOffloadPlan:
                 f"{len(snapshot.tables)} != {len(offload_keys)}."
             )
         device_block_ids: list[tuple[int, ...]] = []
+        transfer_keys: list[tuple[OffloadKey, ...]] = []
         for group_index, (table, keys) in enumerate(zip(snapshot.tables, offload_keys)):
             if not isinstance(keys, tuple):
                 raise TypeError(f"offload key group {group_index} must be a tuple")
@@ -290,11 +291,22 @@ class OwnerOffloadPlan:
                     f"group {group_index} requests {len(keys)} host keys but the "
                     f"owner-local table has only {len(table)} blocks."
                 )
-            device_block_ids.append(table[: len(keys)])
+            # Hybrid KV managers keep logical alignment by inserting the
+            # pool's block-0 null sentinel for skipped sliding-window/SSM
+            # states. It has no request bytes to persist and generic offload
+            # skips it too. Preserve the logical key position while removing
+            # the null pair from the concrete 1:1 transfer plan.
+            concrete = tuple(
+                (block_id, key)
+                for block_id, key in zip(table[: len(keys)], keys)
+                if block_id != 0
+            )
+            device_block_ids.append(tuple(block_id for block_id, _ in concrete))
+            transfer_keys.append(tuple(key for _, key in concrete))
         return cls(
             identity=OwnerOffloadIdentity.from_snapshot(snapshot),
             device_block_ids=tuple(device_block_ids),
-            offload_keys=offload_keys,
+            offload_keys=tuple(transfer_keys),
         )
 
 
@@ -649,10 +661,13 @@ class RequestOwnedBulkOffloadLedger:
             )
         for group_index, block_ids in enumerate(plan.device_block_ids):
             table = state.snapshot.tables[group_index]
-            if table[: len(block_ids)] != block_ids:
+            concrete_prefix = tuple(block_id for block_id in table if block_id != 0)[
+                : len(block_ids)
+            ]
+            if concrete_prefix != block_ids:
                 raise RequestOwnedOffloadError(
                     f"group {group_index} transfer blocks are not the bound "
-                    "table prefix"
+                    "concrete table prefix"
                 )
         return state
 

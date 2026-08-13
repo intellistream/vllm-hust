@@ -273,6 +273,21 @@ def test_plan_rejects_non_exact_geometry_and_null_or_duplicate_blocks() -> None:
             device_block_ids=((1,), (3,)),
             offload_keys=((make_offload_key(b"a", 1),), (make_offload_key(b"b", 1),)),
         )
+    with pytest.raises(TypeError, match="nonempty hash"):
+        OwnerOffloadPlan(
+            identity=identity,
+            device_block_ids=((1,), (3,)),
+            offload_keys=((b"\0\0\0\0",), (make_offload_key(b"b", 1),)),
+        )
+
+
+def test_plan_skips_null_placeholders_and_their_logical_keys() -> None:
+    snapshot = _snapshot(tables=((0, 2), (3, 0)))
+    keys = _keys()
+    plan = OwnerOffloadPlan.from_snapshot(snapshot, keys)
+
+    assert plan.device_block_ids == ((2,), (3,))
+    assert plan.offload_keys == ((keys[0][1],), (keys[1][0],))
 
 
 def test_owner_host_keys_survive_generation_but_fence_partial_extension() -> None:

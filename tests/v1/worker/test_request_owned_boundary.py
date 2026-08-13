@@ -51,6 +51,7 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.request_owned_kv import (
     AllocationResult,
     DeferredFreeResult,
+    RequestOwnedKVSnapshot,
     RequestOwnedStepMetadata,
 )
 from vllm.v1.worker.request_owned_offload import RequestOwnedBulkOffloadAdapter
@@ -828,6 +829,45 @@ def test_exclusive_bulk_preempt_restore_resume_emits_terminal_receipt() -> None:
     resume_batch = wrapper.execute_model(resume_step).owner_receipt_batches[0]
     assert resume_batch.events[0].accepted
     assert not store.is_restore_ready(key)
+
+
+def test_bulk_preempt_skips_hybrid_null_block_placeholders() -> None:
+    wrapper = _wrapper(0, _FakeWorker())
+    wrapper._request_owned_offload_adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=0,
+        manager=CPUOffloadingManager(num_blocks=8),
+        worker=_SyncOffloadingWorker(),
+    )
+    key = OwnerLeaseKey("req", 0)
+    snapshot = RequestOwnedKVSnapshot(
+        key=key,
+        owner_rank=0,
+        allocation_generation=1,
+        num_computed_tokens=8,
+        reserved_num_tokens=8,
+        pending_free=True,
+        tables=((0, 2), (3, 0)),
+    )
+
+    class _NullPlaceholderStore:
+        group_block_sizes = (4, 4)
+
+        def computed_prefix_snapshot(self, candidate):
+            assert candidate == key
+            return snapshot
+
+        def preempt(self, command):
+            return DeferredFreeResult(accepted=True, key=command.key, deferred=True)
+
+    command = OwnerCommand(
+        key=key,
+        owner_id=0,
+        command_seq=1,
+        kind=OwnerCommandKind.PREEMPT,
+        required_num_tokens=8,
+    )
+    result = wrapper._store_request_owned_preempt(command, _NullPlaceholderStore())
+    assert result.accepted
 
 
 def test_bulk_restore_rolls_back_on_late_step_failure_and_is_retryable() -> None:

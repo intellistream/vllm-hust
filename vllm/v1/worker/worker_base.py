@@ -1153,7 +1153,7 @@ class WorkerWrapperBase:
                 error=receipt.error,
             )
         reclaimable = adapter.take_reclaimable(identity)
-        if reclaimable != snapshot.tables:
+        if reclaimable != plan.device_block_ids:
             raise RequestOwnedOffloadError(
                 "PREEMPT durable receipt named the wrong physical source"
             )
