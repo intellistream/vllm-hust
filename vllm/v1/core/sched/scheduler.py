@@ -2723,6 +2723,17 @@ class Scheduler(SchedulerInterface):
             scheduled_owner_leases=scheduled_owner_leases,
         )
 
+        # The request-owned scheduler bypasses the ordinary KV block planner,
+        # but O-line bulk offload still installs an exclusive connector whose
+        # worker-side lifecycle expects a non-None metadata envelope on every
+        # step.  The connector is deliberately inert for generic jobs; invoke
+        # its standard builder here so it can supply that empty typed envelope
+        # without leaking generic scheduler ownership into the O-line path.
+        if self.connector is not None:
+            scheduler_output.kv_connector_metadata = self._build_kv_connector_meta(
+                self.connector, scheduler_output
+            )
+
         if getattr(
             self.scheduler_config,
             "enable_request_owned_windows",

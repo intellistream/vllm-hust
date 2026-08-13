@@ -75,6 +75,16 @@ class _KVCacheSpy:
         raise AttributeError(name)
 
 
+class _ConnectorMetadataSpy:
+    def __init__(self) -> None:
+        self.outputs = []
+        self.metadata = object()
+
+    def build_connector_meta(self, scheduler_output):
+        self.outputs.append(scheduler_output)
+        return self.metadata
+
+
 def _make_scheduler(
     *,
     world_size: int = 2,
@@ -320,6 +330,19 @@ def test_empty_control_step_is_valid_and_stamps_step() -> None:
     assert [o.owner_id for o in out.owner_assignment_observations] == [0, 1]
     # The empty envelope round-trips.
     _apply_receipts(scheduler, out, {})
+
+
+def test_offloaded_control_step_builds_typed_connector_metadata() -> None:
+    scheduler = _make_scheduler(enable_request_owned_kv_offload=True)
+    connector = _ConnectorMetadataSpy()
+    scheduler.connector = connector
+
+    out = scheduler.schedule()
+
+    assert connector.outputs == [out]
+    assert out.kv_connector_metadata is connector.metadata
+    assert out.owner_commands == []
+    assert out.total_num_scheduled_tokens == 0
 
 
 def test_layout_probe_records_worker_confirmed_post_step_capacity(tmp_path) -> None:
