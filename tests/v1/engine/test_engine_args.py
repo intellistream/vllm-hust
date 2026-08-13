@@ -156,7 +156,7 @@ def test_request_owned_flags_default_false():
     assert engine_args.enable_request_owned_sampling is False
     assert engine_args.enable_request_owned_graph is False
     assert engine_args.enable_request_owned_windows is False
-    assert engine_args.request_owned_decode_window_steps == 32
+    assert engine_args.request_owned_decode_window_steps == 1
     assert engine_args.request_owned_decode_reservation_tokens is None
 
     vllm_config = engine_args.create_engine_config()
@@ -165,7 +165,7 @@ def test_request_owned_flags_default_false():
     assert vllm_config.scheduler_config.enable_request_owned_sampling is False
     assert vllm_config.scheduler_config.enable_request_owned_graph is False
     assert vllm_config.scheduler_config.enable_request_owned_windows is False
-    assert vllm_config.scheduler_config.request_owned_decode_window_steps == 32
+    assert vllm_config.scheduler_config.request_owned_decode_window_steps == 1
     assert vllm_config.scheduler_config.request_owned_decode_reservation_tokens is None
 
 

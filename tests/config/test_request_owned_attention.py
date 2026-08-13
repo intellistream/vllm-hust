@@ -67,7 +67,7 @@ def _vllm_config(
     enable_request_owned_q_wkv_fanin: bool = False,
     enable_request_owned_graph: bool = False,
     enable_request_owned_windows: bool = False,
-    request_owned_decode_window_steps: int = 32,
+    request_owned_decode_window_steps: int = 1,
     scheduler_config: SchedulerConfig | None = None,
     compilation_config: CompilationConfig | None = None,
     parallel_config: ParallelConfig | None = None,
@@ -108,7 +108,7 @@ def test_request_owned_attention_defaults_off():
     assert SchedulerConfig.default_factory().enable_request_owned_q_wkv_fanin is False
     assert SchedulerConfig.default_factory().enable_request_owned_graph is False
     assert SchedulerConfig.default_factory().enable_request_owned_windows is False
-    assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 32
+    assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 1
     assert (
         SchedulerConfig.default_factory().request_owned_decode_reservation_tokens
         is None
@@ -117,7 +117,7 @@ def test_request_owned_attention_defaults_off():
     assert VllmConfig().scheduler_config.enable_request_owned_q_wkv_fanin is False
     assert VllmConfig().scheduler_config.enable_request_owned_graph is False
     assert VllmConfig().scheduler_config.enable_request_owned_windows is False
-    assert VllmConfig().scheduler_config.request_owned_decode_window_steps == 32
+    assert VllmConfig().scheduler_config.request_owned_decode_window_steps == 1
     assert (
         VllmConfig().scheduler_config.request_owned_decode_reservation_tokens is None
     )

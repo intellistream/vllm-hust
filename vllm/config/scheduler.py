@@ -224,12 +224,13 @@ class SchedulerConfig:
     scheduling or preemption authority.  This is a scheduling policy only and
     does not change the compiled model graph."""
 
-    request_owned_decode_window_steps: int = Field(default=32, ge=1)
+    request_owned_decode_window_steps: int = Field(default=1, ge=1)
     """Maximum acknowledged decode steps before a window boundary.
 
     At the boundary, queued prefill work receives one bounded wave before the
-    scheduler reforms the next owner-ordered decode cohort.  The default keeps
-    a useful FULL-graph run while bounding queueing delay; it is ignored unless
+    scheduler reforms the next owner-ordered decode cohort.  Device evidence
+    found no distinguishable throughput cost at one step versus two while the
+    shorter boundary reduced late-prefill wait.  The value is ignored unless
     ``enable_request_owned_windows`` is true."""
 
     request_owned_decode_reservation_tokens: int | None = Field(default=None, ge=1)

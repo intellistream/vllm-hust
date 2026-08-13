@@ -82,7 +82,7 @@ def _make_scheduler(
     max_num_running_reqs: int = 16,
     enable_request_owned_graph: bool = False,
     enable_request_owned_windows: bool = False,
-    request_owned_decode_window_steps: int = 32,
+    request_owned_decode_window_steps: int = 1,
     request_owned_decode_reservation_tokens: int | None = None,
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
