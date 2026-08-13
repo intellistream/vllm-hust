@@ -251,10 +251,7 @@ class CudagraphDispatcher:
                 if x <= max_num_tokens and x >= uniform_decode_query_len
             ]
             if request_owned_full_signature is not None:
-                fixed_num_tokens = (
-                    sum(request_owned_full_signature.owner_counts)
-                    * uniform_decode_query_len
-                )
+                fixed_num_tokens = sum(request_owned_full_signature.owner_counts)
                 cudagraph_capture_sizes_for_decode = [
                     x
                     for x in cudagraph_capture_sizes_for_decode
