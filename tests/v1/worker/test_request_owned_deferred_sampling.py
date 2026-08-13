@@ -123,7 +123,13 @@ class _FakeStore:
             error="RESTORE is out of scope for the physical KV store",
         )
 
-    def build_step_metadata(self, step_seq, tokens, request_token_counts):
+    def build_step_metadata(
+        self,
+        step_seq,
+        tokens,
+        request_token_counts,
+        scheduled_spec_decode_tokens,
+    ):
         self.calls.append("build")
         if self.reject_build:
             return SimpleNamespace(
@@ -141,7 +147,7 @@ class _FakeStore:
             error=None,
         )
 
-    def mark_computed_batch(self, metadata):
+    def mark_computed_batch(self, metadata, committed_num_tokens=None):
         self.calls.append("mark")
         self.mark_calls += 1
         self.last_mark_metadata = metadata

@@ -1439,3 +1439,96 @@ def test_mark_computed_batch_expectation_generation_mismatch():
     assert "expectation generation" in rejected.error
     assert store._records[key].num_computed_tokens == 0
     assert key in store._pending_marks
+
+
+def test_speculative_mark_commits_verified_prefix_and_reuses_reserved_tail():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("spec")
+    initial = _free(manager)
+    reserve = store.reserve(_command(key, OwnerCommandKind.RESERVE, required=16, seq=1))
+    assert reserve.accepted
+    assert _sizes(reserve.tables) == (4, 4)
+
+    # The allocation publication heartbeat separates RESERVE from execution.
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(
+        2,
+        [_token(key, 16, step_seq=2)],
+        {"spec": 4},
+        {"spec": [11, 12, 13]},
+    )
+    assert built.accepted
+    (entry,) = built.metadata.entries
+    assert entry.pre_step_num_computed_tokens == 0
+    assert entry.post_step_num_tokens == 4
+    assert entry.num_speculative_tokens == 3
+
+    # One accepted draft plus the correction token commits two positions;
+    # the complete four-position execution remains physically resident.
+    marked = store.mark_computed_batch(built.metadata, {key: 2})
+    assert marked.accepted
+    assert store._records[key].num_computed_tokens == 2
+    assert store._records[key].reserved_num_tokens == 16
+    assert store.get_block_table(key) == reserve.tables
+    assert _free(manager) == initial - 8
+
+    # The next target step starts from the verified prefix and overwrites the
+    # rejected suffix without allocating it again.
+    next_step = store.build_step_metadata(
+        3,
+        [_token(key, 16, step_seq=3)],
+        {"spec": 4},
+        {"spec": [21, 22, 23]},
+    )
+    assert next_step.accepted
+    (next_entry,) = next_step.metadata.entries
+    assert next_entry.pre_step_num_computed_tokens == 2
+    assert next_entry.post_step_num_tokens == 6
+    assert next_entry.tables == reserve.tables
+    assert store.mark_computed_batch(next_step.metadata, {key: 6}).accepted
+
+    # A later EXTEND allocates only beyond the physical watermark (16), not
+    # from the logical watermark (6).
+    extended = store.extend(_command(key, OwnerCommandKind.EXTEND, required=20, seq=2))
+    assert extended.accepted
+    assert _sizes(extended.tables) == (5, 5)
+    assert _sizes(extended.delta) == (1, 1)
+    # The synthetic second cache group is sliding-window: advancing from the
+    # physical watermark lets it recycle expired blocks while full attention
+    # grows by one block.  Pool usage therefore stays flat here; critically,
+    # the rejected logical suffix was not allocated a second time.
+    assert _free(manager) == initial - 8
+
+
+def test_speculative_mark_requires_atomic_in_range_commit_mapping():
+    manager = _make_manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    key = _key("spec")
+    assert store.reserve(
+        _command(key, OwnerCommandKind.RESERVE, required=8, seq=1)
+    ).accepted
+    assert store.build_step_metadata(1, [], {}).accepted
+    built = store.build_step_metadata(
+        2,
+        [_token(key, 8, step_seq=2)],
+        {"spec": 4},
+        {"spec": [1, 2, 3]},
+    )
+    assert built.accepted
+
+    missing = store.mark_computed_batch(built.metadata)
+    assert not missing.accepted
+    assert "missing speculative commits" in missing.error
+    assert store._records[key].num_computed_tokens == 0
+
+    too_low = store.mark_computed_batch(built.metadata, {key: 0})
+    assert not too_low.accepted
+    assert "must be in [1, 4]" in too_low.error
+    assert store._records[key].num_computed_tokens == 0
+
+    too_high = store.mark_computed_batch(built.metadata, {key: 5})
+    assert not too_high.accepted
+    assert "must be in [1, 4]" in too_high.error
+    assert store._records[key].num_computed_tokens == 0
+    assert store.mark_computed_batch(built.metadata, {key: 1}).accepted

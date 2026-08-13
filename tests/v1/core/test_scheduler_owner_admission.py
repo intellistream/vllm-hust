@@ -117,6 +117,7 @@ def _make_scheduler(
     scheduler.reset_preempted_req_ids = set()
     scheduler.finished_req_ids_dict = None
     scheduler.num_spec_tokens = 0
+    scheduler.num_sampled_tokens_per_step = 1
     scheduler.enable_return_routed_experts = False
     scheduler._inflight_prefills = set()
     scheduler._pause_state = PauseState.UNPAUSED
@@ -507,6 +508,32 @@ def test_horizon_cap_extend_stall_and_refused_extend_retry() -> None:
     assert token.command_seq == retry.command_seq
     # Cumulative exclusive horizon: positions [0, 16) runnable now.
     assert token.runnable_num_tokens == 16
+
+
+def test_request_owned_scheduler_publishes_complete_dspark_target_step() -> None:
+    scheduler = _make_scheduler(
+        max_num_scheduled_tokens=16,
+        request_owned_decode_reservation_tokens=16,
+    )
+    scheduler.num_spec_tokens = 3
+    request = _request("spec", num_prompt_tokens=1, max_tokens=12)
+    scheduler.add_request(request)
+    prefill = _admit(scheduler, request, grant=16)
+    assert prefill.num_scheduled_tokens == {"spec": 1}
+    _apply_window_step(scheduler, prefill, {})
+
+    request.spec_token_ids = [41, 42, 43]
+    verify = scheduler.schedule()
+    assert verify.num_scheduled_tokens == {"spec": 4}
+    assert verify.scheduled_spec_decode_tokens == {"spec": [41, 42, 43]}
+    assert request.spec_token_ids == []
+
+    # Rejecting every draft still commits the ordinary correction token;
+    # the existing scheduler output path rolls optimistic K+1 progress back
+    # to the verified logical prefix.
+    pre_step = request.num_computed_tokens - 4
+    _apply_window_step(scheduler, verify, {})
+    assert request.num_computed_tokens == pre_step + 1
 
 
 def test_preempt_receipt_resume_keeps_sticky_owner_and_restarts_prefill() -> None:
@@ -1114,8 +1141,7 @@ def test_owner_graph_balanced_prefill_chunks_exact_cohort_in_lockstep() -> None:
 
     reserve_step = scheduler.schedule()
     commands = {
-        command.key.request_id: command
-        for command in reserve_step.owner_commands
+        command.key.request_id: command for command in reserve_step.owner_commands
     }
     assert {command.owner_id for command in commands.values()} == set(range(8))
     _apply_receipts(
@@ -1856,8 +1882,7 @@ def test_zero_budget_promotion_remains_new_until_first_dispatch() -> None:
 
     reserve_step = scheduler.schedule()
     commands = {
-        command.key.request_id: command
-        for command in reserve_step.owner_commands
+        command.key.request_id: command for command in reserve_step.owner_commands
     }
     assert set(commands) == {"req-0", "req-1", "req-2"}
     events_by_rank = {}
