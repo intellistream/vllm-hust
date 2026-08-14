@@ -29,7 +29,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.worker.request_owned_kv import RequestOwnedKVSnapshot
+from vllm.v1.worker.request_owned_kv import (
+    RequestOwnedKVSnapshot,
+    request_owned_effective_tokens_per_block,
+)
 
 RESTORE_PLAN_SCHEMA = "request-owned-restore-plan/v1"
 
@@ -276,8 +279,8 @@ class PackedRestoreGeometry:
                 )
             start = min(item.offset_bytes for item in slices)
             end = max(item.offset_bytes + item.page_bytes for item in slices)
-            effective_tokens = group.kv_cache_spec.block_size * max(
-                1, int(getattr(group.kv_cache_spec, "compress_ratio", 1))
+            effective_tokens = request_owned_effective_tokens_per_block(
+                group.kv_cache_spec
             )
             geometries.append(
                 RestoreGroupGeometry(

@@ -84,6 +84,7 @@ from vllm.v1.core.sched.ownership import (
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
+    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 from vllm.v1.request import RequestStatus
@@ -114,6 +115,59 @@ class _AllocationRequest:
         self.num_computed_tokens = num_computed_tokens
         self.num_prompt_tokens = num_prompt_tokens
         self.status = RequestStatus.RUNNING
+
+
+def _request_owned_compress_ratio(kv_cache_spec: KVCacheSpec) -> int:
+    """Return one fail-closed allocation-binding compression ratio."""
+
+    ratio = getattr(kv_cache_spec, "compress_ratio", 1)
+    if ratio is None:
+        ratio = 1
+    if isinstance(ratio, bool) or not isinstance(ratio, int) or ratio <= 0:
+        raise ValueError(
+            "request-owned KV cache spec has invalid compress_ratio "
+            f"{ratio!r}; expected a positive non-bool integer"
+        )
+    return ratio
+
+
+def request_owned_allocation_binding_spec(
+    kv_cache_spec: KVCacheSpec,
+) -> KVCacheSpec:
+    """Resolve the concrete spec that binds a request-owned group allocation.
+
+    DeepSeek-V4 may wrap MLA specs with the same physical ``block_size`` but
+    different compression ratios in one :class:`UniformTypeKVCacheSpecs`.
+    The real request-owned manager binds that group to the smallest ratio,
+    which has the largest storage footprint.  Every consumer of group table
+    cardinality must use the same representative rather than treating the
+    ratio-less outer wrapper as uncompressed.
+    """
+
+    if not isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        _request_owned_compress_ratio(kv_cache_spec)
+        return kv_cache_spec
+    inner_specs = tuple(kv_cache_spec.kv_cache_specs.values())
+    if not inner_specs:
+        raise ValueError(
+            "request-owned uniform KV cache group has no inner KV cache specs"
+        )
+    ratios = tuple(_request_owned_compress_ratio(spec) for spec in inner_specs)
+    representative = inner_specs[ratios.index(min(ratios))]
+    if representative.block_size != kv_cache_spec.block_size:
+        raise ValueError(
+            "request-owned uniform KV cache representative block_size "
+            f"{representative.block_size} != wrapper block_size "
+            f"{kv_cache_spec.block_size}"
+        )
+    return representative
+
+
+def request_owned_effective_tokens_per_block(kv_cache_spec: KVCacheSpec) -> int:
+    """Logical token capacity of one real group-table physical block ID."""
+
+    representative = request_owned_allocation_binding_spec(kv_cache_spec)
+    return representative.block_size * _request_owned_compress_ratio(representative)
 
 
 @dataclass
@@ -1325,8 +1379,7 @@ class RequestOwnedKVStore:
         """Worker-private logical tokens represented by each group block."""
 
         return tuple(
-            spec.block_size * max(1, int(getattr(spec, "compress_ratio", 1)))
-            for spec in self._group_specs
+            request_owned_effective_tokens_per_block(spec) for spec in self._group_specs
         )
 
     def flush(self) -> tuple[OwnerLeaseKey, ...]:
@@ -1403,8 +1456,9 @@ class RequestOwnedKVStore:
             OwnerCacheGroupSnapshot(
                 group_index=index,
                 spec_kind=get_kv_cache_spec_kind(spec).value,
-                effective_tokens_per_block=spec.block_size
-                * max(1, int(getattr(spec, "compress_ratio", 1))),
+                effective_tokens_per_block=(
+                    request_owned_effective_tokens_per_block(spec)
+                ),
                 allocated_blocks=allocated[index],
                 resident_blocks=allocated[index],
             )

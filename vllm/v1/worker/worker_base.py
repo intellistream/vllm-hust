@@ -35,6 +35,7 @@ from vllm.v1.worker.request_owned_kv import (
     RequestOwnedKVStore,
     RequestOwnedStepBuildCheckpoint,
     RequestOwnedStepMetadata,
+    request_owned_allocation_binding_spec,
 )
 from vllm.v1.worker.request_owned_offload import (
     OwnerOffloadIdentity,
@@ -270,17 +271,6 @@ class _RequestOwnedDeferredStep:
             )
 
 
-def _effective_compress_ratio(kv_cache_spec: KVCacheSpec) -> int:
-    """Allocation-binding compress ratio of one candidate inner spec.
-
-    A spec without a ``compress_ratio`` field (e.g. plain full attention) is
-    uncompressed, i.e. ratio 1.  ``None`` is treated the same way so a
-    half-populated fixture cannot crash the representative comparison.
-    """
-    ratio = getattr(kv_cache_spec, "compress_ratio", 1)
-    return 1 if ratio is None else ratio
-
-
 def _normalize_request_owned_kv_cache_config(
     kv_cache_config: KVCacheConfig,
 ) -> KVCacheConfig:
@@ -309,22 +299,13 @@ def _normalize_request_owned_kv_cache_config(
         spec = group.kv_cache_spec
         if not isinstance(spec, UniformTypeKVCacheSpecs):
             continue
-        inner_specs = spec.kv_cache_specs
-        if not inner_specs:
+        try:
+            group.kv_cache_spec = request_owned_allocation_binding_spec(spec)
+        except ValueError as exc:
             raise ValueError(
-                "Cannot build the request-owned KV store: uniform KV cache "
-                f"group {group.layer_names!r} has no inner KV cache specs."
-            )
-        representative = min(inner_specs.values(), key=_effective_compress_ratio)
-        ratio = _effective_compress_ratio(representative)
-        if isinstance(ratio, bool) or not isinstance(ratio, int) or ratio <= 0:
-            raise ValueError(
-                "Cannot build the request-owned KV store: uniform KV cache "
-                f"group {group.layer_names!r} resolves to a representative "
-                f"with invalid compress_ratio {ratio!r}; expected a positive "
-                "non-bool integer."
-            )
-        group.kv_cache_spec = representative
+                "Cannot build the request-owned KV store for uniform KV cache "
+                f"group {group.layer_names!r}: {exc}"
+            ) from exc
     return normalized
 
 

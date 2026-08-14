@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.request_owned_kv import RequestOwnedKVSnapshot
@@ -158,6 +159,61 @@ def test_live_packed_geometry_canonicalizes_alias_slices_exactly_once():
             config, block_size_tokens=128
         ).fingerprint
     )
+
+
+def test_uniform_mixed_compression_geometry_uses_allocation_binding_extent():
+    high = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+        compress_ratio=128,
+    )
+    low = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+        compress_ratio=4,
+    )
+    high_page = high.page_size_bytes
+    low_page = low.page_size_bytes
+    stride = high_page + low_page
+    num_blocks = 8
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                num_blocks * stride,
+                ["high"],
+                offset=0,
+                block_stride=stride,
+            ),
+            KVCacheTensor(
+                num_blocks * stride,
+                ["low"],
+                offset=high_page,
+                block_stride=stride,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["high", "low"],
+                UniformTypeKVCacheSpecs(
+                    block_size=128,
+                    kv_cache_specs={"high": high, "low": low},
+                ),
+            )
+        ],
+    )
+
+    geometry = PackedRestoreGeometry.from_kv_cache_config(
+        config,
+        block_size_tokens=128,
+    )
+
+    assert geometry.groups[0].effective_tokens_per_block == 128 * 4
+    assert geometry.groups[0].canonical_span.page_bytes == stride
 
 
 def test_canonical_span_rejects_unpriced_gaps():
