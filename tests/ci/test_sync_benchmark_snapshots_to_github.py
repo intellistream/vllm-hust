@@ -300,6 +300,9 @@ def test_sync_benchmark_snapshots_verifies_published_commit(tmp_path):
     assert "GITHUB_SNAPSHOT_SYNC_VERIFIED_COMMIT=" in env_text
     assert "GITHUB_SNAPSHOT_SYNC_SUBMISSION_PATH=submissions/ci-test" in env_text
     assert "GITHUB_SNAPSHOT_SYNC_SNAPSHOT_PATH=leaderboard-data/snapshots" in env_text
+    assert run(
+        ["git", "remote", "get-url", "origin"], benchmark_repo
+    ).stdout.strip() == str(remote)
     assert (benchmark_repo / "submissions" / "ci-test" / "STATUS").read_text(
         encoding="utf-8"
     ) == "OK\n"

@@ -605,6 +605,31 @@ def test_l3_benchmark_publish_preflight_runs_before_benchmark():
     assert "GITHUB_SNAPSHOT_SYNC_VERIFIED_COMMIT" in text[summary_step:]
 
 
+def test_benchmark_writer_credentials_are_scoped_outside_model_processes():
+    text = workflow_text()
+    job_env = text[text.index("    env:") : text.index("    steps:")]
+    preflight_start = text.index("      - name: L3 benchmark publication preflight")
+    preflight_end = text.index("\n      - name:", preflight_start + 1)
+    benchmark_start = text.index(
+        "      - name: Run benchmark CI and optional formal publish"
+    )
+    benchmark_end = text.index("\n      - name:", benchmark_start + 1)
+    publisher_start = text.index(
+        "      - name: Publish validated formal benchmark results"
+    )
+    publisher_end = text.index("\n      - name:", publisher_start + 1)
+
+    assert "BENCHMARK_REPO_GH_TOKEN:" not in job_env
+    assert "BENCHMARK_REPO_SSH_KEY:" not in job_env
+    assert "BENCHMARK_REPO_GH_TOKEN:" in text[preflight_start:preflight_end]
+    assert "BENCHMARK_REPO_SSH_KEY:" in text[preflight_start:preflight_end]
+    assert 'PUBLISH_TO_BENCHMARK_REPO: "0"' in text[benchmark_start:benchmark_end]
+    assert "BENCHMARK_REPO_GH_TOKEN:" not in text[benchmark_start:benchmark_end]
+    assert "BENCHMARK_REPO_SSH_KEY:" not in text[benchmark_start:benchmark_end]
+    assert "BENCHMARK_REPO_GH_TOKEN:" in text[publisher_start:publisher_end]
+    assert "BENCHMARK_REPO_SSH_KEY:" in text[publisher_start:publisher_end]
+
+
 def test_target_checkout_uses_resilient_git_http_retry_settings():
     text = workflow_text()
     checkout_step = text[

@@ -58,9 +58,17 @@ def test_benchmark_snapshot_sync_explains_missing_write_credentials():
     runner_text = script_text("run_ascend_benchmark_ci.sh")
 
     assert "L3 benchmark repository publication is enabled" in text
+    assert "GIT_ASKPASS" in text
+    assert "x-access-token:${BENCHMARK_REPO_GH_TOKEN}" not in text
+    assert "ORIGINAL_REMOTE_URL" in text
     assert "no cross-repository write credential is available" in text
     assert "VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY" in text
     assert "VLLM_HUST_BENCHMARK_GH_TOKEN" in text
+    token_writer_index = text.index('if [[ -n "$BENCHMARK_REPO_GH_TOKEN" ]]')
+    ssh_writer_index = text.index(
+        'if [[ -n "$BENCHMARK_REPO_SSH_KEY" ]]', token_writer_index
+    )
+    assert token_writer_index < ssh_writer_index
     assert "Benchmark repo publish target:" in text
     staging_index = text.index("publication_staging_dir=$(mktemp -d")
     public_validator_index = text.index("validate_public_leaderboard_snapshots.py")

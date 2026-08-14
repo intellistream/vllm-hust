@@ -21,6 +21,8 @@ BENCHMARK_REPO_REMOTE=${BENCHMARK_REPO_REMOTE:-origin}
 BENCHMARK_REPO_SLUG=${BENCHMARK_REPO_SLUG:-vLLM-HUST/vllm-hust-benchmark}
 BENCHMARK_REPO_GH_TOKEN=${BENCHMARK_REPO_GH_TOKEN:-}
 BENCHMARK_REPO_SSH_KEY=${BENCHMARK_REPO_SSH_KEY:-}
+AUTH_DIR=
+ORIGINAL_REMOTE_URL=
 
 required_submission_files=(
   leaderboard_manifest.json
@@ -91,17 +93,39 @@ fi
 configure_push_remote() {
   local remote_url=
 
-  # Prefer SSH key over GH token: the SSH key is provisioned specifically
-  # for the benchmark repo, while the GH token may belong to a user
-  # without write access to the target repository.
-  if [[ -n "$BENCHMARK_REPO_SSH_KEY" ]]; then
-    remote_url="git@github.com:${BENCHMARK_REPO_SLUG}.git"
+  ORIGINAL_REMOTE_URL=$(git -C "$BENCHMARK_REPO_DIR" remote get-url "$BENCHMARK_REPO_REMOTE")
+  # The preflight can prove repository write permission for the token via the
+  # GitHub API. Use that same credential for publication when both are set.
+  if [[ -n "$BENCHMARK_REPO_GH_TOKEN" ]]; then
+    AUTH_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/benchmark-writer.XXXXXX")
+    local askpass_file="$AUTH_DIR/askpass.sh"
+    cat >"$askpass_file" <<'EOF'
+#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' 'x-access-token' ;;
+  *Password*) printf '%s\n' "$BENCHMARK_REPO_GH_TOKEN" ;;
+  *) printf '\n' ;;
+esac
+EOF
+    chmod 700 "$askpass_file"
+    export GIT_ASKPASS="$askpass_file"
+    export GIT_TERMINAL_PROMPT=0
+    remote_url="https://github.com/${BENCHMARK_REPO_SLUG}.git"
     git -C "$BENCHMARK_REPO_DIR" remote set-url "$BENCHMARK_REPO_REMOTE" "$remote_url"
     return 0
   fi
 
-  if [[ -n "$BENCHMARK_REPO_GH_TOKEN" ]]; then
-    remote_url="https://x-access-token:${BENCHMARK_REPO_GH_TOKEN}@github.com/${BENCHMARK_REPO_SLUG}.git"
+  if [[ -n "$BENCHMARK_REPO_SSH_KEY" ]]; then
+    AUTH_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/benchmark-writer.XXXXXX")
+    local key_file="$AUTH_DIR/writer_key"
+    local known_hosts_file="$AUTH_DIR/known_hosts"
+    printf '%s\n' "$BENCHMARK_REPO_SSH_KEY" >"$key_file"
+    chmod 600 "$key_file"
+    printf '%s\n' \
+      '[ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqKqKNSCX3yYaTuk8CSQb8eFXh8UwMphjMrJnnIy9i' \
+      >"$known_hosts_file"
+    export GIT_SSH_COMMAND="ssh -i $key_file -o IdentitiesOnly=yes -o UserKnownHostsFile=$known_hosts_file -o StrictHostKeyChecking=yes"
+    remote_url="ssh://git@ssh.github.com:443/${BENCHMARK_REPO_SLUG}.git"
     git -C "$BENCHMARK_REPO_DIR" remote set-url "$BENCHMARK_REPO_REMOTE" "$remote_url"
     return 0
   fi
@@ -157,6 +181,13 @@ staged_snapshot_dir="$publication_staging_dir/snapshots"
 # shellcheck disable=SC2317,SC2329
 cleanup_publication_staging() {
   rm -rf "$publication_staging_dir"
+  if [[ -n "$ORIGINAL_REMOTE_URL" ]]; then
+    git -C "$BENCHMARK_REPO_DIR" remote set-url "$BENCHMARK_REPO_REMOTE" "$ORIGINAL_REMOTE_URL" || true
+  fi
+  unset BENCHMARK_REPO_GH_TOKEN BENCHMARK_REPO_SSH_KEY GIT_ASKPASS GIT_SSH_COMMAND GIT_TERMINAL_PROMPT
+  if [[ -n "$AUTH_DIR" ]]; then
+    rm -rf "$AUTH_DIR"
+  fi
 }
 trap cleanup_publication_staging EXIT
 

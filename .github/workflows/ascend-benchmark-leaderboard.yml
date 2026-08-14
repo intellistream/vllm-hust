@@ -326,8 +326,6 @@ jobs:
       TARGET_REPO_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'issue_comment' && needs.issue-comment-command.outputs.pr_head_sha || github.sha }}
       BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git
       BENCHMARK_REPO_SLUG: vLLM-HUST/vllm-hust-benchmark
-      BENCHMARK_REPO_GH_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN || '' }}
-      BENCHMARK_REPO_SSH_KEY: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY || '' }}
       BENCHMARK_REPO_REF: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && (vars.VLLM_HUST_BENCHMARK_REPO_REF || 'main') || 'main' }}
       PERFGATE_BENCHMARK_RUNNER_SHA: ${{ vars.VLLM_HUST_PERFGATE_BENCHMARK_RUNNER_SHA || '' }}
       WEBSITE_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-website.git
@@ -622,6 +620,9 @@ jobs:
       - name: L3 benchmark publication preflight
         id: publication-preflight
         shell: bash
+        env:
+          BENCHMARK_REPO_GH_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_HUST_BENCHMARK_GH_TOKEN || '' }}
+          BENCHMARK_REPO_SSH_KEY: ${{ (github.event_name != 'pull_request' && github.event_name != 'issue_comment') && secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY || '' }}
         run: |
           trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           bash .github/workflows/scripts/l3_benchmark_publish_preflight.sh
@@ -1529,6 +1530,7 @@ jobs:
           PERFGATE_MEASURED_RUNS: "1"
           PERFGATE_AGGREGATION: "primary-median-run"
           PERFGATE_REQUIRE_PROVENANCE: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '1' || '0' }}
+          PUBLISH_TO_BENCHMARK_REPO: "0"
         run: |
           set +e
           (
@@ -1563,6 +1565,18 @@ jobs:
           set -e
           printf 'exit_code=%s\n' "$rc" >> "$GITHUB_OUTPUT"
           exit "$rc"
+
+      - name: Publish validated formal benchmark results
+        if: ${{ env.PUBLISH_TO_BENCHMARK_REPO == '1' }}
+        env:
+          BENCHMARK_REPO_GH_TOKEN: ${{ secrets.VLLM_HUST_BENCHMARK_GH_TOKEN }}
+          BENCHMARK_REPO_SSH_KEY: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
+          WORKSPACE_ROOT: ${{ github.workspace }}
+          VLLM_HUST_REPO: ${{ github.workspace }}
+          VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
+          VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
+          RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_REPO_SHA }}
+        run: bash .github/workflows/scripts/publish_ascend_benchmark_results.sh
 
       - name: Performance gate - Stage 1 comparison
         if: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
