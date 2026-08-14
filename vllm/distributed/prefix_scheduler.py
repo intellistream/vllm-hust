@@ -73,11 +73,17 @@ class NodePrefixCacheState:
     expires_at: float | None = None
 
     @classmethod
-    def from_snapshot(cls, snapshot: PrefixCacheSnapshot) -> "NodePrefixCacheState":
+    def from_snapshot(
+        cls,
+        snapshot: PrefixCacheSnapshot,
+        *,
+        worker_incarnation: str | None = None,
+    ) -> "NodePrefixCacheState":
         return cls(
             node_id=snapshot.node_id,
             data_parallel_rank=snapshot.data_parallel_rank,
             hash_block_size=snapshot.hash_block_size,
+            worker_incarnation=worker_incarnation,
             group_block_sizes=dict(snapshot.group_block_sizes),
             group_hashes=defaultdict(
                 set,
@@ -186,7 +192,11 @@ class NodePrefixCacheState:
             return False
         if self.worker_incarnation is None:
             self.worker_incarnation = worker_incarnation
-            return False
+            if not self.group_hashes:
+                return False
+            self.group_hashes.clear()
+            self.group_block_sizes.clear()
+            return True
         if self.worker_incarnation == worker_incarnation:
             return False
         self.worker_incarnation = worker_incarnation
@@ -335,7 +345,10 @@ class GlobalPrefixScheduler:
         state = self._nodes.get(key)
         if state is None:
             self._discard_unranked_placeholder(snapshot.node_id)
-            state = NodePrefixCacheState.from_snapshot(snapshot)
+            state = NodePrefixCacheState.from_snapshot(
+                snapshot,
+                worker_incarnation=worker_incarnation,
+            )
             state.record_worker_receipt(
                 now=self._resolve_now(now),
                 view_ttl_seconds=self._view_ttl_seconds,

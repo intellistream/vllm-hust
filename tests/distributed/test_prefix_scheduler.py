@@ -163,6 +163,39 @@ def test_global_prefix_scheduler_clears_cache_state_on_worker_incarnation_change
     assert new_decision.worker_incarnation == "epoch-b"
 
 
+def test_global_prefix_scheduler_clears_legacy_cache_on_first_incarnation_event():
+    old_hash = _hash(15)
+    new_hash = _hash(16)
+    scheduler = GlobalPrefixScheduler(view_ttl_seconds=60.0, clock=lambda: 1.0)
+    scheduler.register_node("node-a", hash_block_size=16)
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=0.0, events=[_stored_event(old_hash)]),
+    )
+
+    legacy_decision = scheduler.choose_node([old_hash], prompt_num_tokens=32)
+    assert legacy_decision is not None
+    assert legacy_decision.matched_tokens == 16
+    assert legacy_decision.worker_incarnation is None
+
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=1.0, events=[_stored_event(new_hash)]),
+        worker_incarnation="epoch-restarted",
+    )
+
+    old_decision = scheduler.choose_node([old_hash], prompt_num_tokens=32)
+    assert old_decision is None or old_decision.matched_tokens == 0
+    state = scheduler._nodes["node-a", None]
+    assert state.group_hashes[0] == {_external_hash(new_hash)}
+    assert state.worker_incarnation == "epoch-restarted"
+
+    new_decision = scheduler.choose_node([new_hash], prompt_num_tokens=32)
+    assert new_decision is not None
+    assert new_decision.matched_tokens == 16
+    assert new_decision.worker_incarnation == "epoch-restarted"
+
+
 def test_global_prefix_scheduler_cache_loss_event_fails_closed():
     block_hash = _hash(14)
     scheduler = GlobalPrefixScheduler()
@@ -215,6 +248,27 @@ def test_global_prefix_scheduler_routes_to_longest_match():
     assert decision.node_id == "node-b"
     assert decision.data_parallel_rank == 1
     assert decision.matched_tokens == 32
+
+
+def test_global_prefix_scheduler_preserves_first_incarnation_snapshot():
+    block_hash = _hash(17)
+    scheduler = GlobalPrefixScheduler()
+
+    scheduler.update_snapshot(
+        PrefixCacheSnapshot(
+            node_id="node-a",
+            data_parallel_rank=None,
+            hash_block_size=16,
+            group_block_sizes={0: 16},
+            group_hashes={0: {_external_hash(block_hash)}},
+        ),
+        worker_incarnation="epoch-a",
+    )
+
+    decision = scheduler.choose_node([block_hash], prompt_num_tokens=32)
+    assert decision is not None
+    assert decision.matched_tokens == 16
+    assert decision.worker_incarnation == "epoch-a"
 
 
 def test_global_prefix_scheduler_round_robins_ties():
