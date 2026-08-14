@@ -157,7 +157,11 @@ def test_request_owned_flags_default_false():
     assert engine_args.enable_request_owned_graph is False
     assert engine_args.enable_request_owned_kv_offload is False
     assert engine_args.enable_request_owned_windows is False
-    assert engine_args.request_owned_decode_window_steps == 1
+    assert engine_args.request_owned_decode_window_steps == 32
+    assert engine_args.request_owned_hot_low_watermark == 1
+    assert engine_args.request_owned_hot_high_watermark == 2
+    assert engine_args.request_owned_prefill_wave_steps == 1
+    assert engine_args.request_owned_prefill_max_wait_steps == 32
     assert engine_args.request_owned_decode_reservation_tokens is None
 
     vllm_config = engine_args.create_engine_config()
@@ -167,7 +171,7 @@ def test_request_owned_flags_default_false():
     assert vllm_config.scheduler_config.enable_request_owned_graph is False
     assert vllm_config.scheduler_config.enable_request_owned_kv_offload is False
     assert vllm_config.scheduler_config.enable_request_owned_windows is False
-    assert vllm_config.scheduler_config.request_owned_decode_window_steps == 1
+    assert vllm_config.scheduler_config.request_owned_decode_window_steps == 32
     assert vllm_config.scheduler_config.request_owned_decode_reservation_tokens is None
 
 
@@ -187,11 +191,23 @@ def test_request_owned_windows_cli_parses_quantum_without_model_loading():
             "--enable-request-owned-windows",
             "--request-owned-decode-window-steps",
             "7",
+            "--request-owned-hot-low-watermark",
+            "2",
+            "--request-owned-hot-high-watermark",
+            "4",
+            "--request-owned-prefill-wave-steps",
+            "3",
+            "--request-owned-prefill-max-wait-steps",
+            "9",
         ]
     )
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_request_owned_windows is True
     assert engine_args.request_owned_decode_window_steps == 7
+    assert engine_args.request_owned_hot_low_watermark == 2
+    assert engine_args.request_owned_hot_high_watermark == 4
+    assert engine_args.request_owned_prefill_wave_steps == 3
+    assert engine_args.request_owned_prefill_max_wait_steps == 9
 
 
 def test_request_owned_decode_reservation_cli_parses_without_model_loading():

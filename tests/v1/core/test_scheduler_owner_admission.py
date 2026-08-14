@@ -26,8 +26,10 @@ from vllm.v1.core.sched.ownership import (
     OwnerCachePoolSnapshot,
     OwnerCommandKind,
     OwnerLeaseKey,
+    OwnerReadinessReceipt,
     OwnerReceipt,
     OwnerReceiptBatch,
+    OwnerResidencyState,
 )
 from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
@@ -94,6 +96,8 @@ def _make_scheduler(
     enable_request_owned_kv_offload: bool = False,
     enable_request_owned_windows: bool = False,
     request_owned_decode_window_steps: int = 1,
+    request_owned_hot_low_watermark: int = 1,
+    request_owned_hot_high_watermark: int = 2,
     request_owned_decode_reservation_tokens: int | None = None,
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
@@ -103,6 +107,10 @@ def _make_scheduler(
         enable_request_owned_kv_offload=enable_request_owned_kv_offload,
         enable_request_owned_windows=enable_request_owned_windows,
         request_owned_decode_window_steps=request_owned_decode_window_steps,
+        request_owned_hot_low_watermark=request_owned_hot_low_watermark,
+        request_owned_hot_high_watermark=request_owned_hot_high_watermark,
+        request_owned_prefill_wave_steps=1,
+        request_owned_prefill_max_wait_steps=32,
         request_owned_decode_reservation_tokens=(
             request_owned_decode_reservation_tokens
         ),
@@ -169,11 +177,13 @@ def _request(request_id: str, num_prompt_tokens: int = 32, max_tokens: int = 8):
 
 def _apply_receipts(scheduler, scheduler_output, events_by_rank) -> None:
     """Feed the all-worker receipt envelope back into the scheduler."""
+    readiness_by_rank = _default_window_readiness(scheduler, events_by_rank)
     batches = [
         OwnerReceiptBatch(
             owner_rank=rank,
             emitted_step_seq=scheduler_output.step_seq,
             events=tuple(events_by_rank.get(rank, ())),
+            readiness=tuple(readiness_by_rank.get(rank, ())),
         )
         for rank in range(scheduler.parallel_config.world_size)
     ]
@@ -190,14 +200,22 @@ def _ack_window_step(scheduler, scheduler_output) -> None:
     _apply_window_step(scheduler, scheduler_output, {})
 
 
-def _apply_window_step(scheduler, scheduler_output, events_by_rank) -> None:
+def _apply_window_step(
+    scheduler,
+    scheduler_output,
+    events_by_rank,
+    readiness_by_rank=None,
+) -> None:
     """Apply worker receipts and samples only for prompt-complete rows."""
+    if readiness_by_rank is None:
+        readiness_by_rank = _default_window_readiness(scheduler, events_by_rank)
     req_ids = list(scheduler_output.num_scheduled_tokens)
     batches = [
         OwnerReceiptBatch(
             owner_rank=rank,
             emitted_step_seq=scheduler_output.step_seq,
             events=tuple(events_by_rank.get(rank, ())),
+            readiness=tuple(readiness_by_rank.get(rank, ())),
         )
         for rank in range(scheduler.parallel_config.world_size)
     ]
@@ -218,6 +236,231 @@ def _apply_window_step(scheduler, scheduler_output, events_by_rank) -> None:
             owner_receipt_batches=batches,
         ),
     )
+
+
+def _hot(key: OwnerLeaseKey, owner_id: int) -> OwnerReadinessReceipt:
+    return OwnerReadinessReceipt(
+        key=key,
+        owner_id=owner_id,
+        state=OwnerResidencyState.HOT,
+        hot_for_decode=True,
+        hot_for_prefill=True,
+    )
+
+
+def _cold(key: OwnerLeaseKey, owner_id: int) -> OwnerReadinessReceipt:
+    return OwnerReadinessReceipt(
+        key=key,
+        owner_id=owner_id,
+        state=OwnerResidencyState.COLD,
+    )
+
+
+def _default_window_readiness(scheduler, events_by_rank):
+    if not scheduler.scheduler_config.enable_request_owned_windows:
+        return {}
+    coordinator = scheduler.owner_coordinator
+    facts: dict[int, dict[OwnerLeaseKey, OwnerReadinessReceipt]] = {
+        rank: {} for rank in range(scheduler.parallel_config.world_size)
+    }
+    for key in scheduler._owner_key.values():
+        owner_id = coordinator.owner_of(key)
+        if owner_id is None or coordinator.runnable_num_tokens_of(key) is None:
+            continue
+        facts[owner_id][key] = _hot(key, owner_id)
+    for owner_id, events in events_by_rank.items():
+        for event in events:
+            if event.accepted and event.runnable_num_tokens is not None:
+                facts[owner_id][event.key] = _hot(event.key, owner_id)
+            if event.released:
+                facts[owner_id].pop(event.key, None)
+    return {
+        owner_id: list(owner_facts.values()) for owner_id, owner_facts in facts.items()
+    }
+
+
+def test_readiness_snapshot_is_fenced_by_full_owner_lease_key() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    request = _request("reused", num_prompt_tokens=1)
+    scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    (command,) = reserve.owner_commands
+    stale = OwnerLeaseKey(command.key.request_id, command.key.owner_epoch + 1)
+    scheduler._store_owner_readiness(
+        [
+            OwnerReceiptBatch(
+                owner_rank=0,
+                emitted_step_seq=reserve.step_seq,
+                events=(),
+                readiness=(_hot(stale, 0),),
+            )
+        ]
+    )
+    assert scheduler._owner_readiness == {}
+
+
+def test_readiness_snapshot_rejects_wrong_authoritative_owner() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    scheduler.add_request(_request("owned", num_prompt_tokens=1))
+    reserve = scheduler.schedule()
+    (command,) = reserve.owner_commands
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+        },
+    )
+    wrong_owner = 1 - command.owner_id
+    batches = [
+        OwnerReceiptBatch(
+            owner_rank=rank,
+            emitted_step_seq=reserve.step_seq + 1,
+            events=(),
+            readiness=(
+                (_hot(command.key, wrong_owner),) if rank == wrong_owner else ()
+            ),
+        )
+        for rank in range(2)
+    ]
+    with pytest.raises(RuntimeError, match="does not match the coordinator"):
+        scheduler._store_owner_readiness(batches)
+
+
+def test_empty_readiness_snapshot_fails_closed_after_admission() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    scheduler.add_request(_request("missing", num_prompt_tokens=1))
+    reserve = scheduler.schedule()
+    (command,) = reserve.owner_commands
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            0: [
+                _receipt(
+                    command.key,
+                    0,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+        },
+    )
+    with pytest.raises(RuntimeError, match="missing live lease"):
+        scheduler._validate_owner_readiness_coverage(
+            [
+                OwnerReceiptBatch(
+                    owner_rank=0,
+                    emitted_step_seq=reserve.step_seq + 1,
+                    events=(),
+                )
+            ]
+        )
+
+
+def test_non_release_receipt_cannot_remove_readiness_obligation() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    scheduler.add_request(_request("malformed-release", num_prompt_tokens=1))
+    reserve = scheduler.schedule()
+    (command,) = reserve.owner_commands
+    contradictory = _receipt(
+        command.key,
+        0,
+        command.command_seq,
+        runnable=command.required_num_tokens,
+        released=True,
+    )
+    with pytest.raises(RuntimeError, match="non-RELEASE"):
+        scheduler._validate_owner_readiness_coverage(
+            [
+                OwnerReceiptBatch(
+                    owner_rank=0,
+                    emitted_step_seq=reserve.step_seq,
+                    events=(contradictory,),
+                )
+            ]
+        )
+
+
+@pytest.mark.parametrize("enable_windows", [False, True])
+def test_accepted_reserve_requires_runnable_grant_before_mutation(
+    enable_windows: bool,
+) -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        enable_request_owned_graph=enable_windows,
+        enable_request_owned_windows=enable_windows,
+    )
+    scheduler.add_request(_request("missing-grant", num_prompt_tokens=1))
+    reserve = scheduler.schedule()
+    (command,) = reserve.owner_commands
+    malformed = _receipt(
+        command.key,
+        0,
+        command.command_seq,
+        runnable=None,
+    )
+    with pytest.raises(RuntimeError, match="must carry a runnable grant"):
+        scheduler._validate_owner_readiness_coverage(
+            [
+                OwnerReceiptBatch(
+                    owner_rank=0,
+                    emitted_step_seq=reserve.step_seq,
+                    events=(malformed,),
+                )
+            ]
+        )
+
+
+def test_known_cold_request_cannot_enter_model_window() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    scheduler.add_request(_request("cold", num_prompt_tokens=1))
+    reserve = scheduler.schedule()
+    (command,) = reserve.owner_commands
+    _apply_window_step(
+        scheduler,
+        reserve,
+        {
+            0: [
+                _receipt(
+                    command.key,
+                    0,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+        },
+        {0: [_cold(command.key, 0)]},
+    )
+    stalled = scheduler.schedule()
+    assert stalled.num_scheduled_tokens == {}
 
 
 def _pool(
@@ -1475,6 +1718,25 @@ def test_decode_quantum_runs_one_bounded_prefill_wave_then_resumes() -> None:
         },
     )
 
+    # The accepted receipt makes the prefill lease authoritative, but the
+    # admission pass promotes it on the next scheduler observation. That
+    # next decode step then sees the RUNNING candidate. The controller opens
+    # the wave at its following q=2 observation; the receipt itself does not
+    # grant phase authority.
+    admission_boundary = scheduler.schedule()
+    assert admission_boundary.num_scheduled_tokens == {
+        "decode-0": 1,
+        "decode-1": 1,
+    }
+    _ack_window_step(scheduler, admission_boundary)
+
+    next_observation = scheduler.schedule()
+    assert next_observation.num_scheduled_tokens == {
+        "decode-0": 1,
+        "decode-1": 1,
+    }
+    _ack_window_step(scheduler, next_observation)
+
     prefill_wave = scheduler.schedule()
     assert prefill_wave.num_scheduled_tokens == {"late": 16}
     _ack_window_step(scheduler, prefill_wave)
@@ -1484,6 +1746,76 @@ def test_decode_quantum_runs_one_bounded_prefill_wave_then_resumes() -> None:
         "decode-0": 1,
         "decode-1": 1,
     }
+
+
+def test_decode_boundary_does_not_switch_when_hot_reservoir_is_sufficient() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=4,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_window_steps=1,
+        request_owned_hot_low_watermark=0,
+        request_owned_hot_high_watermark=1,
+    )
+    for owner in range(2):
+        scheduler.add_request(
+            _request(f"decode-{owner}", num_prompt_tokens=1, max_tokens=8)
+        )
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            command.owner_id: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+            ]
+            for command in commands
+        },
+    )
+    _ack_window_step(scheduler, scheduler.schedule())
+
+    late = _request("late", num_prompt_tokens=16)
+    scheduler.add_request(late)
+    decode_and_reserve = scheduler.schedule()
+    (late_command,) = decode_and_reserve.owner_commands
+    decode_facts = {
+        command.owner_id: [_hot(command.key, command.owner_id)] for command in commands
+    }
+    decode_facts.setdefault(late_command.owner_id, []).append(
+        _hot(late_command.key, late_command.owner_id)
+    )
+    _apply_window_step(
+        scheduler,
+        decode_and_reserve,
+        {
+            late_command.owner_id: [
+                _receipt(
+                    late_command.key,
+                    late_command.owner_id,
+                    late_command.command_seq,
+                    runnable=late_command.required_num_tokens,
+                )
+            ]
+        },
+        decode_facts,
+    )
+
+    still_decode = scheduler.schedule()
+    assert set(still_decode.num_scheduled_tokens) == {"decode-0", "decode-1"}
+    readiness = {owner_id: list(facts) for owner_id, facts in decode_facts.items()}
+    _apply_window_step(scheduler, still_decode, {}, readiness)
+
+    next_step = scheduler.schedule()
+    assert set(next_step.num_scheduled_tokens) == {"decode-0", "decode-1"}
+    assert "late" not in next_step.num_scheduled_tokens
 
 
 def test_partial_decode_window_drains_without_waiting_for_full_cohort() -> None:
@@ -1826,6 +2158,13 @@ def test_inserted_long_prefill_yields_after_one_bounded_chunk() -> None:
             ]
         },
     )
+
+    admission_boundary = scheduler.schedule()
+    assert admission_boundary.num_scheduled_tokens == {
+        "decode-0": 1,
+        "decode-1": 1,
+    }
+    _ack_window_step(scheduler, admission_boundary)
 
     first_chunk = scheduler.schedule()
     assert first_chunk.num_scheduled_tokens == {"long-prefill": 32}

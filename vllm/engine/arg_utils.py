@@ -725,6 +725,18 @@ class EngineArgs:
     request_owned_decode_window_steps: int = (
         SchedulerConfig.request_owned_decode_window_steps
     )
+    request_owned_hot_low_watermark: int = (
+        SchedulerConfig.request_owned_hot_low_watermark
+    )
+    request_owned_hot_high_watermark: int = (
+        SchedulerConfig.request_owned_hot_high_watermark
+    )
+    request_owned_prefill_wave_steps: int = (
+        SchedulerConfig.request_owned_prefill_wave_steps
+    )
+    request_owned_prefill_max_wait_steps: int = (
+        SchedulerConfig.request_owned_prefill_max_wait_steps
+    )
     request_owned_decode_reservation_tokens: int | None = (
         SchedulerConfig.request_owned_decode_reservation_tokens
     )
@@ -1511,6 +1523,22 @@ class EngineArgs:
             **scheduler_kwargs["request_owned_decode_window_steps"],
         )
         scheduler_group.add_argument(
+            "--request-owned-hot-low-watermark",
+            **scheduler_kwargs["request_owned_hot_low_watermark"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-hot-high-watermark",
+            **scheduler_kwargs["request_owned_hot_high_watermark"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-prefill-wave-steps",
+            **scheduler_kwargs["request_owned_prefill_wave_steps"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-prefill-max-wait-steps",
+            **scheduler_kwargs["request_owned_prefill_max_wait_steps"],
+        )
+        scheduler_group.add_argument(
             "--request-owned-decode-reservation-tokens",
             **scheduler_kwargs["request_owned_decode_reservation_tokens"],
         )
@@ -2221,6 +2249,12 @@ class EngineArgs:
             enable_request_owned_kv_offload=self.enable_request_owned_kv_offload,
             enable_request_owned_windows=self.enable_request_owned_windows,
             request_owned_decode_window_steps=(self.request_owned_decode_window_steps),
+            request_owned_hot_low_watermark=(self.request_owned_hot_low_watermark),
+            request_owned_hot_high_watermark=(self.request_owned_hot_high_watermark),
+            request_owned_prefill_wave_steps=(self.request_owned_prefill_wave_steps),
+            request_owned_prefill_max_wait_steps=(
+                self.request_owned_prefill_max_wait_steps
+            ),
             request_owned_decode_reservation_tokens=(
                 self.request_owned_decode_reservation_tokens
             ),

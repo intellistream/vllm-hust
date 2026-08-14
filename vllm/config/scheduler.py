@@ -233,14 +233,25 @@ class SchedulerConfig:
     scheduling or preemption authority.  This is a scheduling policy only and
     does not change the compiled model graph."""
 
-    request_owned_decode_window_steps: int = Field(default=1, ge=1)
-    """Maximum acknowledged decode steps before a window boundary.
+    request_owned_decode_window_steps: int = Field(default=32, ge=1)
+    """Acknowledged decode steps between controller observations.
 
-    At the boundary, queued prefill work receives one bounded wave before the
-    scheduler reforms the next owner-ordered decode cohort.  Device evidence
-    found no distinguishable throughput cost at one step versus two while the
-    shorter boundary reduced late-prefill wait.  The value is ignored unless
-    ``enable_request_owned_windows`` is true."""
+    This is a conservative observation interval, not a prefill/decode service
+    ratio. Device evidence found no distinguishable bounded phase-switch cost
+    at one step versus two, but did not model continuous arrivals. The value
+    is ignored unless ``enable_request_owned_windows`` is true."""
+
+    request_owned_hot_low_watermark: int = Field(default=1, ge=0)
+    """Per-owner HOT decode-spare threshold that permits replenishment."""
+
+    request_owned_hot_high_watermark: int = Field(default=2, ge=1)
+    """Per-owner HOT decode-spare target for a bounded prefill wave."""
+
+    request_owned_prefill_wave_steps: int = Field(default=1, ge=1)
+    """Maximum positive-token invocations in one frozen prefill wave."""
+
+    request_owned_prefill_max_wait_steps: int = Field(default=32, ge=1)
+    """Scheduler-step wait guardrail independent of the HOT watermarks."""
 
     request_owned_decode_reservation_tokens: int | None = Field(default=None, ge=1)
     """Optional decode-token chunk for request-owned physical reservations.

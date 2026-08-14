@@ -68,7 +68,7 @@ def _vllm_config(
     enable_request_owned_graph: bool = False,
     enable_request_owned_kv_offload: bool = False,
     enable_request_owned_windows: bool = False,
-    request_owned_decode_window_steps: int = 1,
+    request_owned_decode_window_steps: int = 32,
     scheduler_config: SchedulerConfig | None = None,
     compilation_config: CompilationConfig | None = None,
     parallel_config: ParallelConfig | None = None,
@@ -111,7 +111,11 @@ def test_request_owned_attention_defaults_off():
     assert SchedulerConfig.default_factory().enable_request_owned_graph is False
     assert SchedulerConfig.default_factory().enable_request_owned_kv_offload is False
     assert SchedulerConfig.default_factory().enable_request_owned_windows is False
-    assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 1
+    assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 32
+    assert SchedulerConfig.default_factory().request_owned_hot_low_watermark == 1
+    assert SchedulerConfig.default_factory().request_owned_hot_high_watermark == 2
+    assert SchedulerConfig.default_factory().request_owned_prefill_wave_steps == 1
+    assert SchedulerConfig.default_factory().request_owned_prefill_max_wait_steps == 32
     assert (
         SchedulerConfig.default_factory().request_owned_decode_reservation_tokens
         is None
@@ -121,7 +125,7 @@ def test_request_owned_attention_defaults_off():
     assert VllmConfig().scheduler_config.enable_request_owned_graph is False
     assert VllmConfig().scheduler_config.enable_request_owned_kv_offload is False
     assert VllmConfig().scheduler_config.enable_request_owned_windows is False
-    assert VllmConfig().scheduler_config.request_owned_decode_window_steps == 1
+    assert VllmConfig().scheduler_config.request_owned_decode_window_steps == 32
     assert VllmConfig().scheduler_config.request_owned_decode_reservation_tokens is None
 
 
@@ -155,6 +159,25 @@ def test_request_owned_windows_construct_with_graph_and_quantum():
 def test_request_owned_window_quantum_must_be_positive(value):
     with pytest.raises(ValueError, match="request_owned_decode_window_steps"):
         SchedulerConfig.default_factory(request_owned_decode_window_steps=value)
+
+
+def test_request_owned_windows_require_ordered_hot_watermarks():
+    with pytest.raises(ValueError, match="HOT watermarks"):
+        _vllm_config(
+            enable_request_owned_graph=True,
+            enable_request_owned_windows=True,
+            scheduler_config=SchedulerConfig.default_factory(
+                enable_request_owned_attention=True,
+                enable_request_owned_graph=True,
+                enable_request_owned_windows=True,
+                request_owned_hot_low_watermark=2,
+                request_owned_hot_high_watermark=2,
+            ),
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            ),
+        )
 
 
 @pytest.mark.parametrize("value", [0, -1])

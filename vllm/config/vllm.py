@@ -2218,6 +2218,16 @@ class VllmConfig:
                 "enable_request_owned_windows=True requires "
                 "enable_request_owned_graph=True."
             )
+        if (
+            request_owned_windows
+            and self.scheduler_config.request_owned_hot_low_watermark
+            >= self.scheduler_config.request_owned_hot_high_watermark
+        ):
+            raise ValueError(
+                "request-owned HOT watermarks must satisfy low < high, got "
+                f"{self.scheduler_config.request_owned_hot_low_watermark} >= "
+                f"{self.scheduler_config.request_owned_hot_high_watermark}."
+            )
         if not self.scheduler_config.enable_request_owned_attention:
             return
 

@@ -51,6 +51,13 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.core.sched.owner_layout import GlobalRowId
 from vllm.v1.core.sched.owner_layout_probe import OwnerLayoutProbe
+from vllm.v1.core.sched.owner_window_policy import (
+    OwnerPrefillCandidate,
+    OwnerWindowPolicy,
+    OwnerWindowPolicyConfig,
+    OwnerWindowPolicyPhase,
+    OwnerWindowReadiness,
+)
 from vllm.v1.core.sched.ownership import (
     EpochFenceError,
     OwnerAdmissionStatus,
@@ -61,8 +68,10 @@ from vllm.v1.core.sched.ownership import (
     OwnerCommandKind,
     OwnerLeaseCoordinator,
     OwnerLeaseKey,
+    OwnerReadinessReceipt,
     OwnerReceipt,
     OwnerReceiptBatch,
+    OwnerResidencyState,
 )
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
@@ -121,7 +130,6 @@ class _OwnerWindowState:
     suspended_decode_slots: tuple[OwnerLeaseKey, ...] = ()
     prefill_wave: tuple[OwnerLeaseKey, ...] = ()
     decode_steps: int = 0
-    prefer_prefill: bool = False
     inflight: _OwnerWindowStep | None = None
 
 
@@ -440,6 +448,10 @@ class Scheduler(SchedulerInterface):
         # record only selects a stable execution cohort and advances at the
         # completed-output boundary.
         self._owner_window_state = _OwnerWindowState()
+        self._owner_window_policy: OwnerWindowPolicy | None = None
+        self._owner_readiness: dict[OwnerLeaseKey, OwnerReadinessReceipt] = {}
+        self._owner_readiness_seen = False
+        self._owner_wait_started_step: dict[OwnerLeaseKey, int] = {}
         # Global rank -> latest worker-confirmed physical pool snapshot
         # (block-ID-free), empty until the first non-None receipt envelope.
         self._owner_pool_snapshots: dict[int, OwnerCachePoolSnapshot] = {}
@@ -2522,6 +2534,40 @@ class Scheduler(SchedulerInterface):
         self.owner_coordinator = OwnerLeaseCoordinator()
         self._owner_pool_snapshots = {}
         self._owner_pool_snapshot_seen = False
+        self._owner_readiness = {}
+        self._owner_readiness_seen = False
+        self._owner_wait_started_step = {}
+        if getattr(self.scheduler_config, "enable_request_owned_windows", False):
+            self._owner_window_policy = OwnerWindowPolicy(
+                OwnerWindowPolicyConfig(
+                    world_size=self.parallel_config.world_size,
+                    decode_observation_steps=(
+                        self.scheduler_config.request_owned_decode_window_steps
+                    ),
+                    hot_low_watermark=getattr(
+                        self.scheduler_config,
+                        "request_owned_hot_low_watermark",
+                        1,
+                    ),
+                    hot_high_watermark=getattr(
+                        self.scheduler_config,
+                        "request_owned_hot_high_watermark",
+                        2,
+                    ),
+                    prefill_invocation_budget=getattr(
+                        self.scheduler_config,
+                        "request_owned_prefill_wave_steps",
+                        1,
+                    ),
+                    prefill_max_wait_steps=getattr(
+                        self.scheduler_config,
+                        "request_owned_prefill_max_wait_steps",
+                        32,
+                    ),
+                )
+            )
+        else:
+            self._owner_window_policy = None
         for owner_id in range(self.parallel_config.world_size):
             self.owner_coordinator.observe(self._owner_observation(owner_id))
 
@@ -2967,17 +3013,7 @@ class Scheduler(SchedulerInterface):
 
         self._owner_window_reconcile()
         if state.phase is None:
-            prefill_wave = (
-                self._owner_window_form_prefill_wave() if state.prefer_prefill else ()
-            )
-            if prefill_wave:
-                state.prefer_prefill = False
-                state.phase = _OwnerWindowPhase.PREFILL
-                state.prefill_wave = prefill_wave
-                decode_slots = ()
-            else:
-                state.prefer_prefill = False
-                decode_slots = self._owner_window_form_decode_slots()
+            decode_slots = self._owner_window_form_decode_slots()
             if len(decode_slots) == self.parallel_config.world_size:
                 state.phase = _OwnerWindowPhase.DECODE
                 state.decode_slots = decode_slots
@@ -2992,6 +3028,9 @@ class Scheduler(SchedulerInterface):
                 if prefill_wave:
                     state.phase = _OwnerWindowPhase.PREFILL
                     state.prefill_wave = prefill_wave
+                    policy = self._owner_window_policy
+                    assert policy is not None
+                    policy.start_prefill(prefill_wave, reason="initial-prefill")
                 elif decode_slots:
                     state.phase = _OwnerWindowPhase.DECODE
                     state.decode_slots = decode_slots
@@ -3025,13 +3064,22 @@ class Scheduler(SchedulerInterface):
         assert coordinator is not None
         request_id = request.request_id
         key = self._owner_key.get(request_id)
-        return bool(
+        available = bool(
             key is not None
             and self._owner_pending_command.get(request_id) is None
             and not coordinator.is_release_pending(key)
             and not coordinator.is_released(key)
             and not coordinator.is_preempted(key)
         )
+        if not available or not self._owner_readiness_seen:
+            return available
+        assert key is not None
+        fact = self._owner_readiness.get(key)
+        if fact is None or fact.state is not OwnerResidencyState.HOT:
+            return False
+        if request.num_computed_tokens < request.num_prompt_tokens:
+            return fact.hot_for_prefill
+        return fact.hot_for_decode
 
     def _owner_window_reconcile(self) -> None:
         """Discard phase membership only at an acknowledged boundary."""
@@ -3046,8 +3094,12 @@ class Scheduler(SchedulerInterface):
                 state.decode_slots = ()
                 state.decode_steps = 0
                 state.suspended_decode_slots = ()
+                policy = self._owner_window_policy
+                assert policy is not None
+                policy.reset_decode_observation()
             elif any(
                 request.num_computed_tokens < request.num_prompt_tokens
+                or not self._owner_window_request_available(request)
                 for request in requests
                 if request is not None
             ):
@@ -3057,18 +3109,25 @@ class Scheduler(SchedulerInterface):
                 state.decode_slots = ()
                 state.decode_steps = 0
                 state.suspended_decode_slots = ()
+                policy = self._owner_window_policy
+                assert policy is not None
+                policy.reset_decode_observation()
         elif state.phase is _OwnerWindowPhase.PREFILL:
             live = tuple(
                 key
                 for key in state.prefill_wave
                 if (request := self._owner_window_live_request(key)) is not None
                 and request.num_computed_tokens < request.num_prompt_tokens
+                and self._owner_window_request_available(request)
             )
             if live:
                 state.prefill_wave = live
             else:
                 state.phase = None
                 state.prefill_wave = ()
+                policy = self._owner_window_policy
+                assert policy is not None
+                policy.cancel_prefill()
 
     def _owner_window_form_decode_slots(self) -> tuple[OwnerLeaseKey, ...]:
         """Return one owner-indexed decode cohort, exact when available."""
@@ -3257,17 +3316,16 @@ class Scheduler(SchedulerInterface):
                 state.phase = None
                 state.decode_slots = ()
                 state.decode_steps = 0
+                policy = self._owner_window_policy
+                assert policy is not None
+                policy.reset_decode_observation()
                 return
-            quantum = self.scheduler_config.request_owned_decode_window_steps
-            prefill_waits = any(
-                not request.is_finished()
-                and request.num_computed_tokens < request.num_prompt_tokens
-                and (key := self._owner_key.get(request.request_id)) is not None
-                and key not in state.decode_slots
-                and self._owner_pending_command.get(request.request_id) is None
-                and self.owner_coordinator is not None
-                and self.owner_coordinator.runnable_num_tokens_of(key) is not None
-                for request in self.requests.values()
+            policy = self._owner_window_policy
+            assert policy is not None
+            decision = policy.ack_step(
+                OwnerWindowPolicyPhase.DECODE,
+                self._owner_window_readiness(),
+                positive_tokens=True,
             )
             decode_waits = any(
                 not request.is_finished()
@@ -3279,27 +3337,91 @@ class Scheduler(SchedulerInterface):
                 and self.owner_coordinator.runnable_num_tokens_of(key) is not None
                 for request in self.requests.values()
             )
-            if state.decode_steps >= quantum and prefill_waits:
+            if decision.phase is OwnerWindowPolicyPhase.PREFILL:
                 state.suspended_decode_slots = state.decode_slots
                 state.decode_slots = ()
                 state.decode_steps = 0
-                state.prefer_prefill = True
-                state.phase = None
-            elif state.decode_steps >= quantum and decode_waits:
+                state.prefill_wave = decision.prefill_wave
+                state.phase = _OwnerWindowPhase.PREFILL
+            elif policy.decode_steps == 0 and decode_waits:
                 state.yielded_decode_slots = state.decode_slots
                 state.decode_slots = ()
                 state.decode_steps = 0
                 state.phase = None
         else:
             state.decode_steps = 0
-            if state.suspended_decode_slots:
-                # A prefill inserted into an established decode lane is one
-                # bounded model invocation.  An unfinished long prompt yields
-                # back here and can receive another chunk at a later quantum.
-                # Initial prefill waves, by contrast, stay together until all
-                # members complete so they can enter decode in phase.
+            policy = self._owner_window_policy
+            assert policy is not None
+            decision = policy.ack_step(
+                OwnerWindowPolicyPhase.PREFILL,
+                self._owner_window_readiness(),
+                positive_tokens=True,
+            )
+            state.prefill_wave = decision.prefill_wave
+            if decision.phase is OwnerWindowPolicyPhase.DECODE:
                 state.phase = None
                 state.prefill_wave = ()
+
+    def _owner_window_readiness(self) -> OwnerWindowReadiness:
+        """Build the controller view from fenced worker readiness facts."""
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        world_size = self.parallel_config.world_size
+        hot_decode = [0] * world_size
+        restoring = [0] * world_size
+        host_restorable = [0] * world_size
+        candidates: list[OwnerPrefillCandidate] = []
+        for request in self.requests.values():
+            if request.is_finished():
+                continue
+            key = self._owner_key.get(request.request_id)
+            if key is None:
+                continue
+            owner_id = coordinator.owner_of(key)
+            if owner_id is None:
+                continue
+            fact = self._owner_readiness.get(key)
+            if fact is not None:
+                if fact.state is OwnerResidencyState.RESTORING:
+                    restoring[owner_id] += 1
+                elif fact.state is OwnerResidencyState.COLD:
+                    host_restorable[owner_id] += 1
+                elif (
+                    fact.hot_for_decode
+                    and request.num_computed_tokens >= request.num_prompt_tokens
+                ):
+                    hot_decode[owner_id] += 1
+            if (
+                request.status is RequestStatus.RUNNING
+                and request.num_computed_tokens < request.num_prompt_tokens
+                and self._owner_pending_command.get(request.request_id) is None
+                and coordinator.runnable_num_tokens_of(key) is not None
+                and (
+                    not self._owner_readiness_seen
+                    or (
+                        fact is not None
+                        and fact.state is OwnerResidencyState.HOT
+                        and fact.hot_for_prefill
+                    )
+                )
+            ):
+                candidates.append(
+                    OwnerPrefillCandidate(
+                        key=key,
+                        owner_id=owner_id,
+                        wait_steps=max(
+                            0,
+                            self.current_step
+                            - self._owner_wait_started_step.get(key, self.current_step),
+                        ),
+                    )
+                )
+        return OwnerWindowReadiness(
+            hot_decode_by_owner=tuple(hot_decode),
+            restoring_by_owner=tuple(restoring),
+            host_restorable_by_owner=tuple(host_restorable),
+            prefill_candidates=tuple(candidates),
+        )
 
     def _owner_balanced_prefill_plans(self) -> dict[str, int] | None:
         """Return one lockstep prefill chunk for the exact owner FULL cohort.
@@ -3381,15 +3503,21 @@ class Scheduler(SchedulerInterface):
             key = OwnerLeaseKey(request_id=request_id, owner_epoch=epoch)
             self._owner_key[request_id] = key
             self._owner_epoch[request_id] = epoch
+            self._owner_wait_started_step[key] = self.current_step
         return key
 
     def _roll_owner_epoch(self, request: Request) -> OwnerLeaseKey:
         """Fence a reused request id forward to a fresh lease epoch."""
         request_id = request.request_id
+        old_key = self._owner_key.get(request_id)
         epoch = self._owner_epoch.get(request_id, 0) + 1
         key = OwnerLeaseKey(request_id=request_id, owner_epoch=epoch)
         self._owner_key[request_id] = key
         self._owner_epoch[request_id] = epoch
+        if old_key is not None:
+            self._owner_readiness.pop(old_key, None)
+            self._owner_wait_started_step.pop(old_key, None)
+        self._owner_wait_started_step[key] = self.current_step
         return key
 
     def _owner_reserve_required(self, request: Request) -> int:
@@ -3744,6 +3872,8 @@ class Scheduler(SchedulerInterface):
             coordinator.abandon(key)
             self._owner_key.pop(request_id, None)
             self._owner_pending_command.pop(request_id, None)
+            self._owner_readiness.pop(key, None)
+            self._owner_wait_started_step.pop(key, None)
             return
         # After admission: idempotent RELEASE while release_pending.
         if not coordinator.is_release_pending(key):
@@ -3833,10 +3963,115 @@ class Scheduler(SchedulerInterface):
                 "request-owned receipt ingress requires the G2 owner "
                 "coordinator; the scheduler was not initialized for it."
             )
+        for batch in batches:
+            for fact in getattr(batch, "readiness", ()):
+                if (
+                    self._owner_key.get(fact.key.request_id) == fact.key
+                    and coordinator.owner_of(fact.key) != fact.owner_id
+                ):
+                    raise RuntimeError(
+                        "request-owned readiness owner does not match the "
+                        f"coordinator for {fact.key}."
+                    )
+        self._validate_owner_readiness_coverage(batches)
         self._store_owner_pool_snapshots(batches)
         for batch in batches:
             for event in batch.events:
                 self._apply_owner_receipt(event)
+        self._store_owner_readiness(batches)
+
+    def _validate_owner_readiness_coverage(
+        self, batches: list[OwnerReceiptBatch]
+    ) -> None:
+        """Validate the post-event live set before mutating receipt state."""
+        coordinator = self.owner_coordinator
+        assert coordinator is not None
+        authoritative: list[tuple[OwnerReceipt, OwnerCommandKind]] = []
+        for batch in batches:
+            for event in batch.events:
+                if self._owner_key.get(event.key.request_id) != event.key:
+                    continue
+                pending = self._owner_pending_command.get(event.key.request_id)
+                if (
+                    pending is None
+                    or pending[0] != event.command_seq
+                    or coordinator.owner_of(event.key) != event.owner_id
+                ):
+                    continue
+                command_kind = pending[1]
+                if event.released and command_kind is not OwnerCommandKind.RELEASE:
+                    raise RuntimeError(
+                        "request-owned non-RELEASE receipt cannot claim release "
+                        f"for {event.key}."
+                    )
+                if event.accepted and command_kind is OwnerCommandKind.RELEASE:
+                    if not event.released:
+                        raise RuntimeError(
+                            "accepted request-owned RELEASE receipt must confirm "
+                            f"release for {event.key}."
+                        )
+                elif event.accepted and event.runnable_num_tokens is None:
+                    raise RuntimeError(
+                        "accepted request-owned non-RELEASE receipt must carry "
+                        f"a runnable grant for {event.key}."
+                    )
+                authoritative.append((event, command_kind))
+        if not getattr(self.scheduler_config, "enable_request_owned_windows", False):
+            return
+        expected = {
+            key
+            for key in self._owner_key.values()
+            if coordinator.owner_of(key) is not None
+            and coordinator.runnable_num_tokens_of(key) is not None
+            and not coordinator.is_release_pending(key)
+            and not coordinator.is_released(key)
+        }
+        for event, command_kind in authoritative:
+            if not event.accepted:
+                continue
+            if command_kind is OwnerCommandKind.RELEASE:
+                expected.discard(event.key)
+            else:
+                expected.add(event.key)
+        facts = {
+            fact.key
+            for batch in batches
+            for fact in getattr(batch, "readiness", ())
+            if self._owner_key.get(fact.key.request_id) == fact.key
+            and coordinator.owner_of(fact.key) == fact.owner_id
+        }
+        missing = sorted(
+            expected - facts,
+            key=lambda key: (key.request_id, key.owner_epoch),
+        )
+        if missing:
+            raise RuntimeError(
+                f"request-owned readiness snapshot is missing live lease(s): {missing}."
+            )
+
+    def _store_owner_readiness(self, batches: list[OwnerReceiptBatch]) -> None:
+        """Replace each owner's snapshot after full envelope validation."""
+        readiness_enabled = bool(
+            getattr(self.scheduler_config, "enable_request_owned_windows", False)
+        )
+        next_readiness: dict[OwnerLeaseKey, OwnerReadinessReceipt] = {}
+        for batch in batches:
+            for fact in getattr(batch, "readiness", ()):
+                if (
+                    self._owner_key.get(fact.key.request_id) == fact.key
+                    and self.owner_coordinator is not None
+                    and self.owner_coordinator.owner_of(fact.key) == fact.owner_id
+                ):
+                    next_readiness[fact.key] = fact
+                elif self._owner_key.get(fact.key.request_id) == fact.key:
+                    raise RuntimeError(
+                        "request-owned readiness owner does not match the "
+                        f"coordinator for {fact.key}."
+                    )
+        if not readiness_enabled:
+            return
+        self._owner_readiness = next_readiness
+        self._owner_readiness_seen = True
 
     def _store_owner_pool_snapshots(self, batches: list[OwnerReceiptBatch]) -> None:
         """Record the latest physical pool snapshot per global rank.
@@ -3937,6 +4172,8 @@ class Scheduler(SchedulerInterface):
                 ):
                     coordinator.abandon(key)
                     self._owner_key.pop(request_id, None)
+                    self._owner_readiness.pop(key, None)
+                    self._owner_wait_started_step.pop(key, None)
             return
         if not event.accepted:
             return
@@ -3946,6 +4183,8 @@ class Scheduler(SchedulerInterface):
             if key.owner_epoch >= self._owner_epoch.get(request_id, 0):
                 self._owner_epoch[request_id] = key.owner_epoch + 1
             self._owner_key.pop(request_id, None)
+            self._owner_readiness.pop(key, None)
+            self._owner_wait_started_step.pop(key, None)
             return
         # Accepted RESERVE promotes the request (sticky owner + epoch).
         request = self.requests.get(request_id)
