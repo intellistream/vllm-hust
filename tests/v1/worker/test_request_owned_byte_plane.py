@@ -5,12 +5,19 @@ from uuid import UUID
 
 import pytest
 
-from vllm.v1.core.sched.ownership import OwnerLeaseKey
+from vllm.v1.core.sched.ownership import (
+    AttentionLeaseManager,
+    OwnerAssignmentObservation,
+    OwnerLeaseCoordinator,
+    OwnerLeaseKey,
+    OwnerReceipt,
+)
 from vllm.v1.worker.request_owned_byte_plane import (
     StateHarborBytePlaneAdapter,
     StateHarborBytePlaneError,
     StateHarborCommitOutcome,
     StateHarborGroupPayload,
+    StateHarborRedockTicket,
     StateHarborSourceImage,
     StateHarborWriteLease,
     StateHarborWriterFence,
@@ -428,3 +435,144 @@ def test_reaped_writer_cannot_publish_and_registration_generation_changes_id() -
     result = store.execute_after_staging()
     assert result.receipt.success
     assert ledger.take_reclaimable(identity) == plan.device_block_ids
+
+
+def test_new_owner_redock_holds_reserve_until_exact_h2d_terminal() -> None:
+    backend = _MemoryBytePlane()
+    source_ledger, _, source_identity, source_plan, store = _begin_source_store(backend)
+    result = store.execute_after_staging()
+    assert source_ledger.take_reclaimable(source_identity) == (
+        source_plan.device_block_ids
+    )
+
+    coordinator = OwnerLeaseCoordinator()
+    coordinator.observe(OwnerAssignmentObservation(owner_id=3, observation_seq=1))
+    coordinator.observe(OwnerAssignmentObservation(owner_id=6, observation_seq=1))
+    source_worker = AttentionLeaseManager(owner_rank=3, capacity=64)
+    destination_worker = AttentionLeaseManager(owner_rank=6, capacity=64)
+
+    source_key = OwnerLeaseKey("stateharbor-request", 4)
+    assert coordinator.assign(source_key, explicit_owner=3) == 3
+    source_reserve = source_worker.apply(coordinator.reserve(source_key, 8))
+    assert coordinator.apply_receipt(source_reserve)
+    published = coordinator.publish(1, {source_key})
+    assert len(published) == 1
+    source_worker.record_published(published[0])
+
+    source_preempt = source_worker.apply(coordinator.preempt(source_key))
+    assert coordinator.apply_receipt(source_preempt)
+    source_release = source_worker.apply(coordinator.finish(source_key))
+    assert source_release.released
+    assert coordinator.apply_receipt(source_release)
+
+    destination_key = OwnerLeaseKey("stateharbor-request", 5)
+    assert coordinator.assign(destination_key, explicit_owner=6) == 6
+    buffered_reserve = destination_worker.apply(coordinator.reserve(destination_key, 8))
+    assert buffered_reserve.accepted
+    assert coordinator.runnable_num_tokens_of(destination_key) is None
+    assert coordinator.publish(2) == []
+
+    destination = _snapshot(epoch=5, owner_rank=6, generation=12, first_block=31)
+    destination_ledger = RequestOwnedBulkOffloadLedger(destination.owner_rank)
+    destination_adapter = StateHarborBytePlaneAdapter(
+        ledger=destination_ledger, backend=backend
+    )
+    destination_identity = destination_ledger.bind(destination, active=False)
+    restore_plan = OwnerOffloadPlan.from_snapshot(
+        destination,
+        source_plan.offload_keys,
+        logical_block_indices=source_plan.logical_block_indices,
+    )
+    ticket = StateHarborRedockTicket(
+        source=result.manifest.source,
+        source_manifest_key=result.manifest.object_key,
+        source_release_receipt=source_release,
+        destination_identity=destination_identity,
+        destination_reserve_receipt=buffered_reserve,
+    )
+    redock = destination_adapter.prepare_redock(
+        ticket=ticket,
+        plan=restore_plan,
+        manifest=result.manifest,
+    )
+    assert redock.payloads == tuple(payload.payload for payload in _payloads())
+    assert not destination_ledger.is_hot(destination_identity)
+    assert coordinator.runnable_num_tokens_of(destination_key) is None
+
+    terminal = redock.complete_after_h2d(success=True)
+    assert destination_ledger.is_hot(destination_identity)
+    assert coordinator.runnable_num_tokens_of(destination_key) is None
+
+    assert coordinator.apply_receipt(terminal.admit_destination_reserve())
+    destination_ledger.activate(destination_identity)
+    published = coordinator.publish(3, {destination_key})
+    assert len(published) == 1
+    assert published[0].key == destination_key
+    assert published[0].owner_id == 6
+    with pytest.raises(StateHarborBytePlaneError, match="already admitted"):
+        terminal.admit_destination_reserve()
+
+    with pytest.raises(StateHarborBytePlaneError, match="advance the owner epoch"):
+        StateHarborRedockTicket(
+            source=result.manifest.source,
+            source_manifest_key=result.manifest.object_key,
+            source_release_receipt=source_release,
+            destination_identity=replace(
+                destination_identity,
+                key=source_key,
+            ),
+            destination_reserve_receipt=replace(
+                buffered_reserve,
+                key=source_key,
+            ),
+        )
+
+
+def test_failed_redock_h2d_never_releases_buffered_reserve() -> None:
+    backend = _MemoryBytePlane()
+    _, _, _, source_plan, store = _begin_source_store(backend)
+    result = store.execute_after_staging()
+
+    destination = _snapshot(epoch=5, owner_rank=6, generation=12, first_block=31)
+    destination_ledger = RequestOwnedBulkOffloadLedger(destination.owner_rank)
+    destination_adapter = StateHarborBytePlaneAdapter(
+        ledger=destination_ledger, backend=backend
+    )
+    destination_identity = destination_ledger.bind(destination, active=False)
+    restore_plan = OwnerOffloadPlan.from_snapshot(
+        destination,
+        source_plan.offload_keys,
+        logical_block_indices=source_plan.logical_block_indices,
+    )
+    source_release = OwnerReceipt(
+        key=OwnerLeaseKey("stateharbor-request", 4),
+        owner_id=3,
+        command_seq=9,
+        accepted=True,
+        runnable_num_tokens=8,
+        released=True,
+        pending_dma=0,
+    )
+    buffered_reserve = OwnerReceipt(
+        key=destination.key,
+        owner_id=destination.owner_rank,
+        command_seq=1,
+        accepted=True,
+        runnable_num_tokens=8,
+    )
+    ticket = StateHarborRedockTicket(
+        source=result.manifest.source,
+        source_manifest_key=result.manifest.object_key,
+        source_release_receipt=source_release,
+        destination_identity=destination_identity,
+        destination_reserve_receipt=buffered_reserve,
+    )
+    redock = destination_adapter.prepare_redock(
+        ticket=ticket,
+        plan=restore_plan,
+        manifest=result.manifest,
+    )
+    terminal = redock.complete_after_h2d(success=False, error="copy failed")
+    assert not destination_ledger.is_hot(destination_identity)
+    with pytest.raises(StateHarborBytePlaneError, match="failed redock H2D"):
+        terminal.admit_destination_reserve()

@@ -20,10 +20,12 @@ from hashlib import sha256
 from typing import Protocol
 from uuid import UUID
 
+from vllm.v1.core.sched.ownership import OwnerReceipt
 from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.worker.request_owned_offload import (
     OwnerBulkTransferJob,
     OwnerBulkTransferReceipt,
+    OwnerOffloadIdentity,
     OwnerOffloadPlan,
     RequestOwnedBulkOffloadLedger,
     RequestOwnedOffloadError,
@@ -371,6 +373,138 @@ class StateHarborRestoreWork:
 
 
 @dataclass(frozen=True, slots=True)
+class StateHarborRedockTicket:
+    """StateHarbor authority for one released-source to new-owner restore.
+
+    The destination RESERVE receipt is deliberately buffered in this ticket.
+    It must not reach the scheduler coordinator until the exact shared image
+    has restored and produced a successful destination H2D terminal.
+    """
+
+    source: StateHarborSourceImage
+    source_manifest_key: bytes
+    source_release_receipt: OwnerReceipt
+    destination_identity: OwnerOffloadIdentity
+    destination_reserve_receipt: OwnerReceipt
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, StateHarborSourceImage):
+            raise TypeError(
+                f"source must be a StateHarborSourceImage, got {self.source!r}."
+            )
+        if (
+            not isinstance(self.source_manifest_key, bytes)
+            or len(self.source_manifest_key) != 32
+        ):
+            raise TypeError("source_manifest_key must be a SHA256 object key")
+        if not isinstance(self.source_release_receipt, OwnerReceipt):
+            raise TypeError("source_release_receipt must be an OwnerReceipt")
+        if not isinstance(self.destination_identity, OwnerOffloadIdentity):
+            raise TypeError("destination_identity must be an OwnerOffloadIdentity")
+        if not isinstance(self.destination_reserve_receipt, OwnerReceipt):
+            raise TypeError("destination_reserve_receipt must be an OwnerReceipt")
+
+        released = self.source_release_receipt
+        _require_uint("source_release_receipt.command_seq", released.command_seq)
+        if (
+            released.command_seq == 0
+            or not released.accepted
+            or not released.released
+            or released.error is not None
+            or released.runnable_num_tokens is None
+            or released.pending_dma != 0
+            or released.key.request_id != self.source.request_id
+            or released.key.owner_epoch != self.source.source_owner_epoch
+            or released.owner_id != self.source.source_owner_rank
+        ):
+            raise StateHarborBytePlaneError(
+                "redock requires an accepted exact source RELEASE receipt"
+            )
+
+        destination = self.destination_identity
+        reserve = self.destination_reserve_receipt
+        _require_uint("destination_reserve_receipt.command_seq", reserve.command_seq)
+        if destination.key.request_id != self.source.request_id:
+            raise StateHarborBytePlaneError(
+                "redock destination request must match the source image"
+            )
+        if destination.key.owner_epoch <= self.source.source_owner_epoch:
+            raise StateHarborBytePlaneError(
+                "redock destination must advance the owner epoch"
+            )
+        if destination.owner_rank == self.source.source_owner_rank:
+            raise StateHarborBytePlaneError(
+                "redock destination must be a different owner"
+            )
+        if (
+            reserve.command_seq == 0
+            or not reserve.accepted
+            or reserve.released
+            or reserve.error is not None
+            or reserve.runnable_num_tokens is None
+            or reserve.pending_dma not in (None, 0)
+            or reserve.key != destination.key
+            or reserve.owner_id != destination.owner_rank
+        ):
+            raise StateHarborBytePlaneError(
+                "redock requires an accepted exact destination RESERVE receipt"
+            )
+
+
+@dataclass(slots=True)
+class StateHarborRedockTerminal:
+    """Exact physical terminal that may release one buffered RESERVE receipt."""
+
+    ticket: StateHarborRedockTicket
+    transfer_receipt: OwnerBulkTransferReceipt
+    _admitted: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ticket, StateHarborRedockTicket):
+            raise TypeError("ticket must be a StateHarborRedockTicket")
+        if not isinstance(self.transfer_receipt, OwnerBulkTransferReceipt):
+            raise TypeError("transfer_receipt must be an OwnerBulkTransferReceipt")
+        if self.transfer_receipt.identity != self.ticket.destination_identity:
+            raise StateHarborBytePlaneError(
+                "redock H2D terminal does not name the exact destination"
+            )
+
+    def admit_destination_reserve(self) -> OwnerReceipt:
+        """Release the scheduler receipt once, and only after successful H2D."""
+
+        if self._admitted:
+            raise StateHarborBytePlaneError(
+                "destination RESERVE receipt was already admitted"
+            )
+        if not self.transfer_receipt.success:
+            raise StateHarborBytePlaneError(
+                "failed redock H2D cannot admit destination RESERVE"
+            )
+        self._admitted = True
+        return self.ticket.destination_reserve_receipt
+
+
+@dataclass(slots=True)
+class StateHarborRedockWork:
+    ticket: StateHarborRedockTicket
+    restore: StateHarborRestoreWork
+    _completed: bool = False
+
+    @property
+    def payloads(self) -> tuple[bytes, ...]:
+        return self.restore.payloads
+
+    def complete_after_h2d(
+        self, *, success: bool, error: str | None = None
+    ) -> StateHarborRedockTerminal:
+        if self._completed:
+            raise StateHarborBytePlaneError("redock work was already completed")
+        self._completed = True
+        receipt = self.restore.complete_after_h2d(success=success, error=error)
+        return StateHarborRedockTerminal(self.ticket, receipt)
+
+
+@dataclass(frozen=True, slots=True)
 class StateHarborReleaseReceipt:
     manifest_key: bytes
     deleted_object_keys: tuple[bytes, ...]
@@ -453,6 +587,32 @@ class StateHarborBytePlaneAdapter:
         self.ledger.admit_durable_host_image(plan)
         job = self.ledger.begin_restore(plan)
         return StateHarborRestoreWork(self.ledger, job, manifest, tuple(payloads))
+
+    def prepare_redock(
+        self,
+        *,
+        ticket: StateHarborRedockTicket,
+        plan: OwnerOffloadPlan,
+        manifest: StateHarborImageManifest,
+    ) -> StateHarborRedockWork:
+        """Verify a new-owner ticket, then open the ordinary physical restore."""
+
+        if not isinstance(ticket, StateHarborRedockTicket):
+            raise TypeError("ticket must be a StateHarborRedockTicket")
+        if ticket.source != manifest.source:
+            raise StateHarborBytePlaneError(
+                "redock ticket source does not match the manifest"
+            )
+        if ticket.source_manifest_key != manifest.object_key:
+            raise StateHarborBytePlaneError(
+                "redock ticket does not name the exact manifest"
+            )
+        if ticket.destination_identity != plan.identity:
+            raise StateHarborBytePlaneError(
+                "redock ticket does not name the exact destination plan"
+            )
+        restore = self.prepare_restore(plan=plan, manifest=manifest)
+        return StateHarborRedockWork(ticket, restore)
 
     def release(
         self,
