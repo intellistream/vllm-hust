@@ -421,8 +421,10 @@ jobs:
           fi
 
       - name: Pre-clean stale checkout state
+        id: pre-clean-workspace
         shell: bash
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           legacy_paths=(
             "${GITHUB_WORKSPACE}/.benchmarks"
             "${GITHUB_WORKSPACE}/.ci-runtime"
@@ -451,9 +453,11 @@ jobs:
           }
 
       - name: Resolve trusted main dependency SHAs
+        id: resolve-trusted-shas
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         shell: bash
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           set -euo pipefail
           for name in \
             PERFGATE_BENCHMARK_RUNNER_SHA \
@@ -472,9 +476,11 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Configure GitHub SSH checkout
+        id: configure-github-ssh
         if: ${{ env.BENCHMARK_REPO_SSH_KEY != '' }}
         shell: bash
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           set -euo pipefail
 
           # The runner container may not have HOME set; default to /root for root user.
@@ -539,7 +545,9 @@ jobs:
           fi
 
       - name: Checkout target repo with retry
+        id: checkout-target
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
@@ -612,8 +620,11 @@ jobs:
           clone_with_retry "$TARGET_REPO_URL" "$GITHUB_WORKSPACE" "$TARGET_REPO_SHA" "$TARGET_REPO_REF"
 
       - name: L3 benchmark publication preflight
+        id: publication-preflight
         shell: bash
-        run: bash .github/workflows/scripts/l3_benchmark_publish_preflight.sh
+        run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
+          bash .github/workflows/scripts/l3_benchmark_publish_preflight.sh
 
       - name: Deepen clone for fork-point detection
         if: ${{ github.event_name == 'pull_request' || github.event_name == 'issue_comment' }}
@@ -664,7 +675,9 @@ jobs:
           echo "Fork point: $fork_point"
 
       - name: Checkout benchmark repo
+        id: checkout-benchmark
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
@@ -719,6 +732,7 @@ jobs:
         env:
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           python3 .github/workflows/scripts/resolve_ascend_benchmark_scenario.py
 
       - name: Resolve perfgate spec for Ascend runner
@@ -729,8 +743,10 @@ jobs:
           "${PYTHON_BIN:-python3}" .github/workflows/scripts/resolve_perfgate_spec_file.py
 
       - name: Resolve main same-spec file
+        id: resolve-main-spec
         if: ${{ github.event_name != 'pull_request' && github.event_name != 'issue_comment' && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           spec_file="${SAME_SPEC_SPEC_FILE:-$MAIN_SAME_SPEC_SPEC_FILE}"
           if [[ "$spec_file" = /* ]]; then
             resolved_spec_file="$spec_file"
@@ -744,7 +760,9 @@ jobs:
           echo "SAME_SPEC_SPEC_FILE=$resolved_spec_file" >> "$GITHUB_ENV"
 
       - name: Checkout website repo
+        id: checkout-website
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
@@ -791,7 +809,9 @@ jobs:
           clone_with_retry "$WEBSITE_REPO_URL" "$GITHUB_WORKSPACE/vllm-hust-website"
 
       - name: Checkout vllm-ascend-hust repo
+        id: checkout-plugin
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
@@ -827,9 +847,25 @@ jobs:
             "$GITHUB_WORKSPACE/vllm-ascend-hust" \
             "$VLLM_ASCEND_HUST_REPO_REF"
 
+      - name: Preflight vllm-ascend-hust checkout
+        id: preflight-plugin-checkout
+        shell: bash
+        env:
+          VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
+        run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
+          result_root="$GITHUB_WORKSPACE/.benchmarks/ci/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TARGET_REPO_SHA}"
+          "${PYTHON_BIN:-python3}" \
+            .github/workflows/scripts/verify_ascend_benchmark_plugin.py checkout \
+            --plugin-repo "$VLLM_ASCEND_HUST_REPO" \
+            --expected-sha "$VLLM_ASCEND_HUST_REPO_REF" \
+            --output "$result_root/preflight/plugin-checkout.json"
+
       - name: Preflight benchmark root helper
+        id: preflight-root-helper
         shell: bash
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           if [[ "${ASCEND_BENCHMARK_USE_SUDO}" != "1" ]]; then
             echo "Skipping benchmark root helper preflight because ASCEND_BENCHMARK_USE_SUDO=${ASCEND_BENCHMARK_USE_SUDO}."
             exit 0
@@ -898,7 +934,9 @@ jobs:
           echo "Benchmark root helper preflight passed: $system_helper matches $repo_helper"
 
       - name: Checkout ascend-runtime-manager repo
+        id: checkout-runtime-manager
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           clone_with_retry() {
             local repo_url=$1
             local target_dir=$2
@@ -935,9 +973,11 @@ jobs:
             "$HUST_ASCEND_MANAGER_REPO_REF"
 
       - name: Verify trusted main dependency SHAs
+        id: verify-trusted-shas
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         shell: bash
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           set -euo pipefail
           test "$(git -C "$GITHUB_WORKSPACE/vllm-hust-benchmark" rev-parse HEAD)" = "$PERFGATE_BENCHMARK_RUNNER_SHA"
           test "$(git -C "$GITHUB_WORKSPACE/vllm-ascend-hust" rev-parse HEAD)" = "$PERFGATE_VLLM_ASCEND_HUST_SHA"
@@ -950,7 +990,9 @@ jobs:
           fi
 
       - name: Prepare Hugging Face cache directories
+        id: prepare-hf-cache
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           cache_root="${VLLM_HUST_HF_CACHE_ROOT:-${GITHUB_WORKSPACE}/../.hf-cache}"
           cache_root="${cache_root%/}"
           if [[ -z "$cache_root" || "$cache_root" == "/" ]]; then
@@ -978,9 +1020,11 @@ jobs:
           echo "HF endpoint: $HF_ENDPOINT"
 
       - name: Resolve benchmark Python runtime
+        id: resolve-python-runtime
         env:
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           source "${VLLM_ASCEND_HUST_REPO}/scripts/hust_ascend_manager_helper.sh"
           PYTHON_BIN="$(hust_resolve_python_bin)"
           echo "PYTHON_BIN=$PYTHON_BIN" >> "$GITHUB_ENV"
@@ -1014,7 +1058,9 @@ jobs:
           PY
 
       - name: Install ascend-runtime-manager from fresh checkout
+        id: install-runtime-manager
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           # Remove any stale editable install so hust_ascend_manager_run()
           # picks up the freshly checked-out copy instead of a pre-installed
           # version baked into the runner image.
@@ -1023,19 +1069,26 @@ jobs:
           "${PYTHON_BIN}" -c "import hust_ascend_manager.doctor; print('hust-ascend-manager loaded from:', hust_ascend_manager.doctor.__file__)"
 
       - name: Acquire Ascend hardware lock
-        run: bash .github/workflows/scripts/acquire_ascend_hardware_lock.sh
+        id: acquire-hardware-lock
+        run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
+          bash .github/workflows/scripts/acquire_ascend_hardware_lock.sh
 
       - name: Install Ascend torch stack for preflight
+        id: install-ascend-torch
         env:
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
           bash .github/workflows/scripts/ensure_ascend_torch_stack.sh
 
       - name: Runner health preflight (before install)
+        id: preflight-before-install
         env:
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           if [[ "${ASCEND_BENCHMARK_USE_SUDO}" == "1" ]]; then
             echo "Skipping runner-user preinstall NPU preflight because benchmark startup is configured to use the root helper."
             exit 0
@@ -1184,12 +1237,15 @@ jobs:
           done
 
       - name: Prepare Ascend runtime and install repos
+        id: install-plugin
         env:
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
-          "${PYTHON_BIN}" -m pip uninstall -y vllm vllm-hust 2>/dev/null || true
+          "${PYTHON_BIN}" -m pip uninstall -y \
+            vllm vllm-hust vllm-ascend vllm-ascend-hust 2>/dev/null || true
           bash "${VLLM_ASCEND_HUST_REPO}/scripts/install_local_ascend_plugin.sh" "$VLLM_ASCEND_HUST_REPO"
           "${PYTHON_BIN}" -m pip install --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" "wheel" "packaging>=24.2"
           VLLM_TARGET_DEVICE=empty "${PYTHON_BIN}" -m pip install -e . --no-build-isolation --no-deps
@@ -1201,66 +1257,27 @@ jobs:
           "${PYTHON_BIN}" scripts/ensure_vllm_provider.py
 
       - name: Verify installation
+        id: verify-plugin-install
         env:
           TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
           "${PYTHON_BIN}" --version
-          "${PYTHON_BIN}" - <<'PY'
-          import importlib.metadata as metadata
-          import importlib.util
-          import os
-          from pathlib import Path
-
-
-          def module_path(module_name: str) -> Path:
-            spec = importlib.util.find_spec(module_name)
-            if spec is None or spec.origin is None:
-              raise SystemExit(f"{module_name} is not importable")
-            return Path(spec.origin).resolve()
-
-
-          def dist_version(*dist_names: str) -> str:
-            for dist_name in dist_names:
-              try:
-                return metadata.version(dist_name)
-              except metadata.PackageNotFoundError:
-                continue
-            return "<unknown>"
-
-
-          expected_repo = Path(os.environ["VLLM_ASCEND_HUST_REPO"]).resolve()
-          vllm_path = module_path("vllm")
-          vllm_ascend_path = module_path("vllm_ascend")
-          platform_plugins = metadata.entry_points(group="vllm.platform_plugins")
-          ascend_plugin = [ep for ep in platform_plugins if ep.name == "ascend"]
-
-          print(f"vLLM version: {dist_version('vllm-hust', 'vllm')}")
-          print(f"vllm_ascend version: {dist_version('vllm-ascend-hust', 'vllm-ascend')}")
-          print(f"vLLM module path: {vllm_path}")
-          print(f"vllm_ascend module path: {vllm_ascend_path}")
-          print(f"vllm.platform_plugins ascend entry point: {ascend_plugin[0].value if ascend_plugin else '<missing>'}")
-
-          if expected_repo not in vllm_ascend_path.parents:
-            raise SystemExit(
-              "vllm_ascend is not resolved from the checked-out workspace: "
-              f"{vllm_ascend_path} (expected under {expected_repo})"
-            )
-
-          if not ascend_plugin:
-            raise SystemExit("ascend platform plugin entry point is not installed")
-          try:
-            import xxhash
-          except ImportError as exc:
-            raise SystemExit("xxhash is required by the configured prefix-caching hash algorithm") from exc
-          print(f"xxhash version: {metadata.version('xxhash')}")
-          PY
+          result_root="$GITHUB_WORKSPACE/.benchmarks/ci/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TARGET_REPO_SHA}"
+          "${PYTHON_BIN}" \
+            .github/workflows/scripts/verify_ascend_benchmark_plugin.py installed \
+            --core-repo "$GITHUB_WORKSPACE" \
+            --plugin-repo "$VLLM_ASCEND_HUST_REPO" \
+            --output "$result_root/preflight/plugin-installed.json"
 
       - name: Runner health preflight (before benchmark)
+        id: preflight-before-benchmark
         env:
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           if [[ "${ASCEND_BENCHMARK_USE_SUDO}" == "1" ]]; then
             echo "Skipping runner-user prebenchmark NPU preflight because benchmark startup is configured to use the root helper."
             exit 0
@@ -1387,6 +1404,7 @@ jobs:
           PUBLISH_TO_HF: "0"
         run: |
           set -euo pipefail
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           echo "status=failed" >> "$GITHUB_OUTPUT"
 
           fetch_with_retry() {
@@ -1464,15 +1482,18 @@ jobs:
           retention-days: 14
 
       - name: Sanitize runner before central baseline publication
+        id: sanitize-before-baseline-publish
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.perfgate-producer.outputs.status == 'success' }}
         shell: bash
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           set -euo pipefail
           bash .github/workflows/scripts/cleanup_ascend_ci_processes.sh
           test -z "${GIT_ASKPASS:-}"
           test -z "${PERFGATE_BASELINE_WRITER_TOKEN:-}"
 
       - name: Publish central perfgate baseline
+        id: publish-central-baseline
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.perfgate-producer.outputs.status == 'success' }}
         shell: bash
         env:
@@ -1489,10 +1510,12 @@ jobs:
           PERFGATE_EXPECTED_STRATEGY: "warmup+primary-median-run"
           PERFGATE_EXPECTED_AGGREGATION: "primary-median-run"
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           set -euo pipefail
           bash .github/workflows/scripts/perfgate_store_baseline.sh
 
       - name: Run benchmark CI and optional formal publish
+        id: formal-benchmark
         env:
           WORKSPACE_ROOT: ${{ github.workspace }}
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
@@ -1507,31 +1530,39 @@ jobs:
           PERFGATE_AGGREGATION: "primary-median-run"
           PERFGATE_REQUIRE_PROVENANCE: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && '1' || '0' }}
         run: |
-          source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
-          max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}
-          retry_delay_seconds=${NODE_ENV_RETRY_DELAY_SECONDS:-30}
-          attempt=1
-          while [[ "$attempt" -le "$max_attempts" ]]; do
-            echo "[benchmark] attempt ${attempt}/${max_attempts}"
-            set +e
-            bash .github/workflows/scripts/run_ascend_benchmark_scenario_list.sh
-            rc=$?
+          set +e
+          (
             set -e
+            source "${VLLM_ASCEND_HUST_REPO}/scripts/use_single_ascend_env.sh"
+            max_attempts=${NODE_ENV_RETRY_MAX_ATTEMPTS:-3}
+            retry_delay_seconds=${NODE_ENV_RETRY_DELAY_SECONDS:-30}
+            attempt=1
+            while [[ "$attempt" -le "$max_attempts" ]]; do
+              echo "[benchmark] attempt ${attempt}/${max_attempts}"
+              set +e
+              bash .github/workflows/scripts/run_ascend_benchmark_scenario_list.sh
+              rc=$?
+              set -e
 
-            if [[ "$rc" -eq 0 ]]; then
-              break
-            fi
+              if [[ "$rc" -eq 0 ]]; then
+                break
+              fi
 
-            if [[ "$rc" -eq 86 && "$attempt" -lt "$max_attempts" ]]; then
-              echo "Detected node-level Ascend runtime failure (87/507899); retrying benchmark after ${retry_delay_seconds}s backoff."
-              bash .github/workflows/scripts/cleanup_ascend_ci_processes.sh || true
-              sleep "$retry_delay_seconds"
-              attempt=$((attempt + 1))
-              continue
-            fi
+              if [[ "$rc" -eq 86 && "$attempt" -lt "$max_attempts" ]]; then
+                echo "Detected node-level Ascend runtime failure (87/507899); retrying benchmark after ${retry_delay_seconds}s backoff."
+                bash .github/workflows/scripts/cleanup_ascend_ci_processes.sh || true
+                sleep "$retry_delay_seconds"
+                attempt=$((attempt + 1))
+                continue
+              fi
 
-            exit "$rc"
-          done
+              exit "$rc"
+            done
+          )
+          rc=$?
+          set -e
+          printf 'exit_code=%s\n' "$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Performance gate - Stage 1 comparison
         if: ${{ (github.event_name == 'pull_request' || github.event_name == 'issue_comment') && steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1' }}
@@ -1562,8 +1593,10 @@ jobs:
         run: bash .github/workflows/scripts/perfgate_compare.sh
 
       - name: Cleanup leftover Ascend CI processes
+        id: cleanup-ascend-processes
         if: always()
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           if [[ -f .github/workflows/scripts/cleanup_ascend_ci_processes.sh ]]; then
             bash .github/workflows/scripts/cleanup_ascend_ci_processes.sh
           else
@@ -1571,8 +1604,10 @@ jobs:
           fi
 
       - name: Release Ascend hardware lock
+        id: release-hardware-lock
         if: always()
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           if [[ -f .github/workflows/scripts/release_ascend_hardware_lock.sh ]]; then
             bash .github/workflows/scripts/release_ascend_hardware_lock.sh
           else
@@ -1580,8 +1615,10 @@ jobs:
           fi
 
       - name: Build benchmark summary artifacts
+        id: build-benchmark-summary
         if: always()
         run: |
+          trap 'rc=$?; printf "exit_code=%s\n" "$rc" >> "$GITHUB_OUTPUT"' EXIT
           if [[ -z "${PYTHON_BIN:-}" ]]; then
             PYTHON_BIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
           fi
@@ -1851,6 +1888,102 @@ jobs:
 
           summary_path.write_text("\n".join(lines) + "\n", encoding='utf-8')
           comment_path.write_text("\n".join(comment_lines) + "\n", encoding='utf-8')
+          PY
+
+      - name: Build structured Nightly diagnostics
+        id: structured-nightly-diagnostics
+        if: always()
+        env:
+          ASCEND_BENCHMARK_STEP_RESULTS_JSON: >-
+            [
+              {"id":"checkout-target","name":"Checkout target repo with retry","outcome":"${{ steps.checkout-target.outcome }}","exit_code":"${{ steps.checkout-target.outputs.exit_code }}"},
+              {"id":"pre-clean-workspace","name":"Pre-clean stale checkout state","outcome":"${{ steps.pre-clean-workspace.outcome }}","exit_code":"${{ steps.pre-clean-workspace.outputs.exit_code }}"},
+              {"id":"resolve-trusted-shas","name":"Resolve trusted main dependency SHAs","outcome":"${{ steps.resolve-trusted-shas.outcome }}","exit_code":"${{ steps.resolve-trusted-shas.outputs.exit_code }}"},
+              {"id":"configure-github-ssh","name":"Configure GitHub SSH checkout","outcome":"${{ steps.configure-github-ssh.outcome }}","exit_code":"${{ steps.configure-github-ssh.outputs.exit_code }}"},
+              {"id":"publication-preflight","name":"L3 benchmark publication preflight","outcome":"${{ steps.publication-preflight.outcome }}","exit_code":"${{ steps.publication-preflight.outputs.exit_code }}"},
+              {"id":"checkout-benchmark","name":"Checkout benchmark repo","outcome":"${{ steps.checkout-benchmark.outcome }}","exit_code":"${{ steps.checkout-benchmark.outputs.exit_code }}"},
+              {"id":"resolve-scenario","name":"Resolve L1/L2 benchmark scenario","outcome":"${{ steps.resolve-scenario.outcome }}","exit_code":"${{ steps.resolve-scenario.outputs.exit_code }}"},
+              {"id":"resolve-main-spec","name":"Resolve main same-spec file","outcome":"${{ steps.resolve-main-spec.outcome }}","exit_code":"${{ steps.resolve-main-spec.outputs.exit_code }}"},
+              {"id":"checkout-website","name":"Checkout website repo","outcome":"${{ steps.checkout-website.outcome }}","exit_code":"${{ steps.checkout-website.outputs.exit_code }}"},
+              {"id":"checkout-plugin","name":"Checkout vllm-ascend-hust repo","outcome":"${{ steps.checkout-plugin.outcome }}","exit_code":"${{ steps.checkout-plugin.outputs.exit_code }}"},
+              {"id":"preflight-plugin-checkout","name":"Preflight vllm-ascend-hust checkout","outcome":"${{ steps.preflight-plugin-checkout.outcome }}","exit_code":"${{ steps.preflight-plugin-checkout.outputs.exit_code }}"},
+              {"id":"preflight-root-helper","name":"Preflight benchmark root helper","outcome":"${{ steps.preflight-root-helper.outcome }}","exit_code":"${{ steps.preflight-root-helper.outputs.exit_code }}"},
+              {"id":"checkout-runtime-manager","name":"Checkout ascend-runtime-manager repo","outcome":"${{ steps.checkout-runtime-manager.outcome }}","exit_code":"${{ steps.checkout-runtime-manager.outputs.exit_code }}"},
+              {"id":"verify-trusted-shas","name":"Verify trusted main dependency SHAs","outcome":"${{ steps.verify-trusted-shas.outcome }}","exit_code":"${{ steps.verify-trusted-shas.outputs.exit_code }}"},
+              {"id":"prepare-hf-cache","name":"Prepare Hugging Face cache directories","outcome":"${{ steps.prepare-hf-cache.outcome }}","exit_code":"${{ steps.prepare-hf-cache.outputs.exit_code }}"},
+              {"id":"resolve-python-runtime","name":"Resolve benchmark Python runtime","outcome":"${{ steps.resolve-python-runtime.outcome }}","exit_code":"${{ steps.resolve-python-runtime.outputs.exit_code }}"},
+              {"id":"install-runtime-manager","name":"Install ascend-runtime-manager","outcome":"${{ steps.install-runtime-manager.outcome }}","exit_code":"${{ steps.install-runtime-manager.outputs.exit_code }}"},
+              {"id":"acquire-hardware-lock","name":"Acquire Ascend hardware lock","outcome":"${{ steps.acquire-hardware-lock.outcome }}","exit_code":"${{ steps.acquire-hardware-lock.outputs.exit_code }}"},
+              {"id":"install-ascend-torch","name":"Install Ascend torch stack","outcome":"${{ steps.install-ascend-torch.outcome }}","exit_code":"${{ steps.install-ascend-torch.outputs.exit_code }}"},
+              {"id":"preflight-before-install","name":"Runner health preflight before install","outcome":"${{ steps.preflight-before-install.outcome }}","exit_code":"${{ steps.preflight-before-install.outputs.exit_code }}"},
+              {"id":"install-plugin","name":"Prepare Ascend runtime and install repos","outcome":"${{ steps.install-plugin.outcome }}","exit_code":"${{ steps.install-plugin.outputs.exit_code }}"},
+              {"id":"verify-plugin-install","name":"Verify installation","outcome":"${{ steps.verify-plugin-install.outcome }}","exit_code":"${{ steps.verify-plugin-install.outputs.exit_code }}"},
+              {"id":"preflight-before-benchmark","name":"Runner health preflight before benchmark","outcome":"${{ steps.preflight-before-benchmark.outcome }}","exit_code":"${{ steps.preflight-before-benchmark.outputs.exit_code }}"},
+              {"id":"perfgate-producer","name":"Run perfgate baseline producer benchmark","outcome":"${{ steps.perfgate-producer.outcome }}","exit_code":"${{ steps.perfgate-producer.outputs.exit_code }}"},
+              {"id":"sanitize-before-baseline-publish","name":"Sanitize runner before central baseline publication","outcome":"${{ steps.sanitize-before-baseline-publish.outcome }}","exit_code":"${{ steps.sanitize-before-baseline-publish.outputs.exit_code }}"},
+              {"id":"publish-central-baseline","name":"Publish central perfgate baseline","outcome":"${{ steps.publish-central-baseline.outcome }}","exit_code":"${{ steps.publish-central-baseline.outputs.exit_code }}"},
+              {"id":"formal-benchmark","name":"Run benchmark CI and optional formal publish","outcome":"${{ steps.formal-benchmark.outcome }}","exit_code":"${{ steps.formal-benchmark.outputs.exit_code }}"},
+              {"id":"cleanup-ascend-processes","name":"Cleanup leftover Ascend CI processes","outcome":"${{ steps.cleanup-ascend-processes.outcome }}","exit_code":"${{ steps.cleanup-ascend-processes.outputs.exit_code }}"},
+              {"id":"release-hardware-lock","name":"Release Ascend hardware lock","outcome":"${{ steps.release-hardware-lock.outcome }}","exit_code":"${{ steps.release-hardware-lock.outputs.exit_code }}"},
+              {"id":"build-benchmark-summary","name":"Build benchmark summary artifacts","outcome":"${{ steps.build-benchmark-summary.outcome }}","exit_code":"${{ steps.build-benchmark-summary.outputs.exit_code }}"}
+            ]
+        shell: bash
+        run: |
+          set -euo pipefail
+          result_root="$GITHUB_WORKSPACE/.benchmarks/ci/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TARGET_REPO_SHA}"
+          output="$result_root/nightly-diagnostics.json"
+          python_bin="${PYTHON_BIN:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
+          if [[ -z "$python_bin" ]]; then
+            echo "Unable to build structured Nightly diagnostics because no Python runtime is available." >&2
+            exit 1
+          fi
+
+          diagnostic_script="$GITHUB_WORKSPACE/.github/workflows/scripts/build_ascend_benchmark_diagnostics.py"
+          if [[ -f "$diagnostic_script" ]]; then
+            "$python_bin" "$diagnostic_script" \
+              --result-root "$result_root" \
+              --output "$output" \
+              --step-results-json "$ASCEND_BENCHMARK_STEP_RESULTS_JSON" \
+              --github-summary "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # A target checkout failure can remove the source tree. Preserve a
+          # minimal secret-free failure record so the artifact remains useful.
+          mkdir -p "$result_root"
+          "$python_bin" - "$output" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          raw_steps = json.loads(os.environ["ASCEND_BENCHMARK_STEP_RESULTS_JSON"])
+          failed_steps = []
+          for item in raw_steps:
+            if item.get("outcome") not in {"failure", "cancelled"}:
+              continue
+            exit_code = item.get("exit_code", "")
+            failed_steps.append({
+              "id": item.get("id", "unknown"),
+              "name": item.get("name", "unknown"),
+              "outcome": item.get("outcome", "failure"),
+              "exit_code": int(exit_code) if str(exit_code).isdigit() else None,
+            })
+          payload = {
+            "schema_version": "ascend-nightly-diagnostics/v1",
+            "failed_steps": failed_steps,
+            "scenario_summary": {"passed": 0, "failed": 0, "scenarios": []},
+            "data_quality": [],
+            "plugin_preflight": [],
+            "benchmark_execution_status": "failed",
+            "publication_status": "not-attempted",
+            "data_quality_status": "not-evaluated",
+            "release_visibility_status": "not-published",
+          }
+          Path(sys.argv[1]).write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+          )
           PY
 
       - name: Upload benchmark artifacts

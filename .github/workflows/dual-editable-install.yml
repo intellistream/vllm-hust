@@ -1,0 +1,54 @@
+name: Dual Editable Install
+'on':
+  workflow_dispatch:
+    inputs:
+      vllm_hust_ref:
+        description: vllm-hust git ref to test (branch, tag, or SHA)
+        required: false
+        default: main
+      vllm_ascend_hust_ref:
+        description: vllm-ascend-hust git ref to test (branch, tag, or SHA)
+        required: false
+        default: main
+  pull_request:
+    paths:
+    - pyproject.toml
+    - setup.py
+    - setup.cfg
+    - requirements/**
+    - .github/workflows/dual-editable-install.yml
+    - scripts/ci/validate_dual_editable_install.sh
+    - tests/ci/test_dual_editable_install_static.py
+permissions:
+  contents: read
+jobs:
+  validate-dual-editable:
+    name: Validate dual-editable install
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}/vllm-ascend-hust
+      VLLM_ASCEND_HUST_REPO_URL: https://github.com/vLLM-HUST/vllm-ascend-hust.git
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ inputs.vllm_hust_ref || github.ref }}
+        fetch-depth: 0
+    - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      with:
+        enable-cache: true
+        cache-dependency-glob: |
+          requirements/**/*.txt
+          pyproject.toml
+        python-version: '3.12'
+    - name: Checkout vllm-ascend-hust
+      env:
+        ASCEND_REF: ${{ inputs.vllm_ascend_hust_ref || 'main' }}
+      run: |
+        git clone --no-checkout "$VLLM_ASCEND_HUST_REPO_URL" "$VLLM_ASCEND_HUST_REPO"
+        cd "$VLLM_ASCEND_HUST_REPO"
+        git fetch origin "$ASCEND_REF" --depth 1
+        git checkout "$ASCEND_REF"
+    - name: Run dual-editable validation
+      run: |
+        bash scripts/ci/validate_dual_editable_install.sh

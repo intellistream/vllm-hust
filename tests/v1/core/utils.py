@@ -8,6 +8,7 @@ from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
+    KVCacheCompressionConfig,
     KVTransferConfig,
     ModelConfig,
     ParallelConfig,
@@ -26,6 +27,7 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+from vllm.v1.kv_cache_compression import KVCacheCompressionRuntimeSpec
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -60,6 +62,8 @@ def create_scheduler(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
+    kv_cache_compression_config: KVCacheCompressionConfig | None = None,
+    kv_cache_compression_runtime_spec: KVCacheCompressionRuntimeSpec | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -148,6 +152,7 @@ def create_scheduler(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
+        kv_cache_compression_config=kv_cache_compression_config,
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
@@ -173,6 +178,7 @@ def create_scheduler(
         block_size=block_size,
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
+        kv_cache_compression_runtime_spec=kv_cache_compression_runtime_spec,
     )
     if use_v2_model_runner is None:
         use_v2_model_runner = bool(envs.VLLM_USE_V2_MODEL_RUNNER)

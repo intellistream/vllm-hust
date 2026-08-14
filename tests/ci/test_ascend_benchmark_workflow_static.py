@@ -175,7 +175,18 @@ def test_benchmark_install_removes_conflicting_vllm_provider():
         ) : text.index("      - name: Verify installation")
     ]
 
-    assert '"${PYTHON_BIN}" -m pip uninstall -y vllm vllm-hust' in install_step
+    uninstall_start = install_step.index('"${PYTHON_BIN}" -m pip uninstall -y')
+    plugin_install = install_step.index("install_local_ascend_plugin.sh")
+    uninstall_block = install_step[uninstall_start:plugin_install]
+    uninstall_args = uninstall_block.replace("\\\n", " ").split()
+
+    for distribution in (
+        "vllm",
+        "vllm-hust",
+        "vllm-ascend",
+        "vllm-ascend-hust",
+    ):
+        assert distribution in uninstall_args
     assert (
         '"${PYTHON_BIN}" scripts/ensure_vllm_provider.py --remove-conflicts'
         in install_step
@@ -292,6 +303,45 @@ def test_multi_scenario_runner_prints_failure_diagnostics():
     assert 'print_file_tail "scenario output"' in text
     assert 'print_file_tail "vLLM server log"' in text
     assert 'print_file_tail "runner preflight failure"' in text
+
+
+def test_structured_nightly_diagnostics_capture_steps_scenarios_and_four_states():
+    text = workflow_text()
+    diagnostics_step = text.index("      - name: Build structured Nightly diagnostics")
+    upload_step = text.index("      - name: Upload benchmark artifacts")
+    diagnostics_block = text[diagnostics_step:upload_step]
+
+    assert diagnostics_step < upload_step
+    assert "ASCEND_BENCHMARK_STEP_RESULTS_JSON" in diagnostics_block
+    assert '"id":"formal-benchmark"' in diagnostics_block
+    assert "steps.formal-benchmark.outputs.exit_code" in diagnostics_block
+    assert "build_ascend_benchmark_diagnostics.py" in diagnostics_block
+    assert "nightly-diagnostics.json" in diagnostics_block
+    for state in (
+        "benchmark_execution_status",
+        "publication_status",
+        "data_quality_status",
+        "release_visibility_status",
+    ):
+        assert state in diagnostics_block
+    assert "BENCHMARK_REPO_GH_TOKEN" not in diagnostics_block
+    assert "BENCHMARK_REPO_SSH_KEY" not in diagnostics_block
+
+
+def test_plugin_checkout_and_installed_preflights_run_before_benchmark():
+    text = workflow_text()
+    checkout = text.index("      - name: Checkout vllm-ascend-hust repo")
+    checkout_preflight = text.index("      - name: Preflight vllm-ascend-hust checkout")
+    install = text.index("      - name: Prepare Ascend runtime and install repos")
+    installed_preflight = text.index("      - name: Verify installation")
+    benchmark = text.index("      - name: Run benchmark CI and optional formal publish")
+
+    assert checkout < checkout_preflight < install < installed_preflight < benchmark
+    assert "verify_ascend_benchmark_plugin.py checkout" in text
+    assert '--expected-sha "$VLLM_ASCEND_HUST_REPO_REF"' in text
+    assert "verify_ascend_benchmark_plugin.py installed" in text
+    assert "plugin-checkout.json" in text
+    assert "plugin-installed.json" in text
 
 
 def test_benchmark_script_does_not_force_max_model_len():
@@ -788,3 +838,38 @@ def test_perfgate_producer_and_store_survive_formal_benchmark_failure():
     )
     assert "  store-main-perfgate-baseline:" not in text
     assert text.count("secrets.VLLM_HUST_CENTRAL_BASELINE_WRITER_TOKEN") == 1
+
+
+def test_structured_diagnostics_cover_critical_operational_failures():
+    text = workflow_text()
+    diagnostics_start = text.index("- name: Build structured Nightly diagnostics")
+    diagnostics_end = text.index(
+        "- name: Upload benchmark artifacts", diagnostics_start
+    )
+    diagnostics_block = text[diagnostics_start:diagnostics_end]
+
+    critical_step_ids = (
+        "pre-clean-workspace",
+        "resolve-trusted-shas",
+        "configure-github-ssh",
+        "resolve-main-spec",
+        "checkout-website",
+        "preflight-root-helper",
+        "checkout-runtime-manager",
+        "verify-trusted-shas",
+        "prepare-hf-cache",
+        "acquire-hardware-lock",
+        "perfgate-producer",
+        "sanitize-before-baseline-publish",
+        "publish-central-baseline",
+        "cleanup-ascend-processes",
+        "release-hardware-lock",
+        "build-benchmark-summary",
+    )
+    for step_id in critical_step_ids:
+        assert f"id: {step_id}" in text
+        assert f'"id":"{step_id}"' in diagnostics_block
+        assert f"steps.{step_id}.outcome" in diagnostics_block
+        assert f"steps.{step_id}.outputs.exit_code" in diagnostics_block
+
+    assert "toJson(steps)" not in diagnostics_block

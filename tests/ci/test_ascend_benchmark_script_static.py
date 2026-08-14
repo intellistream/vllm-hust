@@ -78,6 +78,9 @@ def test_benchmark_snapshot_sync_explains_missing_write_credentials():
     assert "Path(sys.argv[1])" in trend_validator_block
     assert git_add_index < git_commit_index < git_push_index
     assert "write_github_env GITHUB_SNAPSHOT_SYNC_STATUS rejected" in text
+    assert "write_github_env GITHUB_SNAPSHOT_SYNC_STATUS attempting" in text
+    assert "write_github_env GITHUB_SNAPSHOT_SYNC_STATUS failed" in text
+    assert "write_github_env GITHUB_SNAPSHOT_SYNC_VERIFICATION failed" in text
     assert (
         "required_submission_files=(" in text
         and "env-manifest.json" in text

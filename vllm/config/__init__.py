@@ -13,6 +13,7 @@ from vllm.config.device import DeviceConfig
 from vllm.config.diffusion import DiffusionConfig
 from vllm.config.ec_transfer import ECTransferConfig
 from vllm.config.kernel import KernelConfig
+from vllm.config.kv_cache_compression import KVCacheCompressionConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.config.load import LoadConfig
@@ -79,6 +80,8 @@ __all__ = [
     "ECTransferConfig",
     # From vllm.config.kernel
     "KernelConfig",
+    # From vllm.config.kv_cache_compression
+    "KVCacheCompressionConfig",
     # From vllm.config.kv_events
     "KVEventsConfig",
     # From vllm.config.kv_transfer
