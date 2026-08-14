@@ -66,6 +66,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "int4": torch.uint8,
     "nvfp4": torch.uint8,
     "fp4_e2m1": torch.uint8,
+    "kivi_int4": torch.uint8,
 }
 
 
@@ -73,7 +74,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
         kv_cache_dtype.startswith("fp8")
         or kv_cache_dtype.endswith("per_token_head")
-        or kv_cache_dtype in ("nvfp4", "int4", "fp4_e2m1")
+        or kv_cache_dtype in ("nvfp4", "int4", "fp4_e2m1", "int8", "kivi_int4")
     )
 
 
@@ -109,6 +110,8 @@ class KVQuantMode(IntEnum):
     NVFP4 = 5
     INT4 = 6
     FP4_E2M1 = 7
+    INT8_PER_TENSOR = 8
+    KIVI_INT4 = 9
 
     @property
     def is_per_token_head(self) -> bool:
@@ -136,6 +139,10 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.NVFP4
     if kv_cache_dtype == "fp4_e2m1":
         return KVQuantMode.FP4_E2M1
+    if kv_cache_dtype == "int8":
+        return KVQuantMode.INT8_PER_TENSOR
+    if kv_cache_dtype == "kivi_int4":
+        return KVQuantMode.KIVI_INT4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
@@ -369,11 +376,6 @@ class TestCrossComponentConsistency:
             is_quant = is_quantized_kv_cache(dtype)
             mode = get_kv_quant_mode(dtype)
             quantized_by_mode = mode != KVQuantMode.NONE
-            if is_quant != quantized_by_mode:
-                # Special case: kivi_int4 is in CacheDType but uses
-                # a different quant path (not in get_kv_quant_mode)
-                if dtype == "kivi_int4":
-                    continue
-                raise AssertionError(
-                    f"Mismatch for {dtype}: is_quantized={is_quant}, mode={mode}"
-                )
+            assert is_quant == quantized_by_mode, (
+                f"Mismatch for {dtype}: is_quantized={is_quant}, mode={mode}"
+            )
