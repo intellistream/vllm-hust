@@ -579,8 +579,45 @@ def test_speculative_completion_derives_verified_logical_commit() -> None:
     }
 
     output.sampled_token_ids = []
-    with pytest.raises(RuntimeError, match="missing the terminal output"):
+    with pytest.raises(RuntimeError, match="align 1:1"):
         WorkerWrapperBase._request_owned_committed_num_tokens(metadata, output)
+
+
+def test_speculative_completion_rejects_misaligned_identity_before_mark() -> None:
+    key = OwnerLeaseKey("spec", 2)
+    metadata = RequestOwnedStepMetadata(
+        step_seq=9,
+        owner_rank=0,
+        entries=(
+            RequestOwnedStepEntry(
+                key=key,
+                allocation_generation=1,
+                pre_step_num_computed_tokens=20,
+                post_step_num_tokens=24,
+                tables=((),),
+                delta=((),),
+                num_speculative_tokens=3,
+            ),
+        ),
+    )
+    output = ModelRunnerOutput(
+        req_ids=["other"],
+        req_id_to_index={"spec": 0},
+        sampled_token_ids=[[31, 32, 99]],
+    )
+    store = _FakeStore(0)
+    wrapper = _wrapper(0, store=store, sampling=True)
+
+    with pytest.raises(RuntimeError, match="bijective and aligned"):
+        wrapper._complete_request_owned_step(
+            step_seq=9,
+            trial_manager=AttentionLeaseManager(owner_rank=0, capacity=64),
+            metadata=metadata,
+            output=output,
+        )
+
+    assert store.mark_calls == 0
+    assert "mark" not in store.calls
 
 
 # -- default delegation ------------------------------------------------------

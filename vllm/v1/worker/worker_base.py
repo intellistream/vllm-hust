@@ -1403,18 +1403,56 @@ class WorkerWrapperBase:
         count.  Non-spec entries retain the store's exact-post contract and
         therefore need no override.
         """
+        speculative_entries = tuple(
+            entry for entry in metadata.entries if entry.num_speculative_tokens > 0
+        )
+        if not speculative_entries:
+            return {}
+
+        req_ids = output.req_ids
+        sampled_token_ids = output.sampled_token_ids
+        req_id_to_index = output.req_id_to_index
+        if len(sampled_token_ids) != len(req_ids):
+            raise RuntimeError(
+                "request-owned speculative completion requires sampled-token "
+                "rows to align 1:1 with req_ids."
+            )
+        if not isinstance(req_id_to_index, dict) or len(req_id_to_index) != len(
+            req_ids
+        ):
+            raise RuntimeError(
+                "request-owned speculative completion requires req_id_to_index "
+                "to be bijective over req_ids."
+            )
+        seen_req_ids: set[str] = set()
+        for expected_index, req_id in enumerate(req_ids):
+            if not isinstance(req_id, str) or req_id in seen_req_ids:
+                raise RuntimeError(
+                    "request-owned speculative completion requires unique "
+                    "string req_ids."
+                )
+            seen_req_ids.add(req_id)
+            mapped_index = req_id_to_index.get(req_id)
+            if (
+                isinstance(mapped_index, bool)
+                or not isinstance(mapped_index, int)
+                or mapped_index != expected_index
+            ):
+                raise RuntimeError(
+                    "request-owned speculative completion requires req_id_to_index "
+                    "to be bijective and aligned with req_ids."
+                )
+
         commits: dict[OwnerLeaseKey, int] = {}
-        for entry in metadata.entries:
-            if entry.num_speculative_tokens == 0:
-                continue
+        for entry in speculative_entries:
             req_id = entry.key.request_id
-            index = output.req_id_to_index.get(req_id)
-            if index is None or index < 0 or index >= len(output.sampled_token_ids):
+            index = req_id_to_index.get(req_id)
+            if index is None:
                 raise RuntimeError(
                     "request-owned speculative completion is missing the "
                     f"terminal output for {req_id!r}."
                 )
-            tokens = output.sampled_token_ids[index]
+            tokens = sampled_token_ids[index]
             if not isinstance(tokens, list):
                 raise RuntimeError(
                     "request-owned speculative completion requires a list "
