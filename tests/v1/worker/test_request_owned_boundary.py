@@ -268,7 +268,7 @@ class _FakeStore:
         self.calls.append("flush")
         return ()
 
-    def mark_computed_batch(self, metadata):
+    def mark_computed_batch(self, metadata, committed_num_tokens=None):
         self.calls.append("mark")
         return RequestOwnedStepMarkResult(
             accepted=True,

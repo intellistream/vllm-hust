@@ -810,7 +810,12 @@ def test_request_owned_scheduler_publishes_and_commits_each_dspark_prefix(
     # same logical horizon that the owner KV transaction commits.
     pre_step = request.num_computed_tokens - 4
     emitted = [41, 42, 43][:accepted_draft_count] + [99]
-    _apply_window_step(scheduler, verify, {}, {"spec": emitted})
+    _apply_window_step(
+        scheduler,
+        verify,
+        {},
+        sampled_token_ids={"spec": emitted},
+    )
     assert request.num_computed_tokens == pre_step + accepted_draft_count + 1
     assert request.output_token_ids[-len(emitted) :] == emitted
 
