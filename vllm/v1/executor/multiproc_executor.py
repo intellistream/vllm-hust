@@ -758,6 +758,15 @@ class WorkerProc:
                         response, unready_proc_handle
                     )
                 except EOFError:
+                    proc = unready_proc_handle.proc
+                    proc.join(timeout=0.1)
+                    logger.error(
+                        "WorkerProc rank %d exited before READY "
+                        "(pid=%s, exitcode=%s)",
+                        unready_proc_handle.rank,
+                        proc.pid,
+                        proc.exitcode,
+                    )
                     e.__suppress_context__ = True
                     raise e from None
 
