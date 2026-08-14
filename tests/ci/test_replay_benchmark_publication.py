@@ -395,7 +395,15 @@ def test_publish_pushes_and_verifies_via_local_bare_remote(
 
     assert "Historical benchmark publication replay verified" in result.stdout
     receipt = Path(env["REPLAY_RECEIPT_FILE"]).read_text(encoding="utf-8")
-    assert "GITHUB_SNAPSHOT_SYNC_STATUS=pushed\n" in receipt
+    sync_statuses = [
+        line
+        for line in receipt.splitlines()
+        if line.startswith("GITHUB_SNAPSHOT_SYNC_STATUS=")
+    ]
+    assert sync_statuses == [
+        "GITHUB_SNAPSHOT_SYNC_STATUS=attempting",
+        "GITHUB_SNAPSHOT_SYNC_STATUS=pushed",
+    ]
     assert "GITHUB_SNAPSHOT_SYNC_VERIFICATION=verified\n" in receipt
     assert "REPLAY_RESULT=verified\n" in receipt
     remote_head = run(["git", "rev-parse", "refs/heads/main"], remote).stdout.strip()

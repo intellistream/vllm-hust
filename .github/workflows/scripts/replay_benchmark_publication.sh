@@ -305,13 +305,32 @@ receipt_value() {
   printf '%s\n' "$values"
 }
 
-sync_status=$(receipt_value GITHUB_SNAPSHOT_SYNC_STATUS)
+receipt_sync_status() {
+  local values
+  local value_count
+  local initial_status
+  local terminal_status
+
+  values=$(sed -n 's/^GITHUB_SNAPSHOT_SYNC_STATUS=//p' "$REPLAY_RECEIPT_FILE")
+  value_count=$(printf '%s\n' "$values" | wc -l | tr -d ' ')
+  initial_status=$(printf '%s\n' "$values" | sed -n '1p')
+  terminal_status=$(printf '%s\n' "$values" | sed -n '2p')
+  if [[ "$value_count" -ne 2 || "$initial_status" != "attempting" ]]; then
+    echo "replay receipt must contain attempting followed by one terminal sync status" >&2
+    exit 2
+  fi
+  case "$terminal_status" in
+    pushed|unchanged) printf '%s\n' "$terminal_status" ;;
+    *)
+      echo "unexpected terminal replay sync status: $terminal_status" >&2
+      exit 2
+      ;;
+  esac
+}
+
+sync_status=$(receipt_sync_status)
 sync_verification=$(receipt_value GITHUB_SNAPSHOT_SYNC_VERIFICATION)
 verified_commit=$(receipt_value GITHUB_SNAPSHOT_SYNC_VERIFIED_COMMIT)
-if [[ "$sync_status" != "pushed" && "$sync_status" != "unchanged" ]]; then
-  echo "unexpected replay sync status: $sync_status" >&2
-  exit 2
-fi
 if [[ "$sync_verification" != "verified" ]]; then
   echo "replay verification did not succeed: $sync_verification" >&2
   exit 2

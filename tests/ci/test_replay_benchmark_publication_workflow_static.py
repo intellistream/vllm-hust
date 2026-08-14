@@ -51,7 +51,7 @@ def test_replay_workflow_downloads_exact_source_run_artifact() -> None:
     assert 'EXPECTED_SOURCE_JOB_ID: "92301693209"' in text
     assert 'EXPECTED_TARGET_SHA: "4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0"' in text
     assert (
-        'EXPECTED_BENCHMARK_MAIN_SHA: "734f3fc3cc7a809889ac1780a1fd980e98226cef"'
+        'EXPECTED_BENCHMARK_MAIN_SHA: "52182b41b3f8f514e69d6cd48730b357f55519bc"'
         in text
     )
     assert "source_run_id:" not in text
@@ -108,7 +108,10 @@ def test_replay_checkouts_do_not_persist_credentials() -> None:
 
     assert text.count("persist-credentials: false") == 3
     assert "cancel-in-progress: false" in text
-    assert "EXPECTED_SYNC_SCRIPT_SHA256:" in text
+    assert (
+        "EXPECTED_SYNC_SCRIPT_SHA256: "
+        "a8701eba5f3f4ba3365b1b2432e91ad6f77272a81ae7d24fea0b80191ae35d29" in text
+    )
     assert "REPLAY_RECEIPT_FILE:" in text
     assert "jsonschema==4.23.0" in text
     assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in text

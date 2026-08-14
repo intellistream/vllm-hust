@@ -28,14 +28,14 @@ jobs:
       SOURCE_RUN_ATTEMPT: "1"
       EXPECTED_SOURCE_JOB_ID: "92301693209"
       EXPECTED_TARGET_SHA: "4a6f5b1ce78ace4b2b4d77229a9707a7f54ba5d0"
-      EXPECTED_BENCHMARK_MAIN_SHA: "734f3fc3cc7a809889ac1780a1fd980e98226cef"
+      EXPECTED_BENCHMARK_MAIN_SHA: "52182b41b3f8f514e69d6cd48730b357f55519bc"
       REPLAY_CONFIRMATION: ${{ inputs.confirmation }}
       REPLAY_ARTIFACT_ROOT: ${{ github.workspace }}/source-artifact
       BENCHMARK_REPO_DIR: ${{ github.workspace }}/vllm-hust-benchmark
       WEBSITE_REPO_DIR: ${{ github.workspace }}/vllm-hust-website
       VLLM_HUST_REPO_DIR: ${{ github.workspace }}
       EXPECTED_WEBSITE_SHA: 9740d1470e8a9dbd2191f5c082498e24ef414a6e
-      EXPECTED_SYNC_SCRIPT_SHA256: 1e647db41b7bc458cf051c8ae124c51381ea47a694afbc566b7c8aa9b71ec267
+      EXPECTED_SYNC_SCRIPT_SHA256: a8701eba5f3f4ba3365b1b2432e91ad6f77272a81ae7d24fea0b80191ae35d29
       REPLAY_RECEIPT_FILE: ${{ github.workspace }}/.replay-output/benchmark-publication-replay.env
       LOCAL_SNAPSHOT_OUTPUT_DIR: ${{ github.workspace }}/.replay-output/benchmark-publication-snapshots
 
@@ -49,7 +49,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: vLLM-HUST/vllm-hust-benchmark
-          ref: 734f3fc3cc7a809889ac1780a1fd980e98226cef
+          ref: 52182b41b3f8f514e69d6cd48730b357f55519bc
           fetch-depth: 0
           path: vllm-hust-benchmark
           persist-credentials: false
