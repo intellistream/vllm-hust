@@ -689,6 +689,34 @@ class RequestOwnedBulkOffloadLedger:
             for key in group
         )
 
+    def admit_durable_host_image(self, plan: OwnerOffloadPlan) -> None:
+        """Admit an externally verified immutable host image for restore.
+
+        A process-local offload manager proves durability through a successful
+        STORE job.  A shared byte plane can instead be populated by another
+        owner process, so the destination ledger needs one narrow receipt
+        boundary after that plane has verified the complete immutable image.
+
+        This method deliberately does *not* make the allocation HOT, ACTIVE,
+        or runnable.  It only admits the exact host keys in ``plan``; the
+        ordinary ``begin_restore`` and exact H2D completion receipt remain
+        mandatory.  Callers are trusted worker-side persistence adapters, not
+        schedulers or storage backends.
+        """
+
+        state = self._require_plan(plan)
+        if state.active:
+            raise RequestOwnedOffloadError(
+                "ACTIVE owner KV cannot admit an external restore image"
+            )
+        if state.inflight_jobs:
+            raise RequestOwnedOffloadError(
+                "cannot admit an external image with owner DMA in flight"
+            )
+        self._durable_host_keys.update(
+            key for group in plan.offload_keys for key in group
+        )
+
     def forget_host_keys(self, keys: tuple[OffloadKey, ...]) -> None:
         """Forget keys evicted by the owner-local offloading manager."""
 
