@@ -442,12 +442,15 @@ def balanced_decode_graph_signature(
     num_tokens: int,
     uniform_decode: bool,
 ) -> RequestOwnedGraphSignature | None:
-    """Return the first request-owned FULL-decode signature, or ``None``.
+    """Return the fixed request-owned uniform-decode signature, or ``None``.
 
-    The initial graphable envelope is intentionally narrow: one decode row per
-    request, one request per owner, and identity canonical/owner order. A
-    caller must treat ``None`` as "FULL forbidden" and fall back to PIECEWISE;
-    it must never reinterpret it as the baseline (non-owner) graph key.
+    The graphable envelope remains intentionally narrow: one request per
+    owner, the same positive number of token rows for every request, and
+    identity canonical/owner order.  The per-owner count is therefore the
+    uniform decode query length (``1 + num_speculative_tokens`` for target
+    verification), not merely a request count.  A caller must treat ``None``
+    as "FULL forbidden" and fall back to PIECEWISE; it must never reinterpret
+    it as the baseline (non-owner) graph key.
     """
 
     if not isinstance(layout, OwnerRowLayout):
@@ -455,15 +458,14 @@ def balanced_decode_graph_signature(
     reqs = _require_nonneg_int(num_reqs, "num_reqs")
     tokens = _require_nonneg_int(num_tokens, "num_tokens")
     if not isinstance(uniform_decode, bool):
-        raise OwnerLayoutError(
-            f"uniform_decode must be a bool, got {uniform_decode!r}"
-        )
-    if not uniform_decode or reqs == 0 or tokens != reqs:
+        raise OwnerLayoutError(f"uniform_decode must be a bool, got {uniform_decode!r}")
+    if not uniform_decode or reqs == 0 or tokens == 0 or tokens % reqs != 0:
         return None
     if layout.logical_len != tokens or layout.world_size != reqs:
         return None
+    rows_per_owner = tokens // reqs
     expected_identity = tuple(range(tokens))
-    if layout.owner_counts != (1,) * layout.world_size:
+    if layout.owner_counts != (rows_per_owner,) * layout.world_size:
         return None
     if layout.forward_permutation != expected_identity:
         return None

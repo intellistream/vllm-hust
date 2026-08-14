@@ -20,6 +20,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.ownership import (
     AttentionLeaseManager,
     OwnerCachePoolSnapshot,
+    OwnerLeaseKey,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -29,6 +30,7 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.request_owned_kv import (
     AllocationResult,
     DeferredFreeResult,
+    RequestOwnedStepEntry,
     RequestOwnedStepMarkResult,
     RequestOwnedStepMetadata,
 )
@@ -123,7 +125,13 @@ class _FakeStore:
             error="RESTORE is out of scope for the physical KV store",
         )
 
-    def build_step_metadata(self, step_seq, tokens, request_token_counts):
+    def build_step_metadata(
+        self,
+        step_seq,
+        tokens,
+        request_token_counts,
+        scheduled_spec_decode_tokens,
+    ):
         self.calls.append("build")
         if self.reject_build:
             return SimpleNamespace(
@@ -141,7 +149,7 @@ class _FakeStore:
             error=None,
         )
 
-    def mark_computed_batch(self, metadata):
+    def mark_computed_batch(self, metadata, committed_num_tokens=None):
         self.calls.append("mark")
         self.mark_calls += 1
         self.last_mark_metadata = metadata
@@ -541,6 +549,38 @@ def test_default_off_path_unchanged_and_never_marks() -> None:
     assert "mark" not in store.calls
     assert result.owner_receipt_batches[0].emitted_step_seq == 1
     assert wrapper._request_owned_deferred is None
+
+
+def test_speculative_completion_derives_verified_logical_commit() -> None:
+    key = OwnerLeaseKey("spec", 2)
+    metadata = RequestOwnedStepMetadata(
+        step_seq=9,
+        owner_rank=0,
+        entries=(
+            RequestOwnedStepEntry(
+                key=key,
+                allocation_generation=1,
+                pre_step_num_computed_tokens=20,
+                post_step_num_tokens=24,
+                tables=((),),
+                delta=((),),
+                num_speculative_tokens=3,
+            ),
+        ),
+    )
+    output = ModelRunnerOutput(
+        req_ids=["spec"],
+        req_id_to_index={"spec": 0},
+        sampled_token_ids=[[31, 99]],
+    )
+
+    assert WorkerWrapperBase._request_owned_committed_num_tokens(metadata, output) == {
+        key: 22
+    }
+
+    output.sampled_token_ids = []
+    with pytest.raises(RuntimeError, match="missing the terminal output"):
+        WorkerWrapperBase._request_owned_committed_num_tokens(metadata, output)
 
 
 # -- default delegation ------------------------------------------------------

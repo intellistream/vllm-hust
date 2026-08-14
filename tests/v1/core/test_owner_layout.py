@@ -111,7 +111,9 @@ def test_epoch_distinct_request_uids_are_distinct_rows() -> None:
     assert layout.logical_len == 2
 
 
-def test_balanced_decode_graph_signature_accepts_only_fixed_identity_envelope() -> None:
+def test_balanced_decode_graph_signature_accepts_fixed_uniform_identity_envelope() -> (
+    None
+):
     group = (7, 2, 11)
     rows = _rows(["a", "b", "c"], [4, 8, 12])
     identity = OwnerRowLayout.build(
@@ -124,6 +126,22 @@ def test_balanced_decode_graph_signature_accepts_only_fixed_identity_envelope() 
         identity, num_reqs=3, num_tokens=3, uniform_decode=True
     ) == RequestOwnedGraphSignature(
         owner_counts=(1, 1, 1), canonical_to_owner=(0, 1, 2)
+    )
+
+    speculative_rows = _rows(["a", "a", "b", "b", "c", "c"], [4, 5, 8, 9, 12, 13])
+    speculative_identity = OwnerRowLayout.build(
+        6,
+        speculative_rows,
+        _owners(["a", "b", "c"], {"a": 7, "b": 2, "c": 11}),
+        group,
+    )
+    assert balanced_decode_graph_signature(
+        speculative_identity,
+        num_reqs=3,
+        num_tokens=6,
+        uniform_decode=True,
+    ) == RequestOwnedGraphSignature(
+        owner_counts=(2, 2, 2), canonical_to_owner=tuple(range(6))
     )
 
     nonidentity = OwnerRowLayout.build(
@@ -153,6 +171,15 @@ def test_balanced_decode_graph_signature_accepts_only_fixed_identity_envelope() 
     assert (
         balanced_decode_graph_signature(
             identity, num_reqs=3, num_tokens=4, uniform_decode=False
+        )
+        is None
+    )
+    assert (
+        balanced_decode_graph_signature(
+            speculative_identity,
+            num_reqs=3,
+            num_tokens=5,
+            uniform_decode=True,
         )
         is None
     )

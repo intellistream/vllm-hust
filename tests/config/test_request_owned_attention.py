@@ -7,7 +7,8 @@ The feature flag lives on SchedulerConfig and defaults to False. When enabled,
 VllmConfig must construct within the supported G2 envelope: Multiproc/non-Ray
 execution, PP=1, eager execution without CUDA graphs, no speculative decoding,
 no KV cache CPU offload/tiering or KV transfer/connectors, prefix caching
-disabled, DCP=1, PCP=1, and synchronous scheduling. Every unsupported mode
+disabled, DCP=1, PCP=1, and synchronous scheduling. Linear DSpark is the
+single speculative exception when owner sampling is enabled. Every unsupported mode
 must fail closed with a specific diagnostic: pipeline parallelism, Ray,
 speculative decoding, non-eager compilation/CUDA graphs, KV cache CPU
 offload, KV transfer, prefix caching, decode/prefill context parallelism,
@@ -65,6 +66,7 @@ def _vllm_config(
     *,
     enable_request_owned_attention: bool = True,
     enable_request_owned_q_wkv_fanin: bool = False,
+    enable_request_owned_sampling: bool = False,
     enable_request_owned_graph: bool = False,
     enable_request_owned_kv_offload: bool = False,
     enable_request_owned_windows: bool = False,
@@ -90,6 +92,7 @@ def _vllm_config(
         or SchedulerConfig.default_factory(
             enable_request_owned_attention=enable_request_owned_attention,
             enable_request_owned_q_wkv_fanin=enable_request_owned_q_wkv_fanin,
+            enable_request_owned_sampling=enable_request_owned_sampling,
             enable_request_owned_graph=enable_request_owned_graph,
             enable_request_owned_kv_offload=enable_request_owned_kv_offload,
             enable_request_owned_windows=enable_request_owned_windows,
@@ -242,6 +245,52 @@ def test_enabled_rejects_ray_executor():
 def test_enabled_rejects_speculative_decoding():
     with pytest.raises(ValueError, match="speculative"):
         _vllm_config(speculative_config=_speculative_config())
+
+
+def test_enabled_accepts_linear_dspark_on_v1_owner_sampling_lane():
+    vllm_config = _vllm_config(
+        enable_request_owned_sampling=True,
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=2,
+        ),
+    )
+    vllm_config.speculative_config = types.SimpleNamespace(
+        method="dspark", num_speculative_tokens=7
+    )
+    vllm_config._validate_request_owned_attention()
+    assert vllm_config.use_v2_model_runner is False
+
+
+def test_enabled_accepts_dspark_target_full_graph_lane():
+    vllm_config = _vllm_config(
+        enable_request_owned_sampling=True,
+        enable_request_owned_graph=True,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=2,
+        ),
+    )
+    vllm_config.speculative_config = types.SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+        enforce_eager=True,
+    )
+    vllm_config._validate_request_owned_attention()
+    assert vllm_config.scheduler_config.enable_request_owned_graph is True
+
+
+def test_enabled_dspark_requires_owner_sampling_transport():
+    vllm_config = _vllm_config()
+    vllm_config.speculative_config = types.SimpleNamespace(
+        method="dspark", num_speculative_tokens=7
+    )
+    with pytest.raises(ValueError, match="enable_request_owned_sampling=True"):
+        vllm_config._validate_request_owned_attention()
 
 
 @pytest.mark.parametrize(

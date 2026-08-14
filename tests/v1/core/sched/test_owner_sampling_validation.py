@@ -72,6 +72,7 @@ def _valid_envelope_args(*, step: int = 7) -> dict:
     return dict(
         scheduler_step_seq=step,
         num_scheduled_tokens={"req-0": 4, "req-1": 1, "req-2": 2},
+        scheduled_spec_decode_tokens={},
         pre_step_num_computed_tokens={"req-0": 10, "req-1": 20, "req-2": 0},
         authoritative_owner_by_request_id={"req-0": 2, "req-1": 0, "req-2": 1},
         authoritative_epoch_by_request_id={"req-0": 1, "req-1": 3, "req-2": 0},
@@ -92,9 +93,7 @@ def _valid_envelope_args(*, step: int = 7) -> dict:
                 row_ids=(_row("req-0", 1, 13),),
             ),
         ],
-        model_runner_output=_merged_output(
-            ["req-1", "req-2", "req-0"], [[7], [], [3]]
-        ),
+        model_runner_output=_merged_output(["req-1", "req-2", "req-0"], [[7], [], [3]]),
     )
 
 
@@ -149,6 +148,8 @@ def _make_scheduler(
     scheduler.current_step = 0
     scheduler.max_num_scheduled_tokens = max_num_scheduled_tokens
     scheduler.max_num_running_reqs = max_num_running_reqs
+    scheduler.max_model_len = 8192
+    scheduler.num_sampled_tokens_per_step = 1
     scheduler.num_waiting_for_streaming_input = 0
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
@@ -301,6 +302,7 @@ def test_valid_zero_token_heartbeat_with_empty_envelope() -> None:
     args = dict(
         scheduler_step_seq=7,
         num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
         pre_step_num_computed_tokens={},
         authoritative_owner_by_request_id={},
         authoritative_epoch_by_request_id={},
@@ -439,6 +441,24 @@ def test_rejects_multi_token_sampled_entry() -> None:
     _expect_invalid(args, "multi-token")
 
 
+def test_accepts_speculative_accepted_prefix_within_k_plus_one() -> None:
+    args = _valid_envelope_args()
+    args["scheduled_spec_decode_tokens"] = {"req-0": [31, 32, 33]}
+    args["model_runner_output"] = _merged_output(
+        ["req-1", "req-2", "req-0"], [[7], [], [31, 32, 99]]
+    )
+    Scheduler._validate_owner_sampling_envelope(**args)
+
+
+def test_rejects_speculative_output_beyond_k_plus_one() -> None:
+    args = _valid_envelope_args()
+    args["scheduled_spec_decode_tokens"] = {"req-0": [31, 32]}
+    args["model_runner_output"] = _merged_output(
+        ["req-1", "req-2", "req-0"], [[7], [], [31, 32, 33, 99]]
+    )
+    _expect_invalid(args, "allowed at most 3")
+
+
 def test_rejects_misaligned_sampled_token_ids() -> None:
     args = _valid_envelope_args()
     args["model_runner_output"] = _merged_output(
@@ -451,6 +471,7 @@ def test_rejects_zero_token_heartbeat_with_rows() -> None:
     args = dict(
         scheduler_step_seq=7,
         num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
         pre_step_num_computed_tokens={},
         authoritative_owner_by_request_id={},
         authoritative_epoch_by_request_id={},
@@ -468,6 +489,7 @@ def test_rejects_zero_token_heartbeat_with_merged_requests() -> None:
     args = dict(
         scheduler_step_seq=7,
         num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
         pre_step_num_computed_tokens={},
         authoritative_owner_by_request_id={},
         authoritative_epoch_by_request_id={},
@@ -495,9 +517,7 @@ def test_seam_default_off_output_preserves_control_only_step() -> None:
 
 
 def test_seam_accepts_token_bearing_envelope_without_mutation() -> None:
-    scheduler = _make_scheduler(
-        max_num_scheduled_tokens=64, sampling_enabled=True
-    )
+    scheduler = _make_scheduler(max_num_scheduled_tokens=64, sampling_enabled=True)
     request = _request("req-0")
     scheduler.add_request(request)
     out = _admit(scheduler, request, grant=8)
@@ -510,9 +530,7 @@ def test_seam_accepts_token_bearing_envelope_without_mutation() -> None:
     (pre,) = [new_req.num_computed_tokens for new_req in out.scheduled_new_reqs]
     assert pre == 0
     assert request.num_computed_tokens == count
-    owner_rank = scheduler.owner_coordinator.owner_of(
-        scheduler._owner_key[req_id]
-    )
+    owner_rank = scheduler.owner_coordinator.owner_of(scheduler._owner_key[req_id])
     assert owner_rank is not None
 
     before = _scheduler_state_snapshot(scheduler, request)
@@ -536,17 +554,13 @@ def test_seam_accepts_token_bearing_envelope_without_mutation() -> None:
 
 
 def test_seam_rejects_invalid_envelope_before_any_mutation() -> None:
-    scheduler = _make_scheduler(
-        max_num_scheduled_tokens=64, sampling_enabled=True
-    )
+    scheduler = _make_scheduler(max_num_scheduled_tokens=64, sampling_enabled=True)
     request = _request("req-0")
     scheduler.add_request(request)
     out = _admit(scheduler, request, grant=8)
 
     req_id = request.request_id
-    owner_rank = scheduler.owner_coordinator.owner_of(
-        scheduler._owner_key[req_id]
-    )
+    owner_rank = scheduler.owner_coordinator.owner_of(scheduler._owner_key[req_id])
     assert owner_rank is not None
     count = out.num_scheduled_tokens[req_id]
     before = _scheduler_state_snapshot(scheduler, request)
@@ -587,9 +601,7 @@ def test_seam_rejects_invalid_envelope_before_any_mutation() -> None:
 
 
 def test_seam_rejects_unknown_finished_scheduled_request() -> None:
-    scheduler = _make_scheduler(
-        max_num_scheduled_tokens=64, sampling_enabled=True
-    )
+    scheduler = _make_scheduler(max_num_scheduled_tokens=64, sampling_enabled=True)
     request = _request("req-0")
     scheduler.add_request(request)
     out = _admit(scheduler, request, grant=8)
@@ -609,9 +621,7 @@ def test_seam_rejects_unknown_finished_scheduled_request() -> None:
                     OwnerSamplingBatch(
                         owner_rank=owner_rank,
                         emitted_step_seq=out.step_seq,
-                        row_ids=(
-                            _row(request.request_id, 0, 31),
-                        ),
+                        row_ids=(_row(request.request_id, 0, 31),),
                     )
                 ],
             ),
@@ -619,9 +629,7 @@ def test_seam_rejects_unknown_finished_scheduled_request() -> None:
 
 
 def test_seam_rejects_missing_lease_key() -> None:
-    scheduler = _make_scheduler(
-        max_num_scheduled_tokens=64, sampling_enabled=True
-    )
+    scheduler = _make_scheduler(max_num_scheduled_tokens=64, sampling_enabled=True)
     request = _request("req-0")
     scheduler.add_request(request)
     out = _admit(scheduler, request, grant=8)

@@ -137,6 +137,36 @@ class TestCudagraphDispatcher:
         assert prefill_mode == CUDAGraphMode.NONE
         assert prefill_key.request_owned_signature is None
 
+    def test_request_owned_speculative_full_key_uses_token_row_counts(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_capture_sizes=[8, 64],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=8)
+        config.num_speculative_tokens = 7
+        dispatcher = CudagraphDispatcher(config)
+        owner_signature = RequestOwnedGraphSignature(
+            owner_counts=(8,) * 8,
+            canonical_to_owner=tuple(range(64)),
+        )
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=8,
+            request_owned_full_signature=owner_signature,
+        )
+
+        owner_mode, owner_key = dispatcher.dispatch(
+            num_tokens=64,
+            uniform_decode=True,
+            request_owned_signature=owner_signature,
+        )
+        assert owner_mode == CUDAGraphMode.FULL
+        assert owner_key.num_tokens == 64
+        assert owner_key.num_reqs == 8
+        assert owner_key.request_owned_signature == owner_signature
+        assert dispatcher.get_capture_descs() == [(CUDAGraphMode.FULL, [owner_key])]
+
     @pytest.mark.parametrize(
         "cudagraph_mode_str,compilation_mode,lora_config",
         [

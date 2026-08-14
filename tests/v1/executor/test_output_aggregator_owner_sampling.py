@@ -323,14 +323,35 @@ def test_discarded_request_empty_token_list():
     assert result.sampled_token_ids == [[5], [], [1], [1], [1]]
 
 
-def test_spec_multi_token_sampled_ids_fails_closed():
+def test_spec_multi_token_sampled_ids_merge_without_logprobs():
+    outputs = [
+        _output(
+            0,
+            [_samp(0, ("req-0", "req-1"))],
+            req_ids=("req-0", "req-1"),
+            sampled_token_ids=[[1, 2, 3], [4]],
+        ),
+        _output(
+            1,
+            [_samp(1, ("req-2",))],
+            req_ids=("req-2",),
+            sampled_token_ids=[[5, 6]],
+        ),
+    ]
+    result = _aggregator(sampling_ranks=[0, 1]).aggregate(outputs)
+    assert result.req_ids == ["req-0", "req-1", "req-2"]
+    assert result.sampled_token_ids == [[1, 2, 3], [4], [5, 6]]
+
+
+def test_spec_multi_token_with_logprobs_fails_closed():
     output = _output(
         0,
         [_samp(0, ("req-0",))],
         req_ids=("req-0",),
         sampled_token_ids=[[1, 2]],
+        logprobs=_logprobs(1),
     )
-    with pytest.raises(RuntimeError, match="multi-token sampling"):
+    with pytest.raises(RuntimeError, match="multi-token requests"):
         _aggregator(sampling_ranks=[0]).aggregate([output])
 
 

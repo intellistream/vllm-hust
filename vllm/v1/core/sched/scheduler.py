@@ -2181,8 +2181,8 @@ class Scheduler(SchedulerInterface):
           num_computed_tokens + scheduled_count - 1``, lane 0), not one
           row per scheduled token,
         * the merged output has a bijective req map aligned to the same
-          request set, with at most one sampled token per request (the G3
-          no-spec envelope), and
+          request set, with at most one sampled token for ordinary requests
+          and at most K+1 for a request with K scheduled DSpark drafts, and
         * zero-token heartbeat steps reject nonempty sampling identities
           and never mutate sampling state (this boundary keeps no sampling
           state at all; it only validates).
@@ -2292,6 +2292,9 @@ class Scheduler(SchedulerInterface):
         self._validate_owner_sampling_envelope(
             scheduler_step_seq=step_seq,
             num_scheduled_tokens=num_scheduled_tokens,
+            scheduled_spec_decode_tokens=(
+                scheduler_output.scheduled_spec_decode_tokens
+            ),
             pre_step_num_computed_tokens=pre_step_num_computed_tokens,
             authoritative_owner_by_request_id=authoritative_owner,
             authoritative_epoch_by_request_id=authoritative_epoch,
@@ -2342,6 +2345,7 @@ class Scheduler(SchedulerInterface):
         *,
         scheduler_step_seq: int,
         num_scheduled_tokens: Mapping[str, int],
+        scheduled_spec_decode_tokens: Mapping[str, Sequence[int]],
         pre_step_num_computed_tokens: Mapping[str, int],
         authoritative_owner_by_request_id: Mapping[str, int],
         authoritative_epoch_by_request_id: Mapping[str, int],
@@ -2466,8 +2470,26 @@ class Scheduler(SchedulerInterface):
                     "must be 0."
                 )
 
+        unknown_spec_requests = set(scheduled_spec_decode_tokens) - scheduled_req_ids
+        if unknown_spec_requests:
+            raise RuntimeError(
+                "owner-sampling envelope: speculative tokens name "
+                "unscheduled request(s) "
+                f"{sorted(unknown_spec_requests)}."
+            )
+        for req_id, draft_tokens in scheduled_spec_decode_tokens.items():
+            if len(draft_tokens) > num_scheduled_tokens[req_id] - 1:
+                raise RuntimeError(
+                    "owner-sampling envelope: speculative horizon for "
+                    f"{req_id!r} has {len(draft_tokens)} drafts but its "
+                    f"target step schedules only "
+                    f"{num_scheduled_tokens[req_id]} tokens."
+                )
+
         # Merged output req map: bijective and aligned to the same request
-        # set as the envelope, with at most one sampled token per request.
+        # set as the envelope. A non-spec request emits at most one token;
+        # a speculative request emits the accepted prefix plus its terminal
+        # correction/bonus token, bounded by K+1.
         req_ids = model_runner_output.req_ids
         req_id_to_index = model_runner_output.req_id_to_index
         if not isinstance(req_id_to_index, dict):
@@ -2508,12 +2530,16 @@ class Scheduler(SchedulerInterface):
                     f"sampled_token_ids[{index}] must be a list, got "
                     f"{type(tokens).__name__}."
                 )
-            if len(tokens) > 1:
+            req_id = req_ids[index]
+            num_draft_tokens = len(scheduled_spec_decode_tokens.get(req_id, ()))
+            max_emitted_tokens = num_draft_tokens + 1
+            if len(tokens) > max_emitted_tokens:
                 raise RuntimeError(
-                    "owner-sampling envelope: spec-shaped multi-token "
-                    f"sampling is unsupported (sampled_token_ids[{index}]"
-                    f"={tokens!r}); the G3 no-spec envelope carries at "
-                    "most one sampled token per request."
+                    "owner-sampling envelope: multi-token sampled count exceeds "
+                    f"the scheduled speculative horizon for {req_id!r}: "
+                    f"got {len(tokens)}, allowed at most "
+                    f"{max_emitted_tokens} ({num_draft_tokens} drafts + "
+                    "one correction/bonus token)."
                 )
 
     @staticmethod
@@ -2669,6 +2695,15 @@ class Scheduler(SchedulerInterface):
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
+        # Mirror the ordinary scheduler's speculative-token handoff after
+        # the request-owned plan is frozen.  The target runner receives only
+        # the draft prefix that fits this step; ownership and row layout stay
+        # request-local, while the scheduler remains the sole authority for
+        # K and for consuming the proposal exactly once.
+        scheduled_spec_decode_tokens = self._owner_take_scheduled_spec_tokens(
+            num_scheduled_tokens
+        )
+
         # Classify first dispatch vs cached/resumed exactly.  A promotion is
         # not a dispatch: when the global token budget is exhausted, the
         # pending marker survives until a later positive-token step.
@@ -2754,7 +2789,7 @@ class Scheduler(SchedulerInterface):
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
-            scheduled_spec_decode_tokens={},
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
             finished_req_ids=self.finished_req_ids,
@@ -3197,7 +3232,14 @@ class Scheduler(SchedulerInterface):
         self,
         slots: tuple[OwnerLeaseKey, ...],
     ) -> None:
-        """Plan exactly one decode token per fixed owner slot."""
+        """Plan one complete decode target step per fixed owner slot.
+
+        A DSpark continuation is an indivisible ``K + 1`` target verify
+        step (K draft tokens plus the ordinary next-token position).  A
+        decode window therefore waits unless the global budget can carry
+        every slot's full plan; it never truncates one owner's proposal and
+        phase-shifts the fixed owner cohort.
+        """
         if not slots or self.max_num_scheduled_tokens < len(slots):
             return
         requests = [self._owner_window_live_request(key) for key in slots]
@@ -3219,8 +3261,14 @@ class Scheduler(SchedulerInterface):
                         self._owner_key[request.request_id],
                     )
             return
+        if sum(plans) > self.max_num_scheduled_tokens:
+            return
         self._owner_token_plans.update(
-            {request.request_id: 1 for request in requests if request is not None}
+            {
+                request.request_id: plan
+                for request, plan in zip(requests, plans)
+                if request is not None
+            }
         )
 
     def _owner_window_plan_prefill(
@@ -3536,8 +3584,8 @@ class Scheduler(SchedulerInterface):
             None,
         )
         if decode_chunk is not None:
-            return min(
-                request.num_prompt_tokens + request.max_tokens,
+            return self._owner_physical_horizon(
+                request,
                 request.num_prompt_tokens + decode_chunk,
             )
         if getattr(
@@ -3545,9 +3593,13 @@ class Scheduler(SchedulerInterface):
             "enable_request_owned_graph",
             False,
         ):
-            return request.num_prompt_tokens + request.max_tokens
-        remaining = request.num_tokens - request.num_computed_tokens
-        return min(self.max_num_scheduled_tokens, remaining)
+            return self._owner_lifetime_horizon(request)
+        remaining = request.num_tokens_with_spec - request.num_computed_tokens
+        return self._owner_physical_horizon(
+            request,
+            request.num_computed_tokens
+            + min(self.max_num_scheduled_tokens, remaining),
+        )
 
     def _owner_resume_required(self, request: Request) -> int:
         """Chunk-scaled RESERVE required count on resume.
@@ -3566,9 +3618,12 @@ class Scheduler(SchedulerInterface):
             None,
         )
         if decode_chunk is not None:
-            return min(
-                request.num_prompt_tokens + request.max_tokens,
-                max(published, request.num_prompt_tokens + decode_chunk),
+            return max(
+                published,
+                self._owner_physical_horizon(
+                    request,
+                    request.num_prompt_tokens + decode_chunk,
+                ),
             )
         if getattr(
             self.scheduler_config,
@@ -3577,11 +3632,15 @@ class Scheduler(SchedulerInterface):
         ):
             return max(
                 published,
-                request.num_prompt_tokens + request.max_tokens,
+                self._owner_lifetime_horizon(request),
             )
-        return min(
-            request.num_tokens,
-            max(published, self.max_num_scheduled_tokens),
+        logical_horizon = min(
+            request.num_tokens_with_spec,
+            self.max_num_scheduled_tokens,
+        )
+        return max(
+            published,
+            self._owner_physical_horizon(request, logical_horizon),
         )
 
     def _owner_extend_required(self, request: Request) -> int:
@@ -3596,17 +3655,81 @@ class Scheduler(SchedulerInterface):
             "request_owned_decode_reservation_tokens",
             None,
         )
+        logical_upper_bound = (
+            self._owner_logical_lifetime_horizon(request)
+            if decode_chunk is not None
+            else max(request.num_tokens_with_spec, request.num_computed_tokens)
+        )
         increment = (
             decode_chunk if decode_chunk is not None else self.max_num_scheduled_tokens
         )
-        upper_bound = (
-            request.num_prompt_tokens + request.max_tokens
-            if decode_chunk is not None
-            else request.num_tokens
+        return self._owner_physical_horizon(
+            request,
+            min(
+                logical_upper_bound,
+                request.num_computed_tokens + increment,
+            ),
+        )
+
+    def _owner_logical_runnable_horizon(
+        self,
+        request: Request,
+        physical_horizon: int,
+    ) -> int:
+        """Logical progress allowed by one physical owner reservation.
+
+        A speculative lease has two different watermarks.  The scheduler may
+        commit only through the logical horizon, while the worker must keep K
+        additional physical positions available for the *next* draft pass.
+        DSpark shifts its K-row query block after every accepted prefix, so a
+        target step ending exactly at the physical fence is not safe: even a
+        one-token commit can make the following draft touch the next block.
+
+        Prefill remains runnable through its prompt even when ``max_model_len``
+        leaves fewer than K tail positions; the ordinary scheduler/model-end
+        checks are still authoritative for the shortened terminal proposal.
+        """
+        if self.num_spec_tokens <= 0:
+            return physical_horizon
+        return max(
+            min(request.num_prompt_tokens, physical_horizon),
+            physical_horizon - self.num_spec_tokens,
+        )
+
+    def _owner_logical_lifetime_horizon(self, request: Request) -> int:
+        """Maximum committed-token horizon for one request incarnation."""
+        return min(
+            self.max_model_len,
+            request.num_prompt_tokens + request.max_tokens,
+        )
+
+    def _owner_physical_horizon(
+        self,
+        request: Request,
+        logical_horizon: int,
+    ) -> int:
+        """Add the overwriteable K-token draft tail to a logical fence."""
+        logical_horizon = min(
+            self._owner_logical_lifetime_horizon(request),
+            logical_horizon,
         )
         return min(
-            upper_bound,
-            request.num_computed_tokens + increment,
+            self.max_model_len,
+            logical_horizon + self.num_spec_tokens,
+        )
+
+    def _owner_lifetime_horizon(self, request: Request) -> int:
+        """Maximum physical horizon for one request-owned incarnation.
+
+        Speculative verification may transiently write K positions beyond
+        the ultimately committed output prefix.  Reserve that provisional
+        suffix (bounded by model length) without promoting it to logical
+        progress; the worker's commit watermark decides which prefix
+        survives verification.
+        """
+        return self._owner_physical_horizon(
+            request,
+            self._owner_logical_lifetime_horizon(request),
         )
 
     def _assign_owner_and_reserve(self, request: Request, key: OwnerLeaseKey) -> None:
@@ -3778,12 +3901,51 @@ class Scheduler(SchedulerInterface):
         coordinator = self.owner_coordinator
         assert coordinator is not None
         key = self._owner_key[request.request_id]
-        horizon = coordinator.runnable_num_tokens_of(key)
-        if horizon is None:
+        physical_horizon = coordinator.runnable_num_tokens_of(key)
+        if physical_horizon is None:
             return 0
-        remaining = request.num_tokens - request.num_computed_tokens
+        horizon = self._owner_logical_runnable_horizon(
+            request,
+            physical_horizon,
+        )
+        remaining = request.num_tokens_with_spec - request.num_computed_tokens
         desired = min(self.max_num_scheduled_tokens, remaining)
+        desired = min(
+            desired,
+            self.max_model_len
+            - request.num_computed_tokens
+            - self.num_sampled_tokens_per_step,
+        )
         return max(0, min(desired, horizon - request.num_computed_tokens))
+
+    def _owner_take_scheduled_spec_tokens(
+        self,
+        num_scheduled_tokens: Mapping[str, int],
+    ) -> dict[str, list[int]]:
+        """Detach the draft prefix covered by a frozen owner-local plan.
+
+        This is the request-owned equivalent of the ordinary scheduler's
+        speculative handoff.  Drafts are scheduler-owned transient state:
+        once their request is scheduled they are either published in this
+        step or discarded, and a later proposer supplies the next draft.
+        """
+        scheduled: dict[str, list[int]] = {}
+        for request_id, num_new_tokens in num_scheduled_tokens.items():
+            request = self.requests[request_id]
+            if not request.spec_token_ids:
+                continue
+            num_scheduled_spec_tokens = (
+                num_new_tokens
+                + request.num_computed_tokens
+                - request.num_tokens
+                - request.num_output_placeholders
+            )
+            if num_scheduled_spec_tokens > 0:
+                scheduled[request_id] = request.spec_token_ids[
+                    :num_scheduled_spec_tokens
+                ]
+            request.spec_token_ids = []
+        return scheduled
 
     def _promote_owner_request(
         self, request: Request, key: OwnerLeaseKey, scheduled_timestamp: float

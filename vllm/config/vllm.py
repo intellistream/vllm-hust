@@ -521,15 +521,14 @@ class VllmConfig:
         if use_v2_model_runner is not None:
             return use_v2_model_runner
 
-        # DSpark is implemented only by the V2 GPU model runner, and DeepSeek-V4
-        # is not otherwise a default-V2 architecture, so force V2 for it. If V2
-        # is unsupported for the rest of the config, _validate_v2_model_runner
-        # raises rather than silently falling back to V1 (which can't run dspark).
+        # The generic GPU DSpark implementation is V2-only.  The experimental
+        # request-owned lane deliberately remains on V1, where platform plugins
+        # (notably vLLM Ascend) provide their owner-aware DSpark proposer.
         if (
             self.speculative_config is not None
             and self.speculative_config.method == "dspark"
         ):
-            return True
+            return not self.scheduler_config.enable_request_owned_attention
 
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
@@ -2154,12 +2153,12 @@ class VllmConfig:
         """Fail closed for the experimental request-owned attention (G3).
 
         The specific G2 envelope rejections below stay first and unchanged
-        (pipeline parallelism, speculative decoding including MTP, non-eager
+        (pipeline parallelism, unsupported speculative methods, non-eager
         execution / CUDA graphs, KV cache CPU offload/tiering, and KV
         transfer / PD disaggregation). G2 provides the control-plane receipt
         contract and worker-local physical KV allocation, so the remaining
         supported envelope is now constructible: Multiproc/non-Ray execution,
-        PP=1, eager execution without CUDA graphs, no speculative decoding,
+        PP=1, eager execution without CUDA graphs, linear DSpark only,
         no KV cache offload/transfer/connectors, prefix caching disabled,
         DCP=1, PCP=1, and synchronous scheduling.
 
@@ -2286,12 +2285,20 @@ class VllmConfig:
             )
 
         if self.speculative_config is not None:
-            raise ValueError(
-                "Request-owned attention is experimental and does not "
-                "support speculative decoding (including MTP), but got "
-                f"speculative_config.method={self.speculative_config.method!r}."
-            )
-
+            method = self.speculative_config.method
+            if method != "dspark":
+                raise ValueError(
+                    "Request-owned attention supports only the linear "
+                    "DSpark speculative method; MTP, ngram, draft-model, "
+                    "and branching proposal paths remain unsupported, but "
+                    f"got speculative_config.method={method!r}."
+                )
+            if not self.scheduler_config.enable_request_owned_sampling:
+                raise ValueError(
+                    "Request-owned DSpark requires "
+                    "enable_request_owned_sampling=True so accepted token "
+                    "prefixes return through the owner-identity envelope."
+                )
         compilation_config = self.compilation_config
         if request_owned_graph:
             if (
@@ -2528,7 +2535,8 @@ class VllmConfig:
         aggregator authoritative across the deferred ``execute_model ->
         None -> sample_tokens`` Multiproc flow.  It therefore requires the
         existing request-owned attention envelope (which already enforces
-        eager execution, no speculative decoding, PP=1, synchronous
+        eager execution, linear DSpark as the only speculative method, PP=1,
+        synchronous
         scheduling, and the rest of the G2/G3 rejections above) and strictly
         the Multiproc executor: the exact per-step adapter
         bind/reuse/clear state machine is proven only for the multiproc
@@ -2564,7 +2572,8 @@ class VllmConfig:
                 "sampling adapter state machine is proven only for the "
                 "Multiproc transport."
             )
-        # Eager execution, no speculative decoding, PP=1, synchronous
+        # Eager execution, the narrow DSpark-only speculative envelope, PP=1,
+        # synchronous
         # scheduling, and the rest of the request-owned envelope are already
         # enforced by _validate_request_owned_attention above (which the
         # first check requires), so no duplicate rejections are needed here.

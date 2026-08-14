@@ -137,6 +137,7 @@ def _make_scheduler(
     scheduler.reset_preempted_req_ids = set()
     scheduler.finished_req_ids_dict = None
     scheduler.num_spec_tokens = 0
+    scheduler.num_sampled_tokens_per_step = 1
     scheduler.enable_return_routed_experts = False
     scheduler._inflight_prefills = set()
     scheduler._pause_state = PauseState.UNPAUSED
@@ -205,6 +206,7 @@ def _apply_window_step(
     scheduler_output,
     events_by_rank,
     readiness_by_rank=None,
+    sampled_token_ids: dict[str, list[int]] | None = None,
 ) -> None:
     """Apply worker receipts and samples only for prompt-complete rows."""
     if readiness_by_rank is None:
@@ -227,7 +229,11 @@ def _apply_window_step(
                 request_id: index for index, request_id in enumerate(req_ids)
             },
             sampled_token_ids=[
-                [100 + index]
+                (
+                    sampled_token_ids[request_id]
+                    if sampled_token_ids is not None and request_id in sampled_token_ids
+                    else [100 + index]
+                )
                 if (request := scheduler.requests.get(request_id)) is None
                 or request.num_computed_tokens >= request.num_prompt_tokens
                 else []
@@ -777,6 +783,36 @@ def test_horizon_cap_extend_stall_and_refused_extend_retry() -> None:
     assert token.command_seq == retry.command_seq
     # Cumulative exclusive horizon: positions [0, 16) runnable now.
     assert token.runnable_num_tokens == 16
+
+
+@pytest.mark.parametrize("accepted_draft_count", range(4))
+def test_request_owned_scheduler_publishes_and_commits_each_dspark_prefix(
+    accepted_draft_count: int,
+) -> None:
+    scheduler = _make_scheduler(
+        max_num_scheduled_tokens=16,
+        request_owned_decode_reservation_tokens=16,
+    )
+    scheduler.num_spec_tokens = 3
+    request = _request("spec", num_prompt_tokens=1, max_tokens=12)
+    scheduler.add_request(request)
+    prefill = _admit(scheduler, request, grant=16)
+    assert prefill.num_scheduled_tokens == {"spec": 1}
+    _apply_window_step(scheduler, prefill, {})
+
+    request.spec_token_ids = [41, 42, 43]
+    verify = scheduler.schedule()
+    assert verify.num_scheduled_tokens == {"spec": 4}
+    assert verify.scheduled_spec_decode_tokens == {"spec": [41, 42, 43]}
+    assert request.spec_token_ids == []
+
+    # A accepted drafts plus the terminal correction/bonus token advance the
+    # same logical horizon that the owner KV transaction commits.
+    pre_step = request.num_computed_tokens - 4
+    emitted = [41, 42, 43][:accepted_draft_count] + [99]
+    _apply_window_step(scheduler, verify, {}, {"spec": emitted})
+    assert request.num_computed_tokens == pre_step + accepted_draft_count + 1
+    assert request.output_token_ids[-len(emitted) :] == emitted
 
 
 def test_preempt_receipt_resume_keeps_sticky_owner_and_restarts_prefill() -> None:
@@ -2008,6 +2044,74 @@ def test_graph_window_decode_reservation_chunk_extends_command_only() -> None:
 
     resumed = scheduler.schedule()
     assert resumed.num_scheduled_tokens == {"chunked": 1}
+
+
+def test_dspark_chunk_reservation_keeps_next_draft_tail_physical() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=64,
+        max_num_running_reqs=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_reservation_tokens=16,
+    )
+    scheduler.num_spec_tokens = 7
+    request = _request("dspark", num_prompt_tokens=32, max_tokens=32)
+    scheduler.add_request(request)
+
+    reserve_step = scheduler.schedule()
+    (reserve,) = reserve_step.owner_commands
+    # 32 prompt + 16 committed-token chunk + K=7 overwriteable draft tail.
+    assert reserve.required_num_tokens == 55
+    _apply_receipts(
+        scheduler,
+        reserve_step,
+        {0: [_receipt(reserve.key, 0, reserve.command_seq, runnable=55)]},
+    )
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"dspark": 32}
+    _ack_window_step(scheduler, prefill)
+
+    # The published physical fence stays at 55, but logical execution stops
+    # at 48 and requests an extension instead of consuming DSpark's K-slot
+    # tail.  That tail is what lets the next draft query cross a block edge.
+    request.num_computed_tokens = 48
+    request.append_output_token_ids([123] * 16)
+    extend_step = scheduler.schedule()
+    assert extend_step.num_scheduled_tokens == {}
+    assert extend_step.scheduled_owner_leases == []
+    (extend,) = extend_step.owner_commands
+    assert extend.kind is OwnerCommandKind.EXTEND
+    assert extend.required_num_tokens == 71
+
+
+def test_dspark_full_lifetime_lease_exposes_only_committable_prefix() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=64,
+        max_num_running_reqs=1,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+    )
+    scheduler.num_spec_tokens = 7
+    request = _request("full", num_prompt_tokens=32, max_tokens=32)
+    scheduler.add_request(request)
+
+    reserve_step = scheduler.schedule()
+    (reserve,) = reserve_step.owner_commands
+    assert reserve.required_num_tokens == 71
+    _apply_receipts(
+        scheduler,
+        reserve_step,
+        {0: [_receipt(reserve.key, 0, reserve.command_seq, runnable=71)]},
+    )
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 63
+    request.append_output_token_ids([123] * 32)
+    assert scheduler._owner_plan_num_new_tokens(request) == 1
+    request.num_computed_tokens = 64
+    assert scheduler._owner_plan_num_new_tokens(request) == 0
 
 
 def test_decode_quantum_rotates_same_owner_ready_requests() -> None:
