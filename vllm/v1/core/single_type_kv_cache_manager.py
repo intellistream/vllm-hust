@@ -413,6 +413,165 @@ class SingleTypeKVCacheManager(ABC):
         # Free blocks in reverse order so that the tail blocks are freed first.
         self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
 
+    def validate_request_tail_truncation(
+        self,
+        request_id: str,
+        num_blocks_to_keep: int,
+        expected_block_ids: tuple[int, ...],
+    ) -> None:
+        """Validate a request tail truncation without changing pool state."""
+        if self.enable_caching:
+            raise ValueError("KV cache compression does not support prefix caching")
+        if request_id in self.num_cached_block:
+            raise ValueError(
+                "KV cache compression cannot truncate cached request blocks"
+            )
+
+        blocks = self.req_to_blocks.get(request_id)
+        if blocks is None:
+            raise ValueError(f"request {request_id!r} has no allocated KV blocks")
+        actual_block_ids = tuple(block.block_id for block in blocks)
+        if actual_block_ids != expected_block_ids:
+            raise ValueError(
+                f"request {request_id!r} block table changed: expected "
+                f"{expected_block_ids}, actual {actual_block_ids}"
+            )
+        if not 0 < num_blocks_to_keep <= len(blocks):
+            raise ValueError(
+                f"request {request_id!r} cannot keep {num_blocks_to_keep} "
+                f"of {len(blocks)} blocks"
+            )
+
+        for block in blocks:
+            if block.is_null:
+                raise ValueError(
+                    "KV cache compression cannot truncate null-block tables"
+                )
+            if block.block_hash is not None:
+                raise ValueError(
+                    "KV cache compression cannot truncate prefix-cached blocks"
+                )
+            if block.ref_cnt != 1:
+                raise ValueError(
+                    "KV cache compression requires exclusively owned blocks; "
+                    f"block {block.block_id} has ref_cnt={block.ref_cnt}"
+                )
+
+    def truncate_request_tail_blocks(
+        self,
+        request_id: str,
+        num_blocks_to_keep: int,
+        expected_block_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """Validate and release a request's contiguous unhashed tail blocks."""
+        self.validate_request_tail_truncation(
+            request_id, num_blocks_to_keep, expected_block_ids
+        )
+        blocks = self.req_to_blocks[request_id]
+
+        tail = list(blocks[num_blocks_to_keep:])
+        if not tail:
+            return ()
+
+        released_ids = tuple(block.block_id for block in tail)
+        del blocks[num_blocks_to_keep:]
+        try:
+            self.block_pool.free_blocks(reversed(tail), prepend=True)
+        except Exception:
+            # Restore manager bookkeeping for diagnostics. A partially failed
+            # block-pool operation is fatal to the engine and must not resume.
+            blocks.extend(tail)
+            raise
+        return released_ids
+
+    def validate_request_block_replacement(
+        self,
+        request_id: str,
+        num_destination_blocks: int,
+        expected_source_block_ids: tuple[int, ...],
+        destination_blocks: Sequence[KVCacheBlock],
+    ) -> None:
+        """Validate an out-of-place source-to-destination transaction."""
+        source_blocks = self.req_to_blocks.get(request_id)
+        if source_blocks is None:
+            raise ValueError(f"request {request_id!r} has no allocated KV blocks")
+        actual_source_ids = tuple(block.block_id for block in source_blocks)
+        if actual_source_ids != expected_source_block_ids:
+            raise ValueError(
+                f"request {request_id!r} block table changed: expected "
+                f"{expected_source_block_ids}, actual {actual_source_ids}"
+            )
+        if not 0 < num_destination_blocks <= len(destination_blocks):
+            raise ValueError(
+                f"request {request_id!r} private destination capacity is "
+                f"{len(destination_blocks)} blocks, but "
+                f"{num_destination_blocks} are required"
+            )
+        source_ids = set(actual_source_ids)
+        destination_ids: set[int] = set()
+        for block in destination_blocks:
+            if block.block_id in source_ids:
+                raise ValueError(
+                    f"request {request_id!r} source and destination overlap at "
+                    f"block {block.block_id}"
+                )
+            if block.block_id in destination_ids:
+                raise ValueError(
+                    f"request {request_id!r} destination repeats block {block.block_id}"
+                )
+            destination_ids.add(block.block_id)
+            if block.is_null or block.ref_cnt != 1:
+                raise ValueError(
+                    f"request {request_id!r} destination block "
+                    f"{block.block_id} is not exclusively owned"
+                )
+            if block.block_hash is not None:
+                raise ValueError(
+                    f"request {request_id!r} destination block "
+                    f"{block.block_id} has a prefix hash"
+                )
+
+    def replace_request_blocks(
+        self,
+        request_id: str,
+        num_destination_blocks: int,
+        expected_source_block_ids: tuple[int, ...],
+        destination_blocks: list[KVCacheBlock],
+    ) -> tuple[
+        tuple[int, ...],
+        tuple[int, ...],
+        tuple[int, ...],
+        tuple[int, ...],
+    ]:
+        """Atomically install a private table and release the semantic source."""
+        self.validate_request_block_replacement(
+            request_id,
+            num_destination_blocks,
+            expected_source_block_ids,
+            destination_blocks,
+        )
+        source_blocks = self.req_to_blocks[request_id]
+        active_destination = destination_blocks[:num_destination_blocks]
+        unused_destination = destination_blocks[num_destination_blocks:]
+        retained_hashed_source_ids = tuple(
+            block.block_id for block in source_blocks if block.block_hash is not None
+        )
+        released_ids = tuple(
+            block.block_id for block in (*unused_destination, *source_blocks)
+        )
+
+        self.req_to_blocks[request_id] = list(active_destination)
+        self.num_cached_block.pop(request_id, None)
+        if unused_destination:
+            self.block_pool.free_blocks(reversed(unused_destination), prepend=True)
+        self.block_pool.free_blocks(reversed(source_blocks))
+        return (
+            expected_source_block_ids,
+            tuple(block.block_id for block in active_destination),
+            released_ids,
+            retained_hashed_source_ids,
+        )
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1507,7 +1666,7 @@ def get_manager_for_kv_cache_spec(
 
 def register_all_kvcache_specs(vllm_config):
     """Built-in spec registration"""
-    full_attention_manager = FullAttentionManager
+    full_attention_manager: type[SingleTypeKVCacheManager] = FullAttentionManager
     prefix_caching_enabled = (
         vllm_config is not None
         and vllm_config.cache_config is not None

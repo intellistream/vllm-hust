@@ -34,6 +34,7 @@ from .device import DeviceConfig
 from .diffusion import DiffusionConfig
 from .ec_transfer import ECTransferConfig
 from .kernel import KernelConfig
+from .kv_cache_compression import KVCacheCompressionConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
@@ -379,6 +380,8 @@ class VllmConfig:
     up to this amount of time to allow already-running requests to complete. Any
     remaining requests are aborted once the timeout is reached.
     """
+    kv_cache_compression_config: KVCacheCompressionConfig | None = None
+    """Optional KV cache compression provider configuration."""
 
     def compute_hash(self) -> str:
         """
@@ -466,6 +469,10 @@ class VllmConfig:
             vllm_factors.append(self.kv_transfer_config.compute_hash())
         else:
             vllm_factors.append("None")
+        # Preserve the historical disabled hash. Compression changes model
+        # execution only when it is explicitly configured.
+        if self.kv_cache_compression_config is not None:
+            vllm_factors.append(self.kv_cache_compression_config.compute_hash())
         if self.ec_transfer_config:
             vllm_factors.append(self.ec_transfer_config.compute_hash())
         else:
