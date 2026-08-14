@@ -143,6 +143,21 @@ class OffloadingConnectorWorker:
         except Exception:
             return
 
+    def _admit_kv_recovery_submission_evidence(
+        self,
+        attempt: KVRecoveryTransferAttempt | None,
+    ) -> bool:
+        if attempt is None:
+            return False
+        timestamp_ns = self._profile_clock_ns()
+        if timestamp_ns is None:
+            # The backend submission succeeded, but without its observation
+            # timestamp the evidence attempt cannot be accepted. Release the
+            # bounded prepared slot while leaving serving unaffected.
+            self._record_kv_recovery_not_submitted(attempt)
+            return False
+        return self._record_kv_recovery_submit(attempt, timestamp_ns)
+
     def _submit_pending_stores(self) -> None:
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
@@ -160,13 +175,10 @@ class OffloadingConnectorWorker:
             if not success:
                 self._record_kv_recovery_not_submitted(attempt)
             assert success
-            if attempt is not None:
-                timestamp_ns = self._profile_clock_ns()
-                if timestamp_ns is not None and self._record_kv_recovery_submit(
-                    attempt, timestamp_ns
-                ):
-                    assert self._kv_recovery_profiled_attempts is not None
-                    self._kv_recovery_profiled_attempts[job_id] = attempt
+            if self._admit_kv_recovery_submission_evidence(attempt):
+                assert attempt is not None
+                assert self._kv_recovery_profiled_attempts is not None
+                self._kv_recovery_profiled_attempts[job_id] = attempt
         self._unsubmitted_store_jobs.clear()
 
     def _prepare_kv_recovery_wait(
@@ -571,13 +583,10 @@ class OffloadingConnectorWorker:
             if not success:
                 self._record_kv_recovery_not_submitted(attempt)
             assert success
-            if attempt is not None:
-                timestamp_ns = self._profile_clock_ns()
-                if timestamp_ns is not None and self._record_kv_recovery_submit(
-                    attempt, timestamp_ns
-                ):
-                    assert self._kv_recovery_profiled_attempts is not None
-                    self._kv_recovery_profiled_attempts[job_id] = attempt
+            if self._admit_kv_recovery_submission_evidence(attempt):
+                assert attempt is not None
+                assert self._kv_recovery_profiled_attempts is not None
+                self._kv_recovery_profiled_attempts[job_id] = attempt
 
     def observe_kv_recovery_first_compute(
         self,

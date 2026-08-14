@@ -549,34 +549,58 @@ def test_disabled_worker_path_does_not_read_profile_clock(
     assert worker.get_finished(set()) == (set(), {"request-0"})
 
 
-def test_submit_clock_failure_keeps_serving_but_cannot_emit_receipt(
+@pytest.mark.parametrize("operation", ["h2d_restore", "d2h_preserve"])
+def test_submit_clock_failure_releases_prepared_attempt(
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ):
-    events: list[tuple] = []
-    observer = RecordingObserver(events)
-    worker, backend, _ = make_worker(observer)
+    sink = RecordingEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver(
+        "a" * 32,
+        "0" * 32,
+        "c" * 32,
+        sink,
+    )
+    worker, backend, events = make_worker(observer)
     backend.events = events
 
     def unavailable_clock():
         raise RuntimeError("clock unavailable")
 
     monkeypatch.setattr(worker_module.time, "monotonic_ns", unavailable_clock)
-    context = make_context("h2d_restore")
-    job = make_load_job()
-    worker.start_kv_transfers(
-        metadata(
-            load_jobs=((7, job),),
-            kv_recovery_contexts=((7, context),),
+    context = make_context(operation)
+    if operation == "h2d_restore":
+        worker.start_kv_transfers(
+            metadata(
+                load_jobs=((7, make_load_job()),),
+                kv_recovery_contexts=((7, context),),
+            )
         )
-    )
-    backend.finished.append(TransferResult(7, True, 128, 0.25))
+    else:
+        worker.prepare_store_kv(
+            metadata(
+                store_jobs=((7, make_store_job()),),
+                kv_recovery_contexts=((7, context),),
+            )
+        )
+        worker.start_kv_transfers(metadata())
 
-    assert worker.get_finished(set()) == (set(), {"request-0"})
-    worker_meta = worker.build_connector_worker_meta()
-    assert worker_meta is not None
-    assert worker_meta.completed_jobs == {7: 1}
-    assert worker_meta.kv_recovery_h2d_receipts == ()
-    assert not any(event[0] == "observer_completed" for event in events)
+    assert events[0][0] == (
+        "backend_submit_load" if operation == "h2d_restore" else "backend_submit_store"
+    )
+    assert observer.prepared_transfer_count == 0
+    assert observer.pending_h2d_count == 0
+    assert observer.pending_d2h_count == 0
+    assert len(sink.not_submitted) == 1
+    assert sink.not_submitted[0].connector_job_id == 7
+    assert not observer.evidence_disabled
+
+    backend.finished.append(TransferResult(7, True, 128, 0.25))
+    worker.get_finished(set())
+
+    assert sink.completions == []
+    assert observer.prepared_transfer_count == 0
+    assert not observer.evidence_disabled
 
 
 def test_h2d_sidecar_reaches_submit_completion_and_scheduler_receipt():
