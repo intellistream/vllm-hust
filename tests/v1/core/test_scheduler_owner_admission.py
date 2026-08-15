@@ -476,7 +476,11 @@ def _pool(
     total_blocks: int = 1000,
     free_blocks: int = 300,
     effective_tokens_per_block: tuple[int, ...] = (),
+    allocation_token_quantum: tuple[int, ...] = (),
 ) -> OwnerCachePoolSnapshot:
+    if not allocation_token_quantum:
+        allocation_token_quantum = (1,) * len(effective_tokens_per_block)
+    assert len(allocation_token_quantum) == len(effective_tokens_per_block)
     return OwnerCachePoolSnapshot(
         owner_rank=owner_rank,
         total_blocks=total_blocks,
@@ -488,8 +492,11 @@ def _pool(
                 effective_tokens_per_block=capacity,
                 allocated_blocks=0,
                 resident_blocks=0,
+                allocation_token_quantum=quantum,
             )
-            for index, capacity in enumerate(effective_tokens_per_block)
+            for index, (capacity, quantum) in enumerate(
+                zip(effective_tokens_per_block, allocation_token_quantum)
+            )
         ),
     )
 
@@ -1290,6 +1297,189 @@ def test_same_step_admissions_charge_projected_blocks_under_small_free_skew() ->
         assert (
             scheduler.owner_coordinator.owner_of(OwnerLeaseKey(request_id, 0)) == owner
         )
+
+
+def test_known_infeasible_reserve_waits_for_confirmed_capacity() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=64,
+        enable_request_owned_graph=True,
+    )
+    groups = (512, 16384, 128, 128, 8, 32)
+    quanta = (4, 128, 1, 1, 1, 1)
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(
+                0,
+                total_blocks=166,
+                free_blocks=9,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            ),
+            1: _pool(
+                1,
+                total_blocks=166,
+                free_blocks=9,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            ),
+        },
+    )
+    request = _request("req-blocked", num_prompt_tokens=32, max_tokens=32)
+    scheduler.add_request(request)
+
+    # A 64-token horizon needs 13 blocks across the six heterogeneous
+    # groups: the C128 group floors 64 / 128 to zero storage tokens, matching
+    # the real Ascend CompressAttentionManager rather than charging a false
+    # one-block ceiling. Both worker-confirmed pools have only nine free, so
+    # the scheduler must not ask either allocator a question it already knows
+    # will fail.
+    out1 = scheduler.schedule()
+    key = OwnerLeaseKey(request.request_id, 0)
+    assert out1.owner_commands == []
+    assert scheduler.owner_coordinator.owner_of(key) is None
+    assert request.request_id not in scheduler._owner_pending_command
+    assert request.status == RequestStatus.WAITING
+    assert request.attention_owner is None
+
+    # An unchanged snapshot does not cause a fresh command sequence or a
+    # retry receipt on the wire.
+    _apply_pool_receipts(
+        scheduler,
+        out1,
+        {
+            0: _pool(
+                0,
+                total_blocks=166,
+                free_blocks=9,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            ),
+            1: _pool(
+                1,
+                total_blocks=166,
+                free_blocks=9,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            ),
+        },
+    )
+    out2 = scheduler.schedule()
+    assert out2.owner_commands == []
+    assert scheduler.owner_coordinator.owner_of(key) is None
+
+    # A later post-flush snapshot makes rank 1 exactly feasible.  The next
+    # pass issues the first and only RESERVE, while its worker remains the
+    # positive allocation authority.
+    _apply_pool_receipts(
+        scheduler,
+        out2,
+        {
+            0: _pool(
+                0,
+                total_blocks=166,
+                free_blocks=9,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            ),
+            1: _pool(
+                1,
+                total_blocks=166,
+                free_blocks=13,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            ),
+        },
+    )
+    out3 = scheduler.schedule()
+    (reserve,) = out3.owner_commands
+    assert reserve.key == key
+    assert reserve.owner_id == 1
+    assert reserve.command_seq == 1
+    assert reserve.required_num_tokens == 64
+
+
+def test_same_step_capacity_projection_suppresses_oversubscription() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=64,
+        enable_request_owned_graph=True,
+    )
+    groups = (512, 16384, 128, 128, 8, 32)
+    quanta = (4, 128, 1, 1, 1, 1)
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(
+                0,
+                free_blocks=13,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            ),
+            1: _pool(
+                1,
+                free_blocks=13,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            ),
+        },
+    )
+    requests = [
+        _request(request_id, num_prompt_tokens=32, max_tokens=32)
+        for request_id in ("req-a", "req-b", "req-c")
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+
+    out1 = scheduler.schedule()
+    assert [
+        (command.key.request_id, command.owner_id) for command in out1.owner_commands
+    ] == [
+        ("req-a", 0),
+        ("req-b", 1),
+    ]
+    blocked = OwnerLeaseKey("req-c", 0)
+    assert scheduler.owner_coordinator.owner_of(blocked) is None
+    assert "req-c" not in scheduler._owner_pending_command
+
+
+def test_capacity_blocked_head_does_not_hide_smaller_feasible_request() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=64,
+        enable_request_owned_graph=True,
+    )
+    groups = (512, 16384, 128, 128, 8, 32)
+    quanta = (4, 128, 1, 1, 1, 1)
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(
+                0,
+                free_blocks=4,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            )
+        },
+    )
+    large = _request("req-large", num_prompt_tokens=32, max_tokens=32)
+    small = _request("req-small", num_prompt_tokens=1, max_tokens=1)
+    scheduler.add_request(large)
+    scheduler.add_request(small)
+
+    out1 = scheduler.schedule()
+    (reserve,) = out1.owner_commands
+    assert reserve.key == OwnerLeaseKey("req-small", 0)
+    assert reserve.required_num_tokens == 2
+    assert scheduler.owner_coordinator.owner_of(OwnerLeaseKey("req-large", 0)) is None
+    assert large.status == RequestStatus.WAITING
 
 
 def test_partial_snapshot_envelope_fails_closed() -> None:

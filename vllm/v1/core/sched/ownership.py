@@ -343,6 +343,12 @@ class OwnerCacheGroupSnapshot:
     allocated_blocks: int
     #: Blocks of this group currently resident in the pool.
     resident_blocks: int
+    #: Logical-token compression quantum applied before storage-block
+    #: rounding. Fresh physical demand is
+    #: ``ceil((num_tokens // quantum) / (effective / quantum))``. It is one
+    #: for ordinary groups; compressed DSV4 groups publish their concrete
+    #: compression ratio so the scheduler can compute exact physical demand.
+    allocation_token_quantum: int = 1
 
     def __post_init__(self) -> None:
         for name in ("group_index", "allocated_blocks", "resident_blocks"):
@@ -356,6 +362,17 @@ class OwnerCacheGroupSnapshot:
             raise TypeError(
                 "effective_tokens_per_block must be a positive non-bool int, "
                 f"got {value!r}."
+            )
+        quantum = self.allocation_token_quantum
+        if isinstance(quantum, bool) or not isinstance(quantum, int) or quantum <= 0:
+            raise TypeError(
+                "allocation_token_quantum must be a positive non-bool int, "
+                f"got {quantum!r}."
+            )
+        if value % quantum:
+            raise ValueError(
+                "effective_tokens_per_block must be divisible by "
+                f"allocation_token_quantum, got {value} % {quantum}."
             )
         if not isinstance(self.spec_kind, str) or not self.spec_kind:
             raise TypeError(

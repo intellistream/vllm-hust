@@ -53,7 +53,7 @@ def test_probe_records_mixed_and_zero_owner_rows(tmp_path, monkeypatch) -> None:
     assert records[0] == {
         "kind": "header",
         "run_id": "owner-cell",
-        "schema": "g5-request-owner-lifecycle-observation/v4",
+        "schema": "g5-request-owner-lifecycle-observation/v5",
         "world_size": 4,
     }
     step = records[1]
@@ -176,6 +176,7 @@ def test_probe_records_block_id_free_physical_capacity(tmp_path) -> None:
                 "group_index": 0,
                 "spec_kind": "full",
                 "effective_tokens_per_block": 128,
+                "allocation_token_quantum": 1,
                 "allocated_blocks": 4,
                 "resident_blocks": 4,
             }

@@ -2901,9 +2901,11 @@ class Scheduler(SchedulerInterface):
 
         First admission assigns the least-committed-work owner and issues a
         small chunk-scaled RESERVE with a WAITING allocation descriptor,
-        leaving the request provisional and unscheduled until its receipt is
-        applied.  PREEMPTED requests resume with a PREEMPTED descriptor on
-        their sticky owner.  Accepted leases promote the request to RUNNING.
+        unless worker-confirmed pool facts prove that no owner can fit it.
+        The request otherwise stays provisional and unscheduled until its
+        receipt is applied.  PREEMPTED requests resume with a PREEMPTED
+        descriptor on their sticky owner.  Accepted leases promote the
+        request to RUNNING.
         """
         coordinator = self.owner_coordinator
         assert coordinator is not None
@@ -2926,9 +2928,10 @@ class Scheduler(SchedulerInterface):
 
             key = self._owner_key_for(request)
             if coordinator.owner_of(key) is None:
-                # First admission: least-work/stable-rank assignment plus a
-                # small chunk-scaled RESERVE(WAITING); the request stays
-                # provisional until the worker receipt is applied.
+                # First admission: choose a feasible least-work/stable-rank
+                # owner and issue a small chunk-scaled RESERVE(WAITING). If
+                # confirmed capacity cannot fit it, leave it unassigned and
+                # retry only against a later scheduling snapshot.
                 self._assign_owner_and_reserve(request, key)
             elif self._owner_pending_command.get(request_id) is not None:
                 # A command is in flight: stall for its receipt.
@@ -3749,18 +3752,27 @@ class Scheduler(SchedulerInterface):
             self._owner_logical_lifetime_horizon(request),
         )
 
-    def _assign_owner_and_reserve(self, request: Request, key: OwnerLeaseKey) -> None:
-        """Assign the scheduler-computed owner and issue the RESERVE.
+    def _assign_owner_and_reserve(self, request: Request, key: OwnerLeaseKey) -> bool:
+        """Assign a feasible scheduler-computed owner and issue the RESERVE.
 
         The scheduler picks the first-admission owner itself from
         worker-confirmed physical pool facts (or lease counts before any
         snapshot) and forces it through the coordinator with
         ``projected_work=0`` so token units never mix with block facts.
+
+        Once physical snapshots are available, a request that provably does
+        not fit any owner remains unassigned and sends no speculative
+        RESERVE.  The worker remains the sole positive allocation authority:
+        this host-side gate only suppresses requests that cannot fit the
+        worker-confirmed free-block facts.
         """
         coordinator = self.owner_coordinator
         assert coordinator is not None
         required = self._owner_reserve_required(request)
-        owner, projected_blocks = self._select_owner_for_admission(required)
+        selected = self._select_owner_for_admission(required)
+        if selected is None:
+            return False
+        owner, projected_blocks = selected
         try:
             coordinator.assign(
                 key,
@@ -3779,44 +3791,54 @@ class Scheduler(SchedulerInterface):
             )
         self._owner_admission_projected_blocks[owner] += projected_blocks
         self._issue_owner_reserve(request, key)
+        return True
 
     @staticmethod
     def _owner_projected_block_demand(
         snapshot: OwnerCachePoolSnapshot,
         required_num_tokens: int,
     ) -> int:
-        """Conservatively project unified-pool blocks for a fresh horizon.
+        """Project unified-pool blocks for a fresh DSV4 horizon.
 
         Every request owns one table in every KV group, while the groups use
-        heterogeneous effective token capacities.  Their block allocations
-        all consume the same physical pool, so the projected pool demand is
-        the sum of each group's ceiling.  Empty group metadata is retained
-        for compatibility with early/host-only protocol snapshots and still
-        charges one block for a nonempty reservation.
+        heterogeneous effective token capacities and compressed groups floor
+        logical tokens to a storage quantum before block rounding. Their
+        physical allocations all consume the same pool, so demand is the sum
+        of those exact per-group cardinalities. Empty group metadata is
+        retained for compatibility with early/host-only protocol snapshots
+        and still charges one block for a nonempty reservation.
         """
         if required_num_tokens <= 0:
             return 0
         if not snapshot.groups:
             return 1
-        return sum(
-            (required_num_tokens + group.effective_tokens_per_block - 1)
-            // group.effective_tokens_per_block
-            for group in snapshot.groups
-        )
+        demand = 0
+        for group in snapshot.groups:
+            quantum = group.allocation_token_quantum
+            storage_tokens = required_num_tokens // quantum
+            storage_tokens_per_block = group.effective_tokens_per_block // quantum
+            demand += (
+                storage_tokens + storage_tokens_per_block - 1
+            ) // storage_tokens_per_block
+        return demand
 
     def _select_owner_for_admission(
         self,
         required_num_tokens: int,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int] | None:
         """Pick the owner for a fresh G2 first admission.
 
         With physical pool snapshots present, the owner with the greatest
         post-admission projected free capacity wins.  The projection charges
         every provisional choice already made in this scheduler pass, so a
         small stale free-block advantage cannot funnel an entire admission
-        wave onto one rank.  Ties break by live/sticky lease count and stable
-        global rank.  Without snapshots the choice falls back to lease-count
-        balance then rank.  No block or pool IDs are consulted.
+        wave onto one rank.  Owners with negative projected free capacity are
+        ineligible: when every owner is ineligible, return ``None`` and let
+        the request wait for a later worker-confirmed pool snapshot instead
+        of issuing a RESERVE that is already known to fail.  Ties break by
+        live/sticky lease count and stable global rank.  Without snapshots
+        the choice falls back to lease-count balance then rank.  No block or
+        pool IDs are consulted.
         """
         coordinator = self.owner_coordinator
         assert coordinator is not None
@@ -3831,23 +3853,32 @@ class Scheduler(SchedulerInterface):
                 for owner_id in ranks
             }
 
+            def projected_free(owner_id: int) -> int:
+                return (
+                    snapshots[owner_id].free_blocks
+                    - projected[owner_id]
+                    - demands[owner_id]
+                )
+
             def score(owner_id: int) -> tuple[int, int, int]:
                 return (
-                    -(
-                        snapshots[owner_id].free_blocks
-                        - projected[owner_id]
-                        - demands[owner_id]
-                    ),
+                    -projected_free(owner_id),
                     coordinator.live_lease_count(owner_id),
                     owner_id,
                 )
+
+            feasible = [owner_id for owner_id in ranks if projected_free(owner_id) >= 0]
+            if not feasible:
+                return None
+            owner = min(feasible, key=score)
         else:
             demands = {owner_id: 0 for owner_id in ranks}
 
             def score(owner_id: int) -> tuple[int, int]:
                 return (coordinator.live_lease_count(owner_id), owner_id)
 
-        owner = min(ranks, key=score)
+            owner = min(ranks, key=score)
+
         return owner, demands[owner]
 
     def _issue_owner_reserve(self, request: Request, key: OwnerLeaseKey) -> None:

@@ -1588,6 +1588,7 @@ class RequestOwnedKVStore:
                 ),
                 allocated_blocks=allocated[index],
                 resident_blocks=allocated[index],
+                allocation_token_quantum=_request_owned_compress_ratio(spec),
             )
             for index, spec in enumerate(self._group_specs)
         )

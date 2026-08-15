@@ -559,6 +559,7 @@ def test_uniform_store_binds_min_compress_ratio_representative(
     snapshot = wrapper._request_owned_kv_store.pool_snapshot()
     assert snapshot.groups[0].spec_kind == "mla_attention"
     assert snapshot.groups[0].effective_tokens_per_block == 4 * 4
+    assert snapshot.groups[0].allocation_token_quantum == 4
     # The original wrapper, dict insertion order, and inner specs are
     # untouched by store construction.
     original_group = raw.kv_cache_groups[0].kv_cache_spec

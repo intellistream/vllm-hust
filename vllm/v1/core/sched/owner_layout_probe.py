@@ -21,7 +21,7 @@ PROBE_DIR_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_DIR"
 RUN_ID_ENV = "VLLM_TELEMETRY_RUN_ID"
 MAX_RECORDS_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_MAX_RECORDS"
 MAX_BYTES_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_MAX_BYTES"
-SCHEMA = "g5-request-owner-lifecycle-observation/v4"
+SCHEMA = "g5-request-owner-lifecycle-observation/v5"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 
@@ -228,6 +228,9 @@ class OwnerLayoutProbe:
                                 "spec_kind": group.spec_kind,
                                 "effective_tokens_per_block": (
                                     group.effective_tokens_per_block
+                                ),
+                                "allocation_token_quantum": (
+                                    group.allocation_token_quantum
                                 ),
                                 "allocated_blocks": group.allocated_blocks,
                                 "resident_blocks": group.resident_blocks,

@@ -786,6 +786,7 @@ def _group(
     effective_tokens_per_block: int = 16,
     allocated_blocks: int = 100,
     resident_blocks: int = 80,
+    allocation_token_quantum: int = 1,
 ) -> OwnerCacheGroupSnapshot:
     return OwnerCacheGroupSnapshot(
         group_index=group_index,
@@ -793,6 +794,7 @@ def _group(
         effective_tokens_per_block=effective_tokens_per_block,
         allocated_blocks=allocated_blocks,
         resident_blocks=resident_blocks,
+        allocation_token_quantum=allocation_token_quantum,
     )
 
 
@@ -820,6 +822,7 @@ def test_cache_group_snapshot_validation() -> None:
         "effective_tokens_per_block",
         "allocated_blocks",
         "resident_blocks",
+        "allocation_token_quantum",
     ):
         for bad in (True, False, -1, 1.0, "1", None):
             kwargs = dict(
@@ -851,6 +854,16 @@ def test_cache_group_snapshot_requires_positive_effective_tokens_per_block() -> 
     with pytest.raises(TypeError, match="effective_tokens_per_block"):
         _group(effective_tokens_per_block=True)  # type: ignore[arg-type]
     assert _group(effective_tokens_per_block=1).effective_tokens_per_block == 1
+
+
+def test_cache_group_snapshot_validates_allocation_quantum() -> None:
+    for bad in (0, -1, True, 1.0, "1", None):
+        with pytest.raises(TypeError, match="allocation_token_quantum"):
+            _group(allocation_token_quantum=bad)
+    with pytest.raises(ValueError, match="must be divisible"):
+        _group(effective_tokens_per_block=16, allocation_token_quantum=3)
+    group = _group(effective_tokens_per_block=64, allocation_token_quantum=4)
+    assert group.allocation_token_quantum == 4
 
 
 def test_cache_pool_snapshot_validation() -> None:
