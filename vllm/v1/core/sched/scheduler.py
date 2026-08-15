@@ -2926,12 +2926,13 @@ class Scheduler(SchedulerInterface):
                 continue
 
             key = self._owner_key_for(request)
+            capacity_blocked = False
             if coordinator.owner_of(key) is None:
                 # First admission: choose a feasible least-work/stable-rank
                 # owner and issue a bounded-horizon RESERVE(WAITING). If
                 # confirmed capacity cannot fit it, leave it unassigned and
                 # retry only against a later scheduling snapshot.
-                self._assign_owner_and_reserve(request, key)
+                capacity_blocked = not self._assign_owner_and_reserve(request, key)
             elif self._owner_pending_command.get(request_id) is not None:
                 # A command is in flight: stall for its receipt.
                 pass
@@ -2943,7 +2944,7 @@ class Scheduler(SchedulerInterface):
                 # Stale incarnation (finished/reused request id): fence
                 # forward to a fresh epoch and admit again.
                 key = self._roll_owner_epoch(request)
-                self._assign_owner_and_reserve(request, key)
+                capacity_blocked = not self._assign_owner_and_reserve(request, key)
             elif coordinator.runnable_num_tokens_of(key) is None:
                 # Defensive: RESERVE in flight without a tracked pending.
                 pass
@@ -2965,6 +2966,29 @@ class Scheduler(SchedulerInterface):
             else:
                 # Accepted lease: promote to RUNNING.
                 self._promote_owner_request(request, key, scheduled_timestamp)
+
+            if (
+                capacity_blocked
+                and self.running
+                and getattr(
+                    self.scheduler_config,
+                    "enable_request_owned_graph",
+                    False,
+                )
+                and getattr(
+                    self.scheduler_config,
+                    "request_owned_decode_reservation_tokens",
+                    None,
+                )
+                is None
+            ):
+                # Match the ordinary scheduler's FCFS capacity behavior while
+                # full-lifetime running work can still complete and release
+                # blocks: keep the infeasible head in place rather than
+                # reserving a smaller tail request. Incremental horizons do
+                # not yet borrow ordinary preemption, so retain their scan
+                # instead of introducing a new progress dependency here.
+                break
 
             request_queue.pop_request()
             if request.status == RequestStatus.RUNNING:

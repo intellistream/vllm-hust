@@ -1562,6 +1562,87 @@ def test_capacity_blocked_head_does_not_hide_smaller_feasible_request() -> None:
     assert large.status == RequestStatus.WAITING
 
 
+def test_capacity_blocked_head_preserves_fcfs_while_running() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=64,
+        enable_request_owned_graph=True,
+    )
+    groups = (512, 16384, 128, 128, 8, 32)
+    quanta = (4, 128, 1, 1, 1, 1)
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(
+                0,
+                free_blocks=4,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            )
+        },
+    )
+    running = _request("req-running", num_prompt_tokens=1, max_tokens=1)
+    running.status = RequestStatus.RUNNING
+    scheduler.running.append(running)
+    scheduler.requests[running.request_id] = running
+
+    large = _request("req-large", num_prompt_tokens=32, max_tokens=32)
+    small = _request("req-small", num_prompt_tokens=1, max_tokens=1)
+    scheduler.add_request(large)
+    scheduler.add_request(small)
+
+    out1 = scheduler.schedule()
+
+    assert out1.owner_commands == []
+    assert [request.request_id for request in scheduler.waiting] == [
+        "req-large",
+        "req-small",
+    ]
+    assert scheduler.owner_coordinator.owner_of(OwnerLeaseKey("req-large", 0)) is None
+    assert scheduler.owner_coordinator.owner_of(OwnerLeaseKey("req-small", 0)) is None
+
+
+def test_capacity_blocked_head_scans_without_completion_capacity() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=64,
+        enable_request_owned_graph=False,
+    )
+    groups = (512, 16384, 128, 128, 8, 32)
+    quanta = (4, 128, 1, 1, 1, 1)
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(
+                0,
+                free_blocks=4,
+                effective_tokens_per_block=groups,
+                allocation_token_quantum=quanta,
+            )
+        },
+    )
+    running = _request("req-running", num_prompt_tokens=1, max_tokens=1)
+    running.status = RequestStatus.RUNNING
+    scheduler.running.append(running)
+    scheduler.requests[running.request_id] = running
+
+    large = _request("req-large", num_prompt_tokens=32, max_tokens=32)
+    small = _request("req-small", num_prompt_tokens=1, max_tokens=1)
+    scheduler.add_request(large)
+    scheduler.add_request(small)
+
+    out1 = scheduler.schedule()
+
+    (reserve,) = out1.owner_commands
+    assert reserve.key == OwnerLeaseKey("req-small", 0)
+    assert reserve.required_num_tokens == 1
+    assert scheduler.owner_coordinator.owner_of(OwnerLeaseKey("req-large", 0)) is None
+
+
 def test_partial_snapshot_envelope_fails_closed() -> None:
     scheduler = _make_scheduler()
     out = scheduler.schedule()
