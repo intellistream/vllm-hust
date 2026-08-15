@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 from collections.abc import Set
 from dataclasses import dataclass
 from threading import Lock
 from typing import Literal, Protocol
+
+import regex as re
 
 KVRecoveryOperation = Literal["d2h_preserve", "h2d_restore"]
 KVRecoveryCapacity = Literal["prepared_transfer", "pending_h2d", "pending_d2h"]

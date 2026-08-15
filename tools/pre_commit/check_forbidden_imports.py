@@ -50,6 +50,8 @@ CHECK_IMPORTS = {
                 "tests/v1/kv_connector/unit/offloading_connector/"
                 "test_kv_recovery_worker.py"
             ),
+            # Verifies the public KV-recovery ABI remains pickle-compatible.
+            "tests/v1/test_kv_recovery_profile.py",
             "benchmarks/kernels/graph_machete_bench.py",
             "benchmarks/kernels/benchmark_lora.py",
             "benchmarks/kernels/benchmark_machete.py",

@@ -130,7 +130,15 @@ class NoopEvidenceSink:
     def transfer_not_submitted(self, attempt):
         return None
 
-    def transfer_completed(self, **kwargs):
+    def transfer_completed(
+        self,
+        attempt,
+        submit_timestamp_ns,
+        timestamp_ns,
+        success,
+        bytes_moved,
+        device_duration_ns,
+    ):
         return None
 
     def transfer_capacity_exhausted(
@@ -765,7 +773,15 @@ def test_equal_d2h_timestamps_fail_before_profile_completion():
             super().__init__()
             self.completion_calls = 0
 
-        def transfer_completed(self, **kwargs):
+        def transfer_completed(
+            self,
+            attempt,
+            submit_timestamp_ns,
+            timestamp_ns,
+            success,
+            bytes_moved,
+            device_duration_ns,
+        ):
             self.completion_calls += 1
             return None
 
