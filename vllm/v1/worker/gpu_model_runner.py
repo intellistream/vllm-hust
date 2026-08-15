@@ -4369,6 +4369,10 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        self._spec_decode_proposer_latency_seconds = 0.0
+        self._spec_decode_verification_started_at = (
+            time.perf_counter() if self.speculative_config is not None else None
+        )
         # Update the EPLB meta.
         if self.eplb_state is not None:
             self.eplb_state.prepare_forward(
@@ -4564,6 +4568,7 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            started_at = time.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4577,6 +4582,9 @@ class GPUModelRunner(
                     slot_mappings,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+            self._spec_decode_proposer_latency_seconds += (
+                time.perf_counter() - started_at
+            )
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
@@ -4672,6 +4680,12 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        verification_latency_seconds = 0.0
+        if self._spec_decode_verification_started_at is not None:
+            verification_latency_seconds = (
+                time.perf_counter() - self._spec_decode_verification_started_at
+            )
+
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -4703,6 +4717,11 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                spec_decode_proposer_latency_seconds=(
+                    self._spec_decode_proposer_latency_seconds
+                ),
+                spec_decode_verification_latency_seconds=(verification_latency_seconds),
+                spec_decode_num_forwards=int(spec_config is not None),
                 routed_experts=None,
             )
 

@@ -39,6 +39,10 @@ from vllm.config.profiler import ProfilerConfig
 from vllm.config.reasoning import ReasoningConfig
 from vllm.config.scheduler import SchedulerConfig
 from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative_capability import (
+    SpeculativeCapability,
+    SpeculativeCapabilityError,
+)
 from vllm.config.speech_to_text import SpeechToTextConfig, SpeechToTextParams
 from vllm.config.structured_outputs import StructuredOutputsConfig
 from vllm.config.utils import (
@@ -117,6 +121,8 @@ __all__ = [
     "SchedulerConfig",
     # From vllm.config.speculative
     "SpeculativeConfig",
+    "SpeculativeCapability",
+    "SpeculativeCapabilityError",
     # From vllm.config.speech_to_text
     "SpeechToTextConfig",
     "SpeechToTextParams",

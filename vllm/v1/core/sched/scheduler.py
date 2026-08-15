@@ -2079,6 +2079,22 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        if self.log_stats and model_runner_output.spec_decode_num_forwards > 0:
+            if spec_decoding_stats is None:
+                spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+            spec_decoding_stats.observe_step(
+                num_forwards=model_runner_output.spec_decode_num_forwards,
+                num_committed_tokens=sum(
+                    len(token_ids) for token_ids in (sampled_token_ids or [])
+                ),
+                proposer_latency_seconds=(
+                    model_runner_output.spec_decode_proposer_latency_seconds
+                ),
+                verification_latency_seconds=(
+                    model_runner_output.spec_decode_verification_latency_seconds
+                ),
+            )
+
         if (
             stats := self.make_stats(
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
