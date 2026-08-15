@@ -7058,9 +7058,15 @@ class GPUModelRunner(
             and cudagraph_mode.has_full_cudagraphs()
         ):
             world_size = self.parallel_config.tensor_parallel_size
+            rows_per_owner = (
+                self.scheduler_config.request_owned_decode_rows_per_owner
+            )
+            token_rows_per_owner = rows_per_owner * self.uniform_decode_query_len
             request_owned_full_signature = RequestOwnedGraphSignature(
-                owner_counts=(1,) * world_size,
-                canonical_to_owner=tuple(range(world_size)),
+                owner_counts=(token_rows_per_owner,) * world_size,
+                canonical_to_owner=tuple(
+                    range(world_size * token_rows_per_owner)
+                ),
             )
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode,

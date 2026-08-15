@@ -144,6 +144,24 @@ def test_balanced_decode_graph_signature_accepts_fixed_uniform_identity_envelope
         owner_counts=(2, 2, 2), canonical_to_owner=tuple(range(6))
     )
 
+    multi_row_identity = OwnerRowLayout.build(
+        7,
+        _rows(["a0", "a1", "b0", "b1", "c0", "c1"], [4, 8, 12, 16, 20, 24]),
+        _owners(
+            ["a0", "a1", "b0", "b1", "c0", "c1"],
+            {"a0": 7, "a1": 7, "b0": 2, "b1": 2, "c0": 11, "c1": 11},
+        ),
+        group,
+    )
+    assert balanced_decode_graph_signature(
+        multi_row_identity,
+        num_reqs=6,
+        num_tokens=6,
+        uniform_decode=True,
+    ) == RequestOwnedGraphSignature(
+        owner_counts=(2, 2, 2), canonical_to_owner=tuple(range(6))
+    )
+
     nonidentity = OwnerRowLayout.build(
         6,
         rows,
@@ -156,11 +174,10 @@ def test_balanced_decode_graph_signature_accepts_fixed_uniform_identity_envelope
         _owners(["a", "b", "c"], {"a": 7, "b": 7, "c": 11}),
         group,
     )
-    assert (
-        balanced_decode_graph_signature(
-            nonidentity, num_reqs=3, num_tokens=3, uniform_decode=True
-        )
-        is None
+    assert balanced_decode_graph_signature(
+        nonidentity, num_reqs=3, num_tokens=3, uniform_decode=True
+    ) == RequestOwnedGraphSignature(
+        owner_counts=(1, 1, 1), canonical_to_owner=(0, 1, 2)
     )
     assert (
         balanced_decode_graph_signature(

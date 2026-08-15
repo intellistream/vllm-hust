@@ -95,6 +95,7 @@ def _make_scheduler(
     enable_request_owned_graph: bool = False,
     enable_request_owned_kv_offload: bool = False,
     enable_request_owned_windows: bool = False,
+    request_owned_decode_rows_per_owner: int = 1,
     request_owned_decode_window_steps: int = 1,
     request_owned_hot_low_watermark: int = 1,
     request_owned_hot_high_watermark: int = 2,
@@ -106,6 +107,7 @@ def _make_scheduler(
         enable_request_owned_graph=enable_request_owned_graph,
         enable_request_owned_kv_offload=enable_request_owned_kv_offload,
         enable_request_owned_windows=enable_request_owned_windows,
+        request_owned_decode_rows_per_owner=request_owned_decode_rows_per_owner,
         request_owned_decode_window_steps=request_owned_decode_window_steps,
         request_owned_hot_low_watermark=request_owned_hot_low_watermark,
         request_owned_hot_high_watermark=request_owned_hot_high_watermark,
@@ -1894,6 +1896,98 @@ def test_partial_decode_window_drains_without_waiting_for_full_cohort() -> None:
     # the existing non-FULL fallback rather than wait forever for owner 1.
     decode = scheduler.schedule()
     assert decode.num_scheduled_tokens == {"solo": 1}
+
+
+def test_multi_row_decode_window_forms_owner_major_full_cohort() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=8,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_rows_per_owner=2,
+    )
+    requests = [
+        _request(f"decode-{index}", num_prompt_tokens=1, max_tokens=8)
+        for index in range(4)
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    assert [command.owner_id for command in commands] == [0, 0, 1, 1]
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            owner: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+                for command in commands
+                if command.owner_id == owner
+            ]
+            for owner in range(2)
+        },
+    )
+
+    # One bounded prefill per owner runs until all four requests are decode
+    # ready; the next window is the exact owner-major 2x2 graph cohort.
+    for _ in range(2):
+        prefill = scheduler.schedule()
+        _ack_window_step(scheduler, prefill)
+    decode = scheduler.schedule()
+    keys = [
+        scheduler._owner_key[request_id]
+        for request_id in decode.num_scheduled_tokens
+    ]
+    owners = [scheduler.owner_coordinator.owner_of(key) for key in keys]
+    assert owners == [0, 0, 1, 1]
+    assert decode.num_scheduled_tokens == {
+        request_id: 1 for request_id in decode.num_scheduled_tokens
+    }
+
+
+def test_multi_row_partial_decode_remains_live_off_full_graph() -> None:
+    scheduler = _make_scheduler(
+        world_size=2,
+        max_num_scheduled_tokens=32,
+        max_num_running_reqs=8,
+        enable_request_owned_graph=True,
+        enable_request_owned_windows=True,
+        request_owned_decode_rows_per_owner=2,
+    )
+    for index in range(3):
+        scheduler.add_request(
+            _request(f"decode-{index}", num_prompt_tokens=1, max_tokens=8)
+        )
+    reserve = scheduler.schedule()
+    commands = list(reserve.owner_commands)
+    _apply_receipts(
+        scheduler,
+        reserve,
+        {
+            owner: [
+                _receipt(
+                    command.key,
+                    command.owner_id,
+                    command.command_seq,
+                    runnable=command.required_num_tokens,
+                )
+                for command in commands
+                if command.owner_id == owner
+            ]
+            for owner in range(2)
+        },
+    )
+    for _ in range(2):
+        prefill = scheduler.schedule()
+        _ack_window_step(scheduler, prefill)
+    partial = scheduler.schedule()
+    assert len(partial.num_scheduled_tokens) == 3
 
 
 def test_partial_decode_yields_to_prefill_that_can_fill_missing_owner() -> None:

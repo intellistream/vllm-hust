@@ -722,6 +722,9 @@ class EngineArgs:
         SchedulerConfig.enable_request_owned_kv_offload
     )
     enable_request_owned_windows: bool = SchedulerConfig.enable_request_owned_windows
+    request_owned_decode_rows_per_owner: int = (
+        SchedulerConfig.request_owned_decode_rows_per_owner
+    )
     request_owned_decode_window_steps: int = (
         SchedulerConfig.request_owned_decode_window_steps
     )
@@ -1519,6 +1522,10 @@ class EngineArgs:
             **scheduler_kwargs["enable_request_owned_windows"],
         )
         scheduler_group.add_argument(
+            "--request-owned-decode-rows-per-owner",
+            **scheduler_kwargs["request_owned_decode_rows_per_owner"],
+        )
+        scheduler_group.add_argument(
             "--request-owned-decode-window-steps",
             **scheduler_kwargs["request_owned_decode_window_steps"],
         )
@@ -2248,6 +2255,9 @@ class EngineArgs:
             enable_request_owned_graph=self.enable_request_owned_graph,
             enable_request_owned_kv_offload=self.enable_request_owned_kv_offload,
             enable_request_owned_windows=self.enable_request_owned_windows,
+            request_owned_decode_rows_per_owner=(
+                self.request_owned_decode_rows_per_owner
+            ),
             request_owned_decode_window_steps=(self.request_owned_decode_window_steps),
             request_owned_hot_low_watermark=(self.request_owned_hot_low_watermark),
             request_owned_hot_high_watermark=(self.request_owned_hot_high_watermark),

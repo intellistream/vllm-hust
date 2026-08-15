@@ -2184,6 +2184,9 @@ class VllmConfig:
         """
         request_owned_graph = self.scheduler_config.enable_request_owned_graph
         request_owned_windows = self.scheduler_config.enable_request_owned_windows
+        request_owned_decode_rows_per_owner = (
+            self.scheduler_config.request_owned_decode_rows_per_owner
+        )
         request_owned_q_wkv_fanin = (
             self.scheduler_config.enable_request_owned_q_wkv_fanin
         )
@@ -2230,7 +2233,28 @@ class VllmConfig:
         if not self.scheduler_config.enable_request_owned_attention:
             return
 
+        if request_owned_decode_rows_per_owner > 1 and not request_owned_windows:
+            raise ValueError(
+                "request_owned_decode_rows_per_owner > 1 requires "
+                "enable_request_owned_windows=True."
+            )
+
         parallel_config = self.parallel_config
+
+        full_decode_reqs = (
+            parallel_config.world_size * request_owned_decode_rows_per_owner
+        )
+        if (
+            request_owned_graph
+            and self.scheduler_config.max_num_seqs < full_decode_reqs
+        ):
+            raise ValueError(
+                "request-owned FULL decode geometry requires max_num_seqs "
+                "to cover world_size * request_owned_decode_rows_per_owner, "
+                f"got {self.scheduler_config.max_num_seqs} < "
+                f"{parallel_config.world_size} * "
+                f"{request_owned_decode_rows_per_owner} ({full_decode_reqs})."
+            )
 
         if parallel_config.pipeline_parallel_size != 1:
             raise ValueError(
@@ -2323,6 +2347,16 @@ class VllmConfig:
                     "FULL/FULL_DECODE_ONLY have no safe compiled mixed-batch "
                     "path for this model; ineligible request-owned steps fall "
                     "back to non-graph execution."
+                )
+            if (
+                request_owned_decode_rows_per_owner > 1
+                and compilation_config.cudagraph_mode
+                != CUDAGraphMode.FULL_AND_PIECEWISE
+            ):
+                raise ValueError(
+                    "request_owned_decode_rows_per_owner > 1 requires the "
+                    "isolated FULL decode lane with "
+                    "cudagraph_mode=FULL_AND_PIECEWISE."
                 )
         else:
             if compilation_config.mode != CompilationMode.NONE:

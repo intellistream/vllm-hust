@@ -215,9 +215,9 @@ class SchedulerConfig:
 
     Defaults to False.  Mixed and prefill shapes reuse PIECEWISE compilation
     but execute without a request-owned graph key.  The first FULL lane is a
-    finite, startup-captured pure-decode signature with exactly one row per
-    owner; its runner-owned metadata arena and ACL graph entry are sealed
-    before service.  Other FULL shapes remain fail-closed.
+    finite, startup-captured pure-decode signature with an explicit fixed
+    number of rows per owner; its runner-owned metadata arena and ACL graph
+    entry are sealed before service.  Other FULL shapes remain fail-closed.
     The flag changes the compiled graph partition and is therefore included
     in :meth:`compute_hash`."""
 
@@ -232,6 +232,15 @@ class SchedulerConfig:
     ``update_from_output`` after the step has completed; owners receive no
     scheduling or preemption authority.  This is a scheduling policy only and
     does not change the compiled model graph."""
+
+    request_owned_decode_rows_per_owner: int = Field(default=1, ge=1)
+    """Uniform decode requests contributed by each owner to the FULL lane.
+
+    The default preserves the first one-row-per-owner graph. Values greater
+    than one require request-owned windows so the scheduler can hold an exact
+    owner-balanced cohort matching the single startup-captured signature.
+    The value changes compiled graph geometry and is ignored when
+    request-owned attention is disabled."""
 
     request_owned_decode_window_steps: int = Field(default=32, ge=1)
     """Acknowledged decode steps between controller observations.
@@ -328,6 +337,7 @@ class SchedulerConfig:
         factors.append(self.enable_request_owned_attention)
         factors.append(self.enable_request_owned_q_wkv_fanin)
         factors.append(self.enable_request_owned_graph)
+        factors.append(self.request_owned_decode_rows_per_owner)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -375,6 +385,17 @@ class SchedulerConfig:
             "enable_request_owned_graph must be a bool, got "
             f"{type(value).__name__} ({value!r})."
         )
+
+    @field_validator("request_owned_decode_rows_per_owner", mode="before")
+    @classmethod
+    def _reject_bool_request_owned_decode_rows_per_owner(cls, value: Any) -> Any:
+        """Keep the fixed graph geometry out of the bool-as-int alias."""
+        if isinstance(value, bool):
+            raise ValueError(
+                "request_owned_decode_rows_per_owner must be a positive int, "
+                f"got bool ({value!r})."
+            )
+        return value
 
     @field_validator("enable_request_owned_windows", mode="before")
     @classmethod

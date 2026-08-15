@@ -70,6 +70,7 @@ def _vllm_config(
     enable_request_owned_graph: bool = False,
     enable_request_owned_kv_offload: bool = False,
     enable_request_owned_windows: bool = False,
+    request_owned_decode_rows_per_owner: int = 1,
     request_owned_decode_window_steps: int = 32,
     scheduler_config: SchedulerConfig | None = None,
     compilation_config: CompilationConfig | None = None,
@@ -96,6 +97,9 @@ def _vllm_config(
             enable_request_owned_graph=enable_request_owned_graph,
             enable_request_owned_kv_offload=enable_request_owned_kv_offload,
             enable_request_owned_windows=enable_request_owned_windows,
+            request_owned_decode_rows_per_owner=(
+                request_owned_decode_rows_per_owner
+            ),
             request_owned_decode_window_steps=request_owned_decode_window_steps,
             async_scheduling=async_scheduling,
         ),
@@ -114,6 +118,7 @@ def test_request_owned_attention_defaults_off():
     assert SchedulerConfig.default_factory().enable_request_owned_graph is False
     assert SchedulerConfig.default_factory().enable_request_owned_kv_offload is False
     assert SchedulerConfig.default_factory().enable_request_owned_windows is False
+    assert SchedulerConfig.default_factory().request_owned_decode_rows_per_owner == 1
     assert SchedulerConfig.default_factory().request_owned_decode_window_steps == 32
     assert SchedulerConfig.default_factory().request_owned_hot_low_watermark == 1
     assert SchedulerConfig.default_factory().request_owned_hot_high_watermark == 2
@@ -147,6 +152,7 @@ def test_request_owned_windows_construct_with_graph_and_quantum():
     vllm_config = _vllm_config(
         enable_request_owned_graph=True,
         enable_request_owned_windows=True,
+        request_owned_decode_rows_per_owner=4,
         request_owned_decode_window_steps=7,
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
@@ -155,7 +161,69 @@ def test_request_owned_windows_construct_with_graph_and_quantum():
     )
     scheduler_config = vllm_config.scheduler_config
     assert scheduler_config.enable_request_owned_windows is True
+    assert scheduler_config.request_owned_decode_rows_per_owner == 4
     assert scheduler_config.request_owned_decode_window_steps == 7
+
+
+def test_multi_row_decode_requires_scheduler_windows():
+    with pytest.raises(ValueError, match="decode_rows_per_owner > 1 requires"):
+        _vllm_config(
+            enable_request_owned_graph=True,
+            request_owned_decode_rows_per_owner=2,
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            ),
+        )
+
+
+def test_multi_row_decode_requires_full_decode_graph_mode():
+    with pytest.raises(ValueError, match="requires the isolated FULL decode"):
+        _vllm_config(
+            enable_request_owned_graph=True,
+            enable_request_owned_windows=True,
+            request_owned_decode_rows_per_owner=2,
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            ),
+        )
+
+
+def test_multi_row_decode_geometry_is_inert_while_request_ownership_is_off():
+    config = _vllm_config(
+        enable_request_owned_attention=False,
+        request_owned_decode_rows_per_owner=4,
+    )
+    assert config.scheduler_config.request_owned_decode_rows_per_owner == 4
+
+
+def test_multi_row_decode_geometry_rejects_bool_alias():
+    with pytest.raises(ValueError, match="must be a positive int"):
+        SchedulerConfig.default_factory(
+            request_owned_decode_rows_per_owner=True,
+        )
+
+
+def test_multi_row_decode_requires_enough_request_slots():
+    with pytest.raises(ValueError, match="requires max_num_seqs"):
+        _vllm_config(
+            enable_request_owned_graph=True,
+            enable_request_owned_windows=True,
+            request_owned_decode_rows_per_owner=2,
+            parallel_config=ParallelConfig(tensor_parallel_size=2),
+            scheduler_config=SchedulerConfig.default_factory(
+                enable_request_owned_attention=True,
+                enable_request_owned_graph=True,
+                enable_request_owned_windows=True,
+                request_owned_decode_rows_per_owner=2,
+                max_num_seqs=3,
+            ),
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            ),
+        )
 
 
 @pytest.mark.parametrize("value", [0, -1])

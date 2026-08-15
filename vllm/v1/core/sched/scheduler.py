@@ -122,9 +122,9 @@ class _OwnerWindowState:
     """Scheduler-owned phase state for the experimental window policy."""
 
     phase: _OwnerWindowPhase | None = None
-    # Owner-ordered and stable, but not necessarily complete: an exact
-    # world-size cohort is FULL-graph eligible, while a partial cohort must
-    # remain runnable through the ordinary non-FULL fallback.
+    # Owner-major and stable, but not necessarily complete: an exact
+    # rows-per-owner cohort is FULL-graph eligible, while a partial cohort
+    # remains runnable through the ordinary non-FULL fallback.
     decode_slots: tuple[OwnerLeaseKey, ...] = ()
     yielded_decode_slots: tuple[OwnerLeaseKey, ...] = ()
     suspended_decode_slots: tuple[OwnerLeaseKey, ...] = ()
@@ -3031,11 +3031,12 @@ class Scheduler(SchedulerInterface):
     def _owner_window_running_pass(self) -> None:
         """Plan one phase-isolated scheduler window.
 
-        Decode windows keep at most one request per owner in stable owner
-        order across acknowledged steps.  Exact world-size cohorts are FULL
-        graph eligible; partial cohorts use the existing non-FULL fallback so
-        low-load and tail traffic cannot starve.  Prefill work is frozen into
-        bounded waves and never mixed with decode in one model invocation.
+        Decode windows keep a configured number of requests per owner in
+        stable owner-major order across acknowledged steps. Exact balanced
+        cohorts are FULL graph eligible; partial cohorts use the existing
+        non-FULL fallback so low-load and tail traffic cannot starve. Prefill
+        work is frozen into bounded waves and never mixed with decode in one
+        model invocation.
         This method only selects and plans; :meth:`update_from_output` is the
         sole authority that commits phase transitions.
         """
@@ -3049,7 +3050,11 @@ class Scheduler(SchedulerInterface):
         self._owner_window_reconcile()
         if state.phase is None:
             decode_slots = self._owner_window_form_decode_slots()
-            if len(decode_slots) == self.parallel_config.world_size:
+            exact_decode_slots = (
+                self.parallel_config.world_size
+                * self.scheduler_config.request_owned_decode_rows_per_owner
+            )
+            if len(decode_slots) == exact_decode_slots:
                 state.phase = _OwnerWindowPhase.DECODE
                 state.decode_slots = decode_slots
                 state.yielded_decode_slots = ()
@@ -3165,12 +3170,14 @@ class Scheduler(SchedulerInterface):
                 policy.cancel_prefill()
 
     def _owner_window_form_decode_slots(self) -> tuple[OwnerLeaseKey, ...]:
-        """Return one owner-indexed decode cohort, exact when available."""
+        """Return one owner-major decode cohort, exact when available."""
         coordinator = self.owner_coordinator
         assert coordinator is not None
         world_size = self.parallel_config.world_size
+        rows_per_owner = self.scheduler_config.request_owned_decode_rows_per_owner
+        exact_slots = world_size * rows_per_owner
         suspended = self._owner_window_state.suspended_decode_slots
-        if len(suspended) == world_size:
+        if len(suspended) == exact_slots:
             suspended_requests = [
                 self._owner_window_live_request(key) for key in suspended
             ]
@@ -3181,8 +3188,10 @@ class Scheduler(SchedulerInterface):
                 for request in suspended_requests
             ):
                 return suspended
-        slots: list[OwnerLeaseKey | None] = [None] * world_size
-        alternates: list[OwnerLeaseKey | None] = [None] * world_size
+        fresh: list[list[OwnerLeaseKey]] = [[] for _ in range(world_size)]
+        yielded_candidates: list[list[OwnerLeaseKey]] = [
+            [] for _ in range(world_size)
+        ]
         yielded = set(self._owner_window_state.yielded_decode_slots)
         for request in self.running:
             if (
@@ -3197,15 +3206,18 @@ class Scheduler(SchedulerInterface):
             owner = coordinator.owner_of(key)
             if owner is None:
                 continue
-            if slots[owner] is None:
-                slots[owner] = key
-            if key not in yielded and alternates[owner] is None:
-                alternates[owner] = key
-        return tuple(
-            alternate if alternate is not None else slot
-            for slot, alternate in zip(slots, alternates)
-            if slot is not None
-        )
+            bucket = yielded_candidates[owner] if key in yielded else fresh[owner]
+            if len(bucket) < rows_per_owner:
+                bucket.append(key)
+
+        slots: list[OwnerLeaseKey] = []
+        for owner in range(world_size):
+            owner_slots = fresh[owner][:rows_per_owner]
+            remaining = rows_per_owner - len(owner_slots)
+            if remaining:
+                owner_slots.extend(yielded_candidates[owner][:remaining])
+            slots.extend(owner_slots)
+        return tuple(slots)
 
     def _owner_window_form_prefill_wave(self) -> tuple[OwnerLeaseKey, ...]:
         """Freeze at most one runnable prefill per owner in owner order."""
@@ -3355,7 +3367,11 @@ class Scheduler(SchedulerInterface):
         state.inflight = None
         if inflight.phase is _OwnerWindowPhase.DECODE:
             state.decode_steps += 1
-            if len(state.decode_slots) < self.parallel_config.world_size:
+            exact_decode_slots = (
+                self.parallel_config.world_size
+                * self.scheduler_config.request_owned_decode_rows_per_owner
+            )
+            if len(state.decode_slots) < exact_decode_slots:
                 # Partial decode is a liveness fallback, not a captured lane.
                 # Re-form it every acknowledged step so newly runnable work
                 # can fill missing owners rather than waiting for this tail
@@ -3474,8 +3490,9 @@ class Scheduler(SchedulerInterface):
     def _owner_balanced_prefill_plans(self) -> dict[str, int] | None:
         """Return one lockstep prefill chunk for the exact owner FULL cohort.
 
-        The first FULL decode key is finite: exactly one row per process-
-        global owner.  With equal-length prompts, greedily consuming the
+        The legacy balanced-prefill helper is deliberately still restricted
+        to exactly one row per process-global owner. With equal-length prompts,
+        greedily consuming the
         global token budget in request order can turn that future decode lane
         into two phase-shifted subsets even though every NPU has useful
         prefill work.  When *all* active RUNNING requests form that exact
