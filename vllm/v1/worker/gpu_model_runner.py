@@ -146,6 +146,9 @@ from vllm.v1.core.sched.owner_layout import (
     balanced_decode_graph_signature,
     build_owner_row_layout,
 )
+from vllm.v1.core.sched.physical_owner_arena import (
+    build_physical_owner_arena_plan,
+)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -3953,6 +3956,22 @@ class GPUModelRunner(
                     num_tokens=num_tokens,
                     uniform_decode=uniform_decode,
                 )
+                if request_owned_signature is None:
+                    physical_plan = build_physical_owner_arena_plan(
+                        self._request_owner_layout,
+                        rows_per_owner=(
+                            self.scheduler_config.request_owned_decode_rows_per_owner
+                        ),
+                        num_reqs=num_reqs,
+                        num_tokens=num_tokens,
+                        uniform_decode=uniform_decode,
+                    )
+                    if physical_plan is not None:
+                        request_owned_signature = physical_plan.graph_signature
+                        # FULL captures the physical execution envelope. The
+                        # shorter logical prefix remains authoritative for
+                        # lifecycle, sampling, and output accounting.
+                        num_tokens_padded = physical_plan.capacity
                 request_owned_full_ineligible = request_owned_signature is None
 
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
