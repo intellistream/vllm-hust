@@ -251,7 +251,10 @@ class AttentionSpec(KVCacheSpec):
         # Per-token-head scales are stored in separate tensors managed
         # by the attention backend, but the memory is carved from the
         # raw KV cache allocation so it must be budgeted here.
-        if self.kv_quant_mode.is_per_token_head:
+        if self.kv_quant_mode.is_per_token_head or self.kv_quant_mode.is_int4:
+            # INT4 (packed 2x int4/byte) also stores per-token-head dynamic
+            # scales inline in an fp32 slot appended to each head, so the raw
+            # KV cache allocation must budget that scale memory here too.
             real_page_size += (
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
