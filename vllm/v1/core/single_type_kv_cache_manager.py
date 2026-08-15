@@ -1666,16 +1666,27 @@ def get_manager_for_kv_cache_spec(
 
 def register_all_kvcache_specs(vllm_config):
     """Built-in spec registration"""
+    from vllm import envs
+
     full_attention_manager: type[SingleTypeKVCacheManager] = FullAttentionManager
     prefix_caching_enabled = (
         vllm_config is not None
         and vllm_config.cache_config is not None
         and vllm_config.cache_config.enable_prefix_caching
     )
+    # KnormFullAttentionManager is registered only when should_activate()
+    # returns True. This is the single source of truth shared with
+    # gpu_model_runner._knorm_active, ensuring manager registration and
+    # wrapper installation always agree. See issue #163.
+    try:
+        from vllm.knorm.config import should_activate as _knorm_should_activate
+    except ImportError:
+        _knorm_should_activate = lambda _: False  # type: ignore[assignment]  # noqa: E731
+
     knorm_compatible = (
         vllm_config is not None
         and vllm_config.cache_config is not None
-        and not vllm_config.cache_config.enable_prefix_caching
+        and _knorm_should_activate(vllm_config.cache_config.enable_prefix_caching)
     )
     if knorm_compatible:
         try:
@@ -1684,14 +1695,15 @@ def register_all_kvcache_specs(vllm_config):
             full_attention_manager = KnormFullAttentionManager
         except ImportError:
             pass  # knorm module not installed - use default FullAttentionManager
-    elif prefix_caching_enabled:
-        from vllm import envs
-
-        if envs.VLLM_KNORM_ENABLED:
-            logger.warning_once(
-                "Knorm KV compression is disabled because prefix caching is enabled. "
-                "Set --no-enable-prefix-caching to use Knorm."
-            )
+    elif (
+        prefix_caching_enabled
+        and envs.VLLM_KNORM_ENABLED
+        and envs.VLLM_KNORM_COMPRESSION_RATIO < 1.0
+    ):
+        logger.warning_once(
+            "Knorm KV compression is disabled because prefix caching is enabled. "
+            "Set --no-enable-prefix-caching to use Knorm."
+        )
 
     KVCacheSpecRegistry.register(
         FullAttentionSpec,

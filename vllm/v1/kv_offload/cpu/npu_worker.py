@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.b134_events import EVENTS_ENABLED, emit
 from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
     CanonicalKVCacheRef,
@@ -18,6 +20,10 @@ from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     OffloadingWorker,
     TransferResult,
+)
+from vllm.v1.kv_offload.cpu.b134_descriptor_layout import (
+    CAPTURE_ENABLED,
+    capture_descriptor_layout,
 )
 from vllm.v1.kv_offload.cpu.gpu_worker import compute_sub_block_ptrs
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
@@ -40,6 +46,7 @@ class NPUTransfer:
     dma_dst: torch.Tensor | None = None
     dma_sizes: torch.Tensor | None = None
     staging_buffer: torch.Tensor | None = None
+    submitted_at: float | None = None
 
 
 def _get_torch_npu() -> Any:
@@ -206,6 +213,7 @@ class AscendSingleDirectionOffloadingHandler:
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
+        transfer_started_at = time.monotonic() if EVENTS_ENABLED else 0.0
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
 
         src_blocks = src_spec.block_ids
@@ -245,6 +253,9 @@ class AscendSingleDirectionOffloadingHandler:
         dst_offset = 0
         op_idx = 0
         num_transfer_bytes = 0
+        layout_descriptors: list[dict[str, int | str]] | None = (
+            [] if CAPTURE_ENABLED else None
+        )
         for group_size, block_idx, group_data_refs in zip(
             group_sizes, block_indices, self.kv_cache_groups_data_refs
         ):
@@ -283,6 +294,21 @@ class AscendSingleDirectionOffloadingHandler:
                     skip_count=dst_skip,
                 )
                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
+                if layout_descriptors is not None:
+                    src_base = self.src_tensors[data_ref.tensor_idx].data_ptr()
+                    dst_base = self.dst_tensors[data_ref.tensor_idx].data_ptr()
+                    direction = "d2h" if self.npu_to_cpu else "h2d"
+                    for descriptor_idx in range(op_idx, end_idx):
+                        layout_descriptors.append(
+                            {
+                                "direction": direction,
+                                "dst_offset": int(all_dst[descriptor_idx]) - dst_base,
+                                "dst_region": f"dst_tensor_{data_ref.tensor_idx}",
+                                "size": int(all_sizes[descriptor_idx]),
+                                "src_offset": int(all_src[descriptor_idx]) - src_base,
+                                "src_region": f"src_tensor_{data_ref.tensor_idx}",
+                            }
+                        )
                 num_transfer_bytes += group_size * data_ref.page_size_bytes
                 op_idx = end_idx
 
@@ -292,6 +318,13 @@ class AscendSingleDirectionOffloadingHandler:
         assert src_offset == len(src_blocks)
         assert dst_offset == len(dst_blocks)
         assert op_idx == num_copy_ops
+        if layout_descriptors is not None:
+            capture_descriptor_layout(
+                job_id,
+                "d2h" if self.npu_to_cpu else "h2d",
+                layout_descriptors,
+            )
+        descriptors_done_at = time.monotonic() if EVENTS_ENABLED else 0.0
 
         npu = _get_torch_npu()
         start_event = self._new_event()
@@ -305,6 +338,7 @@ class AscendSingleDirectionOffloadingHandler:
             self._stream.wait_stream(npu.current_stream())
         if self._transfers:
             self._stream.wait_event(self._transfers[-1].end_event)
+        dependencies_done_at = time.monotonic() if EVENTS_ENABLED else 0.0
 
         if num_copy_ops and not self.npu_to_cpu:
             max_page_bytes = int(all_sizes.max())
@@ -331,19 +365,31 @@ class AscendSingleDirectionOffloadingHandler:
             start_event.record(self._stream)
             if num_copy_ops:
                 if self.npu_to_cpu:
+                    swap_started_at = time.monotonic() if EVENTS_ENABLED else 0.0
                     torch.ops._C_ascend.swap_blocks_batch(src, dst, sizes, 1)
+                    if EVENTS_ENABLED:
+                        emit(
+                            "swap_d2h_submit",
+                            f"job{job_id}",
+                            descriptors=num_copy_ops,
+                            duration_us=round(
+                                (time.monotonic() - swap_started_at) * 1e6
+                            ),
+                        )
                 else:
                     assert staging_buffer is not None
                     assert dma_src is not None
                     assert dma_dst is not None
                     assert dma_sizes is not None
                     dma_offset = 0
+                    gather_seconds = 0.0
                     for chunk_start, chunk_end in _iter_transfer_chunks(
                         all_sizes,
                         self._staging_capacity_bytes,
                     ):
                         chunk_src = all_src[chunk_start:chunk_end]
                         chunk_sizes = all_sizes[chunk_start:chunk_end]
+                        gather_started_at = time.monotonic() if EVENTS_ENABLED else 0.0
                         chunk_dma_ops = _coalesce_host_pages(
                             chunk_src,
                             chunk_sizes,
@@ -352,6 +398,8 @@ class AscendSingleDirectionOffloadingHandler:
                             all_dma_dst[dma_offset:],
                             all_dma_sizes[dma_offset:],
                         )
+                        if EVENTS_ENABLED:
+                            gather_seconds += time.monotonic() - gather_started_at
                         offsets = (
                             chunk_sizes.cumsum(dtype=chunk_sizes.dtype) - chunk_sizes
                         )
@@ -371,7 +419,26 @@ class AscendSingleDirectionOffloadingHandler:
                         )
                         dma_offset = dma_end
                     num_dma_ops = dma_offset
+                    if EVENTS_ENABLED:
+                        emit(
+                            "gather_h2d",
+                            f"job{job_id}",
+                            dma_runs=num_dma_ops,
+                            duration_us=round(gather_seconds * 1e6),
+                        )
             end_event.record(self._stream)
+        submitted_at = time.monotonic() if EVENTS_ENABLED else None
+        if submitted_at is not None:
+            emit(
+                "transfer_submit",
+                f"job{job_id}",
+                bytes=num_transfer_bytes,
+                dependency_us=round((dependencies_done_at - descriptors_done_at) * 1e6),
+                descriptor_us=round((descriptors_done_at - transfer_started_at) * 1e6),
+                descriptors=num_copy_ops,
+                direction="d2h" if self.npu_to_cpu else "h2d",
+                submit_us=round((submitted_at - dependencies_done_at) * 1e6),
+            )
 
         if num_copy_ops and not self.npu_to_cpu:
             logger.debug(
@@ -396,6 +463,7 @@ class AscendSingleDirectionOffloadingHandler:
                 dma_dst=dma_dst,
                 dma_sizes=dma_sizes,
                 staging_buffer=staging_buffer,
+                submitted_at=submitted_at,
             )
         )
         return True
@@ -404,14 +472,25 @@ class AscendSingleDirectionOffloadingHandler:
         results: list[TransferResult] = []
         while self._transfers and self._transfers[0].end_event.query():
             transfer = self._transfers.popleft()
+            event_seconds = transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
+            if transfer.submitted_at is not None:
+                emit(
+                    "copy_observed_complete",
+                    f"job{transfer.job_id}",
+                    bytes=transfer.num_bytes,
+                    completion_observed_ms=round(
+                        (time.monotonic() - transfer.submitted_at) * 1e3,
+                        3,
+                    ),
+                    device_event_ms=round(event_seconds * 1e3, 3),
+                    direction="d2h" if self.npu_to_cpu else "h2d",
+                )
             results.append(
                 TransferResult(
                     job_id=transfer.job_id,
                     success=True,
                     transfer_size=transfer.num_bytes,
-                    transfer_time=(
-                        transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
-                    ),
+                    transfer_time=event_seconds,
                 )
             )
             self._event_pool.extend((transfer.end_event, transfer.start_event))

@@ -214,6 +214,110 @@ class TestKVCacheSpecRegistry:
         spec = make_spec(FullAttentionSpec)
         assert KVCacheSpecRegistry.get_manager_class(spec) is KnormFullAttentionManager
 
+    def test_knorm_is_not_registered_when_disabled_even_without_prefix_caching(
+        self, monkeypatch
+    ):
+        """Knorm manager must NOT register when VLLM_KNORM_ENABLED=0 even if
+        prefix caching is off. This prevents the half-enabled state where the
+        runner-side wrapper installs but the manager is not registered (or
+        vice versa). See issue #163."""
+        monkeypatch.setenv("VLLM_KNORM_ENABLED", "0")
+        import importlib
+
+        import vllm.envs as envs_mod
+
+        importlib.reload(envs_mod)
+
+        _REGISTRY_KVCACHESPEC_LIST.clear()
+        config = make_vllm_config()
+        config.cache_config.enable_prefix_caching = False
+
+        register_all_kvcache_specs(config)
+
+        spec = make_spec(FullAttentionSpec)
+        assert KVCacheSpecRegistry.get_manager_class(spec) is FullAttentionManager
+
+    def test_knorm_is_not_registered_when_compression_ratio_is_one(self, monkeypatch):
+        """Knorm manager must NOT register when compression_ratio=1.0 (no
+        compression) even if VLLM_KNORM_ENABLED=1 and prefix caching is off.
+        compression_ratio=1.0 means no blocks would be evicted, so installing
+        the wrapper would add overhead with no effect. This matches
+        KnormConfig.is_active which requires compression_ratio < 1.0.
+        See issue #163."""
+        monkeypatch.setenv("VLLM_KNORM_ENABLED", "1")
+        monkeypatch.setenv("VLLM_KNORM_COMPRESSION_RATIO", "1.0")
+        import importlib
+
+        import vllm.envs as envs_mod
+
+        importlib.reload(envs_mod)
+
+        _REGISTRY_KVCACHESPEC_LIST.clear()
+        config = make_vllm_config()
+        config.cache_config.enable_prefix_caching = False
+
+        register_all_kvcache_specs(config)
+
+        spec = make_spec(FullAttentionSpec)
+        assert KVCacheSpecRegistry.get_manager_class(spec) is FullAttentionManager
+
+    def test_knorm_coverage_matrix(self, monkeypatch):
+        """Coverage matrix: Knorm enabled/disabled × prefix caching on/off
+        × compression_ratio 0.5/1.0. Verifies that should_activate() and
+        register_all_kvcache_specs agree on manager type for every
+        combination. See issue #163 review feedback."""
+        import importlib
+
+        import vllm.envs as envs_mod
+        from vllm.knorm.config import should_activate
+
+        cases = [
+            # (knorm_enabled, compression_ratio, prefix_caching, expected_knorm)
+            ("1", "0.5", False, True),  # fully active
+            ("1", "0.5", True, False),  # prefix caching blocks
+            ("1", "1.0", False, False),  # ratio=1.0 blocks
+            ("1", "1.0", True, False),  # both block
+            ("0", "0.5", False, False),  # disabled
+            ("0", "0.5", True, False),  # disabled + prefix
+            ("0", "1.0", False, False),  # all off
+            ("0", "1.0", True, False),  # all off + prefix
+        ]
+
+        for enabled, ratio, prefix_caching, expected_knorm in cases:
+            monkeypatch.setenv("VLLM_KNORM_ENABLED", enabled)
+            monkeypatch.setenv("VLLM_KNORM_COMPRESSION_RATIO", ratio)
+            importlib.reload(envs_mod)
+
+            # Verify should_activate() agrees
+            assert should_activate(prefix_caching) == expected_knorm, (
+                f"should_activate(prefix_caching={prefix_caching}) "
+                f"with ENABLED={enabled}, RATIO={ratio} returned "
+                f"{should_activate(prefix_caching)}, expected {expected_knorm}"
+            )
+
+            # Verify register_all_kvcache_specs registers correct manager
+            _REGISTRY_KVCACHESPEC_LIST.clear()
+            config = make_vllm_config()
+            config.cache_config.enable_prefix_caching = prefix_caching
+
+            register_all_kvcache_specs(config)
+
+            spec = make_spec(FullAttentionSpec)
+            manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+            if expected_knorm:
+                from vllm.knorm.manager import KnormFullAttentionManager
+
+                assert manager_cls is KnormFullAttentionManager, (
+                    f"Expected KnormFullAttentionManager for "
+                    f"ENABLED={enabled}, RATIO={ratio}, prefix={prefix_caching}"
+                )
+            else:
+                assert manager_cls is FullAttentionManager, (
+                    f"Expected FullAttentionManager for "
+                    f"ENABLED={enabled}, RATIO={ratio}, prefix={prefix_caching}, "
+                    f"got {manager_cls}"
+                )
+
     @pytest.mark.parametrize("spec_cls", list(spec_manager_map))
     def test_custom_spec_register(self, spec_cls):
         """A decorated custom spec resolves to the declared manager."""
