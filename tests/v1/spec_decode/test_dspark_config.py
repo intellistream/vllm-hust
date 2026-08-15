@@ -10,6 +10,7 @@ from vllm.models.deepseek_v4.nvidia.dspark import (
     DSparkDeepseekV4ForCausalLM,
 )
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 
 
 def _parallel_drafting_proposer(hf_config: object) -> SpecDecodeBaseProposer:
@@ -53,6 +54,16 @@ def test_dspark_drafter_uses_target_vocabulary_without_remapping():
             ),
             13,
         ),
+        (
+            SimpleNamespace(
+                dflash_config={"mask_token_id": None},
+                mask_token_id=None,
+                dspark_noise_token_id=None,
+                pard_token=14,
+                ptd_token_id=15,
+            ),
+            14,
+        ),
         (SimpleNamespace(pard_token=14, ptd_token_id=15), 14),
         (SimpleNamespace(ptd_token_id=15), 15),
     ],
@@ -65,13 +76,23 @@ def test_parallel_drafting_token_id_precedence(
     proposer._init_parallel_drafting_params()
 
     assert proposer.parallel_drafting_token_id == expected_token_id
+    assert get_parallel_drafting_token_id(hf_config) == expected_token_id
 
 
 def test_parallel_drafting_token_id_requires_supported_configured_id():
-    proposer = _parallel_drafting_proposer(SimpleNamespace())
+    hf_config = SimpleNamespace(
+        dflash_config={"mask_token_id": None},
+        mask_token_id=None,
+        dspark_noise_token_id=None,
+        pard_token=None,
+        ptd_token_id=None,
+    )
+    proposer = _parallel_drafting_proposer(hf_config)
 
     with pytest.raises(ValueError, match="dflash_config.mask_token_id.*ptd_token_id"):
         proposer._init_parallel_drafting_params()
+    with pytest.raises(ValueError, match="dflash_config.mask_token_id.*ptd_token_id"):
+        get_parallel_drafting_token_id(hf_config)
 
 
 def test_dspark_config_inherits_target_quantization(monkeypatch: pytest.MonkeyPatch):

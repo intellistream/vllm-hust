@@ -352,15 +352,15 @@ class SpecDecodeBaseProposer:
         model_hf_config = self.draft_model_config.hf_config
         # DFlash stores mask_token_id in dflash_config
         dflash_config = getattr(model_hf_config, "dflash_config", None)
-        if dflash_config and "mask_token_id" in dflash_config:
+        if dflash_config and dflash_config.get("mask_token_id") is not None:
             self.parallel_drafting_token_id = dflash_config["mask_token_id"]
         elif getattr(model_hf_config, "mask_token_id", None) is not None:
             self.parallel_drafting_token_id = model_hf_config.mask_token_id
-        elif hasattr(model_hf_config, "dspark_noise_token_id"):
+        elif getattr(model_hf_config, "dspark_noise_token_id", None) is not None:
             self.parallel_drafting_token_id = model_hf_config.dspark_noise_token_id
-        elif hasattr(model_hf_config, "pard_token"):
+        elif getattr(model_hf_config, "pard_token", None) is not None:
             self.parallel_drafting_token_id = model_hf_config.pard_token
-        elif hasattr(model_hf_config, "ptd_token_id"):
+        elif getattr(model_hf_config, "ptd_token_id", None) is not None:
             self.parallel_drafting_token_id = model_hf_config.ptd_token_id
         else:
             raise ValueError(
