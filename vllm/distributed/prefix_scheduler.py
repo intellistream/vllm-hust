@@ -6,8 +6,9 @@ The global scheduler stores prefix-cache block hashes reported by each vLLM
 node and routes a new request to the node with the longest cached prefix.
 """
 
+import time
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import count
 from typing import TypeAlias
@@ -35,6 +36,8 @@ class PrefixRouteDecision:
     node_id: str
     matched_tokens: int
     data_parallel_rank: int | None = None
+    view_epoch: int = 0
+    worker_incarnation: str | None = None
 
 
 @dataclass
@@ -64,13 +67,23 @@ class NodePrefixCacheState:
     group_hashes: dict[int, set[PrefixBlockHash]] = field(
         default_factory=lambda: defaultdict(set)
     )
+    worker_incarnation: str | None = None
+    view_epoch: int = 0
+    last_receipt_at: float | None = None
+    expires_at: float | None = None
 
     @classmethod
-    def from_snapshot(cls, snapshot: PrefixCacheSnapshot) -> "NodePrefixCacheState":
+    def from_snapshot(
+        cls,
+        snapshot: PrefixCacheSnapshot,
+        *,
+        worker_incarnation: str | None = None,
+    ) -> "NodePrefixCacheState":
         return cls(
             node_id=snapshot.node_id,
             data_parallel_rank=snapshot.data_parallel_rank,
             hash_block_size=snapshot.hash_block_size,
+            worker_incarnation=worker_incarnation,
             group_block_sizes=dict(snapshot.group_block_sizes),
             group_hashes=defaultdict(
                 set,
@@ -81,12 +94,20 @@ class NodePrefixCacheState:
             ),
         )
 
-    def apply_snapshot(self, snapshot: PrefixCacheSnapshot) -> None:
+    def apply_snapshot(
+        self,
+        snapshot: PrefixCacheSnapshot,
+        *,
+        now: float | None = None,
+        view_ttl_seconds: float | None = None,
+        worker_incarnation: str | None = None,
+    ) -> None:
         if snapshot.node_id != self.node_id:
             raise ValueError(
                 f"snapshot for node {snapshot.node_id!r} cannot update "
                 f"state for node {self.node_id!r}"
             )
+        self._set_worker_incarnation(worker_incarnation)
         self.data_parallel_rank = snapshot.data_parallel_rank
         self.hash_block_size = snapshot.hash_block_size
         self.group_block_sizes = dict(snapshot.group_block_sizes)
@@ -97,21 +118,99 @@ class NodePrefixCacheState:
                 for group_id, hashes in snapshot.group_hashes.items()
             },
         )
+        self.view_epoch += 1
+        self._refresh_receipt(now, view_ttl_seconds)
 
-    def apply_events(self, events: Iterable[KVCacheEvent]) -> None:
+    def apply_events(
+        self,
+        events: Iterable[KVCacheEvent],
+        *,
+        now: float | None = None,
+        view_ttl_seconds: float | None = None,
+        worker_incarnation: str | None = None,
+    ) -> None:
         """Apply prefix-cache deltas emitted by a vLLM node."""
+        incarnation_changed = self._set_worker_incarnation(worker_incarnation)
+        changed = incarnation_changed
         for event in events:
             if isinstance(event, BlockStored):
                 group_idx = 0 if event.group_idx is None else event.group_idx
                 self.group_block_sizes[group_idx] = event.block_size
                 self.group_hashes[group_idx].update(event.block_hashes)
+                changed = True
             elif isinstance(event, BlockRemoved):
                 group_idx = 0 if event.group_idx is None else event.group_idx
                 hashes = self.group_hashes.get(group_idx)
                 if hashes is not None:
                     hashes.difference_update(event.block_hashes)
+                changed = True
             elif isinstance(event, AllBlocksCleared):
                 self.group_hashes.clear()
+                changed = True
+        if changed:
+            self.view_epoch += 1
+        self._refresh_receipt(now, view_ttl_seconds)
+
+    def record_worker_receipt(
+        self,
+        *,
+        now: float | None = None,
+        view_ttl_seconds: float | None = None,
+        worker_incarnation: str | None = None,
+    ) -> None:
+        """Refresh worker liveness without publishing new cache blocks."""
+        if self._set_worker_incarnation(worker_incarnation):
+            self.view_epoch += 1
+        self._refresh_receipt(now, view_ttl_seconds)
+
+    def invalidate(
+        self,
+        *,
+        worker_incarnation: str | None = None,
+        now: float | None = None,
+        view_ttl_seconds: float | None = None,
+    ) -> None:
+        self.group_hashes.clear()
+        self.group_block_sizes.clear()
+        if worker_incarnation is not None:
+            self.worker_incarnation = worker_incarnation
+        self.view_epoch += 1
+        self._refresh_receipt(now, view_ttl_seconds)
+
+    def expire_if_stale(self, now: float) -> bool:
+        if self.expires_at is None or now <= self.expires_at:
+            return False
+        self.group_hashes.clear()
+        self.group_block_sizes.clear()
+        self.last_receipt_at = None
+        self.expires_at = None
+        self.view_epoch += 1
+        return True
+
+    def _set_worker_incarnation(self, worker_incarnation: str | None) -> bool:
+        if worker_incarnation is None:
+            return False
+        if self.worker_incarnation is None:
+            self.worker_incarnation = worker_incarnation
+            if not self.group_hashes:
+                return False
+            self.group_hashes.clear()
+            self.group_block_sizes.clear()
+            return True
+        if self.worker_incarnation == worker_incarnation:
+            return False
+        self.worker_incarnation = worker_incarnation
+        self.group_hashes.clear()
+        self.group_block_sizes.clear()
+        return True
+
+    def _refresh_receipt(
+        self, now: float | None, view_ttl_seconds: float | None
+    ) -> None:
+        if now is None:
+            now = time.monotonic()
+        self.last_receipt_at = now
+        self.expires_at = None if view_ttl_seconds is None else now + view_ttl_seconds
 
     def longest_prefix_match(
         self,
@@ -175,7 +274,16 @@ class NodePrefixCacheState:
 class GlobalPrefixScheduler:
     """In-memory longest-prefix-first router for vLLM nodes."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        view_ttl_seconds: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if view_ttl_seconds is not None and view_ttl_seconds <= 0:
+            raise ValueError("view_ttl_seconds must be positive")
+        self._view_ttl_seconds = view_ttl_seconds
+        self._clock = clock
         self._nodes: dict[tuple[str, int | None], NodePrefixCacheState] = {}
         self._node_defaults: dict[str, tuple[int, int | None, dict[int, int]]] = {}
         self._tie_breaker = count()
@@ -203,7 +311,13 @@ class GlobalPrefixScheduler:
         self._nodes[node_id, data_parallel_rank] = state
         return state
 
-    def update_snapshot(self, snapshot: PrefixCacheSnapshot) -> None:
+    def update_snapshot(
+        self,
+        snapshot: PrefixCacheSnapshot,
+        *,
+        worker_incarnation: str | None = None,
+        now: float | None = None,
+    ) -> None:
         defaults = self._node_defaults.get(snapshot.node_id)
         if defaults is not None:
             _, configured_rank, _ = defaults
@@ -231,20 +345,84 @@ class GlobalPrefixScheduler:
         state = self._nodes.get(key)
         if state is None:
             self._discard_unranked_placeholder(snapshot.node_id)
-            self._nodes[key] = NodePrefixCacheState.from_snapshot(snapshot)
+            state = NodePrefixCacheState.from_snapshot(
+                snapshot,
+                worker_incarnation=worker_incarnation,
+            )
+            state.record_worker_receipt(
+                now=self._resolve_now(now),
+                view_ttl_seconds=self._view_ttl_seconds,
+                worker_incarnation=worker_incarnation,
+            )
+            state.view_epoch += 1
+            self._nodes[key] = state
         else:
-            state.apply_snapshot(snapshot)
+            state.apply_snapshot(
+                snapshot,
+                now=self._resolve_now(now),
+                view_ttl_seconds=self._view_ttl_seconds,
+                worker_incarnation=worker_incarnation,
+            )
 
     def apply_events(
         self,
         node_id: str,
         events: Iterable[KVCacheEvent],
         data_parallel_rank: int | None = None,
+        *,
+        worker_incarnation: str | None = None,
+        now: float | None = None,
     ) -> None:
-        self._state_for_events(node_id, data_parallel_rank).apply_events(events)
+        self._state_for_events(node_id, data_parallel_rank).apply_events(
+            events,
+            now=self._resolve_now(now),
+            view_ttl_seconds=self._view_ttl_seconds,
+            worker_incarnation=worker_incarnation,
+        )
 
-    def apply_event_batch(self, node_id: str, batch: KVEventBatch) -> None:
-        self.apply_events(node_id, batch.events, batch.data_parallel_rank)
+    def apply_event_batch(
+        self,
+        node_id: str,
+        batch: KVEventBatch,
+        *,
+        worker_incarnation: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        self.apply_events(
+            node_id,
+            batch.events,
+            batch.data_parallel_rank,
+            worker_incarnation=worker_incarnation,
+            now=now,
+        )
+
+    def record_worker_receipt(
+        self,
+        node_id: str,
+        data_parallel_rank: int | None = None,
+        *,
+        worker_incarnation: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        self._state_for_events(node_id, data_parallel_rank).record_worker_receipt(
+            now=self._resolve_now(now),
+            view_ttl_seconds=self._view_ttl_seconds,
+            worker_incarnation=worker_incarnation,
+        )
+
+    def invalidate_node(
+        self,
+        node_id: str,
+        data_parallel_rank: int | None = None,
+        *,
+        worker_incarnation: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        self._state_for_events(node_id, data_parallel_rank).invalidate(
+            worker_incarnation=worker_incarnation,
+            now=self._resolve_now(now),
+            view_ttl_seconds=self._view_ttl_seconds,
+        )
 
     def remove_node(self, node_id: str) -> None:
         self._node_defaults.pop(node_id, None)
@@ -312,6 +490,16 @@ class GlobalPrefixScheduler:
         if not states:
             return None
 
+        now = self._clock()
+        states = [
+            state
+            for state in states
+            if not state.expire_if_stale(now)
+            and (self._view_ttl_seconds is None or state.last_receipt_at is not None)
+        ]
+        if not states:
+            return None
+
         scored: list[tuple[int, NodePrefixCacheState]] = []
         for state in states:
             matched_tokens = state.longest_prefix_match(
@@ -330,4 +518,20 @@ class GlobalPrefixScheduler:
             node_id=state.node_id,
             data_parallel_rank=state.data_parallel_rank,
             matched_tokens=best_match,
+            view_epoch=state.view_epoch,
+            worker_incarnation=state.worker_incarnation,
         )
+
+    def is_decision_current(self, decision: PrefixRouteDecision) -> bool:
+        state = self._nodes.get((decision.node_id, decision.data_parallel_rank))
+        if state is None:
+            return False
+        if state.expire_if_stale(self._clock()):
+            return False
+        return (
+            state.view_epoch == decision.view_epoch
+            and state.worker_incarnation == decision.worker_incarnation
+        )
+
+    def _resolve_now(self, now: float | None) -> float:
+        return self._clock() if now is None else now
