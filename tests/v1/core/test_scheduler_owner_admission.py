@@ -477,10 +477,14 @@ def _pool(
     free_blocks: int = 300,
     effective_tokens_per_block: tuple[int, ...] = (),
     allocation_token_quantum: tuple[int, ...] = (),
+    fresh_allocation_block_cap: tuple[int | None, ...] = (),
 ) -> OwnerCachePoolSnapshot:
     if not allocation_token_quantum:
         allocation_token_quantum = (1,) * len(effective_tokens_per_block)
+    if not fresh_allocation_block_cap:
+        fresh_allocation_block_cap = (None,) * len(effective_tokens_per_block)
     assert len(allocation_token_quantum) == len(effective_tokens_per_block)
+    assert len(fresh_allocation_block_cap) == len(effective_tokens_per_block)
     return OwnerCachePoolSnapshot(
         owner_rank=owner_rank,
         total_blocks=total_blocks,
@@ -493,9 +497,14 @@ def _pool(
                 allocated_blocks=0,
                 resident_blocks=0,
                 allocation_token_quantum=quantum,
+                fresh_allocation_block_cap=cap,
             )
-            for index, (capacity, quantum) in enumerate(
-                zip(effective_tokens_per_block, allocation_token_quantum)
+            for index, (capacity, quantum, cap) in enumerate(
+                zip(
+                    effective_tokens_per_block,
+                    allocation_token_quantum,
+                    fresh_allocation_block_cap,
+                )
             )
         ),
     )
@@ -1400,6 +1409,77 @@ def test_known_infeasible_reserve_waits_for_confirmed_capacity() -> None:
     assert reserve.owner_id == 1
     assert reserve.command_seq == 1
     assert reserve.required_num_tokens == 64
+
+
+def test_fresh_admission_projection_honors_recycling_block_cap() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=64,
+        enable_request_owned_graph=True,
+    )
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(
+                0,
+                total_blocks=32,
+                free_blocks=3,
+                effective_tokens_per_block=(8,),
+                fresh_allocation_block_cap=(3,),
+            )
+        },
+    )
+    request = _request("req-windowed", num_prompt_tokens=32, max_tokens=32)
+    scheduler.add_request(request)
+
+    # A linear 64-token projection would charge eight blocks. The concrete
+    # recycling-aware manager caps fresh full-sequence admission at three,
+    # so the worker-confirmed pool is exactly feasible and must still receive
+    # the RESERVE that remains its positive allocation authority.
+    out1 = scheduler.schedule()
+    (reserve,) = out1.owner_commands
+    assert reserve.key == OwnerLeaseKey("req-windowed", 0)
+    assert reserve.required_num_tokens == 64
+
+
+def test_capacity_blocked_request_cancellation_retires_local_key() -> None:
+    scheduler = _make_scheduler(
+        world_size=1,
+        max_num_scheduled_tokens=64,
+        enable_request_owned_graph=True,
+    )
+    out0 = scheduler.schedule()
+    _apply_pool_receipts(
+        scheduler,
+        out0,
+        {
+            0: _pool(
+                0,
+                free_blocks=0,
+                effective_tokens_per_block=(8,),
+            )
+        },
+    )
+    request = _request("req-cancelled", num_prompt_tokens=32, max_tokens=32)
+    scheduler.add_request(request)
+
+    blocked = scheduler.schedule()
+    key = OwnerLeaseKey("req-cancelled", 0)
+    assert blocked.owner_commands == []
+    assert scheduler._owner_key[request.request_id] == key
+    assert scheduler.owner_coordinator.owner_of(key) is None
+
+    scheduler.finish_requests(
+        [request.request_id],
+        RequestStatus.FINISHED_ABORTED,
+    )
+    assert request.request_id not in scheduler._owner_key
+    assert key not in scheduler._owner_wait_started_step
+    cleanup = scheduler.schedule()
+    assert cleanup.owner_commands == []
+    assert not scheduler.has_requests()
 
 
 def test_same_step_capacity_projection_suppresses_oversubscription() -> None:

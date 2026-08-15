@@ -232,6 +232,9 @@ class OwnerLayoutProbe:
                                 "allocation_token_quantum": (
                                     group.allocation_token_quantum
                                 ),
+                                "fresh_allocation_block_cap": (
+                                    group.fresh_allocation_block_cap
+                                ),
                                 "allocated_blocks": group.allocated_blocks,
                                 "resident_blocks": group.resident_blocks,
                             }

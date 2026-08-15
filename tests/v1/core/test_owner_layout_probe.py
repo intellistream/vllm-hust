@@ -142,6 +142,7 @@ def _pool(rank: int, *, free_blocks: int) -> OwnerCachePoolSnapshot:
                 effective_tokens_per_block=128,
                 allocated_blocks=16 - free_blocks,
                 resident_blocks=16 - free_blocks,
+                fresh_allocation_block_cap=3,
             ),
         ),
     )
@@ -177,6 +178,7 @@ def test_probe_records_block_id_free_physical_capacity(tmp_path) -> None:
                 "spec_kind": "full",
                 "effective_tokens_per_block": 128,
                 "allocation_token_quantum": 1,
+                "fresh_allocation_block_cap": 3,
                 "allocated_blocks": 4,
                 "resident_blocks": 4,
             }

@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.base import (
@@ -425,6 +426,25 @@ def _uniform_kv_cache_config(
     )
 
 
+def _sliding_kv_cache_config(
+    num_blocks: int = 32,
+    block_size: int = 4,
+    sliding_window: int = 8,
+) -> KVCacheConfig:
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=4,
+        head_size=8,
+        dtype=torch.float32,
+        sliding_window=sliding_window,
+    )
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["a"], kv_cache_spec=spec)],
+    )
+
+
 def _real_wrapper(worker: _FakeWorker, num_blocks: int = 32) -> WorkerWrapperBase:
     wrapper = WorkerWrapperBase(global_rank=0)
     wrapper.vllm_config = _real_vllm_config()
@@ -567,6 +587,25 @@ def test_uniform_store_binds_min_compress_ratio_representative(
     assert list(original_group.kv_cache_specs) == ["high", "low"]
     assert original_group.kv_cache_specs["high"].compress_ratio == 128
     assert original_group.kv_cache_specs["low"].compress_ratio == 4
+
+
+def test_store_snapshot_publishes_concrete_recycling_admission_cap() -> None:
+    worker = _FakeWorker()
+    wrapper = WorkerWrapperBase(global_rank=0)
+    wrapper.vllm_config = _real_vllm_config()
+    wrapper.worker = worker
+    wrapper.mm_receiver_cache = None
+    config = _sliding_kv_cache_config()
+    wrapper.initialize_from_config([config])
+
+    spec = config.kv_cache_groups[0].kv_cache_spec
+    assert isinstance(spec, SlidingWindowSpec)
+    expected = spec.max_admission_blocks_per_request(
+        max_num_batched_tokens=16,
+        max_model_len=64,
+    )
+    snapshot = wrapper._request_owned_kv_store.pool_snapshot()
+    assert snapshot.groups[0].fresh_allocation_block_cap == expected
 
 
 def test_normalized_config_is_distinct_copy_preserving_metadata() -> None:

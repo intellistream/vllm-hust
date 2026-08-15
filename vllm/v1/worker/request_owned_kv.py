@@ -1589,6 +1589,9 @@ class RequestOwnedKVStore:
                 allocated_blocks=allocated[index],
                 resident_blocks=allocated[index],
                 allocation_token_quantum=_request_owned_compress_ratio(spec),
+                fresh_allocation_block_cap=(
+                    self._fresh_allocation_block_cap(index)
+                ),
             )
             for index, spec in enumerate(self._group_specs)
         )
@@ -1601,6 +1604,25 @@ class RequestOwnedKVStore:
             ),
             groups=groups,
         )
+
+    def _fresh_allocation_block_cap(self, group_index: int) -> int | None:
+        """Concrete manager cap used by full-sequence fresh admission."""
+
+        managers = self._manager.coordinator.single_type_managers
+        if len(managers) != self._num_groups:
+            raise RuntimeError(
+                "request-owned KV manager/group count mismatch: "
+                f"{len(managers)} != {self._num_groups}"
+            )
+        cap = managers[group_index]._max_admission_blocks_per_request
+        if cap is not None and (
+            isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0
+        ):
+            raise RuntimeError(
+                "request-owned KV manager has invalid fresh admission block "
+                f"cap {cap!r} for group {group_index}"
+            )
+        return cap
 
     def _allocator_id(self, key: OwnerLeaseKey) -> str:
         return f"{self._owner_rank}:{key.request_id}:e{key.owner_epoch}"

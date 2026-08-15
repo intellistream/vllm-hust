@@ -787,6 +787,7 @@ def _group(
     allocated_blocks: int = 100,
     resident_blocks: int = 80,
     allocation_token_quantum: int = 1,
+    fresh_allocation_block_cap: int | None = None,
 ) -> OwnerCacheGroupSnapshot:
     return OwnerCacheGroupSnapshot(
         group_index=group_index,
@@ -795,6 +796,7 @@ def _group(
         allocated_blocks=allocated_blocks,
         resident_blocks=resident_blocks,
         allocation_token_quantum=allocation_token_quantum,
+        fresh_allocation_block_cap=fresh_allocation_block_cap,
     )
 
 
@@ -864,6 +866,14 @@ def test_cache_group_snapshot_validates_allocation_quantum() -> None:
         _group(effective_tokens_per_block=16, allocation_token_quantum=3)
     group = _group(effective_tokens_per_block=64, allocation_token_quantum=4)
     assert group.allocation_token_quantum == 4
+
+
+def test_cache_group_snapshot_validates_fresh_allocation_block_cap() -> None:
+    for bad in (0, -1, True, 1.0, "1"):
+        with pytest.raises(TypeError, match="fresh_allocation_block_cap"):
+            _group(fresh_allocation_block_cap=bad)
+    assert _group().fresh_allocation_block_cap is None
+    assert _group(fresh_allocation_block_cap=7).fresh_allocation_block_cap == 7
 
 
 def test_cache_pool_snapshot_validation() -> None:

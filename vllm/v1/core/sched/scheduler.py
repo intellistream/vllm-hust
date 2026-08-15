@@ -2900,12 +2900,11 @@ class Scheduler(SchedulerInterface):
         """Admission pass over the waiting queues.
 
         First admission assigns the least-committed-work owner and issues a
-        small chunk-scaled RESERVE with a WAITING allocation descriptor,
-        unless worker-confirmed pool facts prove that no owner can fit it.
-        The request otherwise stays provisional and unscheduled until its
-        receipt is applied.  PREEMPTED requests resume with a PREEMPTED
-        descriptor on their sticky owner.  Accepted leases promote the
-        request to RUNNING.
+        bounded-horizon RESERVE with a WAITING allocation descriptor, unless
+        worker-confirmed pool facts prove that no owner can fit it. The
+        request otherwise stays provisional and unscheduled until its receipt
+        is applied. PREEMPTED requests resume with a PREEMPTED descriptor on
+        their sticky owner. Accepted leases promote the request to RUNNING.
         """
         coordinator = self.owner_coordinator
         assert coordinator is not None
@@ -2929,7 +2928,7 @@ class Scheduler(SchedulerInterface):
             key = self._owner_key_for(request)
             if coordinator.owner_of(key) is None:
                 # First admission: choose a feasible least-work/stable-rank
-                # owner and issue a small chunk-scaled RESERVE(WAITING). If
+                # owner and issue a bounded-horizon RESERVE(WAITING). If
                 # confirmed capacity cannot fit it, leave it unassigned and
                 # retry only against a later scheduling snapshot.
                 self._assign_owner_and_reserve(request, key)
@@ -3817,9 +3816,15 @@ class Scheduler(SchedulerInterface):
             quantum = group.allocation_token_quantum
             storage_tokens = required_num_tokens // quantum
             storage_tokens_per_block = group.effective_tokens_per_block // quantum
-            demand += (
+            group_demand = (
                 storage_tokens + storage_tokens_per_block - 1
             ) // storage_tokens_per_block
+            if group.fresh_allocation_block_cap is not None:
+                group_demand = min(
+                    group_demand,
+                    group.fresh_allocation_block_cap,
+                )
+            demand += group_demand
         return demand
 
     def _select_owner_for_admission(
@@ -4073,7 +4078,16 @@ class Scheduler(SchedulerInterface):
         request_id = request.request_id
         self._owner_pending_dispatch.pop(request_id, None)
         key = self._owner_key.get(request_id)
-        if key is None or coordinator.owner_of(key) is None:
+        if key is None:
+            return
+        if coordinator.owner_of(key) is None:
+            # Capacity-gated first admission may create a scheduler key while
+            # deliberately leaving the coordinator unassigned. Cancellation
+            # must still retire that provisional local identity.
+            self._owner_key.pop(request_id, None)
+            self._owner_pending_command.pop(request_id, None)
+            self._owner_readiness.pop(key, None)
+            self._owner_wait_started_step.pop(key, None)
             return
         if coordinator.is_released(key):
             return

@@ -349,6 +349,10 @@ class OwnerCacheGroupSnapshot:
     #: for ordinary groups; compressed DSV4 groups publish their concrete
     #: compression ratio so the scheduler can compute exact physical demand.
     allocation_token_quantum: int = 1
+    #: Optional cap used by the concrete full-sequence admission manager for
+    #: one fresh request. Recycling-aware groups such as sliding-window
+    #: attention may hold fewer real blocks than their logical horizon.
+    fresh_allocation_block_cap: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("group_index", "allocated_blocks", "resident_blocks"):
@@ -373,6 +377,14 @@ class OwnerCacheGroupSnapshot:
             raise ValueError(
                 "effective_tokens_per_block must be divisible by "
                 f"allocation_token_quantum, got {value} % {quantum}."
+            )
+        cap = self.fresh_allocation_block_cap
+        if cap is not None and (
+            isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0
+        ):
+            raise TypeError(
+                "fresh_allocation_block_cap must be None or a positive "
+                f"non-bool int, got {cap!r}."
             )
         if not isinstance(self.spec_kind, str) or not self.spec_kind:
             raise TypeError(
