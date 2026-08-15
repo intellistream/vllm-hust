@@ -7,7 +7,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -17,6 +17,7 @@ import msgspec
 import pytest
 import zmq
 from fastapi import HTTPException
+from starlette.datastructures import Headers
 
 from vllm.config.kv_events import KVEventsConfig
 from vllm.distributed.kv_events import (
@@ -38,6 +39,7 @@ from vllm.distributed.prefix_scheduler import (
     GlobalPrefixScheduler,
     NodePrefixCacheState,
     PrefixCacheSnapshot,
+    PrefixRouteDecision,
 )
 from vllm.entrypoints.openai.prefix_routing import (
     NodeLoad,
@@ -45,6 +47,7 @@ from vllm.entrypoints.openai.prefix_routing import (
     PrefixRoutingMiddleware,
     PrefixRoutingNode,
     PrefixRoutingProxy,
+    _extract_prefix_routing_request_id,
     _forward_request,
     _parse_prefix_routing_config,
     _ZmqRecoveryState,
@@ -609,6 +612,109 @@ def test_node_prefix_cache_state_applies_events_and_matches_longest_prefix():
     assert state.longest_prefix_match(block_hashes, prompt_num_tokens=64) == 0
 
 
+def test_global_prefix_scheduler_expires_stale_receipt_before_routing():
+    now = 0.0
+    block_hash = _hash(10)
+    scheduler = GlobalPrefixScheduler(view_ttl_seconds=5.0, clock=lambda: now)
+    scheduler.register_node("node-a", hash_block_size=16)
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=0.0, events=[_stored_event(block_hash)]),
+        worker_incarnation="epoch-a",
+    )
+
+    decision = scheduler.choose_node([block_hash], prompt_num_tokens=32)
+    assert decision is not None
+    assert decision.matched_tokens == 16
+    assert decision.worker_incarnation == "epoch-a"
+
+    now = 6.0
+    assert scheduler.choose_node([block_hash], prompt_num_tokens=32) is None
+    assert scheduler._nodes["node-a", None].group_hashes == {}
+
+
+def test_global_prefix_scheduler_clears_cache_state_on_worker_incarnation_change():
+    old_hash = _hash(11)
+    new_hash = _hash(12)
+    scheduler = GlobalPrefixScheduler()
+    scheduler.register_node("node-a", hash_block_size=16)
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=0.0, events=[_stored_event(old_hash)]),
+        worker_incarnation="epoch-a",
+    )
+
+    scheduler.record_worker_receipt("node-a", worker_incarnation="epoch-b")
+
+    old_decision = scheduler.choose_node([old_hash], prompt_num_tokens=32)
+    assert old_decision is None or old_decision.matched_tokens == 0
+    assert scheduler._nodes["node-a", None].group_hashes == {}
+
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=1.0, events=[_stored_event(new_hash)]),
+        worker_incarnation="epoch-b",
+    )
+    new_decision = scheduler.choose_node([new_hash], prompt_num_tokens=32)
+    assert new_decision is not None
+    assert new_decision.matched_tokens == 16
+    assert new_decision.worker_incarnation == "epoch-b"
+
+
+def test_global_prefix_scheduler_clears_legacy_cache_on_first_incarnation_event():
+    old_hash = _hash(15)
+    new_hash = _hash(16)
+    scheduler = GlobalPrefixScheduler(view_ttl_seconds=60.0, clock=lambda: 1.0)
+    scheduler.register_node("node-a", hash_block_size=16)
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=0.0, events=[_stored_event(old_hash)]),
+    )
+
+    legacy_decision = scheduler.choose_node([old_hash], prompt_num_tokens=32)
+    assert legacy_decision is not None
+    assert legacy_decision.matched_tokens == 16
+    assert legacy_decision.worker_incarnation is None
+
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=1.0, events=[_stored_event(new_hash)]),
+        worker_incarnation="epoch-restarted",
+    )
+
+    old_decision = scheduler.choose_node([old_hash], prompt_num_tokens=32)
+    assert old_decision is None or old_decision.matched_tokens == 0
+    state = scheduler._nodes["node-a", None]
+    assert state.group_hashes[0] == {_external_hash(new_hash)}
+    assert state.worker_incarnation == "epoch-restarted"
+
+    new_decision = scheduler.choose_node([new_hash], prompt_num_tokens=32)
+    assert new_decision is not None
+    assert new_decision.matched_tokens == 16
+    assert new_decision.worker_incarnation == "epoch-restarted"
+
+
+def test_global_prefix_scheduler_cache_loss_event_fails_closed():
+    block_hash = _hash(14)
+    scheduler = GlobalPrefixScheduler()
+    scheduler.register_node("node-a", hash_block_size=16)
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=0.0, events=[_stored_event(block_hash)]),
+        worker_incarnation="epoch-a",
+    )
+
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=1.0, events=[AllBlocksCleared()]),
+        worker_incarnation="epoch-a",
+    )
+
+    decision = scheduler.choose_node([block_hash], prompt_num_tokens=32)
+    assert decision is None or decision.matched_tokens == 0
+    assert scheduler._nodes["node-a", None].group_hashes == {}
+
+
 def test_global_prefix_scheduler_routes_to_longest_match():
     scheduler = GlobalPrefixScheduler()
     block_hashes = [_hash(1), _hash(2), _hash(3)]
@@ -640,6 +746,27 @@ def test_global_prefix_scheduler_routes_to_longest_match():
     assert decision.node_id == "node-b"
     assert decision.data_parallel_rank == 1
     assert decision.matched_tokens == 32
+
+
+def test_global_prefix_scheduler_preserves_first_incarnation_snapshot():
+    block_hash = _hash(17)
+    scheduler = GlobalPrefixScheduler()
+
+    scheduler.update_snapshot(
+        PrefixCacheSnapshot(
+            node_id="node-a",
+            data_parallel_rank=None,
+            hash_block_size=16,
+            group_block_sizes={0: 16},
+            group_hashes={0: {_external_hash(block_hash)}},
+        ),
+        worker_incarnation="epoch-a",
+    )
+
+    decision = scheduler.choose_node([block_hash], prompt_num_tokens=32)
+    assert decision is not None
+    assert decision.matched_tokens == 16
+    assert decision.worker_incarnation == "epoch-a"
 
 
 def test_global_prefix_scheduler_round_robins_ties():
@@ -1046,6 +1173,7 @@ def test_prefix_cache_upload_ignores_proxy_and_rejects_redirect(monkeypatch):
     try:
         assert source_requests
         assert source_requests[0]["Authorization"] == "Bearer shared-secret"
+        assert source_requests[0]["X-Vllm-Prefix-Routing-Worker-Incarnation"]
         assert not redirected_requests
         assert uploader._needs_snapshot.is_set()
         assert not any(
@@ -1080,15 +1208,18 @@ def _event_ingest_request(
     *,
     body: bytes | None = None,
     max_event_ingest_body_size: int = 16 * 1024 * 1024,
+    worker_incarnation: str | None = None,
 ):
     class Scheduler:
         batch = None
 
-        def apply_event_batch(self, node_id, batch):
-            self.batch = (node_id, batch)
+        def apply_event_batch(self, node_id, batch, *, worker_incarnation=None):
+            self.batch = (node_id, batch, worker_incarnation)
 
     class Request:
         headers = {} if token is None else {"authorization": f"Bearer {token}"}
+        if worker_incarnation is not None:
+            headers["x-vllm-prefix-routing-worker-incarnation"] = worker_incarnation
 
         def __init__(self):
             self.scheduler = Scheduler()
@@ -1140,7 +1271,9 @@ def test_prefix_routing_http_event_ingest_rejects_invalid_token(token):
 
 def test_prefix_routing_http_event_ingest_accepts_shared_token():
     request = _event_ingest_request(
-        token="shared-secret", configured_token="shared-secret"
+        token="shared-secret",
+        configured_token="shared-secret",
+        worker_incarnation="worker-epoch-a",
     )
 
     response = asyncio.run(ingest_prefix_routing_kv_events("node-a", request))
@@ -1148,6 +1281,7 @@ def test_prefix_routing_http_event_ingest_accepts_shared_token():
     assert response.status_code == 204
     assert request.scheduler.batch is not None
     assert request.scheduler.batch[0] == "node-a"
+    assert request.scheduler.batch[2] == "worker-epoch-a"
 
 
 def test_prefix_routing_http_event_ingest_rejects_oversized_batch():
@@ -1324,6 +1458,125 @@ def test_prefix_routing_hashes_match_engine_core_cache_key_path():
     assert routing_hashes["different-mm"] != routing_hashes["base"]
     assert routing_hashes["different-lora"] != routing_hashes["base"]
     assert routing_hashes["different-salt"] != routing_hashes["base"]
+
+
+def _idempotency_proxy(cache_size=8):
+    proxy = object.__new__(PrefixRoutingProxy)
+    proxy.config = SimpleNamespace(idempotency_cache_size=cache_size)
+    proxy.scheduler = SimpleNamespace(is_decision_current=lambda decision: True)
+    proxy._route_decision_cache = OrderedDict()
+    proxy._route_decision_locks = {}
+    return proxy
+
+
+def test_prefix_routing_request_id_prefers_headers_over_payload():
+    request_id = _extract_prefix_routing_request_id(
+        Headers({"x-request-id": "header-request"}),
+        {"request_id": "payload-request"},
+    )
+
+    assert request_id == "header-request"
+
+
+def test_prefix_routing_proxy_reuses_request_id_decision():
+    proxy = _idempotency_proxy()
+    calls = 0
+
+    async def choose_node_for_request(path, payload):
+        nonlocal calls
+        calls += 1
+        return PrefixRouteDecision(
+            node_id="node-a" if calls == 1 else "node-b",
+            matched_tokens=16,
+        )
+
+    proxy.choose_node_for_request = choose_node_for_request
+
+    first = asyncio.run(
+        proxy.choose_node_for_request_id(
+            "/v1/completions", {"route": "first"}, "request-1"
+        )
+    )
+    duplicate = asyncio.run(
+        proxy.choose_node_for_request_id(
+            "/v1/completions", {"route": "second"}, "request-1"
+        )
+    )
+
+    assert first is duplicate
+    assert duplicate is not None
+    assert duplicate.node_id == "node-a"
+    assert calls == 1
+
+
+def test_prefix_routing_proxy_skips_idempotency_without_request_id():
+    proxy = _idempotency_proxy()
+    calls = 0
+
+    async def choose_node_for_request(path, payload):
+        nonlocal calls
+        calls += 1
+        return PrefixRouteDecision(
+            node_id="node-a" if calls == 1 else "node-b",
+            matched_tokens=16,
+        )
+
+    proxy.choose_node_for_request = choose_node_for_request
+
+    first = asyncio.run(proxy.choose_node_for_request_id("/v1/completions", {}, None))
+    second = asyncio.run(proxy.choose_node_for_request_id("/v1/completions", {}, None))
+
+    assert first is not None and first.node_id == "node-a"
+    assert second is not None and second.node_id == "node-b"
+    assert calls == 2
+
+
+def test_prefix_routing_proxy_records_local_fallback_for_duplicate_retry():
+    proxy = _idempotency_proxy()
+    calls = 0
+
+    async def choose_node_for_request(path, payload):
+        nonlocal calls
+        calls += 1
+        return PrefixRouteDecision(node_id="node-a", matched_tokens=16)
+
+    proxy.choose_node_for_request = choose_node_for_request
+
+    first = asyncio.run(
+        proxy.choose_node_for_request_id("/v1/completions", {}, "request-1")
+    )
+    proxy.record_route_decision("request-1", None)
+    duplicate = asyncio.run(
+        proxy.choose_node_for_request_id("/v1/completions", {}, "request-1")
+    )
+
+    assert first is not None and first.node_id == "node-a"
+    assert duplicate is None
+    assert calls == 1
+
+
+def test_prefix_routing_proxy_fails_closed_when_cached_decision_is_stale():
+    proxy = _idempotency_proxy()
+    calls = 0
+
+    async def choose_node_for_request(path, payload):
+        nonlocal calls
+        calls += 1
+        return PrefixRouteDecision(node_id="node-a", matched_tokens=16)
+
+    proxy.choose_node_for_request = choose_node_for_request
+
+    first = asyncio.run(
+        proxy.choose_node_for_request_id("/v1/completions", {}, "request-1")
+    )
+    proxy.scheduler = SimpleNamespace(is_decision_current=lambda decision: False)
+    duplicate = asyncio.run(
+        proxy.choose_node_for_request_id("/v1/completions", {}, "request-1")
+    )
+
+    assert first is not None and first.node_id == "node-a"
+    assert duplicate is None
+    assert calls == 1
 
 
 def test_prefix_routing_falls_back_locally_when_upstream_cannot_start():
@@ -2010,6 +2263,44 @@ def test_prefix_routing_applies_contiguous_replay_and_restart_snapshot():
     )
 
 
+def test_prefix_routing_invalidates_stale_view_on_epoch_mismatch_without_snapshot():
+    old_hash = _hash(13)
+    proxy = object.__new__(PrefixRoutingProxy)
+    proxy.scheduler = GlobalPrefixScheduler()
+    proxy.scheduler.register_node("node-a", hash_block_size=16)
+    proxy.scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(
+            ts=0.0,
+            events=[_stored_event(old_hash)],
+        ),
+        worker_incarnation="epoch-a",
+    )
+    node = PrefixRoutingNode(
+        node_id="node-a",
+        url=None,
+        event_endpoint="inproc://events",
+        replay_endpoint="inproc://replay",
+        local=True,
+    )
+    state = _ZmqRecoveryState(publisher_epoch="epoch-a", next_seq=1)
+
+    with pytest.raises(ValueError, match="publisher epoch changed"):
+        proxy._apply_zmq_recovery_response(
+            node,
+            state,
+            ZmqEventReplayResponse(
+                publisher_epoch="epoch-b",
+                next_seq=0,
+                replayed_batches=[],
+            ),
+        )
+
+    old_decision = proxy.scheduler.choose_node([old_hash], prompt_num_tokens=32)
+    assert old_decision is None or old_decision.matched_tokens == 0
+    assert proxy.scheduler._nodes["node-a", None].group_hashes == {}
+
+
 def test_prefix_routing_live_gap_recovers_before_applying_new_event(monkeypatch):
     replayed_hash = _hash(1)
     live_hash = _hash(2)
@@ -2254,6 +2545,13 @@ def test_prefix_cache_config_rejects_invalid_upload_limits(kwargs, error):
         (
             {
                 "nodes": [{"id": "node-a", "url": "local"}],
+                "view_ttl_seconds": 0,
+            },
+            "view_ttl_seconds must be positive or null",
+        ),
+        (
+            {
+                "nodes": [{"id": "node-a", "url": "local"}],
                 "load_poll_interval": True,
             },
             "load_poll_interval must be a finite number",
@@ -2264,6 +2562,13 @@ def test_prefix_cache_config_rejects_invalid_upload_limits(kwargs, error):
                 "load_ttl": -1,
             },
             "load_ttl must be positive",
+        ),
+        (
+            {
+                "nodes": [{"id": "node-a", "url": "local"}],
+                "view_ttl_seconds": True,
+            },
+            "view_ttl_seconds must be positive or null",
         ),
     ],
 )
@@ -2362,6 +2667,30 @@ def test_prefix_routing_config_rejects_load_refresh_slower_than_ttl():
             },
             vllm_config,
         )
+
+
+def test_prefix_routing_config_derives_and_disables_view_ttl():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(hash_block_size=16, block_size=16)
+    )
+
+    config = _parse_prefix_routing_config(
+        {
+            "nodes": [{"id": "node-a", "url": "local"}],
+            "event_sync_interval": 2.0,
+        },
+        vllm_config,
+    )
+    assert config.view_ttl_seconds == 6.0
+
+    disabled = _parse_prefix_routing_config(
+        {
+            "nodes": [{"id": "node-a", "url": "local"}],
+            "view_ttl_seconds": None,
+        },
+        vllm_config,
+    )
+    assert disabled.view_ttl_seconds is None
 
 
 def test_api_app_wires_prefix_routing_middleware_route_and_shutdown(monkeypatch):
