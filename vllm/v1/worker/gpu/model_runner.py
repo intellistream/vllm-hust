@@ -1314,6 +1314,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
+        self._spec_decode_verification_started_at = (
+            time.perf_counter()
+            if self.speculator is not None and not dummy_run
+            else None
+        )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1422,6 +1427,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        verification_latency_seconds = 0.0
+        if self._spec_decode_verification_started_at is not None:
+            verification_latency_seconds = (
+                time.perf_counter() - self._spec_decode_verification_started_at
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1483,6 +1493,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+        proposer_latency_seconds = 0.0
         if self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -1493,6 +1504,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            proposer_started_at = time.perf_counter()
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1507,6 +1519,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
+            proposer_latency_seconds = time.perf_counter() - proposer_started_at
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:
@@ -1520,6 +1533,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+        model_runner_output.spec_decode_proposer_latency_seconds = (
+            proposer_latency_seconds
+        )
+        model_runner_output.spec_decode_verification_latency_seconds = (
+            verification_latency_seconds
+        )
+        model_runner_output.spec_decode_num_forwards = int(self.speculator is not None)
 
         return async_output
 

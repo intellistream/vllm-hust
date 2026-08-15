@@ -214,6 +214,15 @@ class CudaPlatformBase(Platform):
     ]
 
     @classmethod
+    def get_speculative_proposer_capabilities(cls) -> dict[str, str]:
+        """Return portable proposers plus CUDA's DSpark proposer."""
+        capabilities = super().get_speculative_proposer_capabilities()
+        capabilities["dspark"] = (
+            "vllm.v1.worker.gpu.spec_decode.dspark.speculator.DSparkSpeculator"
+        )
+        return capabilities
+
+    @classmethod
     def import_kernels(cls) -> None:
         """Import CUDA kernel extensions (_C_stable_libtorch, optional _qutlass_C)."""
         try:

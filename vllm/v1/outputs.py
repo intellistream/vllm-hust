@@ -274,6 +274,11 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Host-observed speculative phases for operational latency metrics.
+    spec_decode_proposer_latency_seconds: float = 0.0
+    spec_decode_verification_latency_seconds: float = 0.0
+    spec_decode_num_forwards: int = 0
+
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
     #                         num_experts_per_tok); expert IDs as uint8/uint16.
