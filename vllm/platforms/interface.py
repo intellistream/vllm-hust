@@ -554,6 +554,23 @@ class Platform:
         return None
 
     @classmethod
+    def get_speculative_proposer_capabilities(cls) -> dict[str, str]:
+        """Return proposer identities available before device allocation.
+
+        Out-of-tree platforms inherit the portable proposer set and must
+        explicitly opt in to platform-specific methods such as DSpark. The
+        values are stable, machine-readable identities. Querying this hook
+        must not import model code or initialize an accelerator context.
+        """
+        return {
+            # V1 and V2 use different concrete classes for these portable
+            # families, so expose stable implementation-family identities.
+            "mtp": "builtin:mtp",
+            "draft_model": "builtin:draft_model",
+            "ngram": "builtin:ngram",
+        }
+
+    @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
         """
         Apply the platform-specific default values to the config.

@@ -176,6 +176,8 @@ class RaySpecDecodingProm(SpecDecodingProm):
     """
 
     _counter_cls = RayCounterWrapper
+    _gauge_cls = RayGaugeWrapper
+    _histogram_cls = RayHistogramWrapper
 
 
 class RayKVConnectorProm(KVConnectorProm):
