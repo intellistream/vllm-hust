@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import mmap
 import threading
+from typing import Any
 
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 
 def test_strict_load_reservation_keeps_read_worker_off_store_queue():
-    events = []
+    events: list[dict[str, Any]] = []
     first_store_started = threading.Event()
     second_store_started = threading.Event()
     release_store = threading.Event()
@@ -74,7 +76,7 @@ def test_real_io_instrumentation_reports_calls_and_identity(tmp_path):
     source[:] = bytes(index % 251 for index in range(block_size))
     destination = mmap.mmap(-1, block_size)
     path = str(tmp_path / "block.bin")
-    events = []
+    events: list[dict[str, Any]] = []
     identity = {"job_id": 7, "block_id": 3, "direction": "store"}
 
     store_block(
