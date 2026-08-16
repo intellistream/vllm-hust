@@ -231,6 +231,11 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    async def get_prefix_cache_route_fence_state_async(
+        self,
+    ) -> dict[str, Any] | None:
+        raise NotImplementedError
+
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
@@ -317,6 +322,11 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    async def get_prefix_cache_route_fence_state_async(
+        self,
+    ) -> dict[str, Any] | None:
+        return self.engine_core.get_prefix_cache_route_fence_state()
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
@@ -909,6 +919,11 @@ class SyncMPClient(MPClient):
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
 
+    async def get_prefix_cache_route_fence_state_async(
+        self,
+    ) -> dict[str, Any] | None:
+        return self.call_utility("get_prefix_cache_route_fence_state")
+
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
@@ -1156,6 +1171,11 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
+
+    async def get_prefix_cache_route_fence_state_async(
+        self,
+    ) -> dict[str, Any] | None:
+        return await self.call_utility_async("get_prefix_cache_route_fence_state")
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")

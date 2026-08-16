@@ -4,6 +4,7 @@
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import secrets
@@ -51,6 +52,30 @@ logger = init_logger(__name__)
 PREFIX_ROUTING_BYPASS_HEADER = "x-vllm-prefix-routing"
 DATA_PARALLEL_RANK_HEADER = "x-data-parallel-rank"
 WORKER_INCARNATION_HEADER = "x-vllm-prefix-routing-worker-incarnation"
+ROUTE_VALIDATION_MODE_NATIVE_CONTROL = "native-control"
+ROUTE_VALIDATION_MODE_GENERATION_SCOPED = "generation-scoped"
+ROUTE_VALIDATION_MODES = frozenset(
+    {ROUTE_VALIDATION_MODE_NATIVE_CONTROL, ROUTE_VALIDATION_MODE_GENERATION_SCOPED}
+)
+PREFIX_ROUTING_VALIDATION_MODE_HEADER = "x-vllm-prefix-routing-validation-mode"
+EXPECTED_NODE_ID_HEADER = "x-vllm-prefix-routing-expected-node-id"
+EXPECTED_GENERATION_HEADER = "x-vllm-prefix-routing-expected-generation"
+EXPECTED_WORKER_INCARNATION_HEADER = (
+    "x-vllm-prefix-routing-expected-worker-incarnation"
+)
+FENCE_RESULT_HEADER = "x-vllm-prefix-routing-fence"
+FENCE_RESULT_REJECTED = "rejected"
+ACK_GENERATION_HEADER = "x-vllm-prefix-routing-ack-generation"
+ACK_WORKER_INCARNATION_HEADER = "x-vllm-prefix-routing-ack-worker-incarnation"
+ROUTE_RESULT_HEADER = "x-vllm-prefix-routing-result"
+ROUTE_SELECTED_NODE_HEADER = "x-vllm-prefix-routing-selected-node"
+ROUTE_MATCHED_TOKENS_HEADER = "x-vllm-prefix-routing-matched-tokens"
+ROUTE_GENERATION_HEADER = "x-vllm-prefix-routing-generation"
+ROUTE_WORKER_INCARNATION_HEADER = "x-vllm-prefix-routing-worker-incarnation-result"
+ROUTE_RESULT_LOCAL_NO_ROUTE = "local-no-route"
+ROUTE_RESULT_LOCAL_NODE = "local-node"
+ROUTE_RESULT_REMOTE = "remote"
+ROUTE_RESULT_LOCAL_FALLBACK = "local-fallback"
 REQUEST_ID_HEADERS = (
     "x-request-id",
     "x-correlation-id",
@@ -116,7 +141,16 @@ async def ingest_prefix_routing_kv_events(
             status_code=400,
             detail="KV event rank does not match the configured prefix node",
         ) from exc
-    return Response(status_code=204)
+    ack_headers: dict[str, str] = {}
+    get_generation = getattr(proxy.scheduler, "get_node_route_generation", None)
+    if get_generation is not None:
+        generation = get_generation(node_id, batch.data_parallel_rank)
+        if generation is not None:
+            view_epoch, ack_incarnation = generation
+            ack_headers[ACK_GENERATION_HEADER] = str(view_epoch)
+            if ack_incarnation is not None:
+                ack_headers[ACK_WORKER_INCARNATION_HEADER] = ack_incarnation
+    return Response(status_code=204, headers=ack_headers)
 
 
 def attach_prefix_routing_router(app: Any) -> None:
@@ -148,6 +182,8 @@ class PrefixRoutingConfig:
     idempotency_cache_size: int = 4096
     max_request_body_size: int = DEFAULT_MAX_REQUEST_BODY_SIZE
     max_event_ingest_body_size: int = DEFAULT_MAX_EVENT_INGEST_BODY_SIZE
+    route_validation_mode: str = ROUTE_VALIDATION_MODE_GENERATION_SCOPED
+    emit_response_headers: bool = False
 
 
 @dataclass
@@ -165,7 +201,13 @@ class PrefixRoutingProxy:
     ) -> None:
         self.config = config
         self.app_state = app_state
-        self.scheduler = GlobalPrefixScheduler(view_ttl_seconds=config.view_ttl_seconds)
+        self.scheduler = GlobalPrefixScheduler(
+            view_ttl_seconds=config.view_ttl_seconds,
+            strict_cache_generation=(
+                config.route_validation_mode
+                == ROUTE_VALIDATION_MODE_GENERATION_SCOPED
+            ),
+        )
         self.nodes = {node.node_id: node for node in config.nodes}
         self._tasks: list[asyncio.Task] = []
         self._session: aiohttp.ClientSession | None = None
@@ -596,8 +638,22 @@ class PrefixRoutingMiddleware:
         if proxy is None:
             await self.app(scope, receive, send)
             return
+        emit_response_headers = bool(
+            getattr(proxy.config, "emit_response_headers", False)
+        )
 
         if _has_authenticated_bypass(headers, proxy.config.routing_token):
+            if not await _validate_generation_scoped_forwarded_request(
+                scope, headers, proxy
+            ):
+                response = Response(
+                    content="Prefix routing generation fence rejected",
+                    status_code=409,
+                    headers={FENCE_RESULT_HEADER: FENCE_RESULT_REJECTED},
+                    media_type="text/plain",
+                )
+                await response(scope, receive, send)
+                return
             await self.app(_without_bypass_header(scope), receive, send)
             return
 
@@ -625,11 +681,35 @@ class PrefixRoutingMiddleware:
             )
         except Exception:
             logger.exception("Prefix routing failed; falling back to local handling")
-            await self.app(scope, _replay_body(body), send)
+            await self.app(
+                scope,
+                _replay_body(body),
+                _with_response_headers(
+                    send,
+                    _routing_response_headers(
+                        ROUTE_RESULT_LOCAL_FALLBACK,
+                        None,
+                    )
+                    if emit_response_headers
+                    else [],
+                ),
+            )
             return
 
         if decision is None:
-            await self.app(scope, _replay_body(body), send)
+            await self.app(
+                scope,
+                _replay_body(body),
+                _with_response_headers(
+                    send,
+                    _routing_response_headers(
+                        ROUTE_RESULT_LOCAL_NO_ROUTE,
+                        None,
+                    )
+                    if emit_response_headers
+                    else [],
+                ),
+            )
             return
 
         node = proxy.nodes.get(decision.node_id)
@@ -637,7 +717,16 @@ class PrefixRoutingMiddleware:
             await self.app(
                 _with_data_parallel_rank(scope, decision.data_parallel_rank),
                 _replay_body(body),
-                send,
+                _with_response_headers(
+                    send,
+                    _routing_response_headers(
+                        ROUTE_RESULT_LOCAL_NODE,
+                        decision,
+                        selected_node=decision.node_id,
+                    )
+                    if emit_response_headers
+                    else [],
+                ),
             )
             return
 
@@ -648,6 +737,21 @@ class PrefixRoutingMiddleware:
             node,
             proxy.session,
             decision.data_parallel_rank,
+            decision=decision,
+            route_validation_mode=getattr(
+                proxy.config,
+                "route_validation_mode",
+                ROUTE_VALIDATION_MODE_GENERATION_SCOPED,
+            ),
+            route_response_headers=(
+                _routing_response_headers(
+                    ROUTE_RESULT_REMOTE,
+                    decision,
+                    selected_node=decision.node_id,
+                )
+                if emit_response_headers
+                else []
+            ),
         )
         if not forwarded:
             _record_route_decision(proxy, request_id, None)
@@ -659,7 +763,15 @@ class PrefixRoutingMiddleware:
             await self.app(
                 scope,
                 _replay_body(body),
-                send,
+                _with_response_headers(
+                    send,
+                    _routing_response_headers(
+                        ROUTE_RESULT_LOCAL_FALLBACK,
+                        decision,
+                    )
+                    if emit_response_headers
+                    else [],
+                ),
             )
 
 
@@ -872,6 +984,22 @@ def _parse_prefix_routing_config(
             "prefix routing max_event_ingest_body_size must be a positive integer"
         )
 
+    route_validation_mode = raw_config.get(
+        "route_validation_mode", ROUTE_VALIDATION_MODE_GENERATION_SCOPED
+    )
+    if (
+        not isinstance(route_validation_mode, str)
+        or route_validation_mode not in ROUTE_VALIDATION_MODES
+    ):
+        raise ValueError(
+            "prefix routing route_validation_mode must be "
+            "'native-control' or 'generation-scoped'"
+        )
+
+    emit_response_headers = raw_config.get("emit_response_headers", False)
+    if not isinstance(emit_response_headers, bool):
+        raise ValueError("prefix routing emit_response_headers must be a boolean")
+
     return PrefixRoutingConfig(
         nodes=nodes,
         hash_block_size=hash_block_size,
@@ -887,6 +1015,8 @@ def _parse_prefix_routing_config(
         idempotency_cache_size=idempotency_cache_size,
         max_request_body_size=max_request_body_size,
         max_event_ingest_body_size=max_event_ingest_body_size,
+        route_validation_mode=route_validation_mode,
+        emit_response_headers=emit_response_headers,
     )
 
 
@@ -939,6 +1069,56 @@ def _replay_body(body: bytes) -> Receive:
     return receive
 
 
+def _routing_response_headers(
+    result: str,
+    decision: PrefixRouteDecision | None,
+    *,
+    selected_node: str = "local",
+) -> list[tuple[bytes, bytes]]:
+    headers = [
+        (ROUTE_RESULT_HEADER.encode(), result.encode("ascii")),
+        (ROUTE_SELECTED_NODE_HEADER.encode(), selected_node.encode("utf-8")),
+    ]
+    if decision is not None:
+        headers.extend(
+            [
+                (
+                    ROUTE_MATCHED_TOKENS_HEADER.encode(),
+                    str(decision.matched_tokens).encode("ascii"),
+                ),
+                (
+                    ROUTE_GENERATION_HEADER.encode(),
+                    str(decision.view_epoch).encode("ascii"),
+                ),
+            ]
+        )
+        if decision.worker_incarnation is not None:
+            headers.append(
+                (
+                    ROUTE_WORKER_INCARNATION_HEADER.encode(),
+                    decision.worker_incarnation.encode("utf-8"),
+                )
+            )
+    return headers
+
+
+def _with_response_headers(send: Send, headers: list[tuple[bytes, bytes]]) -> Send:
+    if not headers:
+        return send
+
+    async def send_with_headers(message: Message) -> None:
+        if message["type"] == "http.response.start":
+            message = dict(message)
+            message["headers"] = [
+                (key, value)
+                for key, value in message.get("headers", [])
+                if key.lower() not in {header[0].lower() for header in headers}
+            ] + headers
+        await send(message)
+
+    return send_with_headers
+
+
 def _with_data_parallel_rank(scope: Scope, rank: int | None) -> Scope:
     if rank is None:
         return scope
@@ -956,6 +1136,16 @@ def _without_external_routing_headers(scope: Scope) -> Scope:
     stripped_headers = {
         PREFIX_ROUTING_BYPASS_HEADER.encode(),
         DATA_PARALLEL_RANK_HEADER.encode(),
+        PREFIX_ROUTING_VALIDATION_MODE_HEADER.encode(),
+        EXPECTED_NODE_ID_HEADER.encode(),
+        EXPECTED_GENERATION_HEADER.encode(),
+        EXPECTED_WORKER_INCARNATION_HEADER.encode(),
+        FENCE_RESULT_HEADER.encode(),
+        ROUTE_RESULT_HEADER.encode(),
+        ROUTE_SELECTED_NODE_HEADER.encode(),
+        ROUTE_MATCHED_TOKENS_HEADER.encode(),
+        ROUTE_GENERATION_HEADER.encode(),
+        ROUTE_WORKER_INCARNATION_HEADER.encode(),
     }
     routed_scope["headers"] = [
         (key, value)
@@ -967,10 +1157,23 @@ def _without_external_routing_headers(scope: Scope) -> Scope:
 
 def _without_bypass_header(scope: Scope) -> Scope:
     routed_scope = dict(scope)
+    stripped_headers = {
+        PREFIX_ROUTING_BYPASS_HEADER.encode(),
+        PREFIX_ROUTING_VALIDATION_MODE_HEADER.encode(),
+        EXPECTED_NODE_ID_HEADER.encode(),
+        EXPECTED_GENERATION_HEADER.encode(),
+        EXPECTED_WORKER_INCARNATION_HEADER.encode(),
+        FENCE_RESULT_HEADER.encode(),
+        ROUTE_RESULT_HEADER.encode(),
+        ROUTE_SELECTED_NODE_HEADER.encode(),
+        ROUTE_MATCHED_TOKENS_HEADER.encode(),
+        ROUTE_GENERATION_HEADER.encode(),
+        ROUTE_WORKER_INCARNATION_HEADER.encode(),
+    }
     routed_scope["headers"] = [
         (key, value)
         for key, value in scope["headers"]
-        if key.lower() != PREFIX_ROUTING_BYPASS_HEADER.encode()
+        if key.lower() not in stripped_headers
     ]
     return routed_scope
 
@@ -984,6 +1187,136 @@ def _has_authenticated_bypass(headers: Headers, expected_token: str | None) -> b
     return secrets.compare_digest(
         hashlib.sha256(token.encode("utf-8")).digest(),
         hashlib.sha256(expected_token.encode("utf-8")).digest(),
+    )
+
+
+async def _validate_generation_scoped_forwarded_request(
+    scope: Scope, headers: Headers, proxy: Any
+) -> bool:
+    mode = headers.get(PREFIX_ROUTING_VALIDATION_MODE_HEADER)
+    if mode is None or mode == ROUTE_VALIDATION_MODE_NATIVE_CONTROL:
+        return True
+    if mode != ROUTE_VALIDATION_MODE_GENERATION_SCOPED:
+        return False
+
+    node_id = headers.get(EXPECTED_NODE_ID_HEADER)
+    generation = headers.get(EXPECTED_GENERATION_HEADER)
+    worker_incarnation = headers.get(EXPECTED_WORKER_INCARNATION_HEADER)
+    if not node_id or generation is None or not worker_incarnation:
+        return False
+    try:
+        view_epoch = int(generation)
+    except ValueError:
+        return False
+    data_parallel_rank_header = headers.get(DATA_PARALLEL_RANK_HEADER)
+    data_parallel_rank: int | None
+    if data_parallel_rank_header is None:
+        data_parallel_rank = None
+    else:
+        try:
+            data_parallel_rank = int(data_parallel_rank_header)
+        except ValueError:
+            return False
+
+    decision = PrefixRouteDecision(
+        node_id=node_id,
+        matched_tokens=0,
+        data_parallel_rank=data_parallel_rank,
+        view_epoch=view_epoch,
+        worker_incarnation=worker_incarnation,
+    )
+
+    if not _matches_configured_local_node(proxy, node_id, data_parallel_rank):
+        return False
+
+    validator = getattr(scope["app"].state, "prefix_routing_route_validator", None)
+    if validator is not None:
+        return bool(validator(decision))
+
+    try:
+        route_fence_state = await _get_engine_route_fence_state(scope)
+    except Exception:
+        logger.warning(
+            "Prefix routing generation fence state lookup failed",
+            exc_info=True,
+        )
+        return False
+    if route_fence_state is not None:
+        return _route_fence_state_matches(
+            route_fence_state,
+            view_epoch=view_epoch,
+            worker_incarnation=worker_incarnation,
+            data_parallel_rank=data_parallel_rank,
+        )
+
+    scheduler = getattr(proxy, "scheduler", None)
+    is_decision_current = getattr(scheduler, "is_decision_current", None)
+    if is_decision_current is None:
+        return False
+    return bool(is_decision_current(decision))
+
+
+async def _get_engine_route_fence_state(scope: Scope) -> Mapping[str, Any] | None:
+    engine_client = getattr(scope["app"].state, "engine_client", None)
+    if engine_client is None:
+        return None
+    get_state = getattr(engine_client, "get_prefix_cache_route_fence_state", None)
+    if get_state is None:
+        return None
+    state = get_state()
+    if inspect.isawaitable(state):
+        state = await state
+    if state is None:
+        return None
+    if not isinstance(state, Mapping):
+        return None
+    return state
+
+
+def _matches_configured_local_node(
+    proxy: Any, node_id: str, data_parallel_rank: int | None
+) -> bool:
+    nodes = getattr(proxy, "nodes", None)
+    if not isinstance(nodes, Mapping):
+        return True
+    node = nodes.get(node_id)
+    if node is None or not getattr(node, "local", False):
+        return False
+    configured_rank = getattr(node, "data_parallel_rank", None)
+    return configured_rank is None or configured_rank == data_parallel_rank
+
+
+def _route_fence_state_matches(
+    state: Mapping[str, Any],
+    *,
+    view_epoch: int,
+    worker_incarnation: str,
+    data_parallel_rank: int | None,
+) -> bool:
+    try:
+        current_generation = int(state["cache_generation"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    current_incarnation = state.get("worker_incarnation")
+    if not isinstance(current_incarnation, str) or not current_incarnation:
+        return False
+
+    current_rank = state.get("data_parallel_rank")
+    if current_rank is not None:
+        try:
+            current_rank = int(current_rank)
+        except (TypeError, ValueError):
+            return False
+    if (
+        data_parallel_rank is not None
+        and current_rank is not None
+        and data_parallel_rank != current_rank
+    ):
+        return False
+
+    return (
+        current_generation == view_epoch
+        and current_incarnation == worker_incarnation
     )
 
 
@@ -1027,9 +1360,17 @@ async def _forward_request(
     node: PrefixRoutingNode,
     session: aiohttp.ClientSession,
     data_parallel_rank: int | None = None,
+    *,
+    decision: PrefixRouteDecision | None = None,
+    route_validation_mode: str = ROUTE_VALIDATION_MODE_GENERATION_SCOPED,
+    route_response_headers: list[tuple[bytes, bytes]] | None = None,
 ) -> bool:
     if node.url is None or node.routing_token is None:
         raise RuntimeError("remote prefix routing node is missing forwarding config")
+    if route_validation_mode not in ROUTE_VALIDATION_MODES:
+        raise ValueError(
+            f"unknown prefix route validation mode {route_validation_mode!r}"
+        )
     url = f"{node.url.rstrip('/')}{scope['path']}"
     if scope.get("query_string"):
         url += "?" + scope["query_string"].decode("latin-1")
@@ -1039,14 +1380,52 @@ async def _forward_request(
         for key, value in scope["headers"]
         if key.lower() not in (b"host", b"content-length")
     ]
+    stripped_headers = {
+        PREFIX_ROUTING_BYPASS_HEADER,
+        DATA_PARALLEL_RANK_HEADER,
+        PREFIX_ROUTING_VALIDATION_MODE_HEADER,
+        EXPECTED_NODE_ID_HEADER,
+        EXPECTED_GENERATION_HEADER,
+        EXPECTED_WORKER_INCARNATION_HEADER,
+        FENCE_RESULT_HEADER,
+        ROUTE_RESULT_HEADER,
+        ROUTE_SELECTED_NODE_HEADER,
+        ROUTE_MATCHED_TOKENS_HEADER,
+        ROUTE_GENERATION_HEADER,
+        ROUTE_WORKER_INCARNATION_HEADER,
+    }
     headers = [
         (key, value)
         for key, value in headers
-        if key.lower() not in (PREFIX_ROUTING_BYPASS_HEADER, DATA_PARALLEL_RANK_HEADER)
+        if key.lower() not in stripped_headers
     ]
     headers.append((PREFIX_ROUTING_BYPASS_HEADER, node.routing_token))
     if data_parallel_rank is not None:
         headers.append((DATA_PARALLEL_RANK_HEADER, str(data_parallel_rank)))
+    decision_view_epoch = getattr(decision, "view_epoch", None)
+    if (
+        route_validation_mode == ROUTE_VALIDATION_MODE_GENERATION_SCOPED
+        and decision is not None
+        and decision_view_epoch is not None
+    ):
+        headers.extend(
+            [
+                (
+                    PREFIX_ROUTING_VALIDATION_MODE_HEADER,
+                    ROUTE_VALIDATION_MODE_GENERATION_SCOPED,
+                ),
+                (EXPECTED_NODE_ID_HEADER, decision.node_id),
+                (EXPECTED_GENERATION_HEADER, str(decision_view_epoch)),
+            ]
+        )
+        worker_incarnation = getattr(decision, "worker_incarnation", None)
+        if worker_incarnation is not None:
+            headers.append(
+                (
+                    EXPECTED_WORKER_INCARNATION_HEADER,
+                    worker_incarnation,
+                )
+            )
 
     response_started = False
     try:
@@ -1057,17 +1436,25 @@ async def _forward_request(
             headers=headers,
             allow_redirects=False,
         ) as response:
-            response_headers = [
+            if (
+                response.status == 409
+                and response.headers.get(FENCE_RESULT_HEADER) == FENCE_RESULT_REJECTED
+            ):
+                await response.read()
+                return False
+            upstream_response_headers = [
                 (key.encode("latin-1"), value.encode("latin-1"))
                 for key, value in response.headers.items()
                 if key.lower()
                 not in ("transfer-encoding", "content-encoding", "content-length")
             ]
+            if route_response_headers:
+                upstream_response_headers.extend(route_response_headers)
             await send(
                 {
                     "type": "http.response.start",
                     "status": response.status,
-                    "headers": response_headers,
+                    "headers": upstream_response_headers,
                 }
             )
             response_started = True

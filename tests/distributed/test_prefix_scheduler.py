@@ -3,6 +3,7 @@
 
 import asyncio
 import http.server
+import json
 import threading
 import time
 import urllib.error
@@ -40,12 +41,28 @@ from vllm.distributed.prefix_scheduler import (
     PrefixRouteDecision,
 )
 from vllm.entrypoints.openai.prefix_routing import (
+    ACK_GENERATION_HEADER,
+    ACK_WORKER_INCARNATION_HEADER,
+    EXPECTED_GENERATION_HEADER,
+    EXPECTED_NODE_ID_HEADER,
+    EXPECTED_WORKER_INCARNATION_HEADER,
+    FENCE_RESULT_HEADER,
+    FENCE_RESULT_REJECTED,
+    PREFIX_ROUTING_VALIDATION_MODE_HEADER,
+    ROUTE_GENERATION_HEADER,
+    ROUTE_RESULT_HEADER,
+    ROUTE_RESULT_LOCAL_NO_ROUTE,
+    ROUTE_RESULT_REMOTE,
+    ROUTE_SELECTED_NODE_HEADER,
+    ROUTE_VALIDATION_MODE_GENERATION_SCOPED,
+    ROUTE_VALIDATION_MODE_NATIVE_CONTROL,
     PrefixRoutingConfig,
     PrefixRoutingMiddleware,
     PrefixRoutingNode,
     PrefixRoutingProxy,
     _extract_prefix_routing_request_id,
     _forward_request,
+    _matches_configured_local_node,
     _parse_prefix_routing_config,
     _ZmqRecoveryState,
     ingest_prefix_routing_kv_events,
@@ -135,6 +152,27 @@ def test_global_prefix_scheduler_expires_stale_receipt_before_routing():
     assert scheduler._nodes["node-a", None].group_hashes == {}
 
 
+def test_global_prefix_scheduler_reports_route_generation():
+    block_hash = _hash(17)
+    scheduler = GlobalPrefixScheduler()
+    scheduler.register_node("node-a", hash_block_size=16, data_parallel_rank=2)
+
+    assert scheduler.get_node_route_generation("node-a", 2) == (0, None)
+
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(ts=0.0, data_parallel_rank=2, events=[_stored_event(block_hash)]),
+        worker_incarnation="epoch-a",
+    )
+
+    decision = scheduler.choose_node([block_hash], prompt_num_tokens=32)
+    assert decision is not None
+    assert scheduler.get_node_route_generation("node-a", 2) == (
+        decision.view_epoch,
+        "epoch-a",
+    )
+
+
 def test_global_prefix_scheduler_clears_cache_state_on_worker_incarnation_change():
     old_hash = _hash(11)
     new_hash = _hash(12)
@@ -215,6 +253,68 @@ def test_global_prefix_scheduler_cache_loss_event_fails_closed():
     decision = scheduler.choose_node([block_hash], prompt_num_tokens=32)
     assert decision is None or decision.matched_tokens == 0
     assert scheduler._nodes["node-a", None].group_hashes == {}
+
+
+def test_global_prefix_scheduler_generation_gap_clears_unknown_old_view():
+    old_hash = _hash(18)
+    new_hash = _hash(19)
+    scheduler = GlobalPrefixScheduler(strict_cache_generation=True)
+    scheduler.register_node("node-a", hash_block_size=16)
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(
+            ts=0.0,
+            events=[_stored_event(old_hash)],
+            cache_generation=1,
+        ),
+        worker_incarnation="epoch-a",
+    )
+
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(
+            ts=1.0,
+            events=[_stored_event(new_hash)],
+            cache_generation=3,
+        ),
+        worker_incarnation="epoch-a",
+    )
+
+    old_decision = scheduler.choose_node([old_hash], prompt_num_tokens=32)
+    new_decision = scheduler.choose_node([new_hash], prompt_num_tokens=32)
+    assert old_decision is None or old_decision.matched_tokens == 0
+    assert new_decision is not None
+    assert new_decision.matched_tokens == 16
+    assert new_decision.view_epoch == 3
+
+
+def test_global_prefix_scheduler_native_control_keeps_old_view_on_generation_gap():
+    old_hash = _hash(20)
+    new_hash = _hash(21)
+    scheduler = GlobalPrefixScheduler(strict_cache_generation=False)
+    scheduler.register_node("node-a", hash_block_size=16)
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(
+            ts=0.0,
+            events=[_stored_event(old_hash)],
+            cache_generation=1,
+        ),
+        worker_incarnation="epoch-a",
+    )
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(
+            ts=1.0,
+            events=[_stored_event(new_hash)],
+            cache_generation=3,
+        ),
+        worker_incarnation="epoch-a",
+    )
+
+    old_decision = scheduler.choose_node([old_hash], prompt_num_tokens=32)
+    assert old_decision is not None
+    assert old_decision.matched_tokens == 16
 
 
 def test_global_prefix_scheduler_routes_to_longest_match():
@@ -452,6 +552,18 @@ def test_prefix_cache_upload_is_independent_from_event_publisher():
         uploader.shutdown()
 
 
+def test_kv_event_batch_decodes_legacy_three_field_payload():
+    payload = msgspec.msgpack.encode((1.0, [], None))
+
+    decoded = msgspec.msgpack.decode(payload, type=KVEventBatch)
+
+    assert decoded.ts == 1.0
+    assert decoded.events == []
+    assert decoded.data_parallel_rank is None
+    assert decoded.cache_generation is None
+    assert decoded.is_snapshot is False
+
+
 def _stored_event(block_hash, *, group_idx=0):
     return BlockStored(
         block_hashes=[_external_hash(block_hash)],
@@ -547,6 +659,102 @@ def test_prefix_cache_upload_can_disable_periodic_snapshots():
 
     assert not uploader._needs_snapshot.is_set()
     uploader.shutdown()
+
+
+def test_prefix_cache_upload_assigns_cache_generation_and_snapshot_flag():
+    uploader = HttpPrefixCacheEventUploader(
+        data_parallel_rank=0,
+        endpoint="http://127.0.0.1:9/prefix_routing",
+        token="shared-secret",
+        _start_thread=False,
+    )
+    batch = KVEventBatch(ts=1.0, events=[_stored_event(_hash(1))])
+
+    uploader.publish(batch)
+    snapshot, _ = uploader._build_snapshot_batch()
+
+    assert batch.cache_generation == 1
+    assert snapshot.cache_generation == 1
+    assert snapshot.is_snapshot is True
+    uploader.shutdown()
+
+
+def test_prefix_cache_upload_exposes_route_fence_state():
+    uploader = HttpPrefixCacheEventUploader(
+        data_parallel_rank=4,
+        endpoint="http://127.0.0.1:9/prefix_routing",
+        token="shared-secret",
+        _start_thread=False,
+    )
+
+    uploader.publish(KVEventBatch(ts=1.0, events=[_stored_event(_hash(1))]))
+    uploader.publish(KVEventBatch(ts=2.0, events=[AllBlocksCleared()]))
+
+    state = uploader.get_route_fence_state()
+    assert state == {
+        "cache_generation": 2,
+        "worker_incarnation": uploader._publisher_epoch,
+        "data_parallel_rank": 4,
+    }
+    uploader.shutdown()
+
+
+def test_prefix_cache_upload_records_local_route_fence_without_queueing_upload():
+    uploader = HttpPrefixCacheEventUploader(
+        data_parallel_rank=4,
+        endpoint="http://127.0.0.1:9/prefix_routing",
+        token="shared-secret",
+        _start_thread=False,
+    )
+
+    uploader.record_local_route_fence_events([_stored_event(_hash(1))])
+    uploader.record_local_route_fence_events([AllBlocksCleared()])
+
+    assert uploader.get_route_fence_state()["cache_generation"] == 2
+    assert uploader._event_queue.empty()
+    assert uploader._group_hashes == {}
+    uploader.shutdown()
+
+
+def test_prefix_cache_upload_fault_injection_drops_matching_upload_once(monkeypatch):
+    monkeypatch.setenv(
+        "VLLM_PREFIX_CACHE_UPLOAD_FAULTS",
+        json.dumps({"drop_event_types": ["AllBlocksCleared"], "max_drops": 1}),
+    )
+    uploader = HttpPrefixCacheEventUploader(
+        data_parallel_rank=0,
+        endpoint="http://127.0.0.1:9/prefix_routing",
+        token="shared-secret",
+        _start_thread=False,
+    )
+
+    uploader.publish(KVEventBatch(ts=1.0, events=[AllBlocksCleared()]))
+    assert uploader._event_queue.empty()
+
+    uploader.publish(KVEventBatch(ts=2.0, events=[AllBlocksCleared()]))
+    assert not uploader._event_queue.empty()
+    uploader.shutdown()
+
+
+def test_prefix_cache_publishers_can_share_explicit_worker_incarnation(monkeypatch):
+    monkeypatch.setenv("VLLM_PREFIX_ROUTING_WORKER_INCARNATION", "epoch-shared")
+    uploader = HttpPrefixCacheEventUploader(
+        data_parallel_rank=0,
+        endpoint="http://127.0.0.1:9/prefix_routing",
+        token="shared-secret",
+        _start_thread=False,
+    )
+    publisher = ZmqEventPublisher(
+        data_parallel_rank=0,
+        endpoint="inproc://prefix-routing-shared-incarnation",
+    )
+
+    try:
+        assert uploader._publisher_epoch == "epoch-shared"
+        assert publisher._publisher_epoch == "epoch-shared"
+    finally:
+        uploader.shutdown()
+        publisher.shutdown()
 
 
 def test_prefix_cache_upload_recovers_after_disconnect():
@@ -694,6 +902,12 @@ def _event_ingest_request(
         def apply_event_batch(self, node_id, batch, *, worker_incarnation=None):
             self.batch = (node_id, batch, worker_incarnation)
 
+        def get_node_route_generation(self, node_id, data_parallel_rank=None):
+            assert self.batch is not None
+            assert self.batch[0] == node_id
+            assert self.batch[1].data_parallel_rank == data_parallel_rank
+            return 7, self.batch[2]
+
     class Request:
         headers = {} if token is None else {"authorization": f"Bearer {token}"}
         if worker_incarnation is not None:
@@ -757,6 +971,8 @@ def test_prefix_routing_http_event_ingest_accepts_shared_token():
     response = asyncio.run(ingest_prefix_routing_kv_events("node-a", request))
 
     assert response.status_code == 204
+    assert response.headers[ACK_GENERATION_HEADER] == "7"
+    assert response.headers[ACK_WORKER_INCARNATION_HEADER] == "worker-epoch-a"
     assert request.scheduler.batch is not None
     assert request.scheduler.batch[0] == "node-a"
     assert request.scheduler.batch[2] == "worker-epoch-a"
@@ -1201,6 +1417,219 @@ def test_prefix_routing_stream_failure_does_not_restart_response():
     assert sum(message["type"] == "http.response.start" for message in sent) == 1
 
 
+def test_prefix_routing_forward_request_sends_generation_scope_headers():
+    request_headers = []
+    sent = []
+
+    class Content:
+        async def iter_chunked(self, size):
+            yield b"{}"
+
+    class Response:
+        status = 200
+        headers = {"content-type": "application/json"}
+        content = Content()
+
+    class RequestContext:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class ClientSession:
+        def request(self, **kwargs):
+            request_headers.extend(kwargs["headers"])
+            return RequestContext()
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "method": "POST",
+        "path": "/v1/completions",
+        "query_string": b"",
+        "headers": [
+            (b"x-vllm-prefix-routing", b"forged"),
+            (b"x-vllm-prefix-routing-expected-generation", b"999"),
+            (b"x-vllm-prefix-routing-expected-worker-incarnation", b"forged"),
+        ],
+    }
+    node = PrefixRoutingNode(
+        node_id="node-a",
+        url="http://node-a:8000",
+        routing_token="outgoing-secret",
+    )
+    decision = PrefixRouteDecision(
+        node_id="node-a",
+        matched_tokens=32,
+        data_parallel_rank=3,
+        view_epoch=9,
+        worker_incarnation="epoch-a",
+    )
+
+    forwarded = asyncio.run(
+        _forward_request(
+            scope,
+            b"{}",
+            send,
+            node,
+            ClientSession(),
+            data_parallel_rank=3,
+            decision=decision,
+            route_validation_mode=ROUTE_VALIDATION_MODE_GENERATION_SCOPED,
+            route_response_headers=[
+                (ROUTE_RESULT_HEADER.encode(), ROUTE_RESULT_REMOTE.encode()),
+                (ROUTE_SELECTED_NODE_HEADER.encode(), b"node-a"),
+                (ROUTE_GENERATION_HEADER.encode(), b"9"),
+            ],
+        )
+    )
+
+    assert forwarded is True
+    assert ("x-vllm-prefix-routing", "outgoing-secret") in request_headers
+    assert ("x-data-parallel-rank", "3") in request_headers
+    assert (
+        "x-vllm-prefix-routing-validation-mode",
+        ROUTE_VALIDATION_MODE_GENERATION_SCOPED,
+    ) in request_headers
+    assert ("x-vllm-prefix-routing-expected-node-id", "node-a") in request_headers
+    assert ("x-vllm-prefix-routing-expected-generation", "9") in request_headers
+    assert (
+        "x-vllm-prefix-routing-expected-worker-incarnation",
+        "epoch-a",
+    ) in request_headers
+    assert ("x-vllm-prefix-routing-expected-generation", "999") not in request_headers
+    assert (
+        "x-vllm-prefix-routing-expected-worker-incarnation",
+        "forged",
+    ) not in request_headers
+    assert (
+        ROUTE_RESULT_HEADER.encode(),
+        ROUTE_RESULT_REMOTE.encode(),
+    ) in sent[0]["headers"]
+    assert (ROUTE_SELECTED_NODE_HEADER.encode(), b"node-a") in sent[0]["headers"]
+    assert (ROUTE_GENERATION_HEADER.encode(), b"9") in sent[0]["headers"]
+
+
+def test_prefix_routing_forward_request_native_control_omits_generation_scope_headers():
+    request_headers = []
+
+    class Content:
+        async def iter_chunked(self, size):
+            yield b"{}"
+
+    class Response:
+        status = 200
+        headers = {"content-type": "application/json"}
+        content = Content()
+
+    class RequestContext:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class ClientSession:
+        def request(self, **kwargs):
+            request_headers.extend(kwargs["headers"])
+            return RequestContext()
+
+    async def send(message):
+        pass
+
+    scope = {
+        "method": "POST",
+        "path": "/v1/completions",
+        "query_string": b"",
+        "headers": [],
+    }
+    node = PrefixRoutingNode(
+        node_id="node-a",
+        url="http://node-a:8000",
+        routing_token="outgoing-secret",
+    )
+    decision = PrefixRouteDecision(
+        node_id="node-a",
+        matched_tokens=32,
+        view_epoch=9,
+        worker_incarnation="epoch-a",
+    )
+
+    forwarded = asyncio.run(
+        _forward_request(
+            scope,
+            b"{}",
+            send,
+            node,
+            ClientSession(),
+            decision=decision,
+            route_validation_mode=ROUTE_VALIDATION_MODE_NATIVE_CONTROL,
+        )
+    )
+
+    assert forwarded is True
+    assert all(
+        key
+        not in (
+            PREFIX_ROUTING_VALIDATION_MODE_HEADER,
+            EXPECTED_NODE_ID_HEADER,
+            EXPECTED_GENERATION_HEADER,
+            EXPECTED_WORKER_INCARNATION_HEADER,
+        )
+        for key, _ in request_headers
+    )
+
+
+def test_prefix_routing_forward_request_fence_reject_falls_back_before_response():
+    sent = []
+    read_called = False
+
+    class Response:
+        status = 409
+        headers = {FENCE_RESULT_HEADER: FENCE_RESULT_REJECTED}
+
+        async def read(self):
+            nonlocal read_called
+            read_called = True
+            return b""
+
+    class RequestContext:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class ClientSession:
+        def request(self, **kwargs):
+            return RequestContext()
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "method": "POST",
+        "path": "/v1/completions",
+        "query_string": b"",
+        "headers": [],
+    }
+    node = PrefixRoutingNode(
+        node_id="node-a",
+        url="http://node-a:8000",
+        routing_token="outgoing-secret",
+    )
+
+    forwarded = asyncio.run(
+        _forward_request(scope, b"{}", send, node, ClientSession())
+    )
+
+    assert forwarded is False
+    assert read_called is True
+    assert sent == []
+
+
 def test_prefix_routing_rejects_forged_bypass_and_external_rank():
     request_body = b'{"model":"test-model","prompt":"hello"}'
     routed_scopes = []
@@ -1260,6 +1689,55 @@ def test_prefix_routing_rejects_forged_bypass_and_external_rank():
     )
 
 
+def test_prefix_routing_emits_local_no_route_observation_headers():
+    sent = []
+
+    class Proxy:
+        config = SimpleNamespace(
+            routing_token="shared-secret",
+            max_request_body_size=1024,
+            emit_response_headers=True,
+        )
+        nodes = {}
+
+        async def choose_node_for_request(self, path, payload):
+            return None
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"local"})
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/completions",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (ROUTE_RESULT_HEADER.encode(), b"forged"),
+            (ROUTE_SELECTED_NODE_HEADER.encode(), b"forged"),
+        ],
+        "server": ("router", 8000),
+        "app": SimpleNamespace(state=SimpleNamespace(prefix_routing_proxy=Proxy())),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b'{"model":"test","prompt":"x"}'}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(PrefixRoutingMiddleware(app)(scope, receive, send))
+
+    response_headers = dict(sent[0]["headers"])
+    assert response_headers[ROUTE_RESULT_HEADER.encode()] == (
+        ROUTE_RESULT_LOCAL_NO_ROUTE.encode()
+    )
+    assert response_headers[ROUTE_SELECTED_NODE_HEADER.encode()] == b"local"
+
+
 def test_prefix_routing_accepts_authenticated_internal_bypass():
     app_scopes = []
 
@@ -1301,6 +1779,220 @@ def test_prefix_routing_accepts_authenticated_internal_bypass():
     assert all(
         key.lower() != b"x-vllm-prefix-routing" for key, _ in app_scopes[0]["headers"]
     )
+
+
+def test_prefix_routing_accepts_current_generation_scoped_bypass():
+    app_scopes = []
+    scheduler = GlobalPrefixScheduler()
+    scheduler.register_node("node-a", hash_block_size=16, data_parallel_rank=4)
+    scheduler.apply_event_batch(
+        "node-a",
+        KVEventBatch(
+            ts=1.0,
+            data_parallel_rank=4,
+            events=[_stored_event(_hash(18))],
+        ),
+        worker_incarnation="epoch-a",
+    )
+    generation = scheduler.get_node_route_generation("node-a", 4)
+    assert generation is not None
+
+    class Proxy:
+        config = SimpleNamespace(routing_token="shared-secret")
+
+        def __init__(self):
+            self.scheduler = scheduler
+
+        async def choose_node_for_request(self, path, payload):
+            raise AssertionError("authenticated bypass must not be routed again")
+
+    async def app(scope, receive, send):
+        app_scopes.append(scope)
+        await receive()
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/completions",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"x-vllm-prefix-routing", b"shared-secret"),
+            (b"x-data-parallel-rank", b"4"),
+            (
+                PREFIX_ROUTING_VALIDATION_MODE_HEADER.encode(),
+                ROUTE_VALIDATION_MODE_GENERATION_SCOPED.encode(),
+            ),
+            (EXPECTED_NODE_ID_HEADER.encode(), b"node-a"),
+            (EXPECTED_GENERATION_HEADER.encode(), str(generation[0]).encode("ascii")),
+            (EXPECTED_WORKER_INCARNATION_HEADER.encode(), b"epoch-a"),
+        ],
+        "server": ("router", 8000),
+        "app": SimpleNamespace(state=SimpleNamespace(prefix_routing_proxy=Proxy())),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"{}"}
+
+    async def send(message):
+        raise AssertionError(f"unexpected response: {message}")
+
+    asyncio.run(PrefixRoutingMiddleware(app)(scope, receive, send))
+
+    assert len(app_scopes) == 1
+    assert (b"x-data-parallel-rank", b"4") in app_scopes[0]["headers"]
+    assert all(
+        key.lower()
+        not in (
+            b"x-vllm-prefix-routing",
+            PREFIX_ROUTING_VALIDATION_MODE_HEADER.encode(),
+            EXPECTED_NODE_ID_HEADER.encode(),
+            EXPECTED_GENERATION_HEADER.encode(),
+            EXPECTED_WORKER_INCARNATION_HEADER.encode(),
+        )
+        for key, _ in app_scopes[0]["headers"]
+    )
+
+
+def test_prefix_routing_engine_fence_rejects_stale_local_generation():
+    sent = []
+
+    class EngineClient:
+        async def get_prefix_cache_route_fence_state(self):
+            return {
+                "cache_generation": 2,
+                "worker_incarnation": "epoch-a",
+                "data_parallel_rank": 4,
+            }
+
+    class Proxy:
+        config = SimpleNamespace(routing_token="shared-secret")
+        nodes = {
+            "node-a": PrefixRoutingNode(
+                node_id="node-a",
+                url=None,
+                data_parallel_rank=4,
+                local=True,
+            )
+        }
+        scheduler = SimpleNamespace(is_decision_current=lambda decision: True)
+
+    async def app(scope, receive, send):
+        raise AssertionError("stale generation must not reach the local app")
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/completions",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"x-vllm-prefix-routing", b"shared-secret"),
+            (b"x-data-parallel-rank", b"4"),
+            (
+                PREFIX_ROUTING_VALIDATION_MODE_HEADER.encode(),
+                ROUTE_VALIDATION_MODE_GENERATION_SCOPED.encode(),
+            ),
+            (EXPECTED_NODE_ID_HEADER.encode(), b"node-a"),
+            (EXPECTED_GENERATION_HEADER.encode(), b"1"),
+            (EXPECTED_WORKER_INCARNATION_HEADER.encode(), b"epoch-a"),
+        ],
+        "server": ("router", 8000),
+        "app": SimpleNamespace(
+            state=SimpleNamespace(
+                engine_client=EngineClient(),
+                prefix_routing_proxy=Proxy(),
+            )
+        ),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"{}"}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(PrefixRoutingMiddleware(app)(scope, receive, send))
+
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 409
+    assert (FENCE_RESULT_HEADER.encode(), FENCE_RESULT_REJECTED.encode()) in sent[0][
+        "headers"
+    ]
+
+
+def test_prefix_routing_generation_scoped_requires_matching_local_node():
+    class Proxy:
+        nodes = {
+            "node-a": PrefixRoutingNode(
+                node_id="node-a",
+                url=None,
+                data_parallel_rank=4,
+                local=True,
+            ),
+            "node-b": PrefixRoutingNode(
+                node_id="node-b",
+                url="http://127.0.0.1:8001",
+                data_parallel_rank=5,
+                local=False,
+            ),
+        }
+
+    proxy = Proxy()
+
+    assert _matches_configured_local_node(proxy, "node-a", 4)
+    assert not _matches_configured_local_node(proxy, "node-a", 5)
+    assert not _matches_configured_local_node(proxy, "node-b", 5)
+    assert not _matches_configured_local_node(proxy, "node-c", 4)
+
+
+def test_prefix_routing_rejects_stale_generation_scoped_bypass():
+    sent = []
+
+    class Proxy:
+        config = SimpleNamespace(routing_token="shared-secret")
+        scheduler = SimpleNamespace(is_decision_current=lambda decision: False)
+
+    async def app(scope, receive, send):
+        raise AssertionError("stale generation must not reach the local app")
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/completions",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"x-vllm-prefix-routing", b"shared-secret"),
+            (b"x-data-parallel-rank", b"4"),
+            (
+                PREFIX_ROUTING_VALIDATION_MODE_HEADER.encode(),
+                ROUTE_VALIDATION_MODE_GENERATION_SCOPED.encode(),
+            ),
+            (EXPECTED_NODE_ID_HEADER.encode(), b"node-a"),
+            (EXPECTED_GENERATION_HEADER.encode(), b"9"),
+            (EXPECTED_WORKER_INCARNATION_HEADER.encode(), b"epoch-a"),
+        ],
+        "server": ("router", 8000),
+        "app": SimpleNamespace(state=SimpleNamespace(prefix_routing_proxy=Proxy())),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"{}"}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(PrefixRoutingMiddleware(app)(scope, receive, send))
+
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 409
+    assert (FENCE_RESULT_HEADER.encode(), FENCE_RESULT_REJECTED.encode()) in sent[0][
+        "headers"
+    ]
 
 
 def test_prefix_routing_rejects_oversized_request_body():
@@ -1535,12 +2227,14 @@ def _make_replay_publisher(buffer_steps=2):
     publisher._group_hashes = {}
     publisher._publisher_epoch = "worker-epoch-a"
     publisher._next_seq = 0
+    publisher._cache_generation = 0
     publisher._data_parallel_rank = 0
     publisher._pack = msgspec.msgpack.Encoder()
     return publisher
 
 
 def _record_replay_batch(publisher, batch):
+    publisher._assign_cache_generation(batch)
     seq = publisher._next_seq
     publisher._next_seq += 1
     payload = publisher._pack.encode(batch)
@@ -2027,6 +2721,20 @@ def test_prefix_cache_config_rejects_invalid_upload_limits(kwargs, error):
             },
             "view_ttl_seconds must be positive or null",
         ),
+        (
+            {
+                "nodes": [{"id": "node-a", "url": "local"}],
+                "route_validation_mode": "projected",
+            },
+            "route_validation_mode must be 'native-control' or 'generation-scoped'",
+        ),
+        (
+            {
+                "nodes": [{"id": "node-a", "url": "local"}],
+                "emit_response_headers": "yes",
+            },
+            "emit_response_headers must be a boolean",
+        ),
     ],
 )
 def test_prefix_routing_config_rejects_invalid_values(config, error):
@@ -2051,6 +2759,8 @@ def test_prefix_routing_config_derives_and_disables_view_ttl():
         vllm_config,
     )
     assert config.view_ttl_seconds == 6.0
+    assert config.route_validation_mode == ROUTE_VALIDATION_MODE_GENERATION_SCOPED
+    assert config.emit_response_headers is False
 
     disabled = _parse_prefix_routing_config(
         {
@@ -2060,6 +2770,17 @@ def test_prefix_routing_config_derives_and_disables_view_ttl():
         vllm_config,
     )
     assert disabled.view_ttl_seconds is None
+
+    native_control = _parse_prefix_routing_config(
+        {
+            "nodes": [{"id": "node-a", "url": "local"}],
+            "route_validation_mode": ROUTE_VALIDATION_MODE_NATIVE_CONTROL,
+            "emit_response_headers": True,
+        },
+        vllm_config,
+    )
+    assert native_control.route_validation_mode == ROUTE_VALIDATION_MODE_NATIVE_CONTROL
+    assert native_control.emit_response_headers is True
 
 
 def test_api_app_wires_prefix_routing_middleware_route_and_shutdown(monkeypatch):

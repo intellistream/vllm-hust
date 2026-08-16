@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -15,6 +16,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_events import (
+    AllBlocksCleared,
     EventPublisherFactory,
     KVEventBatch,
     PrefixCacheEventUploaderFactory,
@@ -71,6 +73,9 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+PREFIX_ROUTING_VALIDATION_MODE_ENV = "VLLM_PREFIX_ROUTING_VALIDATION_MODE"
+PREFIX_ROUTING_GENERATION_SCOPED_MODE = "generation-scoped"
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -91,6 +96,10 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
+        self.enable_prefix_route_local_fence = (
+            os.getenv(PREFIX_ROUTING_VALIDATION_MODE_ENV)
+            == PREFIX_ROUTING_GENERATION_SCOPED_MODE
+        )
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
@@ -1850,23 +1859,7 @@ class Scheduler(SchedulerInterface):
                     else scheduler_kv_connector_stats
                 )
 
-        # collect KV cache events from KV cache manager
-        events = self.kv_cache_manager.take_events()
-
-        # collect KV cache events from connector
-        if self.connector is not None:
-            connector_events = self.connector.take_events()
-            if connector_events:
-                if events is None:
-                    events = list(connector_events)
-                else:
-                    events.extend(connector_events)
-
-        # publish collected KV cache events
-        if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
-            self.kv_event_publisher.publish(batch)
-            self.prefix_cache_event_uploader.publish(batch)
+        self._publish_kv_cache_events()
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
@@ -2283,6 +2276,8 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if reset_successful and self.enable_prefix_route_local_fence:
+            self._record_local_prefix_cache_route_fence_events([AllBlocksCleared()])
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
@@ -2295,6 +2290,46 @@ class Scheduler(SchedulerInterface):
             reset_successful = self.reset_connector_cache() and reset_successful
 
         return reset_successful
+
+    def get_prefix_cache_route_fence_state(self) -> dict[str, Any] | None:
+        for publisher in (
+            self.prefix_cache_event_uploader,
+            self.kv_event_publisher,
+        ):
+            get_state = getattr(publisher, "get_route_fence_state", None)
+            if get_state is None:
+                continue
+            state = get_state()
+            if state is not None:
+                return state
+        return None
+
+    def _record_local_prefix_cache_route_fence_events(
+        self, events: list[Any]
+    ) -> None:
+        for publisher in (
+            self.prefix_cache_event_uploader,
+            self.kv_event_publisher,
+        ):
+            record = getattr(publisher, "record_local_route_fence_events", None)
+            if record is not None:
+                record(events)
+
+    def _publish_kv_cache_events(self) -> None:
+        events = self.kv_cache_manager.take_events()
+
+        if self.connector is not None:
+            connector_events = self.connector.take_events()
+            if connector_events:
+                if events is None:
+                    events = list(connector_events)
+                else:
+                    events.extend(connector_events)
+
+        if events:
+            batch = KVEventBatch(ts=time.time(), events=events)
+            self.kv_event_publisher.publish(batch)
+            self.prefix_cache_event_uploader.publish(batch)
 
     def reset_connector_cache(self) -> bool:
         if self.connector is None:
