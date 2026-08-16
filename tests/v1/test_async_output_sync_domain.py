@@ -121,9 +121,7 @@ def test_batch_sync_exception_falls_back_to_per_output_sync(caplog) -> None:
     outputs = [FakeAsyncOutput(domain) for _ in range(2)]
     outputs[-1].sync_error = True
 
-    with caplog.at_level(
-        logging.CRITICAL, logger=multiproc_executor.__name__
-    ):
+    with caplog.at_level(logging.CRITICAL, logger=multiproc_executor.__name__):
         proc.enqueue_output_batch(outputs)
 
     # Safety property (3): every output is synchronized individually via
