@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.request_owned_drain import RequestOwnedKVDrainController
 from vllm.v1.worker.request_owned_kv import (
     AllocationResult,
     DeferredFreeResult,
@@ -43,7 +44,6 @@ from vllm.v1.worker.request_owned_offload import (
     OwnerOffloadPlan,
     RequestOwnedBulkOffloadAdapter,
     RequestOwnedBulkRestoreWork,
-    RequestOwnedOffloadError,
     make_request_owned_offload_keys,
 )
 
@@ -250,6 +250,7 @@ class _RequestOwnedDeferredStep:
     step_seq: int
     trial_manager: AttentionLeaseManager
     metadata: RequestOwnedStepMetadata
+    wait_for_drain: bool
 
     def __post_init__(self) -> None:
         if (
@@ -270,6 +271,8 @@ class _RequestOwnedDeferredStep:
                 "metadata must be a RequestOwnedStepMetadata, got "
                 f"{type(self.metadata).__name__}."
             )
+        if not isinstance(self.wait_for_drain, bool):
+            raise TypeError("wait_for_drain must be a bool")
 
 
 def _normalize_request_owned_kv_cache_config(
@@ -345,6 +348,7 @@ class WorkerWrapperBase:
         self._request_owned_offload_adapter: RequestOwnedBulkOffloadAdapter | None = (
             None
         )
+        self._request_owned_kv_drain: RequestOwnedKVDrainController | None = None
         #: Immutable worker-local G3 execution metadata of the last step
         #: whose command+publication validation succeeded.  Cleared at the
         #: start of every request-owned call (the concrete worker is
@@ -629,7 +633,11 @@ class WorkerWrapperBase:
             )
         try:
             result = self._execute_request_owned_control_step_impl(scheduler_output)
-        except BaseException:
+        except BaseException as exc:
+            if self._request_owned_kv_drain is not None:
+                self._request_owned_kv_drain.fail_uncommitted(
+                    f"control step failed before PREEMPT receipt commit ({exc!r})"
+                )
             self._rollback_request_owned_restore_guard()
             raise
         if self._request_owned_restore_guard is not None:
@@ -773,6 +781,13 @@ class WorkerWrapperBase:
             command.kind is OwnerCommandKind.RESTORE
             for command in scheduler_output.owner_commands
         )
+        drain = self._request_owned_kv_drain
+        if drain is not None:
+            if drain.advance(store):
+                store.flush()
+            if restore_control_step and drain.pending_dma:
+                drain.wait(store)
+                store.flush()
         if restore_control_step and (
             any(
                 command.kind is not OwnerCommandKind.RESTORE
@@ -805,9 +820,18 @@ class WorkerWrapperBase:
             if not preflight.accepted:
                 trial_manager = candidate
                 continue
+            if (
+                command.kind is OwnerCommandKind.RELEASE
+                and drain is not None
+                and drain.has_key(command.key)
+            ):
+                drain.wait_key(command.key, store)
+                store.flush()
+                drain.discard_receipt(command.key)
             physical, pending_restore = self._apply_request_owned_physical(
                 command, store, step_seq
             )
+            drain = self._request_owned_kv_drain
             if physical.accepted:
                 if pending_restore is not None:
                     restore_work.append(pending_restore)
@@ -883,6 +907,7 @@ class WorkerWrapperBase:
                     step_seq=step_seq,
                     trial_manager=trial_manager,
                     metadata=metadata,
+                    wait_for_drain=total_tokens == 0,
                 )
                 return None
 
@@ -914,7 +939,11 @@ class WorkerWrapperBase:
             # Synchronous token output: same terminal path as the deferred
             # sample_tokens completion (mark -> flush -> emit -> commit).
             result = self._complete_request_owned_step(
-                step_seq, trial_manager, metadata, output
+                step_seq,
+                trial_manager,
+                metadata,
+                output,
+                wait_for_drain=total_tokens == 0,
             )
             self._request_owned_restore_guard = None
             return result
@@ -925,8 +954,11 @@ class WorkerWrapperBase:
         # finished are deferred physical PREEMPT/RELEASE frees returned to the
         # shared pool, so the receipt certifies physical free.  The attached
         # capacity snapshot is block-ID-free and is taken after the flush.
+        self._finish_request_owned_drains(store, wait=total_tokens == 0)
         store.flush()
         batch = trial_manager.emit_batch(step_seq)
+        if self._request_owned_kv_drain is not None:
+            batch = self._request_owned_kv_drain.decorate_batch(batch)
         result.owner_receipt_batches = [
             replace(batch, cache_pool=store.pool_snapshot())
         ]
@@ -1112,49 +1144,31 @@ class WorkerWrapperBase:
             )
         return adapter
 
+    def _require_request_owned_kv_drain(self) -> RequestOwnedKVDrainController:
+        controller = self._request_owned_kv_drain
+        adapter = self._require_request_owned_offload_adapter()
+        if controller is None:
+            controller = RequestOwnedKVDrainController(adapter)
+            self._request_owned_kv_drain = controller
+        elif controller.adapter is not adapter:
+            raise RuntimeError("request-owned KV drain adapter changed during runtime")
+        return controller
+
     def _store_request_owned_preempt(
         self, command: OwnerCommand, store: RequestOwnedKVStore
     ) -> DeferredFreeResult:
-        adapter = self._require_request_owned_offload_adapter()
-        snapshot = store.computed_prefix_snapshot(command.key)
-        if snapshot is None:
-            return DeferredFreeResult(
-                accepted=False,
-                key=command.key,
-                error="PREEMPT has no owner-local computed-prefix source",
-            )
-        identity = adapter.bind(snapshot, active=True)
-        adapter.retire(identity)
-        plan = OwnerOffloadPlan.from_snapshot(
-            snapshot,
-            make_request_owned_offload_keys(snapshot, store.group_block_sizes),
-        )
-        job = adapter.submit_store(plan)
-        adapter.wait((job,))
-        receipts = adapter.poll()
-        matching = tuple(item for item in receipts if item.job_id == job.job_id)
-        if len(matching) != 1 or len(receipts) != 1:
-            adapter.abort(identity)
-            raise RequestOwnedOffloadError(
-                f"PREEMPT store produced {len(matching)} exact and "
-                f"{len(receipts)} total completion receipts"
-            )
-        receipt = matching[0]
-        if not receipt.success:
-            # The GPU source is still intact. Reopen the retired ledger state
-            # so a later PREEMPT retry can submit the same generation again.
-            adapter.activate(identity)
-            return DeferredFreeResult(
-                accepted=False,
-                key=command.key,
-                error=receipt.error,
-            )
-        reclaimable = adapter.take_reclaimable(identity)
-        if reclaimable != plan.device_block_ids:
-            raise RequestOwnedOffloadError(
-                "PREEMPT durable receipt named the wrong physical source"
-            )
-        return store.preempt(command)
+        return self._require_request_owned_kv_drain().start(command, store)
+
+    def _finish_request_owned_drains(
+        self, store: RequestOwnedKVStore, *, wait: bool
+    ) -> None:
+        controller = self._request_owned_kv_drain
+        if controller is None:
+            return
+        if wait:
+            controller.wait(store)
+        else:
+            controller.advance(store)
 
     def _execute_request_owned_bulk_restore(
         self,
@@ -1311,7 +1325,11 @@ class WorkerWrapperBase:
             )
 
         result = self._complete_request_owned_step(
-            pending.step_seq, pending.trial_manager, pending.metadata, output
+            pending.step_seq,
+            pending.trial_manager,
+            pending.metadata,
+            output,
+            wait_for_drain=pending.wait_for_drain,
         )
         # Clear the pending record only after the terminal path fully
         # succeeded (manager committed); a failure above leaves it intact.
@@ -1324,6 +1342,8 @@ class WorkerWrapperBase:
         trial_manager: AttentionLeaseManager,
         metadata: RequestOwnedStepMetadata,
         output: ModelRunnerOutput,
+        *,
+        wait_for_drain: bool = False,
     ) -> ModelRunnerOutput:
         """Shared terminal decoration for request-owned sampling.
 
@@ -1370,8 +1390,11 @@ class WorkerWrapperBase:
             # returned to the shared pool, so the receipt certifies physical
             # free.  The attached capacity snapshot is block-ID-free and is
             # taken after the flush.
+            self._finish_request_owned_drains(store, wait=wait_for_drain)
             store.flush()
             batch = trial_manager.emit_batch(step_seq)
+            if self._request_owned_kv_drain is not None:
+                batch = self._request_owned_kv_drain.decorate_batch(batch)
             result.owner_receipt_batches = [
                 replace(batch, cache_pool=store.pool_snapshot())
             ]
