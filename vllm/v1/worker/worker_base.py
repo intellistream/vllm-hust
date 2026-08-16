@@ -43,8 +43,11 @@ from vllm.v1.worker.request_owned_offload import (
     OwnerOffloadIdentity,
     OwnerOffloadPlan,
     RequestOwnedBulkOffloadAdapter,
-    RequestOwnedBulkRestoreWork,
     make_request_owned_offload_keys,
+)
+from vllm.v1.worker.request_owned_restore_runtime import (
+    RequestOwnedBulkRestoreWork,
+    RequestOwnedRestoreGuard,
 )
 
 if TYPE_CHECKING:
@@ -251,6 +254,7 @@ class _RequestOwnedDeferredStep:
     trial_manager: AttentionLeaseManager
     metadata: RequestOwnedStepMetadata
     wait_for_drain: bool
+    restore_guard: RequestOwnedRestoreGuard | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -273,6 +277,10 @@ class _RequestOwnedDeferredStep:
             )
         if not isinstance(self.wait_for_drain, bool):
             raise TypeError("wait_for_drain must be a bool")
+        if self.restore_guard is not None and not isinstance(
+            self.restore_guard, RequestOwnedRestoreGuard
+        ):
+            raise TypeError("restore_guard must be a RequestOwnedRestoreGuard or None")
 
 
 def _normalize_request_owned_kv_cache_config(
@@ -373,19 +381,10 @@ class WorkerWrapperBase:
         #: mark.
         self._request_owned_fail_stop: str | None = None
 
-        #: Exact destinations of a bulk RESTORE whose H2D has completed but
-        #: whose control step has not committed yet.  The public wrapper
-        #: rolls these destinations back on *any* later step failure, leaving
-        #: the durable cold image intact so the same RESTORE can be retried.
-        self._request_owned_restore_guard: (
-            tuple[
-                tuple[RequestOwnedBulkRestoreWork, ...],
-                RequestOwnedKVStore,
-                RequestOwnedStepBuildCheckpoint,
-                int,
-            ]
-            | None
-        ) = None
+        #: Exact destinations of a bulk RESTORE whose H2D may be in flight
+        #: while unrelated work executes and whose control step has not
+        #: committed yet. The wrapper fences DMA before rollback/recycling.
+        self._request_owned_restore_guard: RequestOwnedRestoreGuard | None = None
 
     def shutdown(self) -> None:
         if self.worker is not None:
@@ -782,24 +781,20 @@ class WorkerWrapperBase:
             for command in scheduler_output.owner_commands
         )
         drain = self._request_owned_kv_drain
-        if drain is not None:
-            if drain.advance(store):
-                store.flush()
-            if restore_control_step and drain.pending_dma:
-                drain.wait(store)
-                store.flush()
-        if restore_control_step and (
-            any(
-                command.kind is not OwnerCommandKind.RESTORE
-                for command in scheduler_output.owner_commands
-            )
-            or total_tokens != 0
-            or any(count != 0 for count in per_request_tokens.values())
-            or scheduler_output.scheduled_owner_leases
-        ):
+        if drain is not None and drain.advance(store):
+            store.flush()
+        restore_keys = {
+            command.key
+            for command in scheduler_output.owner_commands
+            if command.kind is OwnerCommandKind.RESTORE
+        }
+        scheduled_restore_keys = restore_keys.intersection(
+            token.key for token in scheduler_output.scheduled_owner_leases
+        )
+        if scheduled_restore_keys:
             raise RuntimeError(
-                "request-owned bulk RESTORE requires an exclusive zero-token "
-                "global owner control step"
+                "request-owned background RESTORE cannot schedule its target "
+                "before the terminal H2D receipt"
             )
 
         # Commands form one reliable in-order stream per owner.  Every worker
@@ -840,11 +835,12 @@ class WorkerWrapperBase:
                         restore_build_checkpoint = store.checkpoint_step_build()
                     # Arm immediately: a later command in the same owner
                     # batch can still fail before the H2D hook runs.
-                    self._request_owned_restore_guard = (
-                        tuple(restore_work),
-                        store,
-                        restore_build_checkpoint,
-                        step_seq,
+                    self._request_owned_restore_guard = RequestOwnedRestoreGuard(
+                        work=tuple(restore_work),
+                        commands=tuple(restore_commands),
+                        store=store,
+                        build_checkpoint=restore_build_checkpoint,
+                        step_seq=step_seq,
                     )
                 trial_manager = candidate
                 continue
@@ -854,14 +850,7 @@ class WorkerWrapperBase:
             trial_manager.apply(command, external_reject_error=reject_error)
 
         if restore_work:
-            self._execute_request_owned_bulk_restore(tuple(restore_work), store)
-            # H2D and destination readiness are now real, but the logical
-            # RESTORE receipt is not durable until this whole control step
-            # commits.  Arm the rollback guard *before* completing the trial
-            # manager so metadata delivery, model execution, output checks,
-            # flush, receipt emission, and commit are all covered.
-            for command in restore_commands:
-                trial_manager.complete_restore(command.key, command.command_seq)
+            self._execute_request_owned_bulk_restore(tuple(restore_work))
 
         for token in scheduler_output.scheduled_owner_leases:
             if token.owner_id == self.global_rank:
@@ -876,6 +865,10 @@ class WorkerWrapperBase:
         metadata = self._build_request_owned_step_metadata(
             store, step_seq, scheduler_output
         )
+        if self._request_owned_restore_guard is not None:
+            self._request_owned_restore_guard.note_step_build(
+                nonempty=bool(metadata.entries)
+            )
         self._request_owned_step_metadata = metadata
         # G3 handoff: deliver the immutable metadata to the concrete worker
         # through its private hook, without attaching it to or mutating any
@@ -888,34 +881,31 @@ class WorkerWrapperBase:
         from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
         if sampling_enabled and output is None:
-            if restore_control_step:
-                # Ascend deliberately represents an owner-sampling zero-token
-                # heartbeat as execute_model() -> None followed by an empty
-                # sample_tokens() envelope. RESTORE must still commit in this
-                # synchronous collective RPC so the whole-step rollback guard
-                # never escapes across the executor's deferred boundary. Ask
-                # the concrete worker for that real heartbeat rather than
-                # fabricating an empty output (the sampling aggregator requires
-                # one owner-qualified empty batch from every rank).
+            if restore_control_step and total_tokens == 0:
+                # Close every global RESTORE step in this collective RPC so
+                # a zero-token heartbeat needs no grammar round trip. H2D
+                # remains in flight through model execution and sampling,
+                # then its exact receipt is fenced below.
                 output = self.worker.sample_tokens(None)
             else:
                 # Deferred sampling: keep the trial manager and the exact
-                # metadata in one pending record keyed by step_seq.  Nothing is
-                # marked, flushed, emitted, or committed until sample_tokens
-                # completes the step.
+                # metadata in one pending record keyed by step_seq. A mixed
+                # RESTORE transfers its guard too, so H2D can keep running
+                # without replacing the executor's real grammar payload.
+                restore_guard = self._request_owned_restore_guard
+                self._request_owned_restore_guard = None
                 self._request_owned_deferred = _RequestOwnedDeferredStep(
                     step_seq=step_seq,
                     trial_manager=trial_manager,
                     metadata=metadata,
                     wait_for_drain=total_tokens == 0,
+                    restore_guard=restore_guard,
                 )
                 return None
 
         if output is None:
-            if sampling_enabled and restore_control_step:
-                raise RuntimeError(
-                    "request-owned RESTORE heartbeat sample_tokens returned None"
-                )
+            if sampling_enabled and restore_control_step and total_tokens == 0:
+                raise RuntimeError("request-owned RESTORE sample_tokens returned None")
             raise RuntimeError(
                 "request-owned attention G1 does not support split sampling: "
                 "execute_model returned None and no exact receipt FIFO exists."
@@ -934,6 +924,9 @@ class WorkerWrapperBase:
                 "request-owned attention worker returned an unexpected "
                 f"output type {type(output).__name__}."
             )
+
+        if self._request_owned_restore_guard is not None:
+            self._request_owned_restore_guard.finish(trial_manager)
 
         if sampling_enabled:
             # Synchronous token output: same terminal path as the deferred
@@ -973,33 +966,12 @@ class WorkerWrapperBase:
         self._request_owned_restore_guard = None
         if guard is None:
             return
-        work, store, build_checkpoint, step_seq = guard
-        errors: list[str] = []
-        try:
-            store.rollback_empty_step_build(build_checkpoint, step_seq)
-        except BaseException as exc:
-            errors.append(f"step-build rollback for {step_seq}: {exc!r}")
-        for item in work:
-            identity = item.plan.identity
-            try:
-                item.adapter.abort(identity)
-            except BaseException as exc:
-                errors.append(f"adapter abort for {identity.key!r}: {exc!r}")
-            try:
-                if not store.abort_restore(
-                    identity.key, identity.allocation_generation
-                ):
-                    errors.append(
-                        "physical destination did not match "
-                        f"{identity.key!r} generation "
-                        f"{identity.allocation_generation}"
-                    )
-            except BaseException as exc:
-                errors.append(f"store abort for {identity.key!r}: {exc!r}")
-        if errors:
-            raise RuntimeError(
-                "request-owned RESTORE rollback failed: " + "; ".join(errors)
+        if guard.nonempty_step_built and self._request_owned_fail_stop is None:
+            self._request_owned_fail_stop = (
+                "background RESTORE overlapped a nonempty step that failed; "
+                "the executed step cannot be retried safely"
             )
+        guard.rollback()
 
     def _request_owned_sampling_enabled(self) -> bool:
         """G3 sampling gate, default off.
@@ -1173,7 +1145,6 @@ class WorkerWrapperBase:
     def _execute_request_owned_bulk_restore(
         self,
         work: tuple[RequestOwnedBulkRestoreWork, ...],
-        store: RequestOwnedKVStore,
     ) -> None:
         hook = getattr(self.worker, "execute_request_owned_bulk_restore", None)
         if not callable(hook):
@@ -1183,12 +1154,9 @@ class WorkerWrapperBase:
             )
         hook(work)
         for item in work:
-            identity = item.plan.identity
-            if not store.mark_restore_ready(
-                identity.key, identity.allocation_generation
-            ):
+            if not item.submitted:
                 raise RuntimeError(
-                    "bulk RESTORE completion did not match its destination generation"
+                    "bulk RESTORE hook returned without submitting exact H2D"
                 )
 
     def _build_request_owned_step_metadata(
@@ -1303,34 +1271,42 @@ class WorkerWrapperBase:
                 "exists (replay or out-of-order call)."
             )
 
-        output = self.worker.sample_tokens(grammar_output)
+        self._request_owned_restore_guard = pending.restore_guard
+        try:
+            output = self.worker.sample_tokens(grammar_output)
 
-        from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+            from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
-        if output is None:
-            raise RuntimeError(
-                "request-owned deferred sampling failed: "
-                "worker.sample_tokens returned None."
-            )
-        if isinstance(output, AsyncModelRunnerOutput):
-            raise RuntimeError(
-                "request-owned attention does not support async model "
-                "runner outputs from sample_tokens without a step-keyed "
-                "receipt FIFO."
-            )
-        if not isinstance(output, ModelRunnerOutput):
-            raise RuntimeError(
-                "request-owned attention worker returned an unexpected "
-                f"output type {type(output).__name__} from sample_tokens."
-            )
+            if output is None:
+                raise RuntimeError(
+                    "request-owned deferred sampling failed: "
+                    "worker.sample_tokens returned None."
+                )
+            if isinstance(output, AsyncModelRunnerOutput):
+                raise RuntimeError(
+                    "request-owned attention does not support async model "
+                    "runner outputs from sample_tokens without a step-keyed "
+                    "receipt FIFO."
+                )
+            if not isinstance(output, ModelRunnerOutput):
+                raise RuntimeError(
+                    "request-owned attention worker returned an unexpected "
+                    f"output type {type(output).__name__} from sample_tokens."
+                )
 
-        result = self._complete_request_owned_step(
-            pending.step_seq,
-            pending.trial_manager,
-            pending.metadata,
-            output,
-            wait_for_drain=pending.wait_for_drain,
-        )
+            if pending.restore_guard is not None:
+                pending.restore_guard.finish(pending.trial_manager)
+            result = self._complete_request_owned_step(
+                pending.step_seq,
+                pending.trial_manager,
+                pending.metadata,
+                output,
+                wait_for_drain=pending.wait_for_drain,
+            )
+        except BaseException:
+            self._rollback_request_owned_restore_guard()
+            raise
+        self._request_owned_restore_guard = None
         # Clear the pending record only after the terminal path fully
         # succeeded (manager committed); a failure above leaves it intact.
         self._request_owned_deferred = None
@@ -1356,10 +1332,9 @@ class WorkerWrapperBase:
         logical manager is committed.  A rejection of the mark fails
         atomically: the logical manager stays uncommitted and (for the
         deferred path) the pending record stays intact.  A failure after a
-        real computed mark is irreversible and latches fail-stop.  The sole
-        exception is an exclusive zero-token RESTORE heartbeat: its empty
-        mark/build fences and physical destination are jointly reversible
-        under the armed whole-step restore guard."""
+        real computed mark is irreversible and latches fail-stop. An empty
+        RESTORE heartbeat remains reversible under its armed guard; a mixed
+        token-bearing RESTORE step still fail-stops after any real mark."""
         store = self._request_owned_kv_store
         if store is None:
             raise RuntimeError(
@@ -1400,10 +1375,9 @@ class WorkerWrapperBase:
             ]
         except BaseException as exc:
             # A real computed batch is irreversible and must latch fail-stop.
-            # An armed RESTORE guard necessarily covers an exclusive empty
-            # heartbeat; its scalar empty-mark/build fences are rolled back
-            # with the physical destination by the outer wrapper.
-            if self._request_owned_restore_guard is None:
+            # Only an empty RESTORE heartbeat can roll back its scalar build
+            # fence together with the physical destination.
+            if metadata.entries or self._request_owned_restore_guard is None:
                 self._request_owned_fail_stop = (
                     "computed batch mark succeeded but the irreversible "
                     f"terminal completion failed ({exc!r}); the step is "

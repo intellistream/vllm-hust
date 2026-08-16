@@ -24,9 +24,11 @@ from vllm.v1.worker.request_owned_offload import (
     OwnerOffloadPlan,
     RequestOwnedBulkOffloadAdapter,
     RequestOwnedBulkOffloadLedger,
-    RequestOwnedBulkRestoreWork,
     RequestOwnedOffloadError,
     make_request_owned_offload_keys,
+)
+from vllm.v1.worker.request_owned_restore_runtime import (
+    RequestOwnedBulkRestoreWork,
 )
 
 
@@ -508,7 +510,7 @@ def test_adapter_restores_only_source_concrete_positions_into_fresh_blocks() -> 
     adapter.activate(destination_id)
 
 
-def test_restore_work_is_post_zero_completion_and_replay_fenced() -> None:
+def test_restore_work_submits_after_zero_then_completes_after_useful_work() -> None:
     device = torch.arange(10 * 8, dtype=torch.int16).view(10, 8)
     manager = CPUOffloadingManager(num_blocks=8)
     worker = _TensorOffloadingWorker(device, num_host_blocks=8)
@@ -535,10 +537,52 @@ def test_restore_work_is_post_zero_completion_and_replay_fenced() -> None:
         plan=restore_plan,
         zero_block_ids=((5, 6, 9), (7, 8)),
     )
-    receipt = work.execute_after_zero()
-    assert receipt.success
-    with pytest.raises(RequestOwnedOffloadError, match="already executed"):
+    job = work.execute_after_zero()
+    assert job.direction is OwnerBulkTransferDirection.RESTORE
+    assert work.submitted
+    with pytest.raises(RequestOwnedOffloadError, match="already submitted"):
         work.execute_after_zero()
+
+    receipt = work.finish_after_submit()
+    assert receipt.success
+    with pytest.raises(RequestOwnedOffloadError, match="already completed"):
+        work.finish_after_submit()
+
+
+def test_poll_jobs_preserves_unrelated_completion_receipts(monkeypatch) -> None:
+    manager = CPUOffloadingManager(num_blocks=16)
+    worker = _FakeOffloadingWorker()
+    adapter = RequestOwnedBulkOffloadAdapter(
+        owner_rank=3,
+        manager=manager,
+        worker=worker,
+    )
+
+    jobs = []
+    for request_id, blocks in (("a", ((1, 2), (3, 4))), ("b", ((5, 6), (7, 8)))):
+        snapshot = _snapshot(request_id=request_id, tables=blocks)
+        identity = adapter.bind(snapshot, active=True)
+        adapter.retire(identity)
+        keys = make_request_owned_offload_keys(snapshot, (4, 4))
+        jobs.append(
+            adapter.submit_store(OwnerOffloadPlan.from_snapshot(snapshot, keys))
+        )
+
+    for job in jobs:
+        worker.finish(job.job_id)
+    recorded: list[int] = []
+    record_store_image = adapter._record_store_image
+
+    def record_once(receipt):
+        recorded.append(receipt.job_id)
+        record_store_image(receipt)
+
+    monkeypatch.setattr(adapter, "_record_store_image", record_once)
+    assert adapter.poll_jobs((jobs[1],))[0].job_id == jobs[1].job_id
+    assert sorted(recorded) == sorted(job.job_id for job in jobs)
+    assert adapter.poll_jobs((jobs[0],))[0].job_id == jobs[0].job_id
+    assert sorted(recorded) == sorted(job.job_id for job in jobs)
+    assert adapter.poll() == ()
 
 
 def test_adapter_failure_or_abort_never_reclaims_or_publishes_durable() -> None:

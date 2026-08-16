@@ -841,6 +841,7 @@ class RequestOwnedBulkOffloadAdapter:
         self.ledger = RequestOwnedBulkOffloadLedger(owner_rank)
         self._submissions: dict[int, _AdapterSubmission] = {}
         self._ready_receipts: deque[OwnerBulkTransferReceipt] = deque()
+        self._held_receipts: deque[OwnerBulkTransferReceipt] = deque()
         self._owned_host_keys: dict[OwnerLeaseKey, set[OffloadKey]] = {}
 
     def bind(
@@ -952,7 +953,9 @@ class RequestOwnedBulkOffloadAdapter:
     def poll(self) -> tuple[OwnerBulkTransferReceipt, ...]:
         """Consume worker results and return exact owner-qualified receipts."""
 
-        receipts = list(self._ready_receipts)
+        receipts = list(self._held_receipts)
+        self._held_receipts.clear()
+        new_receipts = list(self._ready_receipts)
         self._ready_receipts.clear()
         for result in self.worker.get_finished():
             submission = self._submissions.pop(result.job_id, None)
@@ -989,14 +992,33 @@ class RequestOwnedBulkOffloadAdapter:
             )
             if not submission.aborted:
                 self.ledger.complete(receipt)
-            receipts.append(receipt)
-        for receipt in receipts:
+            new_receipts.append(receipt)
+        for receipt in new_receipts:
             if (
                 receipt.success
                 and receipt.direction is OwnerBulkTransferDirection.STORE
             ):
                 self._record_store_image(receipt)
+        receipts.extend(new_receipts)
         return tuple(receipts)
+
+    def poll_jobs(
+        self, jobs: tuple[OwnerBulkTransferJob, ...]
+    ) -> tuple[OwnerBulkTransferReceipt, ...]:
+        """Poll exact jobs without consuming unrelated transfer receipts."""
+
+        job_ids = tuple(job.job_id for job in jobs)
+        if len(set(job_ids)) != len(job_ids):
+            raise RequestOwnedOffloadError(
+                "cannot poll duplicate owner transfer job IDs"
+            )
+        expected = set(job_ids)
+        selected: list[OwnerBulkTransferReceipt] = []
+        retained: list[OwnerBulkTransferReceipt] = []
+        for receipt in self.poll():
+            (selected if receipt.job_id in expected else retained).append(receipt)
+        self._held_receipts.extend(retained)
+        return tuple(selected)
 
     def wait(self, jobs: tuple[OwnerBulkTransferJob, ...]) -> None:
         """Wait for submitted DMA only; call :meth:`poll` for receipts."""
@@ -1149,69 +1171,3 @@ class RequestOwnedBulkOffloadAdapter:
             block_indices.append(positions[0] if positions else 0)
             block_ids.extend(group_blocks[index] for index in positions)
         return GPULoadStoreSpec(block_ids, group_sizes, block_indices)
-
-
-@dataclass(slots=True)
-class RequestOwnedBulkRestoreWork:
-    """One exact post-zero, pre-forward full-restore action.
-
-    The object stays worker-private.  The device-specific runner owns the
-    zeroing seam, then calls :meth:`execute_after_zero`; the method is
-    replay-fenced and returns only after the upstream offloading worker has
-    produced the exact completion receipt.
-    """
-
-    step_seq: int
-    adapter: RequestOwnedBulkOffloadAdapter
-    plan: OwnerOffloadPlan
-    zero_block_ids: tuple[tuple[int, ...], ...]
-    executed: bool = False
-
-    def __post_init__(self) -> None:
-        if (
-            isinstance(self.step_seq, bool)
-            or not isinstance(self.step_seq, int)
-            or self.step_seq <= 0
-        ):
-            raise TypeError(
-                f"step_seq must be a positive non-bool int, got {self.step_seq!r}."
-            )
-        if not isinstance(self.adapter, RequestOwnedBulkOffloadAdapter):
-            raise TypeError("adapter must be a RequestOwnedBulkOffloadAdapter")
-        if not isinstance(self.plan, OwnerOffloadPlan):
-            raise TypeError("plan must be an OwnerOffloadPlan")
-        if not isinstance(self.zero_block_ids, tuple):
-            raise TypeError("zero_block_ids must be a tuple of group tuples")
-        if len(self.zero_block_ids) != len(self.plan.device_block_ids):
-            raise ValueError("zero and restore plans must cover the same groups")
-        for restore_ids, zero_ids in zip(
-            self.plan.device_block_ids, self.zero_block_ids
-        ):
-            if not set(restore_ids).issubset(zero_ids):
-                raise ValueError(
-                    "every restore destination must be covered by the zero plan"
-                )
-
-    def execute_after_zero(self) -> OwnerBulkTransferReceipt:
-        if self.executed:
-            raise RequestOwnedOffloadError(
-                f"restore work for step {self.step_seq} was already executed"
-            )
-        self.executed = True
-        job = self.adapter.submit_restore(self.plan)
-        self.adapter.wait((job,))
-        receipts = self.adapter.poll()
-        matching = tuple(
-            receipt for receipt in receipts if receipt.job_id == job.job_id
-        )
-        if len(matching) != 1 or len(receipts) != 1:
-            raise RequestOwnedOffloadError(
-                f"bulk restore job {job.job_id} produced {len(matching)} exact "
-                f"and {len(receipts)} total receipts"
-            )
-        receipt = matching[0]
-        if not receipt.success:
-            raise RequestOwnedOffloadError(
-                receipt.error or f"bulk restore job {job.job_id} failed"
-            )
-        return receipt

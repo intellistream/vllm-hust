@@ -18,3 +18,7 @@ and inquiry, not individual assets, lifecycle state, or chronology.
   altering background D2H, reclaim/receipt ordering, same-key RELEASE, or the
   shared STORE/RESTORE adapter poll boundary. Read
   [`scenarios/request-owned-kv-drain/GUIDE.md`](scenarios/request-owned-kv-drain/GUIDE.md).
+- **Evolve request-owned background restore:** use when changing H2D restore
+  overlap, its rollback/activation fence, deferred sampling integration, or
+  its shared receipt path with D2H drain. Read
+  [`scenarios/evolve-request-owned-background-restore/GUIDE.md`](scenarios/evolve-request-owned-background-restore/GUIDE.md).

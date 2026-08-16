@@ -30,8 +30,11 @@ that publishes reclaim authority before host durability.
 - A zero-token control step waits once for all current drains. This prevents
   command-only heartbeat spinning when there is no useful work to overlap.
 - `RequestOwnedBulkOffloadAdapter.poll()` destructively consumes completions
-  from its shared STORE/RESTORE worker namespace. Before the synchronous
-  RESTORE path can submit and poll H2D, all background drains must be quiesced.
+  from its shared STORE/RESTORE worker namespace. Background RESTORE must use
+  `poll_jobs()` for its exact H2D jobs; that path holds already-processed STORE
+  receipts without replaying their host-image side effects, so the drain
+  controller can consume them at its next terminal poll. Never bypass that
+  selector or force D2H quiescence merely to submit H2D.
 - A same-key RELEASE must wait for its D2H before it may invalidate adapter or
   source state. The now-superseded PREEMPT receipt is discarded; only the
   current RELEASE receipt is published.

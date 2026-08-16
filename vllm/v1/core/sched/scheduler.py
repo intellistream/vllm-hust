@@ -3956,7 +3956,7 @@ class Scheduler(SchedulerInterface):
         )
 
     def _issue_owner_restore(self, request: Request, key: OwnerLeaseKey) -> None:
-        """Issue one synchronous bulk RESTORE before resume admission."""
+        """Issue one receipt-gated background RESTORE before resume admission."""
 
         coordinator = self.owner_coordinator
         assert coordinator is not None
