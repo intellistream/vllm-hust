@@ -768,6 +768,9 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def get_prefix_cache_route_fence_state(self) -> dict[str, Any] | None:
+        return self.scheduler.get_prefix_cache_route_fence_state()
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

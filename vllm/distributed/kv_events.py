@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import json
+import os
 import queue
 import threading
 import time
@@ -24,6 +26,14 @@ from vllm.v1.core.kv_cache_utils import ExternalBlockHash
 
 logger = init_logger(__name__)
 
+WORKER_INCARNATION_ENV = "VLLM_PREFIX_ROUTING_WORKER_INCARNATION"
+PREFIX_CACHE_UPLOAD_FAULTS_ENV = "VLLM_PREFIX_CACHE_UPLOAD_FAULTS"
+_PROCESS_WORKER_INCARNATION = uuid.uuid4().hex
+
+
+def _worker_incarnation() -> str:
+    return os.getenv(WORKER_INCARNATION_ENV) or _PROCESS_WORKER_INCARNATION
+
 
 class EventBatch(
     msgspec.Struct,
@@ -34,6 +44,8 @@ class EventBatch(
     ts: float
     events: list[Any]
     data_parallel_rank: int | None = None
+    cache_generation: int | None = None
+    is_snapshot: bool = False
 
 
 class KVCacheEvent(
@@ -290,6 +302,12 @@ class EventPublisher(ABC):
     def shutdown(self) -> None:
         """Shutdown the publisher."""
 
+    def get_route_fence_state(self) -> dict[str, Any] | None:
+        return None
+
+    def record_local_route_fence_events(self, events: list[Any]) -> None:
+        return
+
 
 class NullEventPublisher(EventPublisher):
     """No-op implementation (default when disabled)."""
@@ -299,6 +317,87 @@ class NullEventPublisher(EventPublisher):
 
     def shutdown(self) -> None:
         return
+
+
+class _PrefixCacheUploadFaults:
+    """Explicit M0-only upload fault injector.
+
+    The injector is configured exclusively through
+    ``VLLM_PREFIX_CACHE_UPLOAD_FAULTS`` and is disabled by default. It only
+    drops the side-channel HTTP upload after the local mirror has consumed the
+    event, which models a lost worker-to-master update without mutating the
+    worker's real cache state.
+    """
+
+    def __init__(
+        self,
+        *,
+        drop_event_types: set[str] | None = None,
+        max_drops: int = 0,
+        drop_snapshots: bool = False,
+    ) -> None:
+        self._drop_event_types = drop_event_types
+        self._remaining_drops = max(0, max_drops)
+        self._drop_snapshots = drop_snapshots
+
+    @classmethod
+    def from_env(cls) -> "_PrefixCacheUploadFaults":
+        raw = os.getenv(PREFIX_CACHE_UPLOAD_FAULTS_ENV)
+        if not raw:
+            return cls()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Ignoring invalid %s JSON fault config",
+                PREFIX_CACHE_UPLOAD_FAULTS_ENV,
+            )
+            return cls()
+        if not isinstance(payload, dict):
+            logger.warning(
+                "Ignoring non-object %s fault config",
+                PREFIX_CACHE_UPLOAD_FAULTS_ENV,
+            )
+            return cls()
+
+        raw_event_types = payload.get("drop_event_types")
+        drop_event_types: set[str] | None
+        if raw_event_types is None:
+            drop_event_types = None
+        elif isinstance(raw_event_types, list) and all(
+            isinstance(item, str) and item for item in raw_event_types
+        ):
+            drop_event_types = set(raw_event_types)
+        else:
+            logger.warning(
+                "Ignoring invalid drop_event_types in %s",
+                PREFIX_CACHE_UPLOAD_FAULTS_ENV,
+            )
+            drop_event_types = None
+
+        raw_max_drops = payload.get("max_drops", 0)
+        max_drops = (
+            raw_max_drops
+            if isinstance(raw_max_drops, int) and not isinstance(raw_max_drops, bool)
+            else 0
+        )
+        return cls(
+            drop_event_types=drop_event_types,
+            max_drops=max_drops,
+            drop_snapshots=bool(payload.get("drop_snapshots", False)),
+        )
+
+    def drop(self, batch: EventBatch) -> bool:
+        if self._remaining_drops <= 0:
+            return False
+        if batch.is_snapshot and not self._drop_snapshots:
+            return False
+        if self._drop_event_types is not None:
+            batch_event_types = {type(event).__name__ for event in batch.events}
+            if batch_event_types.isdisjoint(self._drop_event_types):
+                return False
+        self._remaining_drops -= 1
+        return True
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -368,7 +467,7 @@ class HttpPrefixCacheEventUploader(EventPublisher):
         self._headers = {"Content-Type": "application/msgpack"}
         if token is not None:
             self._headers["Authorization"] = f"Bearer {token}"
-        self._publisher_epoch = uuid.uuid4().hex
+        self._publisher_epoch = _worker_incarnation()
         self._headers["X-Vllm-Prefix-Routing-Worker-Incarnation"] = (
             self._publisher_epoch
         )
@@ -383,6 +482,8 @@ class HttpPrefixCacheEventUploader(EventPublisher):
         self._next_snapshot_at = time.monotonic() + self._snapshot_interval
         self._needs_snapshot = threading.Event()
         self._reconcile_generation = 0
+        self._cache_generation = 0
+        self._faults = _PrefixCacheUploadFaults.from_env()
         if initial_snapshot is not None:
             self._group_block_sizes = dict(initial_snapshot.group_block_sizes)
             self._group_hashes = {
@@ -404,7 +505,14 @@ class HttpPrefixCacheEventUploader(EventPublisher):
             return
         if events.data_parallel_rank is None:
             events.data_parallel_rank = self._data_parallel_rank
+        self._assign_cache_generation(events)
         self._apply_to_mirror(events.events)
+        if self._faults.drop(events):
+            logger.warning(
+                "Prefix-cache upload fault injection dropped batch generation=%s",
+                events.cache_generation,
+            )
+            return
         try:
             self._event_queue.put_nowait(events)
         except queue.Full:
@@ -412,6 +520,30 @@ class HttpPrefixCacheEventUploader(EventPublisher):
             logger.warning(
                 "Prefix-cache upload queue is full; scheduling reconciliation"
             )
+
+    def _assign_cache_generation(self, events: EventBatch) -> None:
+        with self._state_lock:
+            if events.cache_generation is None:
+                self._cache_generation += 1
+                events.cache_generation = self._cache_generation
+            else:
+                self._cache_generation = max(
+                    self._cache_generation, events.cache_generation
+                )
+
+    def get_route_fence_state(self) -> dict[str, Any]:
+        with self._state_lock:
+            cache_generation = self._cache_generation
+        return {
+            "cache_generation": cache_generation,
+            "worker_incarnation": self._publisher_epoch,
+            "data_parallel_rank": self._data_parallel_rank,
+        }
+
+    def record_local_route_fence_events(self, events: list[Any]) -> None:
+        batch = EventBatch(ts=time.time(), events=events)
+        self._assign_cache_generation(batch)
+        self._apply_to_mirror(events)
 
     def _apply_to_mirror(self, events: list[Any]) -> None:
         with self._state_lock:
@@ -470,6 +602,8 @@ class HttpPrefixCacheEventUploader(EventPublisher):
                 ts=time.time(),
                 events=events,
                 data_parallel_rank=self._data_parallel_rank,
+                cache_generation=self._cache_generation,
+                is_snapshot=True,
             ),
             generation,
         )
@@ -618,8 +752,9 @@ class ZmqEventPublisher(EventPublisher):
         self._socket_setup()
 
         # Payload
-        self._publisher_epoch = uuid.uuid4().hex
+        self._publisher_epoch = _worker_incarnation()
         self._next_seq = 0
+        self._cache_generation = 0
         self._topic_bytes = topic.encode("utf-8")
 
         # Thread
@@ -636,9 +771,34 @@ class ZmqEventPublisher(EventPublisher):
             raise RuntimeError("Publisher is closed")
         if events.data_parallel_rank is None:
             events.data_parallel_rank = self._data_parallel_rank
+        self._assign_cache_generation(events)
         if self._replay_endpoint is not None:
             self._apply_to_mirror(events.events)
         self._event_queue.put(events)
+
+    def _assign_cache_generation(self, events: EventBatch) -> None:
+        with self._state_lock:
+            if events.cache_generation is None:
+                self._cache_generation += 1
+                events.cache_generation = self._cache_generation
+            else:
+                self._cache_generation = max(
+                    self._cache_generation, events.cache_generation
+                )
+
+    def get_route_fence_state(self) -> dict[str, Any]:
+        with self._state_lock:
+            cache_generation = self._cache_generation
+        return {
+            "cache_generation": cache_generation,
+            "worker_incarnation": self._publisher_epoch,
+            "data_parallel_rank": self._data_parallel_rank,
+        }
+
+    def record_local_route_fence_events(self, events: list[Any]) -> None:
+        batch = EventBatch(ts=time.time(), events=events)
+        self._assign_cache_generation(batch)
+        self._apply_to_mirror(events)
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
@@ -858,6 +1018,8 @@ class ZmqEventPublisher(EventPublisher):
             ts=time.time(),
             events=events,
             data_parallel_rank=self._data_parallel_rank,
+            cache_generation=self._cache_generation,
+            is_snapshot=True,
         )
 
     @staticmethod

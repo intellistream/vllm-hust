@@ -928,6 +928,9 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    async def get_prefix_cache_route_fence_state(self) -> dict[str, Any] | None:
+        return await self.engine_core.get_prefix_cache_route_fence_state_async()
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
