@@ -18,8 +18,11 @@ PREEMPT/RELEASE released to the manager only at an explicit post-execute
 completion fence (:meth:`RequestOwnedKVStore.flush`).  It emits no
 :class:`OwnerReceipt` and performs no token/block estimation of its own.
 
-Scope (fail closed): prefix caching and branching speculative proposal trees
-remain out of scope.  O1 adds an exclusive host-KV lifecycle: a durable
+Scope (fail closed): branching speculative proposal trees remain out of
+scope. Owner-local prefix caching reuses the real hybrid coordinator, attaches
+only jointly complete immutable prefixes at RESERVE, delays publication of
+new blocks until a successful forward mark, and never exports physical block
+identities. O1 adds an exclusive host-KV lifecycle: a durable
 PREEMPT flush retains only block-ID-free cold allocation facts; RESTORE
 allocates the final destination, which cannot become runnable until the
 concrete worker zeros it and completes the exact bulk H2D.  Linear
@@ -82,6 +85,7 @@ from vllm.v1.core.sched.ownership import (
     OwnerCommandKind,
     OwnerLeaseKey,
     OwnerLeaseToken,
+    OwnerReceiptBatch,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -89,34 +93,10 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
-from vllm.v1.request import RequestStatus
-
-
-class _AllocationRequest:
-    """Private Request-like facade: only the fields the real manager
-    observes on the prefix-cache-disabled path, never a copied prompt
-    token payload."""
-
-    __slots__ = (
-        "request_id",
-        "num_tokens",
-        "num_computed_tokens",
-        "num_prompt_tokens",
-        "status",
-    )
-
-    def __init__(
-        self,
-        request_id: str,
-        num_tokens: int,
-        num_computed_tokens: int,
-        num_prompt_tokens: int,
-    ) -> None:
-        self.request_id = request_id
-        self.num_tokens = num_tokens
-        self.num_computed_tokens = num_computed_tokens
-        self.num_prompt_tokens = num_prompt_tokens
-        self.status = RequestStatus.RUNNING
+from vllm.v1.worker.request_owned_prefix_cache import (
+    RequestOwnedCacheRequest,
+    RequestOwnedPrefixCache,
+)
 
 
 def _request_owned_compress_ratio(kv_cache_spec: KVCacheSpec) -> int:
@@ -486,6 +466,7 @@ class RequestOwnedKVStore:
 
     def __init__(self, kv_cache_manager: KVCacheManager, owner_rank: int) -> None:
         self._manager = kv_cache_manager
+        self._prefix_cache = RequestOwnedPrefixCache(kv_cache_manager)
         self._owner_rank = owner_rank
         self._records: dict[OwnerLeaseKey, _Record] = {}
         #: Exact keys physically freed by a flushed PREEMPT while the
@@ -557,19 +538,14 @@ class RequestOwnedKVStore:
             return _reject_allocation(command, "duplicate reserve for active lease")
 
         allocator_id = self._allocator_id(command.key)
-        computed = command.allocation.num_computed_tokens
-        num_new = command.required_num_tokens - computed
-        blocks: KVCacheBlocks | None = None
-        if num_new > 0:
-            blocks = self._allocate(
-                allocator_id,
-                command.allocation.num_prompt_tokens,
-                computed,
-                num_new,
-                command.required_num_tokens,
-            )
-            if blocks is None:
-                return _reject_allocation(command, "insufficient KV cache to reserve")
+        prefix_allocation = self._prefix_cache.reserve(command, allocator_id)
+        if not prefix_allocation.accepted:
+            return _reject_allocation(command, "insufficient KV cache to reserve")
+        blocks = prefix_allocation.blocks
+        computed = (
+            command.allocation.num_computed_tokens
+            + prefix_allocation.hit_tokens
+        )
 
         self._generation_counter += 1
         record = _Record(
@@ -777,13 +753,14 @@ class RequestOwnedKVStore:
         ):
             return False
         self._manager.free(
-            _AllocationRequest(
+            RequestOwnedCacheRequest(
                 request_id=record.allocator_id,
                 num_tokens=0,
                 num_computed_tokens=0,
                 num_prompt_tokens=record.num_prompt_tokens,
             )
         )
+        self._prefix_cache.forget(record.allocator_id)
         del self._records[key]
         self._tombstones.add(key)
         return True
@@ -811,6 +788,7 @@ class RequestOwnedKVStore:
                 return False
             if num_tokens != expectation.post_step_num_tokens:
                 return False
+            self._prefix_cache.commit(record.allocator_id, num_tokens)
             record.num_computed_tokens = num_tokens
             del self._pending_marks[key]
             return True
@@ -820,6 +798,7 @@ class RequestOwnedKVStore:
             return False
         if num_tokens > record.reserved_num_tokens:
             return False
+        self._prefix_cache.commit(record.allocator_id, num_tokens)
         record.num_computed_tokens = num_tokens
         return True
 
@@ -1034,6 +1013,11 @@ class RequestOwnedKVStore:
                     f"extra "
                     f"{sorted(extra, key=lambda k: (k.request_id, k.owner_epoch))}."
                 ),
+            )
+        for entry in metadata.entries:
+            self._prefix_cache.commit(
+                self._records[entry.key].allocator_id,
+                committed_num_tokens.get(entry.key, entry.post_step_num_tokens),
             )
         for entry in metadata.entries:
             record = self._records[entry.key]
@@ -1524,13 +1508,14 @@ class RequestOwnedKVStore:
                     self.group_block_sizes,
                 )
             self._manager.free(
-                _AllocationRequest(
+                RequestOwnedCacheRequest(
                     request_id=record.allocator_id,
                     num_tokens=0,
                     num_computed_tokens=0,
                     num_prompt_tokens=record.num_prompt_tokens,
                 )
             )
+            self._prefix_cache.forget(record.allocator_id)
             if record.preempted:
                 assert source_block_indices is not None
                 self._tombstones.add(key)
@@ -1636,18 +1621,30 @@ class RequestOwnedKVStore:
         num_tokens: int,
     ) -> KVCacheBlocks | None:
         """One real-manager allocation; the sole source of block counts."""
-        request = _AllocationRequest(
-            request_id=allocator_id,
-            num_tokens=num_tokens,
-            num_computed_tokens=num_computed_tokens,
+        return self._prefix_cache.allocate(
+            allocator_id=allocator_id,
             num_prompt_tokens=num_prompt_tokens,
-        )
-        return self._manager.allocate_slots(
-            request,
+            num_computed_tokens=num_computed_tokens,
             num_new_tokens=num_new_tokens,
-            full_sequence_must_fit=True,
-            has_scheduled_reqs=False,
+            num_tokens=num_tokens,
         )
+
+    def decorate_prefix_cache_receipts(
+        self, batch: OwnerReceiptBatch
+    ) -> OwnerReceiptBatch:
+        """Attach exact owner-local prefix hits to logical receipts."""
+
+        return self._prefix_cache.decorate_receipt_batch(batch)
+
+    def acknowledge_prefix_cache_receipts(self, batch) -> None:
+        self._prefix_cache.acknowledge_receipt_batch(batch)
+
+    def reset_prefix_cache(self) -> bool:
+        """Reset published owner-local prefixes only after every lease drains."""
+
+        if self._records or self._pending_marks:
+            return False
+        return self._prefix_cache.reset()
 
     def _tables(self, record: _Record) -> tuple[tuple[int, ...], ...]:
         ids = self._manager.get_block_ids(record.allocator_id)

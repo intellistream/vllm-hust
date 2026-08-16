@@ -531,9 +531,9 @@ class WorkerWrapperBase:
             # G2: after the underlying worker initializes, bind this rank's
             # physical store when request-owned attention is enabled.  The
             # store reuses one real KVCacheManager over this rank's
-            # KVCacheConfig; prefix caching, Eagle, events, and stats are all
-            # disabled because the scheduler-side manager stays the only
-            # prefix/Eagle authority and this store never publishes block IDs.
+            # KVCacheConfig. Prefix hashes are owner-local; Eagle, events,
+            # and stats stay disabled, and physical block IDs never leave
+            # this worker boundary.
             if self.vllm_config.scheduler_config.enable_request_owned_attention:
                 self._request_owned_kv_store = self._create_request_owned_kv_store(
                     kv_cache_config
@@ -594,7 +594,7 @@ class WorkerWrapperBase:
             max_num_batched_tokens=(
                 self.vllm_config.scheduler_config.max_num_batched_tokens
             ),
-            enable_caching=False,
+            enable_caching=self.vllm_config.cache_config.enable_prefix_caching,
             use_eagle=False,
             log_stats=False,
             enable_kv_cache_events=False,
@@ -985,10 +985,14 @@ class WorkerWrapperBase:
         batch = trial_manager.emit_batch(step_seq)
         if self._request_owned_kv_drain is not None:
             batch = self._request_owned_kv_drain.decorate_batch(batch)
+        if self._request_owned_prefix_caching_enabled():
+            batch = store.decorate_prefix_cache_receipts(batch)
         result.owner_receipt_batches = [
             replace(batch, cache_pool=store.pool_snapshot())
         ]
         self._request_owned_control_manager = trial_manager
+        if self._request_owned_prefix_caching_enabled():
+            store.acknowledge_prefix_cache_receipts(batch)
         self._request_owned_restore_guard = None
         return result
 
@@ -1027,6 +1031,10 @@ class WorkerWrapperBase:
                 f"{type(value).__name__} ({value!r})."
             )
         return value
+
+    def _request_owned_prefix_caching_enabled(self) -> bool:
+        cache_config = getattr(self.vllm_config, "cache_config", None)
+        return getattr(cache_config, "enable_prefix_caching", False) is True
 
     def _request_owned_fail_stop_guard(self) -> None:
         """Reject every request-owned call once the fail-stop latch is set.
@@ -1403,6 +1411,8 @@ class WorkerWrapperBase:
             batch = trial_manager.emit_batch(step_seq)
             if self._request_owned_kv_drain is not None:
                 batch = self._request_owned_kv_drain.decorate_batch(batch)
+            if self._request_owned_prefix_caching_enabled():
+                batch = store.decorate_prefix_cache_receipts(batch)
             result.owner_receipt_batches = [
                 replace(batch, cache_pool=store.pool_snapshot())
             ]
@@ -1418,6 +1428,8 @@ class WorkerWrapperBase:
                 )
             raise
         self._request_owned_control_manager = trial_manager
+        if self._request_owned_prefix_caching_enabled():
+            store.acknowledge_prefix_cache_receipts(batch)
         return result
 
     @staticmethod
@@ -1504,3 +1516,11 @@ class WorkerWrapperBase:
             mm_receiver_cache.clear_cache()
 
         self.worker.reset_mm_cache()
+
+    def reset_request_owned_prefix_cache(self) -> bool:
+        """Reset this rank's physical prefix index at an idle protocol seam."""
+
+        store = self._request_owned_kv_store
+        if store is None or not self._request_owned_prefix_caching_enabled():
+            return True
+        return store.reset_prefix_cache()

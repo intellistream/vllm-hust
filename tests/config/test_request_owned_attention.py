@@ -1,28 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Tests for the experimental request-owned attention (G2) config gate.
+"""Construction-time fail-closed tests for request-owned attention.
 
-The feature flag lives on SchedulerConfig and defaults to False. When enabled,
-VllmConfig must construct within the supported G2 envelope: Multiproc/non-Ray
-execution, PP=1, eager execution without CUDA graphs, no speculative decoding,
-no KV cache CPU offload/tiering or KV transfer/connectors, prefix caching
-disabled, DCP=1, PCP=1, and synchronous scheduling. Linear DSpark is the
-single speculative exception when owner sampling is enabled. Every unsupported mode
-must fail closed with a specific diagnostic: pipeline parallelism, Ray,
-speculative decoding, non-eager compilation/CUDA graphs, KV cache CPU
-offload, KV transfer, prefix caching, decode/prefill context parallelism,
-async scheduling, and multimodal/encoder-decoder models.
-
-The G3 envelope adds construction-time rejections for combinations whose
-runtime semantics the request-owned path does not implement yet: Model
-Runner V2, dynamic batch overlap / micro-batching (DBO), distributed EC
-cache transfer, KV-sharing fast prefill, any executor other than Multiproc
-(UniProc tolerated only for single-process host/control tests), non-
-generative (pooling/draft) runner types, and sequence parallelism / async
-TP. FlashComm and the optional O-projection TP split are plugin-side
-switches with no core construction-time field, so they are not asserted
-here and keep their runtime gates.
+The supported envelope is synchronous text generation with PP/DCP/PCP=1,
+Multiproc execution, optional owner-local prefix caching, and the explicitly
+gated graph/DSpark paths. Unsupported transfer, executor, batching, runner,
+and parallel modes retain precise diagnostics.
 """
 
 import types
@@ -85,7 +69,7 @@ def _vllm_config(
 
     By default the supported G2 envelope is used: eager execution, PP=1,
     no speculative decoding, no KV cache CPU offload/tiering or KV transfer,
-    prefix caching disabled, DCP=1, PCP=1, and synchronous scheduling.
+    owner-local prefix caching disabled, DCP=1, PCP=1, and synchronous scheduling.
     Passing any explicit config replaces exactly that part of the envelope.
     """
     return VllmConfig(
@@ -539,7 +523,10 @@ def test_request_owned_kv_offload_requires_configured_capacity(capacity):
     with pytest.raises(ValueError, match="requires a positive"):
         _vllm_config(
             enable_request_owned_kv_offload=True,
-            cache_config=CacheConfig(kv_offloading_size=capacity),
+            cache_config=CacheConfig(
+                kv_offloading_size=capacity,
+                enable_prefix_caching=False,
+            ),
         )
 
 
@@ -577,9 +564,9 @@ def test_enabled_rejects_kv_transfer():
         _vllm_config(kv_transfer_config=_active_kv_transfer_config())
 
 
-def test_enabled_rejects_prefix_caching():
-    with pytest.raises(ValueError, match="enable_prefix_caching"):
-        _vllm_config(cache_config=CacheConfig(enable_prefix_caching=True))
+def test_enabled_accepts_owner_local_prefix_caching():
+    config = _vllm_config(cache_config=CacheConfig(enable_prefix_caching=True))
+    assert config.cache_config.enable_prefix_caching is True
 
 
 def test_enabled_rejects_decode_context_parallelism():
@@ -671,9 +658,8 @@ def test_enabled_rejects_ec_transfer():
 
 
 def test_enabled_rejects_kv_sharing_fast_prefill():
-    # CacheConfig defaults to enable_prefix_caching=True, which the G2 gate
-    # already rejects; keep the rest of the envelope allowed so this test
-    # isolates the KV-sharing fast-prefill rejection.
+    # Keep prefix caching disabled so this remains exactly the established
+    # KV-sharing fast-prefill rejection rather than exercising the new path.
     with pytest.raises(ValueError, match="kv_sharing_fast_prefill"):
         _vllm_config(
             cache_config=CacheConfig(

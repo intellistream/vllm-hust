@@ -69,6 +69,10 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.request_owned_prefix import (
+    require_prefix_reset,
+    reset_request_owned_prefix_cache,
+)
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -802,8 +806,8 @@ class EngineCore:
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        return self.scheduler.reset_prefix_cache(
-            reset_running_requests, reset_connector
+        return reset_request_owned_prefix_cache(
+            self, reset_running_requests, reset_connector
         )
 
     def reset_encoder_cache(self) -> None:
@@ -831,12 +835,12 @@ class EngineCore:
         reset_running_requests: bool = True,
         reset_connector: bool = True,
     ) -> None:
-        # reset_connector=True so external connectors clear alongside
-        # local caches, matching the pause_generation(clear_cache=True)
-        # contract. No-op when no connector is configured.
-        self.reset_prefix_cache(
-            reset_running_requests=reset_running_requests,
-            reset_connector=reset_connector,
+        # External connectors clear with local caches; absent is a no-op.
+        require_prefix_reset(
+            self.reset_prefix_cache(
+                reset_running_requests=reset_running_requests,
+                reset_connector=reset_connector,
+            )
         )
         self.reset_mm_cache()
         self.reset_encoder_cache()

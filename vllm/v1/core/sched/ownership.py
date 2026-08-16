@@ -46,6 +46,11 @@ the G1 protocol only; they must not be used as G2 physical admission.
 import enum
 from dataclasses import dataclass, replace
 
+from vllm.v1.core.request_owned_prefix import (
+    OwnerPrefixDescriptor,
+    validate_owner_prefix_receipt_hit,
+)
+
 # ---------------------------------------------------------------------------
 # Protocol types
 # ---------------------------------------------------------------------------
@@ -147,6 +152,9 @@ class OwnerAllocationDescriptor:
     num_computed_tokens: int
     num_tokens: int
     status: OwnerAdmissionStatus
+    #: Immutable content hashes offered for owner-local prefix lookup.
+    #: ``None`` disables lookup for this reservation.
+    prefix: OwnerPrefixDescriptor | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, OwnerLeaseKey):
@@ -169,6 +177,13 @@ class OwnerAllocationDescriptor:
         if not isinstance(self.status, OwnerAdmissionStatus):
             raise TypeError(
                 f"status must be an OwnerAdmissionStatus, got {self.status!r}."
+            )
+        if self.prefix is not None and not isinstance(
+            self.prefix, OwnerPrefixDescriptor
+        ):
+            raise TypeError(
+                "prefix must be an OwnerPrefixDescriptor or None, got "
+                f"{self.prefix!r}."
             )
 
 
@@ -251,6 +266,17 @@ class OwnerReceipt:
     #: as physical admission; see :class:`OwnerCachePoolSnapshot`.
     free_capacity: int | None = None
     error: str | None = None
+    #: Exact owner-local immutable prefix attached by an accepted RESERVE.
+    #: ``None`` when prefix caching was disabled or this is not a RESERVE.
+    #: Kept last so existing positional construction remains compatible.
+    prefix_cache_hit_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        validate_owner_prefix_receipt_hit(
+            self.prefix_cache_hit_tokens,
+            self.accepted,
+            self.runnable_num_tokens,
+        )
 
 
 @dataclass(frozen=True)

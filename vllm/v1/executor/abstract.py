@@ -402,6 +402,11 @@ class Executor(ABC):
         """Reset the encoder cache in each worker to clear cached encoder outputs."""
         self.collective_rpc("reset_encoder_cache")
 
+    def reset_request_owned_prefix_cache(self) -> bool:
+        """Reset every rank-local request-owned prefix cache."""
+
+        return all(self.collective_rpc("reset_request_owned_prefix_cache"))
+
     def sleep(self, level: int = 1):
         if self.is_sleeping:
             logger.warning("Executor is already sleeping.")

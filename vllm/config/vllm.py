@@ -2194,7 +2194,7 @@ class VllmConfig:
         contract and worker-local physical KV allocation, so the remaining
         supported envelope is now constructible: Multiproc/non-Ray execution,
         PP=1, eager execution without CUDA graphs, linear DSpark only,
-        no KV cache offload/transfer/connectors, prefix caching disabled,
+        no KV cache offload/transfer/connectors, owner-local prefix caching,
         DCP=1, PCP=1, and synchronous scheduling.
 
         G3 additionally fails closed at construction time for combinations
@@ -2425,6 +2425,12 @@ class VllmConfig:
             )
 
         if request_owned_kv_offload:
+            if self.cache_config.enable_prefix_caching:
+                raise ValueError(
+                    "enable_request_owned_kv_offload=True is not yet "
+                    "compatible with request-owned prefix caching. Disable "
+                    "one of the two features."
+                )
             if not (
                 self.cache_config.kv_offloading_size is not None
                 and self.cache_config.kv_offloading_size > 0
@@ -2485,15 +2491,6 @@ class VllmConfig:
                 f"kv_transfer_config.kv_connector="
                 f"{self.kv_transfer_config.kv_connector!r} with "
                 f"kv_role={self.kv_transfer_config.kv_role!r}."
-            )
-
-        if self.cache_config.enable_prefix_caching:
-            raise ValueError(
-                "Request-owned attention is experimental and does not "
-                "support prefix caching, but got cache_config."
-                f"enable_prefix_caching={self.cache_config.enable_prefix_caching}. "
-                "Disable prefix caching (enable_prefix_caching=False) to "
-                "use request-owned attention."
             )
 
         if parallel_config.decode_context_parallel_size > 1:

@@ -74,6 +74,12 @@ from vllm.v1.core.sched.ownership import (
     OwnerReceiptBatch,
     OwnerResidencyState,
 )
+from vllm.v1.core.sched.request_owned_admission import (
+    owner_projected_block_demand,
+)
+from vllm.v1.core.sched.request_owned_prefix_directory import (
+    RequestOwnedPrefixScheduler,
+)
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -343,6 +349,7 @@ class Scheduler(SchedulerInterface):
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
+        self.hash_block_size = hash_block_size
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -1930,6 +1937,9 @@ class Scheduler(SchedulerInterface):
             # G2: apply structurally valid receipts before any ordinary
             # output or request mutation below.
             self._apply_request_owned_receipts(scheduler_output, model_runner_output)
+            self._owner_prefix.observe_scheduled(
+                self.requests, scheduler_output.num_scheduled_tokens
+            )
             # Evidence must bind the executed layout to the worker-confirmed
             # post-step pool state.  Recording during schedule() would lag
             # physical capacity by one step and could not directly prove the
@@ -2899,6 +2909,16 @@ class Scheduler(SchedulerInterface):
         self._owner_readiness = {}
         self._owner_readiness_seen = False
         self._owner_wait_started_step = {}
+        self._owner_prefix = RequestOwnedPrefixScheduler(
+            enabled=getattr(
+                getattr(self, "cache_config", None),
+                "enable_prefix_caching",
+                False,
+            ),
+            world_size=self.parallel_config.world_size,
+            scheduler_block_size=getattr(self, "block_size", 1),
+            hash_block_size=getattr(self, "hash_block_size", 1),
+        )
         if getattr(self.scheduler_config, "enable_request_owned_windows", False):
             self._owner_window_policy = OwnerWindowPolicy(
                 OwnerWindowPolicyConfig(
@@ -4128,7 +4148,7 @@ class Scheduler(SchedulerInterface):
         coordinator = self.owner_coordinator
         assert coordinator is not None
         required = self._owner_reserve_required(request)
-        selected = self._select_owner_for_admission(required)
+        selected = self._select_owner_for_admission(request, required)
         if selected is None:
             return False
         owner, projected_blocks = selected
@@ -4152,43 +4172,9 @@ class Scheduler(SchedulerInterface):
         self._issue_owner_reserve(request, key)
         return True
 
-    @staticmethod
-    def _owner_projected_block_demand(
-        snapshot: OwnerCachePoolSnapshot,
-        required_num_tokens: int,
-    ) -> int:
-        """Project unified-pool blocks for a fresh DSV4 horizon.
-
-        Every request owns one table in every KV group, while the groups use
-        heterogeneous effective token capacities and compressed groups floor
-        logical tokens to a storage quantum before block rounding. Their
-        physical allocations all consume the same pool, so demand is the sum
-        of those exact per-group cardinalities. Empty group metadata is
-        retained for compatibility with early/host-only protocol snapshots
-        and still charges one block for a nonempty reservation.
-        """
-        if required_num_tokens <= 0:
-            return 0
-        if not snapshot.groups:
-            return 1
-        demand = 0
-        for group in snapshot.groups:
-            quantum = group.allocation_token_quantum
-            storage_tokens = required_num_tokens // quantum
-            storage_tokens_per_block = group.effective_tokens_per_block // quantum
-            group_demand = (
-                storage_tokens + storage_tokens_per_block - 1
-            ) // storage_tokens_per_block
-            if group.fresh_allocation_block_cap is not None:
-                group_demand = min(
-                    group_demand,
-                    group.fresh_allocation_block_cap,
-                )
-            demand += group_demand
-        return demand
-
     def _select_owner_for_admission(
         self,
+        request: Request,
         required_num_tokens: int,
     ) -> tuple[int, int] | None:
         """Pick the owner for a fresh G2 first admission.
@@ -4212,7 +4198,7 @@ class Scheduler(SchedulerInterface):
             snapshots = self._owner_pool_snapshots
             projected = self._owner_admission_projected_blocks
             demands = {
-                owner_id: self._owner_projected_block_demand(
+                owner_id: owner_projected_block_demand(
                     snapshots[owner_id], required_num_tokens
                 )
                 for owner_id in ranks
@@ -4235,7 +4221,20 @@ class Scheduler(SchedulerInterface):
             feasible = [owner_id for owner_id in ranks if projected_free(owner_id) >= 0]
             if not feasible:
                 return None
-            owner = min(feasible, key=score)
+            prefix_owner = self._owner_prefix.select_owner(
+                request,
+                {owner_id: projected_free(owner_id) for owner_id in feasible},
+                {owner_id: demands[owner_id] for owner_id in feasible},
+                {
+                    owner_id: coordinator.live_lease_count(owner_id)
+                    for owner_id in feasible
+                },
+            )
+            owner = (
+                prefix_owner
+                if prefix_owner is not None
+                else min(feasible, key=score)
+            )
         else:
             demands = {owner_id: 0 for owner_id in ranks}
 
@@ -4273,6 +4272,7 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens=num_computed_tokens,
             num_tokens=command.required_num_tokens,
             status=status,
+            prefix=self._owner_prefix.descriptor(request),
         )
         self._owner_outbox.append(replace(command, allocation=allocation))
         self._owner_pending_command[request.request_id] = (
@@ -4711,6 +4711,10 @@ class Scheduler(SchedulerInterface):
             coordinator.apply_receipt(event)
             return
         pending = self._owner_pending_command.get(request_id)
+        request = self.requests.get(request_id)
+        prefix_hit = self._owner_prefix.validate_reserve_receipt(
+            event, pending, request
+        )
         if (
             getattr(
                 self.scheduler_config,
@@ -4761,6 +4765,14 @@ class Scheduler(SchedulerInterface):
             return
         if not event.accepted:
             return
+        if prefix_hit is not None:
+            assert request is not None
+            self._owner_prefix.record_lookup(
+                request,
+                prefix_hit,
+                getattr(self.kv_cache_manager, "prefix_cache_stats", None),
+            )
+            request.num_computed_tokens = prefix_hit
         if coordinator.is_released(key) and self._owner_key.get(request_id) == key:
             # Accepted release: the incarnation is done.  Fence request-id
             # reuse forward so the next incarnation gets a fresh epoch.
@@ -4771,7 +4783,6 @@ class Scheduler(SchedulerInterface):
             self._owner_wait_started_step.pop(key, None)
             return
         # Accepted RESERVE promotes the request (sticky owner + epoch).
-        request = self.requests.get(request_id)
         if (
             request is not None
             and request.attention_owner is None
@@ -5143,6 +5154,21 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        owner_prefix = getattr(self, "_owner_prefix", None)
+        if owner_prefix is not None and owner_prefix.enabled:
+            raise RuntimeError(
+                "Request-owned prefix caches have rank-local physical state. "
+                "Reset them through EngineCore.reset_prefix_cache() so the "
+                "scheduler and every owner rank are cleared together."
+            )
+        return self._reset_prefix_cache_local(
+            reset_running_requests, reset_connector
+        )
+
+    def _reset_prefix_cache_local(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        """Reset scheduler-local state inside the EngineCore reset fence."""
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
@@ -5184,6 +5210,9 @@ class Scheduler(SchedulerInterface):
 
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
+
+        if reset_successful:
+            self._owner_prefix.reset()
 
         return reset_successful
 
