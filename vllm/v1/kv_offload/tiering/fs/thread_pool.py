@@ -9,6 +9,7 @@ Thread pool:
 """
 
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
 
@@ -16,6 +17,20 @@ from vllm.logger import init_logger
 from vllm.v1.kv_offload.tiering.base import JobId
 
 logger = init_logger(__name__)
+
+InstrumentationCallback = Callable[[dict[str, object]], None]
+
+
+def _emit(
+    callback: InstrumentationCallback | None,
+    event: str,
+    **fields: object,
+) -> None:
+    if callback is not None:
+        try:
+            callback({"event": event, "timestamp_ns": time.monotonic_ns(), **fields})
+        except Exception:
+            logger.exception("Filesystem tier instrumentation callback failed")
 
 
 class JobState:
@@ -25,14 +40,31 @@ class JobState:
     Each task calls task_done(success) when it finishes.
     """
 
-    __slots__ = ("_job_id", "_n_tasks", "_completed", "_success", "_lock")
+    __slots__ = (
+        "_job_id",
+        "_n_tasks",
+        "_completed",
+        "_success",
+        "_lock",
+        "enqueue_ns",
+        "direction",
+    )
 
-    def __init__(self, job_id: JobId, n_tasks: int) -> None:
+    def __init__(
+        self,
+        job_id: JobId,
+        n_tasks: int,
+        *,
+        enqueue_ns: int,
+        direction: str,
+    ) -> None:
         self._job_id: JobId = job_id
         self._n_tasks = n_tasks
         self._completed = 0
         self._success = True
         self._lock = threading.Lock()
+        self.enqueue_ns = enqueue_ns
+        self.direction = direction
 
     @property
     def job_id(self) -> JobId:
@@ -61,6 +93,9 @@ class DualQueueThreadPool:
         n_read_threads: int,
         n_write_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
+        *,
+        strict_load_reservation: bool = False,
+        instrumentation_callback: InstrumentationCallback | None = None,
     ) -> None:
         self._load_q: deque = deque()
         self._store_q: deque = deque()
@@ -69,6 +104,8 @@ class DualQueueThreadPool:
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
+        self._strict_load_reservation = strict_load_reservation
+        self._instrumentation_callback = instrumentation_callback
 
         for i in range(n_read_threads):
             t = threading.Thread(
@@ -97,11 +134,26 @@ class DualQueueThreadPool:
         tasks: Iterable[Callable],
     ) -> None:
         """Enqueue load tasks for a job (high-priority for load-priority threads)."""
-        state = JobState(job_id, n_tasks)
+        enqueue_ns = time.monotonic_ns()
+        state = JobState(
+            job_id,
+            n_tasks,
+            enqueue_ns=enqueue_ns,
+            direction="load",
+        )
         with self._condition:
             self._inflight_jobs += 1
-            for fn in tasks:
-                self._load_q.append((fn, state))
+            for task_index, fn in enumerate(tasks):
+                self._load_q.append((fn, state, task_index))
+        _emit(
+            self._instrumentation_callback,
+            "job_enqueue",
+            job_id=job_id,
+            direction="load",
+            task_count=n_tasks,
+            enqueue_ns=enqueue_ns,
+        )
+        with self._condition:
             self._condition.notify(n_tasks)
 
     def enqueue_store(
@@ -111,11 +163,26 @@ class DualQueueThreadPool:
         tasks: Iterable[Callable],
     ) -> None:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
-        state = JobState(job_id, n_tasks)
+        enqueue_ns = time.monotonic_ns()
+        state = JobState(
+            job_id,
+            n_tasks,
+            enqueue_ns=enqueue_ns,
+            direction="store",
+        )
         with self._condition:
             self._inflight_jobs += 1
-            for fn in tasks:
-                self._store_q.append((fn, state))
+            for task_index, fn in enumerate(tasks):
+                self._store_q.append((fn, state, task_index))
+        _emit(
+            self._instrumentation_callback,
+            "job_enqueue",
+            job_id=job_id,
+            direction="store",
+            task_count=n_tasks,
+            enqueue_ns=enqueue_ns,
+        )
+        with self._condition:
             self._condition.notify(n_tasks)
 
     def get_finished(self) -> list[tuple[JobId, bool]]:
@@ -152,20 +219,54 @@ class DualQueueThreadPool:
 
     def _worker(self, load_priority: bool) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
+        worker_class = "read_priority" if load_priority else "write_priority"
         while True:
             with self._condition:
                 self._condition.wait_for(
-                    lambda: self._stop or self._load_q or self._store_q
+                    lambda: (
+                        self._stop
+                        or self._load_q
+                        or (
+                            self._store_q
+                            and not (load_priority and self._strict_load_reservation)
+                        )
+                    )
                 )
                 if self._stop:
                     return
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
-                task, state = primary.popleft() if primary else secondary.popleft()
+                task, state, task_index = (
+                    primary.popleft() if primary else secondary.popleft()
+                )
+            dequeue_ns = time.monotonic_ns()
+            _emit(
+                self._instrumentation_callback,
+                "task_dequeue",
+                job_id=state.job_id,
+                direction=state.direction,
+                task_index=task_index,
+                worker_class=worker_class,
+                enqueue_ns=state.enqueue_ns,
+                dequeue_ns=dequeue_ns,
+                queue_wait_ns=dequeue_ns - state.enqueue_ns,
+            )
+            start_ns = time.monotonic_ns()
+            _emit(
+                self._instrumentation_callback,
+                "task_start",
+                job_id=state.job_id,
+                direction=state.direction,
+                task_index=task_index,
+                worker_class=worker_class,
+                start_ns=start_ns,
+            )
             try:
                 task()
+                task_success = True
                 job_finished, success = state.task_done(True)
             except Exception as exc:
+                task_success = False
                 logger.error(
                     "Job %s block I/O failed: %s",
                     state.job_id,
@@ -173,8 +274,32 @@ class DualQueueThreadPool:
                 )
                 job_finished, success = state.task_done(False)
 
+            finish_ns = time.monotonic_ns()
+            _emit(
+                self._instrumentation_callback,
+                "task_finish",
+                job_id=state.job_id,
+                direction=state.direction,
+                task_index=task_index,
+                worker_class=worker_class,
+                start_ns=start_ns,
+                finish_ns=finish_ns,
+                service_ns=finish_ns - start_ns,
+                success=task_success,
+            )
+
             if job_finished:
                 with self._condition:
                     self._finished_q.append((state.job_id, success))
                     self._inflight_jobs -= 1
                     self._condition.notify_all()
+                _emit(
+                    self._instrumentation_callback,
+                    "job_finish",
+                    job_id=state.job_id,
+                    direction=state.direction,
+                    enqueue_ns=state.enqueue_ns,
+                    finish_ns=finish_ns,
+                    complete_ns=finish_ns - state.enqueue_ns,
+                    success=success,
+                )
