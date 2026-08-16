@@ -18,6 +18,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
 )
+from vllm.model_executor.warmup.qwen_triton_warmup_config import (
+    needs_qwen_triton_warmup,
+)
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import _zero_kv_blocks_kernel
@@ -26,16 +29,6 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
-
-_QWEN_MODEL_TYPES = frozenset(
-    {
-        "qwen3_next",
-        "qwen3_5",
-        "qwen3_5_text",
-        "qwen3_5_moe",
-        "qwen3_5_moe_text",
-    }
-)
 
 _ZERO_KV_N_BLOCKS = (1, 2)
 
@@ -349,19 +342,11 @@ def qwen_triton_warmup(
     if runner.is_pooling_model:
         return
 
-    hf_text_config = getattr(model_config, "hf_text_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
-    model_type = None
-    for config in (hf_text_config, hf_config):
-        model_type = getattr(config, "model_type", None)
-        if model_type is not None:
-            model_type = str(model_type)
-            break
-    if model_type not in _QWEN_MODEL_TYPES:
+    if not needs_qwen_triton_warmup(model_config):
         return
 
     device = getattr(runner, "device", torch.device("cuda"))
-    logger.info("Warming up Qwen Triton kernels for model_type=%s.", model_type)
+    logger.info("Warming up Qwen Triton kernels.")
 
     zero_config = _zero_kv_warmup_config(runner)
     if _warm_zero_kv_blocks_with_runner_zeroer(runner):

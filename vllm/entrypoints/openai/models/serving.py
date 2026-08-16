@@ -4,6 +4,7 @@
 from asyncio import Lock
 from collections import defaultdict
 from http import HTTPStatus
+from typing import Any
 
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
@@ -39,9 +40,11 @@ class OpenAIModelRegistry:
         self,
         model_config: ModelConfig,
         base_model_paths: list[BaseModelPath],
+        speculative_capability: dict[str, Any] | None = None,
     ) -> None:
         self.model_config = model_config
         self.base_model_paths = base_model_paths
+        self.speculative_capability = speculative_capability
         self.lora_requests: dict[str, LoRARequest] = {}
 
     def model_name(self, lora_request: LoRARequest | None = None) -> str:
@@ -70,6 +73,7 @@ class OpenAIModelRegistry:
                     id=base_model.name,
                     max_model_len=max_model_len,
                     root=base_model.model_path,
+                    speculative_capability=self.speculative_capability,
                     permission=[ModelPermission()],
                 )
                 for base_model in self.base_model_paths
@@ -98,9 +102,14 @@ class OpenAIServingModels:
     ):
         super().__init__()
 
+        capability_payload = engine_client.vllm_config.speculative_capability.to_dict()
+        if not isinstance(capability_payload, dict):
+            capability_payload = None
+
         self.registry = OpenAIModelRegistry(
             model_config=engine_client.model_config,
             base_model_paths=base_model_paths,
+            speculative_capability=capability_payload,
         )
 
         self.engine_client = engine_client

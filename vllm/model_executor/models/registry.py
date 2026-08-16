@@ -141,6 +141,8 @@ _TEXT_GENERATION_MODELS = {
     "Lfm2MoeForCausalLM": ("lfm2_moe", "Lfm2MoeForCausalLM"),
     "LagunaForCausalLM": ("laguna", "LagunaForCausalLM"),
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
+    "SliceGPTLlamaForCausalLM": ("slicegpt_llama", "SliceGPTLlamaForCausalLM"),
+    "SliceGPTQwen2ForCausalLM": ("slicegpt_qwen2", "SliceGPTQwen2ForCausalLM"),
     "Llama4ForCausalLM": ("llama4", "Llama4ForCausalLM"),
     # For decapoda-research/llama-*
     "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
@@ -586,6 +588,8 @@ _SPECULATIVE_DECODING_MODELS = {
     "MiMoV2OmniMTPModel": ("mimo_v2_mtp", "MiMoV2OmniMTP"),
     "EagleCohereForCausalLM": ("cohere_eagle", "EagleCohereForCausalLM"),
     "EagleLlamaForCausalLM": ("llama_eagle", "EagleLlamaForCausalLM"),
+    "Qwen2ForCausalLMEagle": ("qwen2_eagle", "Qwen2ForCausalLMEagle"),
+    "EagleQwen2ForCausalLMEagle": ("qwen2_eagle", "Qwen2ForCausalLMEagle"),
     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),

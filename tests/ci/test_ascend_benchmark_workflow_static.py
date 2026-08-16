@@ -14,6 +14,10 @@ RUNNER_SCRIPT_PATH = (
     Path(__file__).resolve().parents[2]
     / ".github/workflows/scripts/run_ascend_benchmark_scenario_list.sh"
 )
+BENCHMARK_RUNNER_SCRIPT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / ".github/workflows/scripts/run_ascend_benchmark_ci.sh"
+)
 
 
 def workflow_text() -> str:
@@ -22,6 +26,10 @@ def workflow_text() -> str:
 
 def runner_script_text() -> str:
     return RUNNER_SCRIPT_PATH.read_text(encoding="utf-8")
+
+
+def benchmark_runner_script_text() -> str:
+    return BENCHMARK_RUNNER_SCRIPT_PATH.read_text(encoding="utf-8")
 
 
 def workflow_yaml() -> dict:
@@ -50,6 +58,32 @@ def test_pr_comment_update_job_has_job_level_issues_write_permission():
     assert "pull-requests: write" in permissions_block
 
 
+def test_pull_request_trigger_keeps_new_commit_and_reopen_events() -> None:
+    text = workflow_text()
+    trigger = text[text.index("on:") : text.index("  issue_comment:")]
+
+    assert "types: [labeled, synchronize, reopened]" in trigger
+
+
+def test_main_push_trigger_and_pr_head_checkout_are_preserved() -> None:
+    text = workflow_text()
+    trigger = text[text.index("on:") : text.index("  pull_request:")]
+    benchmark_job_start = text.index("  ascend-benchmark:")
+    benchmark_job = text[
+        benchmark_job_start : text.index("    permissions:", benchmark_job_start)
+    ]
+
+    assert "push:" in trigger
+    assert "branches: [main]" in trigger
+    assert "github.event_name == 'push'" in benchmark_job
+    assert (
+        "TARGET_REPO_SHA: ${{ github.event_name == 'pull_request' && "
+        "github.event.pull_request.head.sha || github.event_name == "
+        "'issue_comment' && needs.issue-comment-command.outputs.pr_head_sha || "
+        "github.sha }}" in text
+    )
+
+
 def test_issue_comment_non_pr_commands_receive_denial_feedback():
     text = workflow_text()
 
@@ -73,61 +107,44 @@ def test_fork_pr_security_note_is_blocking():
     )
 
 
-def test_main_baseline_store_has_spec_file_and_benchmark_repo_checkout():
+def test_main_baseline_publication_stays_in_trusted_benchmark_job():
     text = workflow_text()
-    store_job = text[text.index("  store-main-perfgate-baseline:") :]
+    publish_step = text.index("- name: Publish central perfgate baseline")
+    formal_step = text.index("- name: Run benchmark CI and optional formal publish")
+    publish_block = text[publish_step:formal_step]
 
-    assert "TARGET_REPO_SHA: ${{ github.sha }}" in store_job
+    assert "  store-main-perfgate-baseline:" not in text
+    assert "runs-on: ubuntu-latest" not in publish_block
     assert (
         "RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-"
-        "${{ env.TARGET_REPO_SHA }}"
-    ) in store_job
+        "${{ env.TARGET_REPO_SHA }}-perfgate"
+    ) in publish_block
     assert (
         "RESULT_ROOT: ${{ github.workspace }}/.benchmarks/ci/ci-"
         "${{ github.run_id }}-${{ github.run_attempt }}-"
-        "${{ env.TARGET_REPO_SHA }}"
-    ) in store_job
-    assert "PERFGATE_SPEC_FILE:" not in store_job
-    assert "MAIN_SAME_SPEC_SPEC_FILE:" not in store_job
-    assert (
-        "BENCHMARK_REPO_URL: https://github.com/vLLM-HUST/vllm-hust-benchmark.git"
-        in store_job
-    )
-    assert "BENCHMARK_REPO_REF:" in store_job
-    assert "Checkout benchmark repo" in store_job
-    assert "git@github.com:vLLM-HUST/vllm-hust-benchmark.git" not in store_job
-    assert (
-        "vllm-hust-benchmark/${{ vars.VLLM_HUST_SAME_SPEC_SPEC_FILE || "
-        "vars.VLLM_HUST_MAIN_SAME_SPEC_SPEC_FILE || "
-        "'docs/official-baselines/official-ascend-jan-2026-v0180-random-online-"
-        "qwen25-14b-910b2.json' }}"
-    ) in store_job
+        "${{ env.TARGET_REPO_SHA }}-perfgate"
+    ) in publish_block
+    assert "PERFGATE_BENCHMARK_REPO_DIR:" in publish_block
+    assert "PERFGATE_TARGET_GIT_REPOSITORY:" in publish_block
+    assert "VLLM_HUST_CENTRAL_BASELINE_WRITER_TOKEN" in publish_block
+    assert "perfgate_store_baseline.sh" in publish_block
 
 
 def test_benchmark_repo_default_ref_is_main():
     text = workflow_text()
 
     assert "feature/perfgate-two-stage" not in text
-    assert (
-        "BENCHMARK_REPO_REF: ${{ (github.event_name == 'pull_request' || "
-        "github.event_name == 'issue_comment' || github.event_name == "
-        "'workflow_dispatch') && (vars.VLLM_HUST_BENCHMARK_REPO_REF || "
-        "'main') || 'main' }}"
-    ) in text
+    assert "vars.VLLM_HUST_BENCHMARK_REPO_REF || 'main'" in text
+    assert "vars.VLLM_HUST_PERFGATE_BENCHMARK_RUNNER_SHA" in text
 
 
 def test_pr_and_manual_checkout_urls_use_https_without_publish_ssh_key():
     text = workflow_text()
 
-    assert "format('https://github.com/{0}.git', github.repository)" in text
-    assert "format('git@github.com:{0}.git', github.repository)" in text
-    read_only_events = (
-        "github.event_name == 'pull_request' || github.event_name == "
-        "'issue_comment' || github.event_name == 'workflow_dispatch'"
-    )
-    assert text.count(read_only_events) >= 5
+    assert "TARGET_REPO_URL: https://github.com/${{ github.repository }}.git" in text
     assert "https://github.com/vLLM-HUST/vllm-hust-benchmark.git" in text
     assert "https://github.com/vLLM-HUST/vllm-ascend-hust.git" in text
+    assert "https://github.com/vLLM-HUST/ascend-runtime-manager.git" in text
 
 
 def test_benchmark_checkout_retries_have_hard_network_timeouts():
@@ -158,7 +175,18 @@ def test_benchmark_install_removes_conflicting_vllm_provider():
         ) : text.index("      - name: Verify installation")
     ]
 
-    assert '"${PYTHON_BIN}" -m pip uninstall -y vllm vllm-hust' in install_step
+    uninstall_start = install_step.index('"${PYTHON_BIN}" -m pip uninstall -y')
+    plugin_install = install_step.index("install_local_ascend_plugin.sh")
+    uninstall_block = install_step[uninstall_start:plugin_install]
+    uninstall_args = uninstall_block.replace("\\\n", " ").split()
+
+    for distribution in (
+        "vllm",
+        "vllm-hust",
+        "vllm-ascend",
+        "vllm-ascend-hust",
+    ):
+        assert distribution in uninstall_args
     assert (
         '"${PYTHON_BIN}" scripts/ensure_vllm_provider.py --remove-conflicts'
         in install_step
@@ -177,6 +205,39 @@ def test_benchmark_install_removes_conflicting_vllm_provider():
     )
 
 
+def test_trusted_main_requires_pinned_public_companion_checkouts():
+    text = workflow_text()
+
+    assert "TARGET_REPO_URL: https://github.com/${{ github.repository }}.git" in text
+    assert (
+        "BENCHMARK_REPO_URL: "
+        "https://github.com/vLLM-HUST/vllm-hust-benchmark.git" in text
+    )
+    assert (
+        "VLLM_ASCEND_HUST_REPO_URL: "
+        "https://github.com/vLLM-HUST/vllm-ascend-hust.git" in text
+    )
+    assert (
+        "HUST_ASCEND_MANAGER_REPO_URL: "
+        "https://github.com/vLLM-HUST/ascend-runtime-manager.git" in text
+    )
+    assert "- name: Resolve trusted main dependency SHAs" in text
+    for name in (
+        "PERFGATE_BENCHMARK_RUNNER_SHA",
+        "PERFGATE_VLLM_ASCEND_HUST_SHA",
+        "PERFGATE_RUNTIME_MANAGER_SHA",
+    ):
+        assert name in text
+    assert "must be configured as a full immutable 40-character Git SHA" in text
+    assert 'echo "BENCHMARK_REPO_REF=$PERFGATE_BENCHMARK_RUNNER_SHA"' in text
+    assert 'echo "VLLM_ASCEND_HUST_REPO_REF=$PERFGATE_VLLM_ASCEND_HUST_SHA"' in text
+    assert 'echo "HUST_ASCEND_MANAGER_REPO_REF=$PERFGATE_RUNTIME_MANAGER_SHA"' in text
+    assert "- name: Verify trusted main dependency SHAs" in text
+    assert 'rev-parse HEAD)" = "$PERFGATE_BENCHMARK_RUNNER_SHA"' in text
+    assert 'rev-parse HEAD)" = "$PERFGATE_VLLM_ASCEND_HUST_SHA"' in text
+    assert 'rev-parse HEAD)" = "$PERFGATE_RUNTIME_MANAGER_SHA"' in text
+
+
 def test_main_benchmark_defaults_match_ascend_main_config():
     text = workflow_text()
 
@@ -188,7 +249,6 @@ def test_main_benchmark_defaults_match_ascend_main_config():
     assert "steps.resolve-scenario.outputs.BENCH_SCENARIO_COUNT == '1'" in text
     assert "multi_scenario_results.tsv" in text
     assert "Perfgate comparison: `skipped for multi-scenario run" in text
-    assert "vars.VLLM_HUST_MAIN_BENCHMARK_SCENARIOS == ''" in text
     assert (
         "github.event_name == 'pull_request' || github.event_name == 'issue_comment'"
     ) in text
@@ -243,6 +303,45 @@ def test_multi_scenario_runner_prints_failure_diagnostics():
     assert 'print_file_tail "scenario output"' in text
     assert 'print_file_tail "vLLM server log"' in text
     assert 'print_file_tail "runner preflight failure"' in text
+
+
+def test_structured_nightly_diagnostics_capture_steps_scenarios_and_four_states():
+    text = workflow_text()
+    diagnostics_step = text.index("      - name: Build structured Nightly diagnostics")
+    upload_step = text.index("      - name: Upload benchmark artifacts")
+    diagnostics_block = text[diagnostics_step:upload_step]
+
+    assert diagnostics_step < upload_step
+    assert "ASCEND_BENCHMARK_STEP_RESULTS_JSON" in diagnostics_block
+    assert '"id":"formal-benchmark"' in diagnostics_block
+    assert "steps.formal-benchmark.outputs.exit_code" in diagnostics_block
+    assert "build_ascend_benchmark_diagnostics.py" in diagnostics_block
+    assert "nightly-diagnostics.json" in diagnostics_block
+    for state in (
+        "benchmark_execution_status",
+        "publication_status",
+        "data_quality_status",
+        "release_visibility_status",
+    ):
+        assert state in diagnostics_block
+    assert "BENCHMARK_REPO_GH_TOKEN" not in diagnostics_block
+    assert "BENCHMARK_REPO_SSH_KEY" not in diagnostics_block
+
+
+def test_plugin_checkout_and_installed_preflights_run_before_benchmark():
+    text = workflow_text()
+    checkout = text.index("      - name: Checkout vllm-ascend-hust repo")
+    checkout_preflight = text.index("      - name: Preflight vllm-ascend-hust checkout")
+    install = text.index("      - name: Prepare Ascend runtime and install repos")
+    installed_preflight = text.index("      - name: Verify installation")
+    benchmark = text.index("      - name: Run benchmark CI and optional formal publish")
+
+    assert checkout < checkout_preflight < install < installed_preflight < benchmark
+    assert "verify_ascend_benchmark_plugin.py checkout" in text
+    assert '--expected-sha "$VLLM_ASCEND_HUST_REPO_REF"' in text
+    assert "verify_ascend_benchmark_plugin.py installed" in text
+    assert "plugin-checkout.json" in text
+    assert "plugin-installed.json" in text
 
 
 def test_benchmark_script_does_not_force_max_model_len():
@@ -328,7 +427,9 @@ def test_issue_comment_path_uses_pr_head_sha_and_base_sha():
     text = workflow_text()
 
     assert (
-        "TARGET_REPO_SHA: ${{ github.event_name == 'issue_comment' && "
+        "TARGET_REPO_SHA: ${{ github.event_name == 'pull_request' && "
+        "github.event.pull_request.head.sha || github.event_name == "
+        "'issue_comment' && "
         "needs.issue-comment-command.outputs.pr_head_sha || github.sha }}" in text
     )
     assert (
@@ -569,3 +670,206 @@ def test_issue_comment_non_pr_and_fork_pr_are_not_allowed_by_parser_tests():
 
     assert "test_resolve_issue_comment_pr_context_rejects_non_pr_issue" in parser_tests
     assert "test_resolve_issue_comment_pr_context_rejects_fork_pr" in parser_tests
+
+
+STORE_SCRIPT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / ".github/workflows/scripts/perfgate_store_baseline.sh"
+)
+
+
+def store_script_text() -> str:
+    return STORE_SCRIPT_PATH.read_text(encoding="utf-8")
+
+
+def test_producer_sets_perfgate_measurement_knobs():
+    text = workflow_text()
+
+    producer_step = text.index("- name: Run perfgate baseline producer benchmark")
+    producer_block = text[
+        producer_step : text.index(
+            "- name: Upload perfgate producer artifact", producer_step
+        )
+    ]
+    assert 'PERFGATE_WARMUP_RUNS: "1"' in producer_block
+    assert 'PERFGATE_MEASURED_RUNS: "3"' in producer_block
+    assert 'PERFGATE_AGGREGATION: "primary-median-run"' in producer_block
+    assert (
+        "RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-"
+        "${{ env.TARGET_REPO_SHA }}-perfgate" in producer_block
+    )
+    assert "merge-base --is-ancestor HEAD origin/main" in producer_block
+
+
+def test_store_baseline_step_expects_measurement_policy():
+    text = workflow_text()
+
+    store_step = text.index("- name: Publish central perfgate baseline")
+    formal_step = text.index("- name: Run benchmark CI and optional formal publish")
+    store_block = text[store_step:formal_step]
+
+    assert 'PERFGATE_EXPECTED_WARMUP_RUNS: "1"' in store_block
+    assert 'PERFGATE_EXPECTED_MEASURED_RUNS: "3"' in store_block
+    assert 'PERFGATE_EXPECTED_SCHEMA_VERSION: "perfgate-measurement/v2"' in store_block
+    assert 'PERFGATE_EXPECTED_STRATEGY: "warmup+primary-median-run"' in store_block
+    assert 'PERFGATE_EXPECTED_AGGREGATION: "primary-median-run"' in store_block
+
+
+def test_pr_stage1_and_stage2_keep_single_measurement_policy():
+    text = workflow_text()
+
+    formal_step = text.index("- name: Run benchmark CI and optional formal publish")
+    stage1_step = text.index("- name: Performance gate - Stage 1 comparison")
+    stage2_step = text.index(
+        "- name: Performance gate - Stage 2 trial rebase and benchmark"
+    )
+    final_compare_step = text.index(
+        "- name: Performance gate - two-stage comparison", stage2_step
+    )
+
+    pr_block = text[formal_step:stage1_step]
+    stage2_block = text[stage2_step:final_compare_step]
+
+    assert 'PERFGATE_WARMUP_RUNS: "0"' in pr_block
+    assert 'PERFGATE_MEASURED_RUNS: "1"' in pr_block
+    assert 'PERFGATE_AGGREGATION: "primary-median-run"' in pr_block
+    assert "PERFGATE_REQUIRE_PROVENANCE:" in pr_block
+    assert "&& '1' || '0'" in pr_block
+    assert 'PERFGATE_WARMUP_RUNS: "0"' in stage2_block
+    assert 'PERFGATE_MEASURED_RUNS: "1"' in stage2_block
+    assert 'PERFGATE_AGGREGATION: "primary-median-run"' in stage2_block
+    assert 'PERFGATE_REQUIRE_PROVENANCE: "1"' in stage2_block
+    assert 'PERFGATE_WARMUP_RUNS: "1"' not in pr_block + stage2_block
+    assert 'PERFGATE_MEASURED_RUNS: "3"' not in pr_block + stage2_block
+
+
+def test_runner_script_forwards_perfgate_measurement_env():
+    text = benchmark_runner_script_text()
+
+    for name in (
+        "PERFGATE_AGGREGATION",
+        "PERFGATE_MEASURED_RUNS",
+        "PERFGATE_REQUIRE_PROVENANCE",
+        "PERFGATE_WARMUP_RUNS",
+    ):
+        assert f"\n  {name}\n" in text, f"{name} missing from SUDO_PRESERVE_ENV_VARS"
+
+    assert text.count('PERFGATE_WARMUP_RUNS="${PERFGATE_WARMUP_RUNS:-0}"') >= 2
+    assert text.count('PERFGATE_MEASURED_RUNS="${PERFGATE_MEASURED_RUNS:-1}"') >= 2
+    assert (
+        text.count('PERFGATE_AGGREGATION="${PERFGATE_AGGREGATION:-primary-median-run}"')
+        >= 2
+    )
+
+
+def test_runner_script_copies_measurement_json_fail_closed():
+    text = benchmark_runner_script_text()
+
+    assert 'cp "$same_spec_submission_dir/measurement.json"' in text
+    assert "repeated-run measurement strategy is enabled" in text
+    assert '"${PERFGATE_WARMUP_RUNS:-0}" -gt 0' in text
+    assert '"${PERFGATE_MEASURED_RUNS:-1}" -gt 1' in text
+    assert "perfgate-provenance.json" in text
+    assert '"${PERFGATE_REQUIRE_PROVENANCE:-0}" == "1"' in text
+    assert '"schema_version": "perfgate-runtime-provenance/v1"' in text
+    assert 'PERFGATE_CANN_VERSION="${HUST_ASCEND_RUNTIME_VERSION:-}"' in text
+    assert 'git -C "${HUST_ASCEND_MANAGER_REPO:-}" rev-parse HEAD' in text
+    assert 'PERFGATE_RUNTIME_MANAGER_SHA="$runtime_manager_commit"' in text
+    assert '"runtime_manager_sha": one_line' in text
+
+
+def test_store_baseline_script_uses_central_exact_protocol_and_askpass():
+    text = store_script_text()
+
+    assert "vllm_hust_benchmark.perfgate_baselines publish" in text
+    assert '--measurement-file "$MEASUREMENT_FILE"' in text
+    assert '--target-repository "$TARGET_REPOSITORY"' in text
+    assert '--spec-hash "$SPEC_HASH"' in text
+    assert '--benchmark-runner-sha "$BENCHMARK_RUNNER_SHA"' in text
+    assert '--runtime-manager-sha "$RUNTIME_MANAGER_SHA"' in text
+    assert "perfgate-measurement/v2" in text
+    assert "warmup+primary-median-run" in text
+    assert 'secondary_sort_key == "run_index"' in text
+    assert "UPDATE_POINTER=(--update-latest-pointer)" in text
+    assert "GIT_ASKPASS" in text
+    assert "GIT_TERMINAL_PROMPT=0" in text
+    assert "x-access-token" in text
+    assert "x-access-token:${" not in text
+    assert "verify_raw_result_evidence warmup" in text
+    assert "verify_raw_result_evidence per_run" in text
+    assert 'sha256sum "$raw_result"' in text
+    assert "baselines/$GITHUB_SHA" not in text
+    assert "latest-main-pointer.json" not in text
+
+
+def test_trusted_main_benchmark_runner_supports_runtime_manager_provenance() -> None:
+    workflow = workflow_text()
+    check_start = workflow.index("- name: Verify trusted main dependency SHAs")
+    check_end = workflow.index(
+        "- name: Prepare Hugging Face cache directories", check_start
+    )
+    dependency_check = workflow[check_start:check_end]
+
+    assert "perfgate_baselines publish --help" in dependency_check
+    assert "--runtime-manager-sha" in dependency_check
+    assert "Pinned benchmark runner does not support" in dependency_check
+
+
+def test_perfgate_producer_and_store_survive_formal_benchmark_failure():
+    text = workflow_text()
+
+    assert "id: perfgate-producer" in text
+    assert "if: ${{ github.event_name == 'push'" in text
+    assert "id: perfgate-producer\n        if: ${{ always()" not in text
+    assert "continue-on-error: true" in text
+    assert 'echo "status=failed" >> "$GITHUB_OUTPUT"' in text
+    assert 'echo "status=success" >> "$GITHUB_OUTPUT"' in text
+    assert (
+        "name: ascend-perfgate-${{ github.run_id }}-${{ github.run_attempt }}" in text
+    )
+    assert text.index("- name: Upload perfgate producer artifact") < text.index(
+        "- name: Sanitize runner before central baseline publication"
+    )
+    assert text.index(
+        "- name: Sanitize runner before central baseline publication"
+    ) < text.index("- name: Publish central perfgate baseline")
+    assert text.index("- name: Publish central perfgate baseline") < text.index(
+        "- name: Run benchmark CI and optional formal publish"
+    )
+    assert "  store-main-perfgate-baseline:" not in text
+    assert text.count("secrets.VLLM_HUST_CENTRAL_BASELINE_WRITER_TOKEN") == 1
+
+
+def test_structured_diagnostics_cover_critical_operational_failures():
+    text = workflow_text()
+    diagnostics_start = text.index("- name: Build structured Nightly diagnostics")
+    diagnostics_end = text.index(
+        "- name: Upload benchmark artifacts", diagnostics_start
+    )
+    diagnostics_block = text[diagnostics_start:diagnostics_end]
+
+    critical_step_ids = (
+        "pre-clean-workspace",
+        "resolve-trusted-shas",
+        "configure-github-ssh",
+        "resolve-main-spec",
+        "checkout-website",
+        "preflight-root-helper",
+        "checkout-runtime-manager",
+        "verify-trusted-shas",
+        "prepare-hf-cache",
+        "acquire-hardware-lock",
+        "perfgate-producer",
+        "sanitize-before-baseline-publish",
+        "publish-central-baseline",
+        "cleanup-ascend-processes",
+        "release-hardware-lock",
+        "build-benchmark-summary",
+    )
+    for step_id in critical_step_ids:
+        assert f"id: {step_id}" in text
+        assert f'"id":"{step_id}"' in diagnostics_block
+        assert f"steps.{step_id}.outcome" in diagnostics_block
+        assert f"steps.{step_id}.outputs.exit_code" in diagnostics_block
+
+    assert "toJson(steps)" not in diagnostics_block

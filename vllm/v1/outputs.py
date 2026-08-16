@@ -11,6 +11,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_compression import KVCacheCompressionPlan
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -241,12 +242,7 @@ class ModelRunnerOutput:
     # num_generated_tokens is the number of tokens
     # generated in the current step. It can be different for
     # each request due to speculative/jump decoding.
-    sampled_token_ids: list[list[int]] | np.ndarray = field(default_factory=list)
-
-    # [num_reqs]
-    # Number of valid generated tokens in each sampled_token_ids row when
-    # sampled_token_ids is kept in padded array form.
-    num_sampled_tokens: list[int] | np.ndarray | None = None
+    sampled_token_ids: list[list[int]] = field(default_factory=list)
 
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
@@ -268,11 +264,20 @@ class ModelRunnerOutput:
 
     ec_connector_output: ECConnectorOutput | None = None
 
+    # Worker-to-scheduler cache compression transactions. ``None`` on the
+    # disabled/default path.
+    kv_cache_compression_plans: list[KVCacheCompressionPlan] | None = None
+
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Host-observed speculative phases for operational latency metrics.
+    spec_decode_proposer_latency_seconds: float = 0.0
+    spec_decode_verification_latency_seconds: float = 0.0
+    spec_decode_num_forwards: int = 0
 
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,

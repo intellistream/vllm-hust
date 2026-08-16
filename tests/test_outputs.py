@@ -127,73 +127,7 @@ class _FakeScoreLLM:
         ]
 
 
-def test_embedding_request_output_from_base_batch():
-    request_outputs = [
-        _make_pooling_request_output("req-0", torch.tensor([1.0, 2.0])),
-        _make_pooling_request_output("req-1", torch.tensor([3.0, 4.0])),
-    ]
-
-    outputs = EmbeddingRequestOutput.from_base_batch(request_outputs)
-
-    assert [output.request_id for output in outputs] == ["req-0", "req-1"]
-    assert [output.prompt_token_ids for output in outputs] == [[1, 2, 3], [1, 2, 3]]
-    for output, expected in zip(outputs, ([1.0, 2.0], [3.0, 4.0])):
-        assert output.outputs.embedding == pytest.approx(expected)
-
-
-def test_classification_request_output_from_base_batch():
-    request_outputs = [
-        _make_pooling_request_output("req-0", torch.tensor([0.1, 0.9])),
-        _make_pooling_request_output("req-1", torch.tensor([0.7, 0.3])),
-    ]
-
-    outputs = ClassificationRequestOutput.from_base_batch(request_outputs)
-
-    assert [output.request_id for output in outputs] == ["req-0", "req-1"]
-    for output, expected in zip(outputs, ([0.1, 0.9], [0.7, 0.3])):
-        assert output.outputs.probs == pytest.approx(expected)
-
-
-def test_scoring_request_output_from_base_batch():
-    request_outputs = [
-        _make_pooling_request_output("req-0", torch.tensor(0.25)),
-        _make_pooling_request_output("req-1", torch.tensor([0.75])),
-    ]
-
-    outputs = ScoringRequestOutput.from_base_batch(request_outputs)
-
-    assert [output.request_id for output in outputs] == ["req-0", "req-1"]
-    assert [output.outputs.score for output in outputs] == pytest.approx([0.25, 0.75])
-
-
-@pytest.mark.parametrize(
-    ("converter", "data", "message"),
-    [
-        (
-            EmbeddingRequestOutput.from_base_batch,
-            torch.tensor([[1.0, 2.0]]),
-            "pooled_data should be a 1-D embedding vector",
-        ),
-        (
-            ClassificationRequestOutput.from_base_batch,
-            torch.tensor([[1.0, 2.0]]),
-            "pooled_data should be a 1-D probability vector",
-        ),
-        (
-            ScoringRequestOutput.from_base_batch,
-            torch.tensor([1.0, 2.0]),
-            "pooled_data should be a scalar score",
-        ),
-    ],
-)
-def test_batch_converters_preserve_shape_validation(converter, data, message):
-    request_output = _make_pooling_request_output("req-0", data)
-
-    with pytest.raises(ValueError, match=message):
-        converter([request_output])
-
-
-def test_llm_embed_uses_batch_materialization():
+def test_llm_embed_materializes_output():
     outputs = LLM.embed(_FakeEncodeLLM(), ["x"], use_tqdm=False)
 
     assert len(outputs) == 1
@@ -201,7 +135,7 @@ def test_llm_embed_uses_batch_materialization():
     _assert_close_list(outputs[0].outputs.embedding, [1.0, 2.0])
 
 
-def test_llm_classify_uses_batch_materialization():
+def test_llm_classify_materializes_output():
     outputs = LLM.classify(_FakeEncodeLLM(), ["x"], use_tqdm=False)
 
     assert len(outputs) == 1
@@ -209,7 +143,7 @@ def test_llm_classify_uses_batch_materialization():
     _assert_close_list(outputs[0].outputs.probs, [0.2, 0.8])
 
 
-def test_llm_score_uses_batch_materialization():
+def test_llm_score_materializes_output():
     outputs = LLM.score(_FakeScoreLLM(), "a", "b", use_tqdm=False)
 
     assert len(outputs) == 1

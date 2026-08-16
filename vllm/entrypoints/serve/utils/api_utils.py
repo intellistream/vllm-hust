@@ -374,6 +374,16 @@ def _jsonify_arg_value(value: Any) -> Any:
     return repr(value)
 
 
+_SENSITIVE_ARG_NAMES = frozenset({"api_key"})
+
+
+def _redact_sensitive_args(non_default_args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: "<redacted>" if key in _SENSITIVE_ARG_NAMES else value
+        for key, value in non_default_args.items()
+    }
+
+
 def jsonify_non_default_args(
     args: Namespace | EngineArgs,
     *,
@@ -384,11 +394,13 @@ def jsonify_non_default_args(
         for key in exclude:
             non_default_args.pop(key, None)
 
+    non_default_args = _redact_sensitive_args(non_default_args)
+
     return {key: _jsonify_arg_value(value) for key, value in non_default_args.items()}
 
 
 def log_non_default_args(args: Namespace | EngineArgs):
-    non_default_args = get_non_default_args(args)
+    non_default_args = _redact_sensitive_args(get_non_default_args(args))
     logger.info("non-default args: %s", non_default_args)
 
 

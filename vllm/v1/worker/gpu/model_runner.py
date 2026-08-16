@@ -34,6 +34,8 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tp_group,
+    get_world_group,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -52,6 +54,10 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.gpu.adaptive_state_probe import (
+    AdaptiveStateProbe,
+    ProbeTopology,
+)
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
@@ -169,6 +175,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Data parallelism.
         self.dp_size = self.parallel_config.data_parallel_size
         self.dp_rank = self.parallel_config.data_parallel_rank
+        tp_group = get_tp_group()
+        pp_group = get_pp_group()
+        world_group = get_world_group()
+        self.adaptive_state_probe = AdaptiveStateProbe.from_env(
+            ProbeTopology(
+                world_rank=world_group.rank_in_group,
+                world_size=world_group.world_size,
+                dp_rank=self.dp_rank,
+                dp_size=self.dp_size,
+                pp_rank=pp_group.rank_in_group,
+                pp_size=pp_group.world_size,
+                tp_rank=tp_group.rank_in_group,
+                tp_size=tp_group.world_size,
+            )
+        )
 
         # Decode context parallelism.
         self.dcp_size = self.parallel_config.decode_context_parallel_size
@@ -1162,6 +1183,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_active_loras=num_active_loras,
         )
 
+        if self.adaptive_state_probe is not None:
+            self.adaptive_state_probe.record_step(
+                scheduler_output=scheduler_output,
+                batch_desc=batch_desc,
+                max_query_len=max_query_len,
+                uniform_tok_count=uniform_tok_count,
+                dummy_run=dummy_run,
+                skip_compiled=skip_compiled,
+            )
+
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1283,12 +1314,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
+        self._spec_decode_verification_started_at = (
+            time.perf_counter()
+            if self.speculator is not None and not dummy_run
+            else None
+        )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
+            self.kv_connector.observe_kv_recovery_first_compute(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -1310,6 +1347,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
+                self.kv_connector.observe_kv_recovery_first_compute(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
@@ -1391,6 +1429,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        verification_latency_seconds = 0.0
+        if self._spec_decode_verification_started_at is not None:
+            verification_latency_seconds = (
+                time.perf_counter() - self._spec_decode_verification_started_at
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1452,6 +1495,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+        proposer_latency_seconds = 0.0
         if self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -1462,6 +1506,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            proposer_started_at = time.perf_counter()
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1476,6 +1521,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
+            proposer_latency_seconds = time.perf_counter() - proposer_started_at
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:
@@ -1489,6 +1535,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+        model_runner_output.spec_decode_proposer_latency_seconds = (
+            proposer_latency_seconds
+        )
+        model_runner_output.spec_decode_verification_latency_seconds = (
+            verification_latency_seconds
+        )
+        model_runner_output.spec_decode_num_forwards = int(self.speculator is not None)
 
         return async_output
 
