@@ -560,6 +560,25 @@ Some legacy metrics are specific to "speculative decoding". This is where
 we generate candidate tokens using a faster, approximate method or
 model and then validate those tokens with the larger model.
 
+Current V1 servers expose the resolved capability and operational metrics:
+
+- `vllm:spec_decode_capability` (Gauge with method, proposer, platform, and status labels)
+- `vllm:spec_decode_num_drafts` (Counter)
+- `vllm:spec_decode_num_draft_tokens` (Counter)
+- `vllm:spec_decode_num_accepted_tokens` (Counter)
+- `vllm:spec_decode_num_rejected_tokens` (Counter)
+- `vllm:spec_decode_acceptance_rate` (Gauge)
+- `vllm:spec_decode_proposer_latency_seconds` (Histogram)
+- `vllm:spec_decode_verification_latency_seconds` (Histogram)
+- `vllm:spec_decode_effective_tokens_per_forward` (Gauge)
+
+The capability gauge is also emitted for disabled engines, so operators can
+distinguish an intentional no-spec baseline from an enabled proposer. An
+unavailable request fails before engine startup with a structured capability
+error and therefore cannot expose runtime metrics.
+
+The legacy metrics below are retained here as historical design context.
+
 - `vllm:spec_decode_draft_acceptance_rate` (Gauge)
 - `vllm:spec_decode_efficiency` (Gauge)
 - `vllm:spec_decode_num_accepted_tokens` (Counter)

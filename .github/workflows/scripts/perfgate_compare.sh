@@ -58,6 +58,33 @@ if [[ "${PERFGATE_BASELINE_AVAILABLE:-1}" != "1" || -z "${PERFGATE_BASELINE_FILE
   exit 2
 fi
 
+if [[ "${PERFGATE_STAGE1_PROVENANCE_VALID:-1}" != "1" ]]; then
+  reason=${PERFGATE_STAGE1_PROVENANCE_FAILURE_REASON:-Stage 1 candidate provenance validation failed}
+  mkdir -p "$(dirname "$REPORT_FILE")"
+  {
+    echo "## Performance Gate Result"
+    echo
+    echo "### Stage 1: NOT RUN"
+    echo
+    echo "$reason"
+    echo
+    echo "### Stage 2: NOT RUN"
+    echo
+    echo "Stage 2 requires provenance-compatible Stage 1 execution."
+    echo
+    echo "---"
+    echo
+    echo "**Overall: FAIL**"
+    echo "- Mode: \`$MODE\`"
+  } > "$REPORT_FILE"
+  write_env PERFGATE_RESULT fail
+  write_env PERFGATE_REPORT_FILE "$REPORT_FILE"
+  if [[ "$MODE" == "report" ]]; then
+    exit 0
+  fi
+  exit 2
+fi
+
 args=(
   compare2
   --stage1-current "$STAGE1_CURRENT"

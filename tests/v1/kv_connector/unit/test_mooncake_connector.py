@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _derive_ascend_server_name,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -1391,3 +1392,58 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
 
         prefill_worker.sender_loop = origin_sender_loop
         prefill_worker.shutdown()
+
+
+def test_derive_ascend_server_name_no_env(monkeypatch):
+    """Non-Ascend platforms (env unset) keep the bare hostname."""
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
+    assert _derive_ascend_server_name("10.0.0.1", 0) == "10.0.0.1"
+
+
+def test_derive_ascend_server_name_single_instance(monkeypatch):
+    """Single NPU instance derives base port from physical id 0."""
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
+    assert _derive_ascend_server_name("10.0.0.1", 0) == "10.0.0.1:12001"
+
+
+def test_derive_ascend_server_name_multi_instance(monkeypatch):
+    """Co-located instances on different NPUs get unique ports."""
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,5,7")
+    # device_id 1 -> phys_id 5 -> 12001 + 5
+    assert _derive_ascend_server_name("10.0.0.1", 1) == "10.0.0.1:12006"
+    # device_id 2 -> phys_id 7 -> 12001 + 7
+    assert _derive_ascend_server_name("10.0.0.1", 2) == "10.0.0.1:12008"
+
+
+def test_derive_ascend_server_name_strips_whitespace(monkeypatch):
+    """Whitespace around physical ids is tolerated."""
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", " 0 , 3 ")
+    assert _derive_ascend_server_name("10.0.0.1", 1) == "10.0.0.1:12004"
+
+
+def test_derive_ascend_server_name_device_id_out_of_range(monkeypatch):
+    """device_id beyond the visible-device list raises instead of IndexError."""
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1")
+    with pytest.raises(ValueError, match="out of range"):
+        _derive_ascend_server_name("10.0.0.1", 2)
+
+
+def test_derive_ascend_server_name_negative_device_id(monkeypatch):
+    """Negative device_id is rejected."""
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1")
+    with pytest.raises(ValueError, match="out of range"):
+        _derive_ascend_server_name("10.0.0.1", -1)
+
+
+def test_derive_ascend_server_name_non_integer_phys_id(monkeypatch):
+    """Non-integer physical id raises a clear ValueError."""
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "abc,1")
+    with pytest.raises(ValueError, match="non-integer"):
+        _derive_ascend_server_name("10.0.0.1", 0)
+
+
+def test_derive_ascend_server_name_port_overflow(monkeypatch):
+    """Derived port beyond 65535 is rejected."""
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "65535")
+    with pytest.raises(ValueError, match="exceeds 65535"):
+        _derive_ascend_server_name("10.0.0.1", 0)

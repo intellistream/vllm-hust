@@ -7,7 +7,7 @@ from vllm import PoolingParams
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.engine.protocol import UsageInfo
 from vllm.logger import init_logger
-from vllm.outputs import PoolingRequestOutput, ScoringRequestOutput
+from vllm.outputs import PoolingRequestOutput, ScoringOutput
 from vllm.tasks import SCORE_TYPE_MAP, SupportedTask
 from vllm.v1.pool.late_interaction import (
     build_late_interaction_doc_params,
@@ -107,12 +107,10 @@ class ServingScores(PoolingServing):
     ) -> JSONResponse:
         items: list[ScoreResponseData] = []
         num_prompt_tokens = 0
-        score_batch = ScoringRequestOutput.from_base_batch(final_res_batch)
-
-        for idx, (score_res, final_res) in enumerate(zip(score_batch, final_res_batch)):
+        for idx, final_res in enumerate(final_res_batch):
             item = ScoreResponseData(
                 index=idx,
-                score=score_res.outputs.score,
+                score=ScoringOutput.from_base(final_res.outputs).score,
             )
             prompt_token_ids = final_res.prompt_token_ids
 
@@ -147,8 +145,7 @@ class ServingScores(PoolingServing):
 
         results: list[RerankResult] = []
         num_prompt_tokens = 0
-        score_batch = ScoringRequestOutput.from_base_batch(final_res_batch)
-        for idx, (score_res, final_res) in enumerate(zip(score_batch, final_res_batch)):
+        for idx, final_res in enumerate(final_res_batch):
             document = documents[idx]
             if isinstance(document, str):
                 rerank_document = RerankDocument(text=document)
@@ -160,7 +157,7 @@ class ServingScores(PoolingServing):
             result = RerankResult(
                 index=idx,
                 document=rerank_document,
-                relevance_score=score_res.outputs.score,
+                relevance_score=ScoringOutput.from_base(final_res.outputs).score,
             )
             results.append(result)
             prompt_token_ids = final_res.prompt_token_ids

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 from http import HTTPStatus
 from unittest.mock import MagicMock
 
@@ -13,7 +14,10 @@ from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
 )
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
-from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.models.serving import (
+    OpenAIModelRegistry,
+    OpenAIServingModels,
+)
 from vllm.entrypoints.pooling.base.serving import PoolingServingBase
 from vllm.entrypoints.pooling.typing import PoolingServeContext
 from vllm.entrypoints.serve.lora.protocol import (
@@ -58,6 +62,29 @@ async def test_serving_model_name():
         lora_name="adapter", lora_path="/path/to/adapter2", lora_int_id=1
     )
     assert serving_models.model_name(request) == request.lora_name
+
+
+def test_model_card_exposes_speculative_capability():
+    model_config = MagicMock(spec=ModelConfig)
+    model_config.max_model_len = 2048
+    capability = {
+        "requested_method": "none",
+        "detected_checkpoint_method": "dspark",
+        "resolved_method": "none",
+        "proposer": "none",
+        "platform": "ascend",
+        "status": "disabled",
+        "evidence": ["dspark_block_size"],
+    }
+    registry = OpenAIModelRegistry(
+        model_config=model_config,
+        base_model_paths=BASE_MODEL_PATHS,
+        speculative_capability=capability,
+    )
+
+    models = asyncio.run(registry.show_available_models())
+
+    assert models.data[0].speculative_capability == capability
 
 
 @pytest.mark.asyncio

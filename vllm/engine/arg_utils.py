@@ -43,6 +43,7 @@ from vllm.config import (
     ECTransferConfig,
     EPLBConfig,
     KernelConfig,
+    KVCacheCompressionConfig,
     KVEventsConfig,
     KVTransferConfig,
     LoadConfig,
@@ -727,6 +728,7 @@ class EngineArgs:
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+    kv_cache_compression_config: KVCacheCompressionConfig | None = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1523,6 +1525,10 @@ class EngineArgs:
             "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
         )
         vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
+        vllm_group.add_argument(
+            "--kv-cache-compression-config",
+            **vllm_kwargs["kv_cache_compression_config"],
+        )
         vllm_group.add_argument(
             "--ec-transfer-config", **vllm_kwargs["ec_transfer_config"]
         )
@@ -2349,6 +2355,7 @@ class EngineArgs:
             compilation_config=compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
+            kv_cache_compression_config=self.kv_cache_compression_config,
             ec_transfer_config=self.ec_transfer_config,
             reasoning_config=self.reasoning_config,
             profiler_config=self.profiler_config,

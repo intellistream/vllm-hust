@@ -15,6 +15,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
+from vllm.v1.kv_cache_compression import KVCacheCompressionCompatibility
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 if TYPE_CHECKING:
@@ -98,6 +99,38 @@ class WorkerBase:
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
         raise NotImplementedError
+
+    def validate_kv_cache_compression(self) -> KVCacheCompressionCompatibility:
+        """Validate enabled KV cache compression before KV allocation.
+
+        Device workers must override this method to resolve and validate their
+        platform provider. The base implementation never imports a provider.
+        """
+        config = self.vllm_config.kv_cache_compression_config
+        if config is None:
+            return KVCacheCompressionCompatibility(
+                schema_version=1,
+                provider="",
+                supported=True,
+                reasons=(),
+                platform=self.current_platform.device_type,
+            )
+
+        factory = self.current_platform.get_kv_cache_compression_provider_factory()
+        if factory is None:
+            reasons = (
+                "platform does not declare a KV cache compression provider factory",
+            )
+        else:
+            reasons = ("worker does not implement KV cache compression validation",)
+        return KVCacheCompressionCompatibility(
+            schema_version=config.schema_version,
+            provider=config.provider,
+            supported=False,
+            reasons=reasons,
+            platform=self.current_platform.device_type,
+            provider_factory=factory,
+        )
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Prepare model for execution through compilation/warmup.

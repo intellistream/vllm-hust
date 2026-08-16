@@ -157,3 +157,31 @@ def test_eagle3_lm_head_receives_quant_config():
         assert call_kwargs["quant_config"] is mock_quant_config, (
             "ParallelLMHead must receive the draft model's quant_config"
         )
+
+
+def test_qwen2_eagle_preserves_model_prefix():
+    """Qwen2 EAGLE must preserve the caller's prefix for layer registration."""
+    from vllm.model_executor.models.qwen2_eagle import Qwen2ForCausalLMEagle
+
+    mock_hf_config = Mock()
+    mock_hf_config.draft_vocab_size = None
+    mock_hf_config.vocab_size = 32000
+    mock_hf_config.logit_scale = 1.0
+
+    mock_vllm_config = Mock()
+    mock_vllm_config.speculative_config.draft_model_config.hf_config = mock_hf_config
+    mock_vllm_config.model_config.get_num_layers.return_value = 32
+
+    with (
+        patch("vllm.model_executor.models.qwen2_eagle.Qwen2Model") as mock_model,
+        patch("vllm.model_executor.models.qwen2_eagle.LogitsProcessor"),
+    ):
+        Qwen2ForCausalLMEagle(vllm_config=mock_vllm_config, prefix="draft")
+
+    mock_model.assert_called_once_with(
+        vllm_config=mock_vllm_config,
+        prefix="draft.model",
+        start_layer_id=32,
+    )
+    assert mock_hf_config.draft_vocab_size == mock_hf_config.vocab_size
+    assert mock_hf_config.target_layer_count == 32
