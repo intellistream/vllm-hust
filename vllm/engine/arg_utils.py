@@ -104,6 +104,7 @@ from vllm.platforms.hardware_defaults import (
 )
 from vllm.plugins import load_general_plugins
 from vllm.ray.lazy_utils import is_in_ray_actor, is_ray_initialized
+from vllm.sparsity.config import ActivationSparsityConfig
 from vllm.transformers_utils.config import (
     is_interleaved,
     maybe_override_with_speculators,
@@ -725,6 +726,11 @@ class EngineArgs:
         "weight_transfer_config",
     )
 
+    activation_sparsity_config: ActivationSparsityConfig | None = get_field(
+        VllmConfig,
+        "activation_sparsity_config",
+    )
+
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
 
@@ -745,6 +751,10 @@ class EngineArgs:
         if isinstance(self.weight_transfer_config, dict):
             self.weight_transfer_config = WeightTransferConfig(
                 **self.weight_transfer_config
+            )
+        if isinstance(self.activation_sparsity_config, dict):
+            self.activation_sparsity_config = ActivationSparsityConfig(
+                **self.activation_sparsity_config
             )
         if isinstance(self.ir_op_priority, dict):
             self.ir_op_priority = IrOpPriorityConfig(**self.ir_op_priority)
@@ -1547,6 +1557,10 @@ class EngineArgs:
         vllm_group.add_argument("--performance-mode", **vllm_kwargs["performance_mode"])
         vllm_group.add_argument(
             "--weight-transfer-config", **vllm_kwargs["weight_transfer_config"]
+        )
+        vllm_group.add_argument(
+            "--activation-sparsity-config",
+            **vllm_kwargs["activation_sparsity_config"],
         )
 
         # Other arguments
@@ -2356,6 +2370,7 @@ class EngineArgs:
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
+            activation_sparsity_config=self.activation_sparsity_config,
             shutdown_timeout=self.shutdown_timeout,
         )
 

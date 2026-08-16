@@ -432,6 +432,79 @@ def get_sparse_attention_config(
     return config
 
 
+def get_activation_sparsity_config(
+    model_config: Any,
+    load_config: Any,
+    config_filename: str = "activation_sparsity_config.json",
+) -> dict[str, Any]:
+    """Look for ``activation_sparsity_config.json`` in the model directory.
+
+    Follows the same remote/local resolution pattern as
+    :func:`get_sparse_attention_config`.
+
+    Args:
+        model_config: The model config (usually ``ModelConfig``).
+        load_config: The load config (usually ``LoadConfig``).
+        config_filename: Name of the JSON config file to look for.
+
+    Returns:
+        The parsed JSON dict, or ``{}`` if the file does not exist.
+    """
+    # Delegate to the implementation in vllm.sparsity.utils to keep
+    # sparsity-specific logic in one place.
+    from vllm.sparsity.utils import (
+        get_activation_sparsity_config as _get_activation_sparsity_config,
+    )
+
+    return _get_activation_sparsity_config(model_config, load_config, config_filename)
+
+
+def download_gguf(
+    repo_id: str,
+    quant_type: str,
+    cache_dir: str | None = None,
+    revision: str | None = None,
+    ignore_patterns: str | list[str] | None = None,
+) -> str:
+    # Use patterns that snapshot_download can handle directly
+    # Patterns to match:
+    # - *-{quant_type}.gguf (root)
+    # - *-{quant_type}-*.gguf (root sharded)
+    # - */*-{quant_type}.gguf (subdir)
+    # - */*-{quant_type}-*.gguf (subdir sharded)
+    allow_patterns = [
+        f"*-{quant_type}.gguf",
+        f"*-{quant_type}-*.gguf",
+        f"*/*-{quant_type}.gguf",
+        f"*/*-{quant_type}-*.gguf",
+    ]
+
+    # Use download_weights_from_hf which handles caching and downloading
+    folder = download_weights_from_hf(
+        model_name_or_path=repo_id,
+        cache_dir=cache_dir,
+        allow_patterns=allow_patterns,
+        revision=revision,
+        ignore_patterns=ignore_patterns,
+    )
+
+    # Find the downloaded file(s) in the folder
+    local_files = []
+    for pattern in allow_patterns:
+        # Convert pattern to glob pattern for local filesystem
+        glob_pattern = os.path.join(folder, pattern)
+        local_files.extend(glob.glob(glob_pattern))
+
+    if not local_files:
+        raise ValueError(
+            f"Downloaded GGUF files not found in {folder} for quant_type {quant_type}"
+        )
+
+    # Sort to ensure consistent ordering (prefer non-sharded files)
+    local_files.sort(key=lambda x: (x.count("-"), x))
+    return local_files[0]
+
+
 @instrument(span_name="Download weights - HF")
 def download_weights_from_hf(
     model_name_or_path: str,

@@ -53,6 +53,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.sparsity import (
+    ActivationSparsityConfig,
+    build_sparsifier,
+    merge_larosa_rotation_into_linear,
+)
 from vllm.v1.attention.backend import AttentionType
 
 from .adapters import as_embedding_model, as_seq_cls_model
@@ -87,6 +92,7 @@ class LlamaMLP(nn.Module):
         prefix: str = "",
         reduce_results: bool = True,
         disable_tp: bool = False,
+        sparsity_config: "ActivationSparsityConfig | None" = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -112,9 +118,52 @@ class LlamaMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
+        # TEAL / La RoSA injection points
+        try:
+            layer_idx = extract_layer_index(prefix)
+        except Exception:
+            layer_idx = 0
+        self.sparsify_gate_up = (
+            build_sparsifier(sparsity_config, layer_idx, "mlp.gate_up")
+            if sparsity_config is not None
+            else None
+        )
+        if sparsity_config is not None and sparsity_config.use_sparse_gemv:
+            merge_larosa_rotation_into_linear(
+                sparsity_config,
+                layer_idx,
+                "mlp.gate_up",
+                self.gate_up_proj,
+            )
+        self.sparsify_down = (
+            build_sparsifier(sparsity_config, layer_idx, "mlp.down")
+            if sparsity_config is not None
+            else None
+        )
+
     def forward(self, x):
-        x, _ = self.gate_up_proj(x)
+        sparse_gate_up = (
+            self.sparsify_gate_up.try_apply_linear(x, self.gate_up_proj)
+            if self.sparsify_gate_up is not None
+            else None
+        )
+        if sparse_gate_up is not None:
+            x, _ = sparse_gate_up
+        else:
+            if self.sparsify_gate_up is not None:
+                x = self.sparsify_gate_up.apply_dense_fallback(x, self.gate_up_proj)
+            x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
+        sparse_down = (
+            self.sparsify_down.try_apply_linear(x, self.down_proj)
+            if self.sparsify_down is not None
+            else None
+        )
+        if sparse_down is not None:
+            x, _ = sparse_down
+            return x
+        if self.sparsify_down is not None:
+            x = self.sparsify_down.apply_dense_fallback(x, self.down_proj)
         x, _ = self.down_proj(x)
         return x
 
@@ -133,6 +182,7 @@ class LlamaAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        sparsity_config: "ActivationSparsityConfig | None" = None,
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
@@ -218,15 +268,56 @@ class LlamaAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        # TEAL / La RoSA injection points
+        self.sparsify_qkv = (
+            build_sparsifier(sparsity_config, layer_idx, "self_attn.qkv")
+            if sparsity_config is not None
+            else None
+        )
+        if sparsity_config is not None and sparsity_config.use_sparse_gemv:
+            merge_larosa_rotation_into_linear(
+                sparsity_config,
+                layer_idx,
+                "self_attn.qkv",
+                self.qkv_proj,
+            )
+        self.sparsify_o = (
+            build_sparsifier(sparsity_config, layer_idx, "self_attn.o")
+            if sparsity_config is not None
+            else None
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        sparse_qkv = (
+            self.sparsify_qkv.try_apply_linear(hidden_states, self.qkv_proj)
+            if self.sparsify_qkv is not None
+            else None
+        )
+        if sparse_qkv is not None:
+            qkv, _ = sparse_qkv
+        else:
+            if self.sparsify_qkv is not None:
+                hidden_states = self.sparsify_qkv.apply_dense_fallback(
+                    hidden_states, self.qkv_proj
+                )
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        sparse_o = (
+            self.sparsify_o.try_apply_linear(attn_output, self.o_proj)
+            if self.sparsify_o is not None
+            else None
+        )
+        if sparse_o is not None:
+            output, _ = sparse_o
+            return output
+        if self.sparsify_o is not None:
+            attn_output = self.sparsify_o.apply_dense_fallback(attn_output, self.o_proj)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -258,6 +349,7 @@ class LlamaDecoderLayer(nn.Module):
         config = config or vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = self.get_quant_config(vllm_config)
+        sparsity_config = getattr(vllm_config, "activation_sparsity_config", None)
 
         self.hidden_size = config.hidden_size
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
@@ -293,6 +385,7 @@ class LlamaDecoderLayer(nn.Module):
             cache_config=cache_config,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            sparsity_config=sparsity_config,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -301,6 +394,7 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             bias=getattr(config, "mlp_bias", False),
             prefix=f"{prefix}.mlp",
+            sparsity_config=sparsity_config,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(

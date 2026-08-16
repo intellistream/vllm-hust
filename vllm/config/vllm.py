@@ -22,6 +22,10 @@ from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
 from vllm.logger import enable_trace_function_call, init_logger
+from vllm.sparsity.config import (
+    ActivationSparsityConfig,
+    validate_activation_sparsity_compatibility,
+)
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
@@ -374,6 +378,9 @@ class VllmConfig:
     weight_transfer_config: WeightTransferConfig | None = None
     """The configurations for weight transfer during RL training."""
 
+    activation_sparsity_config: ActivationSparsityConfig | None = None
+    """Activation sparsity configuration (TEAL / La RoSA)."""
+
     shutdown_timeout: int = Field(default=0, ge=0)
     """Shutdown grace period for in-flight requests. Shutdown will be delayed for
     up to this amount of time to allow already-running requests to complete. Any
@@ -479,6 +486,10 @@ class VllmConfig:
             else:
                 additional_config_hash = additional_config.compute_hash()
             vllm_factors.append(additional_config_hash)
+        else:
+            vllm_factors.append("None")
+        if self.activation_sparsity_config:
+            vllm_factors.append(self.activation_sparsity_config.compute_hash())
         else:
             vllm_factors.append("None")
         factors.append(vllm_factors)
@@ -1588,6 +1599,19 @@ class VllmConfig:
                 custom_ops.append("+quant_fp8")
 
         self._verify_kv_transfer_compat()
+
+        # Activation sparsity unsupported-combination guard
+        validate_activation_sparsity_compatibility(
+            self.activation_sparsity_config,
+            tensor_parallel_size=(
+                self.parallel_config.tensor_parallel_size
+                if self.parallel_config is not None
+                else 1
+            ),
+            has_quantization=self.quant_config is not None,
+            has_lora=self.lora_config is not None,
+        )
+
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
 

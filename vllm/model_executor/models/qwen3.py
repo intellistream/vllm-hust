@@ -24,7 +24,7 @@
 """Inference-only Qwen3 model compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -45,6 +45,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
+from vllm.sparsity.layers import (
+    build_sparsifier,
+    merge_larosa_rotation_into_linear,
+)
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
 
@@ -60,6 +64,9 @@ from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.sparsity.config import ActivationSparsityConfig
 
 
 class Qwen3Attention(nn.Module):
@@ -78,6 +85,7 @@ class Qwen3Attention(nn.Module):
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
         dual_chunk_attention_config: dict[str, Any] | None = None,
+        sparsity_config: "ActivationSparsityConfig | None" = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -148,12 +156,43 @@ class Qwen3Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
+        layer_idx = extract_layer_index(prefix)
+        self.sparsify_qkv = (
+            build_sparsifier(sparsity_config, layer_idx, "self_attn.qkv")
+            if sparsity_config is not None
+            else None
+        )
+        if sparsity_config is not None and sparsity_config.use_sparse_gemv:
+            merge_larosa_rotation_into_linear(
+                sparsity_config,
+                layer_idx,
+                "self_attn.qkv",
+                self.qkv_proj,
+            )
+        self.sparsify_o = (
+            build_sparsifier(sparsity_config, layer_idx, "self_attn.o")
+            if sparsity_config is not None
+            else None
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        sparse_qkv = (
+            self.sparsify_qkv.try_apply_linear(hidden_states, self.qkv_proj)
+            if self.sparsify_qkv is not None
+            else None
+        )
+        if sparse_qkv is not None:
+            qkv, _ = sparse_qkv
+        else:
+            if self.sparsify_qkv is not None:
+                hidden_states = self.sparsify_qkv.apply_dense_fallback(
+                    hidden_states, self.qkv_proj
+                )
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
@@ -164,6 +203,16 @@ class Qwen3Attention(nn.Module):
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        sparse_o = (
+            self.sparsify_o.try_apply_linear(attn_output, self.o_proj)
+            if self.sparsify_o is not None
+            else None
+        )
+        if sparse_o is not None:
+            output, _ = sparse_o
+            return output
+        if self.sparsify_o is not None:
+            attn_output = self.sparsify_o.apply_dense_fallback(attn_output, self.o_proj)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -175,6 +224,7 @@ class Qwen3DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        sparsity_config: "ActivationSparsityConfig | None" = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -206,6 +256,7 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
             dual_chunk_attention_config=dual_chunk_attention_config,
+            sparsity_config=sparsity_config,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -213,6 +264,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            sparsity_config=sparsity_config,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
