@@ -18,7 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
 from typing import TYPE_CHECKING
 
 try:
@@ -101,6 +101,8 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
+        strict_load_reservation: bool = False,
+        instrumentation_callback: Callable[[dict[str, object]], None] | None = None,
     ):
         """
         Args:
@@ -111,6 +113,8 @@ class FileSystemTierManager(SecondaryTierManager):
             root_dir: Root directory for block files.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
+            strict_load_reservation: Keep read-priority workers reserved for loads.
+            instrumentation_callback: Receives task and I/O lifecycle events.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -141,7 +145,10 @@ class FileSystemTierManager(SecondaryTierManager):
             n_read_threads,
             n_write_threads,
             thread_name_prefix="vllm_kv_py_fs",
+            strict_load_reservation=strict_load_reservation,
+            instrumentation_callback=instrumentation_callback,
         )
+        self._instrumentation_callback = instrumentation_callback
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
@@ -165,6 +172,12 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
+                instrumentation_callback=self._instrumentation_callback,
+                instrumentation_identity={
+                    "job_id": job_metadata.job_id,
+                    "block_id": int(bid),
+                    "direction": "store",
+                },
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
@@ -179,6 +192,12 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
+                instrumentation_callback=self._instrumentation_callback,
+                instrumentation_identity={
+                    "job_id": job_metadata.job_id,
+                    "block_id": int(bid),
+                    "direction": "load",
+                },
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
