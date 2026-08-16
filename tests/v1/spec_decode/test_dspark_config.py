@@ -9,6 +9,7 @@ from vllm.config import ParallelConfig, SpeculativeConfig
 from vllm.models.deepseek_v4.nvidia.dspark import (
     DSparkDeepseekV4ForCausalLM,
 )
+from vllm.platforms import current_platform
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 
@@ -111,6 +112,7 @@ def test_dspark_config_inherits_target_quantization(monkeypatch: pytest.MonkeyPa
         enforce_eager=True,
         max_logprobs=20,
         config_format="hf",
+        hf_text_config=SimpleNamespace(dspark_noise_token_id=128799),
     )
     draft_hf_config = SimpleNamespace(
         model_type="deepseek_v4",
@@ -131,6 +133,11 @@ def test_dspark_config_inherits_target_quantization(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr("vllm.config.speculative.ModelConfig", fake_model_config)
     monkeypatch.setattr(SpeculativeConfig, "update_arch_", lambda _self: None)
+    monkeypatch.setattr(
+        current_platform,
+        "get_speculative_proposer_capabilities",
+        lambda: {"dspark": "test:dspark"},
+    )
 
     speculative_config = SpeculativeConfig(
         model=target_model_config.model,
@@ -141,3 +148,5 @@ def test_dspark_config_inherits_target_quantization(monkeypatch: pytest.MonkeyPa
 
     assert speculative_config.method == "dspark"
     assert speculative_config.draft_model_config.quantization == "fp8"
+    assert speculative_config.capability.status == "enabled"
+    assert speculative_config.capability.resolved_method == "dspark"
