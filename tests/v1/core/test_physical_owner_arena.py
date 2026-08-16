@@ -17,6 +17,7 @@ from vllm.v1.core.sched.physical_owner_arena import (
     PhysicalOwnerArenaError,
     PhysicalOwnerArenaPlan,
     build_physical_owner_arena_plan,
+    select_request_owned_decode_graph_envelope,
 )
 
 _GROUP_RANKS = (7, 2, 11, 5, 13, 3, 17, 19)
@@ -128,6 +129,49 @@ def test_full_plan_matches_the_existing_balanced_graph_key() -> None:
         num_tokens=32,
         uniform_decode=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("counts", "expects_physical"),
+    (
+        ((4,) * 8, False),
+        ((2,) * 8, True),  # balanced logical partial occupancy
+        ((4, 0) * 4, True),
+    ),
+)
+def test_graph_envelope_never_shrinks_an_ordinary_partial_batch(
+    counts: tuple[int, ...], expects_physical: bool
+) -> None:
+    signature, plan = select_request_owned_decode_graph_envelope(
+        _layout(counts),
+        rows_per_owner=4,
+        num_reqs=sum(counts),
+        num_tokens=sum(counts),
+        uniform_decode=True,
+    )
+    assert signature == RequestOwnedGraphSignature(
+        owner_counts=(4,) * 8,
+        canonical_to_owner=tuple(range(32)),
+    )
+    assert isinstance(plan, PhysicalOwnerArenaPlan) is expects_physical
+
+
+def test_graph_envelope_preserves_the_balanced_multi_token_lane() -> None:
+    layout = _layout((4,) * 8)
+    signature, plan = select_request_owned_decode_graph_envelope(
+        layout,
+        rows_per_owner=4,
+        num_reqs=16,
+        num_tokens=32,
+        uniform_decode=True,
+    )
+    assert signature == balanced_decode_graph_signature(
+        layout,
+        num_reqs=16,
+        num_tokens=32,
+        uniform_decode=True,
+    )
+    assert plan is None
 
 
 @pytest.mark.parametrize(

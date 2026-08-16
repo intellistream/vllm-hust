@@ -22,6 +22,7 @@ from vllm.v1.core.sched.owner_layout import (
     OwnerLayoutError,
     OwnerRowLayout,
     RequestOwnedGraphSignature,
+    balanced_decode_graph_signature,
 )
 
 
@@ -332,3 +333,42 @@ def build_physical_owner_arena_plan(
         forward_indices=tuple(forward),
         inverse_indices=tuple(inverse),
     )
+
+
+def select_request_owned_decode_graph_envelope(
+    layout: OwnerRowLayout,
+    *,
+    rows_per_owner: int,
+    num_reqs: int,
+    num_tokens: int,
+    uniform_decode: bool,
+) -> tuple[RequestOwnedGraphSignature | None, PhysicalOwnerArenaPlan | None]:
+    """Select the captured execution key without shrinking a partial batch.
+
+    A balanced logical layout can still occupy only part of the captured
+    owner arena.  In that case its smaller balanced signature is valid as a
+    logical description but is not a captured execution envelope, so the
+    fixed physical signature must take precedence.  Multi-token balanced
+    lanes remain on their established logical signature because R4-v1's
+    physical plan deliberately covers ordinary one-token decode only.
+    """
+
+    logical_signature = balanced_decode_graph_signature(
+        layout,
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        uniform_decode=uniform_decode,
+    )
+    physical_plan = build_physical_owner_arena_plan(
+        layout,
+        rows_per_owner=rows_per_owner,
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        uniform_decode=uniform_decode,
+    )
+    if physical_plan is not None and (
+        logical_signature is None
+        or physical_plan.logical_len < physical_plan.capacity
+    ):
+        return physical_plan.graph_signature, physical_plan
+    return logical_signature, None
