@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -65,6 +66,49 @@ from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
+
+# Mooncake Transfer Engine's default server port. On Ascend, the local
+# server name advertised via the P2P handshake must carry a unique port per
+# instance, otherwise co-located instances (e.g. disaggregated prefill and
+# decode) resolve to the same RPC endpoint. The port is derived from the
+# physical NPU id so that instances on different NPUs stay addressable.
+_MOONCAKE_ASCEND_BASE_PORT = 12001
+
+
+def _derive_ascend_server_name(hostname: str, device_id: int) -> str:
+    """Derive the per-instance "ip:port" server name on Ascend.
+
+    ASCEND_RT_VISIBLE_DEVICES lists the physical NPU ids visible to the
+    process. The P2P handshake endpoint must be unique per instance, so the
+    port is derived from the physical NPU id. Returns the bare hostname on
+    non-Ascend platforms where the env var is unset.
+    """
+    ascend_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+    if not ascend_devices:
+        return hostname
+    phys_ids = [dev.strip() for dev in ascend_devices.split(",")]
+    if not 0 <= device_id < len(phys_ids):
+        raise ValueError(
+            f"device_id {device_id} is out of range for "
+            f"ASCEND_RT_VISIBLE_DEVICES={ascend_devices!r} "
+            f"({len(phys_ids)} devices); TP config does not match the "
+            "visible device list"
+        )
+    try:
+        phys_id = int(phys_ids[device_id])
+    except ValueError as exc:
+        raise ValueError(
+            f"non-integer physical NPU id {phys_ids[device_id]!r} in "
+            f"ASCEND_RT_VISIBLE_DEVICES={ascend_devices!r}"
+        ) from exc
+    port = _MOONCAKE_ASCEND_BASE_PORT + phys_id
+    if port > 65535:
+        raise ValueError(
+            f"derived Mooncake port {port} exceeds 65535 "
+            f"(base {_MOONCAKE_ASCEND_BASE_PORT} + phys_id {phys_id})"
+        )
+    return f"{hostname}:{port}"
+
 
 try:
     from mooncake.engine import TransferEngine
@@ -934,8 +978,16 @@ class MooncakeConnectorWorker:
         logger.info(
             "The Mooncake Transfer Engine is using %s as its protocol.", protocol
         )
+        # The local server name must be "ip:port". On Ascend, the RPC endpoint
+        # advertised via the P2P handshake has to be unique per instance,
+        # otherwise two co-located vLLM instances (e.g. disaggregated prefill
+        # and decode) resolve to the same endpoint and KV transfer fails to
+        # connect. Derive a per-instance port from the physical NPU id when
+        # running on Ascend. This is a no-op on other platforms because
+        # ASCEND_RT_VISIBLE_DEVICES is only set by the Ascend runtime.
+        local_server_name = _derive_ascend_server_name(self.hostname, self.device_id)
         ret_value = self.engine.initialize(
-            self.hostname, "P2PHANDSHAKE", protocol, device_name
+            local_server_name, "P2PHANDSHAKE", protocol, device_name
         )
         if ret_value != 0:
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")

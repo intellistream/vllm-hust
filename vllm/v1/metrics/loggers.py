@@ -451,6 +451,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             labelnames,
             per_engine_labelvalues,
             is_diffusion=vllm_config.model_config.is_diffusion,
+            capability=vllm_config.speculative_capability,
         )
         self.kv_connector_prom = self._kv_connector_cls(
             vllm_config, labelnames, per_engine_labelvalues

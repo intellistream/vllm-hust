@@ -25,7 +25,9 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
-from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
+from vllm.model_executor.warmup.qwen_triton_warmup_config import (
+    needs_qwen_triton_warmup,
+)
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup_if_needed,
 )
@@ -54,7 +56,15 @@ def kernel_warmup(worker: "Worker"):
             getattr(worker.model_runner, "device", torch.device("cuda")),
             worker.scheduler_config.max_num_batched_tokens,
         )
-    qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+    # Qwen's Triton warmup imports kernels that query the active device target.
+    # Check the model family through a dependency-free helper before importing
+    # those kernels so non-Qwen workers never touch the Triton driver here.
+    if needs_qwen_triton_warmup(worker.vllm_config.model_config):
+        from vllm.model_executor.warmup.qwen_triton_warmup import (
+            qwen_triton_warmup,
+        )
+
+        qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real

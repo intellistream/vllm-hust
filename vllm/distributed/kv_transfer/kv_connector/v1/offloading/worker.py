@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
+import math
+import time
 from collections import defaultdict
+from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import replace
+from itertools import islice
 
 import torch
 
@@ -25,6 +31,16 @@ from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     OffloadingSpec,
     OffloadingWorker,
+)
+from vllm.v1.kv_recovery_profile import (
+    MAX_TRANSFER_IDS_PER_WAIT_SET,
+    KVRecoveryComputeContext,
+    KVRecoveryH2DReceipt,
+    KVRecoveryTransferAttempt,
+    KVRecoveryTransferContext,
+    KVRecoveryWaitAttempt,
+    KVRecoveryWaitMembership,
+    KVRecoveryWorkerObserver,
 )
 
 logger = init_logger(__name__)
@@ -57,16 +73,218 @@ def _page_size_from_tensor(tensor: torch.Tensor, num_blocks: int) -> int:
 class OffloadingConnectorWorker:
     """Implementation of Worker side methods"""
 
-    def __init__(self, spec: OffloadingSpec):
+    def __init__(
+        self,
+        spec: OffloadingSpec,
+        kv_recovery_observer: KVRecoveryWorkerObserver | None = None,
+    ):
         self.spec = spec
         self.worker: OffloadingWorker | None = None
+        self._kv_recovery_observer = kv_recovery_observer
 
-        # job_id -> req_id for in-flight loads.
+        # Preserve the original profiler-off state shapes. Optional identity
+        # uses separate tables allocated only when an observer is active.
         self._load_jobs: dict[int, ReqId] = {}
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
+        self._kv_recovery_store_contexts: (
+            dict[int, KVRecoveryTransferContext] | None
+        ) = {} if kv_recovery_observer is not None else None
+        self._kv_recovery_profiled_attempts: (
+            dict[int, KVRecoveryTransferAttempt] | None
+        ) = {} if kv_recovery_observer is not None else None
+        self._kv_recovery_compute_contexts: (
+            dict[ReqId, KVRecoveryComputeContext] | None
+        ) = {} if kv_recovery_observer is not None else None
         self._connector_worker_meta = OffloadingWorkerMetadata()
+
+    def _begin_kv_recovery_transfer(
+        self,
+        job_id: int,
+        context: KVRecoveryTransferContext | None,
+    ) -> KVRecoveryTransferAttempt | None:
+        observer = self._kv_recovery_observer
+        if observer is None or context is None:
+            return None
+        try:
+            attempt = observer.begin_transfer(job_id, context)
+            if not isinstance(attempt, KVRecoveryTransferAttempt):
+                return None
+            if attempt.connector_job_id != job_id or attempt.context != context:
+                return None
+            return attempt
+        except Exception:
+            return None
+
+    def _record_kv_recovery_submit(
+        self,
+        attempt: KVRecoveryTransferAttempt | None,
+        timestamp_ns: int,
+    ) -> bool:
+        observer = self._kv_recovery_observer
+        if observer is None or attempt is None:
+            return False
+        try:
+            observer.transfer_submitted(attempt, timestamp_ns)
+        except Exception:
+            return False
+        return True
+
+    def _record_kv_recovery_not_submitted(
+        self,
+        attempt: KVRecoveryTransferAttempt | None,
+    ) -> None:
+        observer = self._kv_recovery_observer
+        if observer is None or attempt is None:
+            return
+        try:
+            observer.transfer_not_submitted(attempt)
+        except Exception:
+            return
+
+    def _admit_kv_recovery_submission_evidence(
+        self,
+        attempt: KVRecoveryTransferAttempt | None,
+    ) -> bool:
+        if attempt is None:
+            return False
+        timestamp_ns = self._profile_clock_ns()
+        if timestamp_ns is None:
+            # The backend submission succeeded, but without its observation
+            # timestamp the evidence attempt cannot be accepted. Release the
+            # bounded prepared slot while leaving serving unaffected.
+            self._record_kv_recovery_not_submitted(attempt)
+            return False
+        return self._record_kv_recovery_submit(attempt, timestamp_ns)
+
+    def _submit_pending_stores(self) -> None:
+        assert self.worker is not None
+        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+            context = (
+                self._kv_recovery_store_contexts.pop(job_id, None)
+                if self._kv_recovery_store_contexts is not None
+                else None
+            )
+            attempt = self._begin_kv_recovery_transfer(job_id, context)
+            try:
+                success = self.worker.submit_store(job_id, src_spec, dst_spec)
+            except Exception:
+                self._record_kv_recovery_not_submitted(attempt)
+                raise
+            if not success:
+                self._record_kv_recovery_not_submitted(attempt)
+            assert success
+            if self._admit_kv_recovery_submission_evidence(attempt):
+                assert attempt is not None
+                assert self._kv_recovery_profiled_attempts is not None
+                self._kv_recovery_profiled_attempts[job_id] = attempt
+        self._unsubmitted_store_jobs.clear()
+
+    def _prepare_kv_recovery_wait(
+        self, job_ids: set[int]
+    ) -> KVRecoveryWaitMembership | None:
+        observer = self._kv_recovery_observer
+        if observer is None or not job_ids:
+            return None
+        try:
+            observed_job_ids = frozenset(
+                job_ids
+                if len(job_ids) <= MAX_TRANSFER_IDS_PER_WAIT_SET
+                else islice(job_ids, MAX_TRANSFER_IDS_PER_WAIT_SET + 1)
+            )
+            membership = observer.prepare_wait(observed_job_ids)
+            return (
+                membership if isinstance(membership, KVRecoveryWaitMembership) else None
+            )
+        except Exception:
+            return None
+
+    def _record_kv_recovery_wait(
+        self,
+        membership: KVRecoveryWaitMembership,
+        entry_timestamp_ns: int,
+    ) -> None:
+        observer = self._kv_recovery_observer
+        if observer is None:
+            return
+        try:
+            observer.wait_completed(
+                KVRecoveryWaitAttempt(
+                    membership,
+                    entry_timestamp_ns,
+                )
+            )
+        except Exception:
+            return
+
+    @staticmethod
+    def _profile_clock_ns() -> int | None:
+        try:
+            return time.monotonic_ns()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _device_duration_ns(transfer_time: float | None) -> int | None:
+        if (
+            transfer_time is None
+            or type(transfer_time) not in (int, float)
+            or not math.isfinite(transfer_time)
+        ):
+            return None
+        if transfer_time <= 0 or transfer_time > ((2**64 - 1) / 1_000_000_000):
+            return None
+        try:
+            duration_ns = math.floor(transfer_time * 1_000_000_000 + 0.5)
+        except OverflowError:
+            return None
+        return duration_ns if duration_ns <= 2**64 - 1 else None
+
+    def _record_kv_recovery_completion(
+        self,
+        job_id: int,
+        timestamp_ns: int,
+        success: bool,
+        bytes_moved: int | None,
+        transfer_time: float | None,
+        attempt: KVRecoveryTransferAttempt,
+    ) -> None:
+        observer = self._kv_recovery_observer
+        if observer is None:
+            return
+        try:
+            receipt = observer.transfer_completed(
+                connector_job_id=job_id,
+                timestamp_ns=timestamp_ns,
+                success=success,
+                bytes_moved=bytes_moved,
+                device_duration_ns=self._device_duration_ns(transfer_time),
+            )
+            if receipt is None or not isinstance(receipt, KVRecoveryH2DReceipt):
+                return
+            context = attempt.context
+            if (
+                context.operation != "h2d_restore"
+                or receipt.connector_job_id != job_id
+                or receipt.transfer_id != attempt.transfer_id
+                or receipt.identity != context.identity
+                or receipt.block_set_id != context.block_set_id
+                or receipt.timestamp_ns != timestamp_ns
+                or receipt.bytes_moved != bytes_moved
+            ):
+                return
+        except Exception:
+            return
+        if self._connector_worker_meta.add_kv_recovery_h2d_receipt(receipt):
+            return
+        try:
+            observer.h2d_receipt_capacity_exhausted(
+                receipt,
+                "serialization_failure",
+            )
+        except Exception:
+            return
 
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
         self.worker = self.spec.get_worker(kv_caches)
@@ -306,26 +524,125 @@ class OffloadingConnectorWorker:
 
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
-        self._unsubmitted_store_jobs.clear()
+        self._submit_pending_stores()
 
         if kv_connector_metadata.jobs_to_flush:
+            wait_membership = self._prepare_kv_recovery_wait(
+                kv_connector_metadata.jobs_to_flush
+            )
+            entry_timestamp_ns = (
+                self._profile_clock_ns() if wait_membership is not None else None
+            )
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
+            if entry_timestamp_ns is not None and wait_membership is not None:
+                self._record_kv_recovery_wait(
+                    wait_membership,
+                    entry_timestamp_ns,
+                )
+
+        # A flush is normally a completion fence, not an abandonment. Only
+        # consume contexts named by the scheduler's explicit discard handoff,
+        # and do so after any required backend wait has completed.
+        if kv_connector_metadata.kv_recovery_jobs_to_invalidate:
+            observer = self._kv_recovery_observer
+            if observer is not None:
+                with suppress(Exception):
+                    observer.invalidate_transfers(
+                        kv_connector_metadata.kv_recovery_jobs_to_invalidate
+                    )
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
-        self._unsubmitted_store_jobs.clear()
+        self._submit_pending_stores()
+
+        if self._kv_recovery_compute_contexts is not None:
+            self._fail_unobserved_first_compute()
+            self._kv_recovery_compute_contexts = dict(
+                metadata.kv_recovery_compute_contexts or {}
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "KV-recovery start_kv_transfers compute_contexts=%s",
+                    sorted(self._kv_recovery_compute_contexts),
+                )
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
+            context = None
+            if metadata.kv_recovery_contexts is not None:
+                context = metadata.kv_recovery_contexts.get(job_id)
+            attempt = self._begin_kv_recovery_transfer(job_id, context)
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
-            success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
+            try:
+                success = self.worker.submit_load(
+                    job_id, entry.src_spec, entry.dst_spec
+                )
+            except Exception:
+                self._record_kv_recovery_not_submitted(attempt)
+                raise
+            if not success:
+                self._record_kv_recovery_not_submitted(attempt)
             assert success
+            if self._admit_kv_recovery_submission_evidence(attempt):
+                assert attempt is not None
+                assert self._kv_recovery_profiled_attempts is not None
+                self._kv_recovery_profiled_attempts[job_id] = attempt
+
+    def observe_kv_recovery_first_compute(
+        self,
+        scheduled_request_ids: Iterable[str],
+    ) -> None:
+        """Consume the exact admitted sidecars at the worker forward entry."""
+        observer = self._kv_recovery_observer
+        contexts = self._kv_recovery_compute_contexts
+        if observer is None or not contexts:
+            return
+        try:
+            scheduled_request_ids = frozenset(scheduled_request_ids)
+        except Exception:
+            self._fail_unobserved_first_compute()
+            return
+        timestamp_ns = self._profile_clock_ns()
+        if timestamp_ns is None:
+            self._fail_unobserved_first_compute()
+            return
+        pending = tuple(contexts.items())
+        contexts.clear()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KV-recovery first_compute observe: contexts=%s scheduled=%s",
+                sorted(k for k, _ in pending),
+                sorted(scheduled_request_ids),
+            )
+        for runtime_request_id, context in pending:
+            if (
+                runtime_request_id not in scheduled_request_ids
+                or context.identity.runtime_request_id != runtime_request_id
+            ):
+                logger.debug(
+                    "KV-recovery first_compute NOT observed for %s (in_scheduled=%s)",
+                    runtime_request_id,
+                    runtime_request_id in scheduled_request_ids,
+                )
+                with suppress(Exception):
+                    observer.first_compute_not_observed(context)
+                continue
+            logger.debug(
+                "KV-recovery first_compute observed for %s", runtime_request_id
+            )
+            with suppress(Exception):
+                observer.first_compute(context, timestamp_ns)
+
+    def _fail_unobserved_first_compute(self) -> None:
+        observer = self._kv_recovery_observer
+        contexts = self._kv_recovery_compute_contexts
+        if observer is None or not contexts:
+            return
+        pending = tuple(contexts.values())
+        contexts.clear()
+        for context in pending:
+            with suppress(Exception):
+                observer.first_compute_not_observed(context)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -336,6 +653,13 @@ class OffloadingConnectorWorker:
             self._unsubmitted_store_jobs.append(
                 (job_id, entry.src_spec, entry.dst_spec)
             )
+            if (
+                self._kv_recovery_store_contexts is not None
+                and metadata.kv_recovery_contexts is not None
+            ):
+                context = metadata.kv_recovery_contexts.get(job_id)
+                if context is not None:
+                    self._kv_recovery_store_contexts[job_id] = context
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """
@@ -353,7 +677,26 @@ class OffloadingConnectorWorker:
             # we currently do not support job failures
             job_id = transfer_result.job_id
             assert transfer_result.success
+            timestamp_ns = (
+                self._profile_clock_ns()
+                if self._kv_recovery_profiled_attempts is not None
+                else None
+            )
             is_load = job_id in self._load_jobs
+            attempt = (
+                self._kv_recovery_profiled_attempts.pop(job_id, None)
+                if self._kv_recovery_profiled_attempts is not None
+                else None
+            )
+            if attempt is not None and timestamp_ns is not None:
+                self._record_kv_recovery_completion(
+                    job_id=job_id,
+                    timestamp_ns=timestamp_ns,
+                    success=transfer_result.success,
+                    bytes_moved=transfer_result.transfer_size,
+                    transfer_time=transfer_result.transfer_time,
+                    attempt=attempt,
+                )
             if (
                 transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
@@ -385,6 +728,17 @@ class OffloadingConnectorWorker:
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        if self._kv_recovery_store_contexts is not None:
+            self._kv_recovery_store_contexts.clear()
+        if self._kv_recovery_profiled_attempts is not None:
+            self._kv_recovery_profiled_attempts.clear()
+        if self._kv_recovery_compute_contexts is not None:
+            self._fail_unobserved_first_compute()
         self._connector_worker_meta = OffloadingWorkerMetadata()
-        if self.worker is not None:
-            self.worker.shutdown()
+        try:
+            if self.worker is not None:
+                self.worker.shutdown()
+        finally:
+            if self._kv_recovery_observer is not None:
+                with suppress(Exception):
+                    self._kv_recovery_observer.close()

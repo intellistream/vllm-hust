@@ -55,6 +55,7 @@ from .weight_transfer import WeightTransferConfig
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from vllm.config.speculative_capability import SpeculativeCapability
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 else:
@@ -521,6 +522,33 @@ class VllmConfig:
         ):
             return self.diffusion_config.canvas_length
         return 0
+
+    @property
+    def speculative_capability(self) -> "SpeculativeCapability":
+        """Return the resolved capability for enabled and disabled engines."""
+        if self.speculative_config is not None:
+            return self.speculative_config.capability
+
+        from vllm.config.speculative_capability import (
+            resolve_speculative_capability,
+        )
+        from vllm.platforms import current_platform
+
+        platform_name = (
+            getattr(current_platform, "device_name", None)
+            or current_platform.__class__.__name__
+        )
+        hf_config = (
+            self.model_config.hf_text_config if self.model_config is not None else {}
+        )
+        return resolve_speculative_capability(
+            requested_method=None,
+            hf_config=hf_config,
+            platform=platform_name,
+            registered_proposers=(
+                current_platform.get_speculative_proposer_capabilities()
+            ),
+        )
 
     @property
     def use_v2_model_runner(self) -> bool:

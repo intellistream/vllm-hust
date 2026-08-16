@@ -59,15 +59,15 @@ def get_parallel_drafting_token_id(hf_config) -> int:
     none are present.
     """
     dflash_config = getattr(hf_config, "dflash_config", None) or {}
-    if "mask_token_id" in dflash_config:
+    if dflash_config.get("mask_token_id") is not None:
         return int(dflash_config["mask_token_id"])
     if getattr(hf_config, "mask_token_id", None) is not None:
         return int(hf_config.mask_token_id)
-    if hasattr(hf_config, "dspark_noise_token_id"):
+    if getattr(hf_config, "dspark_noise_token_id", None) is not None:
         return int(hf_config.dspark_noise_token_id)
-    if hasattr(hf_config, "pard_token"):
+    if getattr(hf_config, "pard_token", None) is not None:
         return int(hf_config.pard_token)
-    if hasattr(hf_config, "ptd_token_id"):
+    if getattr(hf_config, "ptd_token_id", None) is not None:
         return int(hf_config.ptd_token_id)
     raise ValueError(
         "Model config must specify `dflash_config.mask_token_id`,"
