@@ -143,8 +143,10 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sched.owner_layout import (
     OwnerRowLayout,
     RequestOwnedGraphSignature,
-    balanced_decode_graph_signature,
     build_owner_row_layout,
+)
+from vllm.v1.core.sched.physical_owner_arena import (
+    select_request_owned_decode_graph_envelope,
 )
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -3947,12 +3949,20 @@ class GPUModelRunner(
             if self._request_owner_layout is None:
                 request_owned_full_ineligible = True
             else:
-                request_owned_signature = balanced_decode_graph_signature(
+                (
+                    request_owned_signature,
+                    physical_plan,
+                ) = select_request_owned_decode_graph_envelope(
                     self._request_owner_layout,
+                    rows_per_owner=(
+                        self.scheduler_config.request_owned_decode_rows_per_owner
+                    ),
                     num_reqs=num_reqs,
                     num_tokens=num_tokens,
                     uniform_decode=uniform_decode,
                 )
+                if physical_plan is not None:
+                    num_tokens_padded = physical_plan.capacity
                 request_owned_full_ineligible = request_owned_signature is None
 
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
