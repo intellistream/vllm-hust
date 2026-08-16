@@ -108,6 +108,7 @@ class UniProcExecutor(Executor):
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        self._validate_request_owned_control_only_step(scheduler_output)
         output = self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),

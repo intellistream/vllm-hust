@@ -7,6 +7,7 @@ import vllm.envs as envs
 from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ECTransferConfig,
     KVCacheCompressionConfig,
     KVTransferConfig,
@@ -64,6 +65,7 @@ def create_scheduler(
     use_v2_model_runner: bool | None = None,
     kv_cache_compression_config: KVCacheCompressionConfig | None = None,
     kv_cache_compression_runtime_spec: KVCacheCompressionRuntimeSpec | None = None,
+    device: str | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -74,6 +76,7 @@ def create_scheduler(
       enable_prefix_caching: optionally force APC config
                              (True/False) or use default
                              (False)
+      device: optionally force a test device without platform auto-detection
 
     Returns:
       {class}`Scheduler` instance
@@ -144,6 +147,7 @@ def create_scheduler(
         else None
     )
 
+    device_config = DeviceConfig(device=device) if device is not None else None
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
@@ -153,6 +157,7 @@ def create_scheduler(
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
         kv_cache_compression_config=kv_cache_compression_config,
+        **({"device_config": device_config} if device_config is not None else {}),
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests

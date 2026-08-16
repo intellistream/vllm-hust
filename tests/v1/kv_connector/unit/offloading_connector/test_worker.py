@@ -111,6 +111,76 @@ def _make_worker(kv_cache_config: KVCacheConfig):
 # ---------------------------------------------------------------------------
 
 
+def test_register_packed_list_views_preserves_sliced_backing_offset():
+    """Ascend compressed caches expose non-contiguous list views."""
+
+    layer_a = "model.layers.0.self_attn"
+    layer_b = "model.layers.1.self_attn"
+    spec_a = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.int8,
+    )
+    config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=64,
+                shared_by=[layer_a],
+                offset=0,
+                block_stride=16,
+            ),
+            KVCacheTensor(
+                size=64,
+                shared_by=[layer_b],
+                offset=8,
+                block_stride=16,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[layer_a], kv_cache_spec=spec_a),
+            KVCacheGroupSpec(layer_names=[layer_b], kv_cache_spec=spec_a),
+        ],
+    )
+    allocation = torch.arange(77, dtype=torch.int8)
+    backing = allocation[7:71]
+    kv_caches = {
+        layer_a: [
+            torch.as_strided(
+                backing,
+                size=(4, 2),
+                stride=(16, 1),
+                storage_offset=backing.storage_offset(),
+            )
+        ],
+        layer_b: [
+            torch.as_strided(
+                backing,
+                size=(4, 2),
+                stride=(16, 1),
+                storage_offset=backing.storage_offset() + 8,
+            )
+        ],
+    }
+    worker, offload_spec = _make_worker(config)
+
+    worker.register_kv_caches(kv_caches)
+
+    canonical = offload_spec.get_worker.call_args.args[0]
+    assert len(canonical.tensors) == 1
+    tensor = canonical.tensors[0].tensor
+    assert tensor.shape == (4, 16)
+    assert tensor.stride() == (16, 1)
+    assert tensor.storage_offset() == backing.storage_offset()
+    assert tensor.data_ptr() == backing.data_ptr()
+    torch.testing.assert_close(tensor.flatten(), backing)
+    assert canonical.group_data_refs == [
+        [CanonicalKVCacheRef(0, 16)],
+        [CanonicalKVCacheRef(0, 16)],
+    ]
+
+
 @pytest.mark.parametrize("backend", ATTN_BACKENDS)
 def test_register_kv_caches(backend):
     """Test register_kv_caches with multiple groups covering all layer types.

@@ -711,6 +711,40 @@ class EngineArgs:
 
     stream_interval: int = SchedulerConfig.stream_interval
 
+    enable_request_owned_attention: bool = (
+        SchedulerConfig.enable_request_owned_attention
+    )
+    enable_request_owned_q_wkv_fanin: bool = (
+        SchedulerConfig.enable_request_owned_q_wkv_fanin
+    )
+    enable_request_owned_sampling: bool = SchedulerConfig.enable_request_owned_sampling
+    enable_request_owned_graph: bool = SchedulerConfig.enable_request_owned_graph
+    enable_request_owned_kv_offload: bool = (
+        SchedulerConfig.enable_request_owned_kv_offload
+    )
+    enable_request_owned_windows: bool = SchedulerConfig.enable_request_owned_windows
+    request_owned_decode_rows_per_owner: int = (
+        SchedulerConfig.request_owned_decode_rows_per_owner
+    )
+    request_owned_decode_window_steps: int = (
+        SchedulerConfig.request_owned_decode_window_steps
+    )
+    request_owned_hot_low_watermark: int = (
+        SchedulerConfig.request_owned_hot_low_watermark
+    )
+    request_owned_hot_high_watermark: int = (
+        SchedulerConfig.request_owned_hot_high_watermark
+    )
+    request_owned_prefill_wave_steps: int = (
+        SchedulerConfig.request_owned_prefill_wave_steps
+    )
+    request_owned_prefill_max_wait_steps: int = (
+        SchedulerConfig.request_owned_prefill_max_wait_steps
+    )
+    request_owned_decode_reservation_tokens: int | None = (
+        SchedulerConfig.request_owned_decode_reservation_tokens
+    )
+
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
@@ -1465,6 +1499,58 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--enable-request-owned-attention",
+            **scheduler_kwargs["enable_request_owned_attention"],
+        )
+        scheduler_group.add_argument(
+            "--enable-request-owned-q-wkv-fanin",
+            **scheduler_kwargs["enable_request_owned_q_wkv_fanin"],
+        )
+        scheduler_group.add_argument(
+            "--enable-request-owned-sampling",
+            **scheduler_kwargs["enable_request_owned_sampling"],
+        )
+        scheduler_group.add_argument(
+            "--enable-request-owned-graph",
+            **scheduler_kwargs["enable_request_owned_graph"],
+        )
+        scheduler_group.add_argument(
+            "--enable-request-owned-kv-offload",
+            **scheduler_kwargs["enable_request_owned_kv_offload"],
+        )
+        scheduler_group.add_argument(
+            "--enable-request-owned-windows",
+            **scheduler_kwargs["enable_request_owned_windows"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-decode-rows-per-owner",
+            **scheduler_kwargs["request_owned_decode_rows_per_owner"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-decode-window-steps",
+            **scheduler_kwargs["request_owned_decode_window_steps"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-hot-low-watermark",
+            **scheduler_kwargs["request_owned_hot_low_watermark"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-hot-high-watermark",
+            **scheduler_kwargs["request_owned_hot_high_watermark"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-prefill-wave-steps",
+            **scheduler_kwargs["request_owned_prefill_wave_steps"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-prefill-max-wait-steps",
+            **scheduler_kwargs["request_owned_prefill_max_wait_steps"],
+        )
+        scheduler_group.add_argument(
+            "--request-owned-decode-reservation-tokens",
+            **scheduler_kwargs["request_owned_decode_reservation_tokens"],
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -2169,6 +2255,25 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            enable_request_owned_attention=self.enable_request_owned_attention,
+            enable_request_owned_q_wkv_fanin=self.enable_request_owned_q_wkv_fanin,
+            enable_request_owned_sampling=self.enable_request_owned_sampling,
+            enable_request_owned_graph=self.enable_request_owned_graph,
+            enable_request_owned_kv_offload=self.enable_request_owned_kv_offload,
+            enable_request_owned_windows=self.enable_request_owned_windows,
+            request_owned_decode_rows_per_owner=(
+                self.request_owned_decode_rows_per_owner
+            ),
+            request_owned_decode_window_steps=(self.request_owned_decode_window_steps),
+            request_owned_hot_low_watermark=(self.request_owned_hot_low_watermark),
+            request_owned_hot_high_watermark=(self.request_owned_hot_high_watermark),
+            request_owned_prefill_wave_steps=(self.request_owned_prefill_wave_steps),
+            request_owned_prefill_max_wait_steps=(
+                self.request_owned_prefill_max_wait_steps
+            ),
+            request_owned_decode_reservation_tokens=(
+                self.request_owned_decode_reservation_tokens
+            ),
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

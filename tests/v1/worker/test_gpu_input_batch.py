@@ -469,6 +469,54 @@ def test_placeholder_spec_token_ids_written_verbatim():
     assert input_batch.token_ids_cpu[0, 3:6].tolist() == [13, -1, -1]
 
 
+def test_sampling_metadata_spec_token_ids_active_slice():
+    """SamplingMetadata.spec_token_ids must expose only the active rows.
+
+    Before condense(), the reusable backing list is oversized (one entry per
+    max_num_reqs slot). _make_sampling_metadata() must publish exactly the
+    first num_reqs active rows, preserving the inner list identity.
+    """
+    input_batch = InputBatch(
+        max_num_reqs=4,
+        max_model_len=8,
+        max_num_batched_tokens=8,
+        device=torch.device("cpu"),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+    )
+    req = CachedRequestState(
+        req_id="req",
+        prompt_token_ids=[10, 11],
+        mm_features=[],
+        sampling_params=SamplingParams(),
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=3,
+        output_token_ids=[12],
+    )
+    input_batch.add_request(req)
+
+    # Regression precondition: without condense(), the backing list is still
+    # oversized relative to the active request count (initialized to
+    # max_num_reqs slots plus one appended row for the added request).
+    assert len(input_batch.spec_token_ids) == 5
+    assert len(input_batch.spec_token_ids) > input_batch.num_reqs
+    assert input_batch.num_reqs == 1
+
+    active_spec_token_ids = input_batch.spec_token_ids[0]
+    input_batch.update_req_spec_token_ids(req, {"req": [13, 14]})
+    assert input_batch.spec_token_ids[0] == [13, 14]
+
+    sampling_metadata = input_batch._make_sampling_metadata()
+
+    assert sampling_metadata.spec_token_ids == [active_spec_token_ids]
+    assert len(sampling_metadata.spec_token_ids) == input_batch.num_reqs == 1
+    # The inner list is reused by identity, not copied.
+    assert sampling_metadata.spec_token_ids[0] is active_spec_token_ids
+    assert sampling_metadata.spec_token_ids[0] == [13, 14]
+
+
 @pytest.mark.parametrize(
     ("pooling_params", "expect_device_prompt_token_ids", "expect_cpu_prompt_token_ids"),
     [

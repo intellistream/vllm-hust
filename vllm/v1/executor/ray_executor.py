@@ -67,7 +67,15 @@ class RayDistributedExecutor(Executor):
     uses_ray: bool = True
     supports_pp: bool = True
 
+    def _reject_request_owned_attention(self) -> None:
+        if self.scheduler_config.enable_request_owned_attention:
+            raise RuntimeError(
+                "Request-owned attention does not support the Ray executor; "
+                "use MultiprocExecutor with HCCL."
+            )
+
     def _init_executor(self) -> None:
+        self._reject_request_owned_attention()
         self.forward_dag: ray.dag.CompiledDAG | None = None
 
         # For TPU or XPU, avoid compiling NVIDIA's NCCL
@@ -392,6 +400,7 @@ class RayDistributedExecutor(Executor):
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        self._reject_request_owned_attention()
         if self.scheduler_output is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -437,6 +446,11 @@ class RayDistributedExecutor(Executor):
         grammar_output: "GrammarOutput | None",
         non_block: bool = False,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        # execute_model() can defer token work until sample_tokens(). Recheck
+        # the mutable flag at the actual dispatch boundary so a disabled ->
+        # enabled transition cannot enter this unsupported backend.
+        self._reject_request_owned_attention()
+
         # Build the compiled DAG for the first time.
         if self.forward_dag is None:  # type: ignore
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
@@ -455,17 +469,18 @@ class RayDistributedExecutor(Executor):
             # the scheduler can yield to the next batch.
             return FutureWrapper(refs[0])
 
-        # Get output from all workers when connector is present
-        assert self.kv_output_aggregator is not None
+        # Get output from all workers when a connector is present.
+        aggregator = self.kv_output_aggregator
+        assert aggregator is not None
         if not non_block:
             # Block and get results from all workers
             outputs = ray.get(refs)
             for output in outputs:
                 detach_zero_copy_from_model_runner_output(output)
-            return self.kv_output_aggregator.aggregate(outputs)
+            return aggregator.aggregate(outputs)
 
         # Return a future that will aggregate outputs from all workers
-        return FutureWrapper(refs, self.kv_output_aggregator)
+        return FutureWrapper(refs, aggregator)
 
     def collective_rpc(  # type: ignore[override]
         self,

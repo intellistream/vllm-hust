@@ -5,7 +5,7 @@ from argparse import ArgumentError
 
 import pytest
 
-from vllm.config import VllmConfig
+from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms.hardware_defaults import (
     get_current_accelerator_scheduling_defaults,
@@ -144,3 +144,218 @@ def test_mm_prefix_lm_raises_batched_tokens_floor():
         vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
 
     assert vllm_config.scheduler_config.max_num_batched_tokens >= 2496
+
+
+def test_request_owned_flags_default_false():
+    """All experimental request-owned flags default to False and never
+    change the scheduler config unless explicitly enabled."""
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    engine_args = EngineArgs.from_cli_args(args=parser.parse_args([]))
+    assert engine_args.enable_request_owned_attention is False
+    assert engine_args.enable_request_owned_q_wkv_fanin is False
+    assert engine_args.enable_request_owned_sampling is False
+    assert engine_args.enable_request_owned_graph is False
+    assert engine_args.enable_request_owned_kv_offload is False
+    assert engine_args.enable_request_owned_windows is False
+    assert engine_args.request_owned_decode_window_steps == 32
+    assert engine_args.request_owned_hot_low_watermark == 1
+    assert engine_args.request_owned_hot_high_watermark == 2
+    assert engine_args.request_owned_prefill_wave_steps == 1
+    assert engine_args.request_owned_prefill_max_wait_steps == 32
+    assert engine_args.request_owned_decode_reservation_tokens is None
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_attention is False
+    assert vllm_config.scheduler_config.enable_request_owned_q_wkv_fanin is False
+    assert vllm_config.scheduler_config.enable_request_owned_sampling is False
+    assert vllm_config.scheduler_config.enable_request_owned_graph is False
+    assert vllm_config.scheduler_config.enable_request_owned_kv_offload is False
+    assert vllm_config.scheduler_config.enable_request_owned_windows is False
+    assert vllm_config.scheduler_config.request_owned_decode_window_steps == 32
+    assert vllm_config.scheduler_config.request_owned_decode_reservation_tokens is None
+
+
+def test_request_owned_kv_offload_cli_is_explicit_opt_in():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--enable-request-owned-kv-offload"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_kv_offload is True
+
+
+def test_request_owned_windows_cli_parses_quantum_without_model_loading():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--enable-request-owned-attention",
+            "--enable-request-owned-graph",
+            "--enable-request-owned-windows",
+            "--request-owned-decode-window-steps",
+            "7",
+            "--request-owned-hot-low-watermark",
+            "2",
+            "--request-owned-hot-high-watermark",
+            "4",
+            "--request-owned-prefill-wave-steps",
+            "3",
+            "--request-owned-prefill-max-wait-steps",
+            "9",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_windows is True
+    assert engine_args.request_owned_decode_window_steps == 7
+    assert engine_args.request_owned_hot_low_watermark == 2
+    assert engine_args.request_owned_hot_high_watermark == 4
+    assert engine_args.request_owned_prefill_wave_steps == 3
+    assert engine_args.request_owned_prefill_max_wait_steps == 9
+
+
+def test_request_owned_decode_reservation_cli_parses_without_model_loading():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--request-owned-decode-reservation-tokens", "2"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.request_owned_decode_reservation_tokens == 2
+
+
+def test_request_owned_attention_flag_propagates_independently(monkeypatch):
+    """--enable-request-owned-attention alone maps exactly to the
+    SchedulerConfig field, leaving sampling off."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--enforce-eager",
+            "--no-enable-prefix-caching",
+            "--no-async-scheduling",
+            "--enable-request-owned-attention",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_attention is True
+    assert engine_args.enable_request_owned_q_wkv_fanin is False
+    assert engine_args.enable_request_owned_sampling is False
+    assert engine_args.enable_request_owned_graph is False
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_attention is True
+    assert vllm_config.scheduler_config.enable_request_owned_q_wkv_fanin is False
+    assert vllm_config.scheduler_config.enable_request_owned_sampling is False
+    assert vllm_config.scheduler_config.enable_request_owned_graph is False
+
+
+def test_request_owned_sampling_flag_propagates_independently():
+    """--enable-request-owned-sampling alone reaches its own EngineArgs field,
+    and existing VllmConfig validation still rejects it without the
+    request-owned attention envelope."""
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--enable-request-owned-sampling",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_attention is False
+    assert engine_args.enable_request_owned_sampling is True
+
+    with pytest.raises(ValueError, match="enable_request_owned_attention=True"):
+        engine_args.create_engine_config()
+
+
+def test_request_owned_q_wkv_fanin_cli_reaches_scheduler_config(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--enforce-eager",
+            "--no-enable-prefix-caching",
+            "--no-async-scheduling",
+            "--enable-request-owned-attention",
+            "--enable-request-owned-q-wkv-fanin",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_attention is True
+    assert engine_args.enable_request_owned_q_wkv_fanin is True
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_attention is True
+    assert vllm_config.scheduler_config.enable_request_owned_q_wkv_fanin is True
+
+
+def test_request_owned_flags_together_reach_scheduler_config(monkeypatch):
+    """The vllm serve CLI form (Multiproc + both flags) parses and reaches
+    scheduler config construction with both booleans enabled."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--enforce-eager",
+            "--no-enable-prefix-caching",
+            "--no-async-scheduling",
+            "--enable-request-owned-attention",
+            "--enable-request-owned-sampling",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_attention is True
+    assert engine_args.enable_request_owned_sampling is True
+    assert engine_args.enable_request_owned_graph is False
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_attention is True
+    assert vllm_config.scheduler_config.enable_request_owned_sampling is True
+    assert vllm_config.scheduler_config.enable_request_owned_graph is False
+
+
+def test_request_owned_graph_cli_reaches_exact_piecewise_lane(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--no-enable-prefix-caching",
+            "--no-async-scheduling",
+            "--enable-request-owned-attention",
+            "--enable-request-owned-sampling",
+            "--enable-request-owned-graph",
+            "--compilation-config",
+            '{"mode":3,"cudagraph_mode":"PIECEWISE"}',
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_request_owned_graph is True
+
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.scheduler_config.enable_request_owned_graph is True
+    assert vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
+
+def test_request_owned_invalid_envelope_still_rejected():
+    """Enabling the flags does not widen the fail-closed envelope: an
+    unsupported pipeline shape is still rejected by existing VllmConfig
+    validation."""
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--distributed-executor-backend",
+            "mp",
+            "--pipeline-parallel-size",
+            "2",
+            "--enable-request-owned-attention",
+            "--enable-request-owned-sampling",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
+        engine_args.create_engine_config()

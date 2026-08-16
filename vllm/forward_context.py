@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -16,6 +16,12 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ubatch_utils import UBatchSlices
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.owner_layout import (
+        OwnerRowLayout,
+        RequestOwnedGraphSignature,
+    )
 
 logger = init_logger(__name__)
 
@@ -55,6 +61,12 @@ class BatchDescriptor:
     are captured for each num_active_loras value. This allows kernels
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
+    """
+    request_owned_signature: "RequestOwnedGraphSignature | None" = None
+    """
+    Step-invariant owner layout signature for request-owned FULL graphs.
+    ``None`` is the baseline/non-owner key. PIECEWISE keys deliberately omit
+    this value because their eager islands consume the live layout each step.
     """
 
 
@@ -184,6 +196,11 @@ class ForwardContext:
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
+    # G1 request-owned attention: the immutable owner row layout for the
+    # current forward step, or None when the feature is off (profiling,
+    # dummy runs, default-off).  Set per step so a stale layout cannot leak.
+    request_owner_layout: "OwnerRowLayout | None" = None
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
@@ -217,6 +234,7 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    request_owner_layout: "OwnerRowLayout | None" = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -235,6 +253,7 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
+        request_owner_layout=request_owner_layout,
     )
 
 
@@ -265,6 +284,7 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    request_owner_layout: "OwnerRowLayout | None" = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -325,6 +345,7 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
+        request_owner_layout=request_owner_layout,
     )
 
     try:

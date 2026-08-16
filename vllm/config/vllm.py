@@ -556,15 +556,14 @@ class VllmConfig:
         if use_v2_model_runner is not None:
             return use_v2_model_runner
 
-        # DSpark is implemented only by the V2 GPU model runner, and DeepSeek-V4
-        # is not otherwise a default-V2 architecture, so force V2 for it. If V2
-        # is unsupported for the rest of the config, _validate_v2_model_runner
-        # raises rather than silently falling back to V1 (which can't run dspark).
+        # The generic GPU DSpark implementation is V2-only.  The experimental
+        # request-owned lane deliberately remains on V1, where platform plugins
+        # (notably vLLM Ascend) provide their owner-aware DSpark proposer.
         if (
             self.speculative_config is not None
             and self.speculative_config.method == "dspark"
         ):
-            return True
+            return not self.scheduler_config.enable_request_owned_attention
 
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
@@ -837,7 +836,9 @@ class VllmConfig:
             self.kv_transfer_config = KVTransferConfig()
 
         if kv_offloading_backend == "native":
-            if envs.VLLM_USE_SIMPLE_KV_OFFLOAD:
+            if self.scheduler_config.enable_request_owned_kv_offload:
+                config_connector = "RequestOwnedOffloadingConnector"
+            elif envs.VLLM_USE_SIMPLE_KV_OFFLOAD:
                 config_connector = "SimpleCPUOffloadConnector"
             else:
                 config_connector = "OffloadingConnector"
@@ -1248,6 +1249,10 @@ class VllmConfig:
                 self.compilation_config.mode,
             )
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        self._validate_request_owned_attention()
+
+        self._validate_request_owned_sampling()
 
         # async tp is built on top of sequence parallelism and requires it.
         pass_config = self.compilation_config.pass_config
@@ -2178,6 +2183,469 @@ class VllmConfig:
                 "Model Runner V2 does not yet support the thinking_token_budget "
                 "request parameter. Set VLLM_USE_V2_MODEL_RUNNER=0 if this is required."
             )
+
+    def _validate_request_owned_attention(self) -> None:
+        """Fail closed for the experimental request-owned attention (G3).
+
+        The specific G2 envelope rejections below stay first and unchanged
+        (pipeline parallelism, unsupported speculative methods, non-eager
+        execution / CUDA graphs, KV cache CPU offload/tiering, and KV
+        transfer / PD disaggregation). G2 provides the control-plane receipt
+        contract and worker-local physical KV allocation, so the remaining
+        supported envelope is now constructible: Multiproc/non-Ray execution,
+        PP=1, eager execution without CUDA graphs, linear DSpark only,
+        no KV cache offload/transfer/connectors, prefix caching disabled,
+        DCP=1, PCP=1, and synchronous scheduling.
+
+        G3 additionally fails closed at construction time for combinations
+        whose runtime semantics the request-owned path does not implement
+        yet: the V2 model runner, dynamic batch overlap / micro-batching
+        (DBO), distributed EC cache transfer, KV-sharing fast prefill, any
+        executor other than Multiproc (UniProc is tolerated only for
+        single-process host/control tests), data parallelism (DP > 1 is not
+        yet proven for request-owned owner IDs/output slots/TP ranks;
+        expert parallelism stays within the single TP/HCCL world and is not
+        gated), non-generative (pooling/draft) runner types, and sequence
+        parallelism / async TP (``pass_config.enable_sp`` /
+        ``pass_config.fuse_gemm_comms``).
+
+        Residual: FlashComm and the optional O-projection TP split are only
+        exposed through platform-plugin environment / ``additional_config``
+        switches; core config has no stable construction-time field for
+        them, so those plugin and runtime gates remain authoritative. Every
+        other combination keeps failing closed with a precise diagnostic;
+        token execution paths retain their own independent gates and are not
+        relaxed here.
+        """
+        request_owned_graph = self.scheduler_config.enable_request_owned_graph
+        request_owned_windows = self.scheduler_config.enable_request_owned_windows
+        request_owned_decode_rows_per_owner = (
+            self.scheduler_config.request_owned_decode_rows_per_owner
+        )
+        request_owned_q_wkv_fanin = (
+            self.scheduler_config.enable_request_owned_q_wkv_fanin
+        )
+        request_owned_kv_offload = self.scheduler_config.enable_request_owned_kv_offload
+        if (
+            request_owned_kv_offload
+            and not self.scheduler_config.enable_request_owned_attention
+        ):
+            raise ValueError(
+                "enable_request_owned_kv_offload=True requires "
+                "enable_request_owned_attention=True."
+            )
+        if (
+            request_owned_q_wkv_fanin
+            and not self.scheduler_config.enable_request_owned_attention
+        ):
+            raise ValueError(
+                "enable_request_owned_q_wkv_fanin=True requires "
+                "enable_request_owned_attention=True."
+            )
+        if (
+            request_owned_graph
+            and not self.scheduler_config.enable_request_owned_attention
+        ):
+            raise ValueError(
+                "enable_request_owned_graph=True requires "
+                "enable_request_owned_attention=True."
+            )
+        if request_owned_windows and not request_owned_graph:
+            raise ValueError(
+                "enable_request_owned_windows=True requires "
+                "enable_request_owned_graph=True."
+            )
+        if (
+            request_owned_windows
+            and self.scheduler_config.request_owned_hot_low_watermark
+            >= self.scheduler_config.request_owned_hot_high_watermark
+        ):
+            raise ValueError(
+                "request-owned HOT watermarks must satisfy low < high, got "
+                f"{self.scheduler_config.request_owned_hot_low_watermark} >= "
+                f"{self.scheduler_config.request_owned_hot_high_watermark}."
+            )
+        if not self.scheduler_config.enable_request_owned_attention:
+            return
+
+        if request_owned_decode_rows_per_owner > 1 and not request_owned_windows:
+            raise ValueError(
+                "request_owned_decode_rows_per_owner > 1 requires "
+                "enable_request_owned_windows=True."
+            )
+
+        parallel_config = self.parallel_config
+
+        full_decode_reqs = (
+            parallel_config.world_size * request_owned_decode_rows_per_owner
+        )
+        if (
+            request_owned_graph
+            and self.scheduler_config.max_num_seqs < full_decode_reqs
+        ):
+            raise ValueError(
+                "request-owned FULL decode geometry requires max_num_seqs "
+                "to cover world_size * request_owned_decode_rows_per_owner, "
+                f"got {self.scheduler_config.max_num_seqs} < "
+                f"{parallel_config.world_size} * "
+                f"{request_owned_decode_rows_per_owner} ({full_decode_reqs})."
+            )
+
+        if parallel_config.pipeline_parallel_size != 1:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "pipeline_parallel_size=1, but got pipeline_parallel_size="
+                f"{parallel_config.pipeline_parallel_size}."
+            )
+
+        if parallel_config.data_parallel_size != 1:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "data_parallel_size=1, but got data_parallel_size="
+                f"{parallel_config.data_parallel_size}. Data parallelism is "
+                "not yet proven for request-owned owner IDs/output "
+                "slots/TP ranks; expert parallelism is unaffected and stays "
+                "within the single TP/HCCL world."
+            )
+
+        if parallel_config.use_ray:
+            raise ValueError(
+                "Request-owned attention does not support the Ray executor. "
+                "The initial distributed runtime is MultiprocExecutor with "
+                "HCCL."
+            )
+
+        executor_backend = parallel_config.distributed_executor_backend
+        if not isinstance(executor_backend, str):
+            raise ValueError(
+                "Request-owned attention requires the Multiproc executor, "
+                "but got a custom executor class "
+                f"{getattr(executor_backend, '__name__', repr(executor_backend))!r}. "
+                "Pass distributed_executor_backend='mp' to use request-owned "
+                "attention."
+            )
+        if executor_backend not in ("mp", "uni"):
+            raise ValueError(
+                "Request-owned attention requires the Multiproc executor, "
+                f"but got distributed_executor_backend={executor_backend!r}. "
+                "Only 'mp' (Multiproc) and, for single-process host/control "
+                "tests only, 'uni' (UniProc) are supported."
+            )
+        world_size = (
+            parallel_config.tensor_parallel_size
+            * parallel_config.pipeline_parallel_size
+        )
+        if executor_backend == "uni" and world_size > 1:
+            raise ValueError(
+                "Request-owned attention allows the UniProc executor only "
+                "for single-process host/control tests (world_size=1), but "
+                f"got distributed_executor_backend='uni' with world_size="
+                f"{world_size}."
+            )
+
+        if self.speculative_config is not None:
+            method = self.speculative_config.method
+            if method != "dspark":
+                raise ValueError(
+                    "Request-owned attention supports only the linear "
+                    "DSpark speculative method; MTP, ngram, draft-model, "
+                    "and branching proposal paths remain unsupported, but "
+                    f"got speculative_config.method={method!r}."
+                )
+            if not self.scheduler_config.enable_request_owned_sampling:
+                raise ValueError(
+                    "Request-owned DSpark requires "
+                    "enable_request_owned_sampling=True so accepted token "
+                    "prefixes return through the owner-identity envelope."
+                )
+        compilation_config = self.compilation_config
+        if request_owned_graph:
+            if (
+                compilation_config.mode != CompilationMode.VLLM_COMPILE
+                or compilation_config.cudagraph_mode
+                not in (
+                    CUDAGraphMode.PIECEWISE,
+                    CUDAGraphMode.FULL_AND_PIECEWISE,
+                )
+            ):
+                mode_name = getattr(compilation_config.mode, "name", None)
+                cudagraph_name = getattr(
+                    compilation_config.cudagraph_mode, "name", None
+                )
+                raise ValueError(
+                    "enable_request_owned_graph=True is an experimental "
+                    "PIECEWISE or isolated FULL-decode/PIECEWISE-mixed lane "
+                    "and requires "
+                    "compilation_config.mode=VLLM_COMPILE with "
+                    "cudagraph_mode=PIECEWISE or FULL_AND_PIECEWISE, but got mode="
+                    f"{mode_name} and cudagraph_mode={cudagraph_name}. "
+                    "FULL/FULL_DECODE_ONLY have no safe compiled mixed-batch "
+                    "path for this model; ineligible request-owned steps fall "
+                    "back to non-graph execution."
+                )
+            if (
+                request_owned_decode_rows_per_owner > 1
+                and compilation_config.cudagraph_mode
+                != CUDAGraphMode.FULL_AND_PIECEWISE
+            ):
+                raise ValueError(
+                    "request_owned_decode_rows_per_owner > 1 requires the "
+                    "isolated FULL decode lane with "
+                    "cudagraph_mode=FULL_AND_PIECEWISE."
+                )
+        else:
+            if compilation_config.mode != CompilationMode.NONE:
+                mode_name = getattr(compilation_config.mode, "name", None)
+                raise ValueError(
+                    "Request-owned attention is experimental and requires "
+                    "eager execution (CompilationMode.NONE) unless the "
+                    "explicit request-owned graph pilot is enabled, but got "
+                    f"compilation_config.mode={mode_name}."
+                )
+            if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                cudagraph_name = getattr(
+                    compilation_config.cudagraph_mode, "name", None
+                )
+                raise ValueError(
+                    "Request-owned attention is experimental and does not "
+                    "support graphs unless enable_request_owned_graph=True, "
+                    "but got compilation_config.cudagraph_mode="
+                    f"{cudagraph_name}."
+                )
+
+        if (
+            self.cache_config.kv_offloading_size is not None
+            and not request_owned_kv_offload
+        ):
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support KV cache CPU offloading, but got "
+                f"cache_config.kv_offloading_size="
+                f"{self.cache_config.kv_offloading_size}."
+            )
+
+        if request_owned_kv_offload:
+            if not (
+                self.cache_config.kv_offloading_size is not None
+                and self.cache_config.kv_offloading_size > 0
+            ):
+                raise ValueError(
+                    "enable_request_owned_kv_offload=True requires a positive "
+                    "cache_config.kv_offloading_size."
+                )
+            if self.cache_config.kv_offloading_backend != "native":
+                raise ValueError(
+                    "enable_request_owned_kv_offload=True supports only the "
+                    "native CPU offload backend."
+                )
+            connector_name = (
+                self.kv_transfer_config.kv_connector
+                if self.kv_transfer_config is not None
+                else None
+            )
+            if connector_name not in (None, "RequestOwnedOffloadingConnector"):
+                raise ValueError(
+                    "enable_request_owned_kv_offload=True requires the exclusive "
+                    "RequestOwnedOffloadingConnector, got "
+                    f"{connector_name!r}."
+                )
+            extra_config = (
+                self.kv_transfer_config.kv_connector_extra_config
+                if self.kv_transfer_config is not None
+                else {}
+            )
+            if "block_size" in extra_config:
+                raise ValueError(
+                    "request-owned bulk offload requires 1:1 host/device block "
+                    "geometry; remove kv_connector_extra_config['block_size']."
+                )
+            if extra_config.get("spec_name", "CPUOffloadingSpec") != (
+                "CPUOffloadingSpec"
+            ):
+                raise ValueError(
+                    "request-owned bulk offload requires CPUOffloadingSpec; "
+                    f"got {extra_config.get('spec_name')!r}."
+                )
+            store_threshold = int(extra_config.get("store_threshold", 0))
+            if store_threshold >= 2:
+                raise ValueError(
+                    "request-owned bulk offload requires store_threshold < 2 "
+                    "so the first PREEMPT cannot be filtered."
+                )
+
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+            and not request_owned_kv_offload
+        ):
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support KV cache transfer/offload/tiering (PD "
+                "disaggregation or KV connectors), but got "
+                f"kv_transfer_config.kv_connector="
+                f"{self.kv_transfer_config.kv_connector!r} with "
+                f"kv_role={self.kv_transfer_config.kv_role!r}."
+            )
+
+        if self.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support prefix caching, but got cache_config."
+                f"enable_prefix_caching={self.cache_config.enable_prefix_caching}. "
+                "Disable prefix caching (enable_prefix_caching=False) to "
+                "use request-owned attention."
+            )
+
+        if parallel_config.decode_context_parallel_size > 1:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "decode_context_parallel_size=1, but got "
+                f"decode_context_parallel_size="
+                f"{parallel_config.decode_context_parallel_size}."
+            )
+
+        if parallel_config.prefill_context_parallel_size > 1:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "prefill_context_parallel_size=1, but got "
+                f"prefill_context_parallel_size="
+                f"{parallel_config.prefill_context_parallel_size}."
+            )
+
+        if self.scheduler_config.async_scheduling:
+            raise ValueError(
+                "Request-owned attention is experimental and requires "
+                "synchronous scheduling, but scheduler_config."
+                f"async_scheduling resolved to "
+                f"{self.scheduler_config.async_scheduling}. Pass "
+                "async_scheduling=False to use request-owned attention."
+            )
+
+        if self.model_config is not None and (
+            self.model_config.is_multimodal_model
+            or self.model_config.is_encoder_decoder
+        ):
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support multimodal or encoder-decoder models, but got "
+                f"model_config.is_multimodal_model="
+                f"{self.model_config.is_multimodal_model} and "
+                f"model_config.is_encoder_decoder="
+                f"{self.model_config.is_encoder_decoder}."
+            )
+
+        if self.use_v2_model_runner:
+            raise ValueError(
+                "Request-owned attention is experimental and requires the "
+                "V1 model runner, but got use_v2_model_runner=True (Model "
+                "Runner V2 is not supported). Set VLLM_USE_V2_MODEL_RUNNER=0 "
+                "to use request-owned attention."
+            )
+
+        if parallel_config.use_ubatching:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support dynamic batch overlap (DBO) or micro-batching, but "
+                f"got parallel_config.enable_dbo="
+                f"{parallel_config.enable_dbo} and parallel_config."
+                f"ubatch_size={parallel_config.ubatch_size}."
+            )
+
+        ec_transfer_config = self.ec_transfer_config
+        if (
+            ec_transfer_config is not None
+            and ec_transfer_config.is_ec_transfer_instance
+        ):
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support distributed EC cache transfer, but got "
+                f"ec_transfer_config.ec_connector="
+                f"{ec_transfer_config.ec_connector!r} with ec_role="
+                f"{ec_transfer_config.ec_role!r}."
+            )
+
+        if self.cache_config.kv_sharing_fast_prefill:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support KV-sharing fast prefill, but got cache_config."
+                f"kv_sharing_fast_prefill="
+                f"{self.cache_config.kv_sharing_fast_prefill}."
+            )
+
+        scheduler_runner_type = self.scheduler_config.runner_type
+        model_runner_type = (
+            getattr(self.model_config, "runner_type", "generate")
+            if self.model_config is not None
+            else "generate"
+        )
+        if scheduler_runner_type != "generate" or model_runner_type != "generate":
+            raise ValueError(
+                "Request-owned attention is experimental and only supports "
+                "generative (text generation) models, but got "
+                f"scheduler_config.runner_type={scheduler_runner_type!r} and "
+                f"model_config.runner_type={model_runner_type!r}."
+            )
+
+        pass_config = self.compilation_config.pass_config
+        if pass_config.enable_sp or pass_config.fuse_gemm_comms:
+            raise ValueError(
+                "Request-owned attention is experimental and does not "
+                "support sequence parallelism (SP) or async TP "
+                "(fuse_gemm_comms), but got pass_config.enable_sp="
+                f"{pass_config.enable_sp} and pass_config.fuse_gemm_comms="
+                f"{pass_config.fuse_gemm_comms}."
+            )
+
+    def _validate_request_owned_sampling(self) -> None:
+        """Fail closed for the experimental request-owned sampling transport.
+
+        ``enable_request_owned_sampling`` is a transport-only opt-in on top
+        of the request-owned attention envelope: it makes the owner-sampling
+        aggregator authoritative across the deferred ``execute_model ->
+        None -> sample_tokens`` Multiproc flow.  It therefore requires the
+        existing request-owned attention envelope (which already enforces
+        eager execution, linear DSpark as the only speculative method, PP=1,
+        synchronous
+        scheduling, and the rest of the G2/G3 rejections above) and strictly
+        the Multiproc executor: the exact per-step adapter
+        bind/reuse/clear state machine is proven only for the multiproc
+        message-queue transport, so UniProc (even at world_size=1), Ray,
+        ``external_launcher``, and custom executor classes fail closed.
+        """
+        if not self.scheduler_config.enable_request_owned_sampling:
+            return
+
+        if not self.scheduler_config.enable_request_owned_attention:
+            raise ValueError(
+                "Request-owned sampling is experimental and requires "
+                "enable_request_owned_attention=True (the existing "
+                "request-owned attention envelope), but got "
+                "enable_request_owned_attention="
+                f"{self.scheduler_config.enable_request_owned_attention}."
+            )
+
+        parallel_config = self.parallel_config
+        if parallel_config.use_ray:
+            raise ValueError(
+                "Request-owned sampling requires the Multiproc executor and "
+                "does not support the Ray executor."
+            )
+        executor_backend = parallel_config.distributed_executor_backend
+        if executor_backend != "mp":
+            raise ValueError(
+                "Request-owned sampling requires "
+                "distributed_executor_backend='mp', but got "
+                f"{executor_backend!r}. UniProc (even for single-process "
+                "host/control tests), Ray, 'external_launcher', and custom "
+                "executor classes are not supported because the per-step "
+                "sampling adapter state machine is proven only for the "
+                "Multiproc transport."
+            )
+        # Eager execution, the narrow DSpark-only speculative envelope, PP=1,
+        # synchronous
+        # scheduling, and the rest of the request-owned envelope are already
+        # enforced by _validate_request_owned_attention above (which the
+        # first check requires), so no duplicate rejections are needed here.
 
     def validate_block_size(self) -> None:
         """Validate block_size against DCP and mamba constraints.

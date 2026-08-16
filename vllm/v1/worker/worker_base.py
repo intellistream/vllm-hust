@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from copy import copy, deepcopy
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
@@ -15,8 +17,39 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.sched.ownership import (
+    AttentionLeaseManager,
+    OwnerCommand,
+    OwnerCommandKind,
+    OwnerLeaseKey,
+)
 from vllm.v1.kv_cache_compression import KVCacheCompressionCompatibility
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.worker.request_owned_drain import RequestOwnedKVDrainController
+from vllm.v1.worker.request_owned_kv import (
+    AllocationResult,
+    DeferredFreeResult,
+    RequestOwnedKVStore,
+    RequestOwnedStepBuildCheckpoint,
+    RequestOwnedStepMetadata,
+    request_owned_allocation_binding_spec,
+)
+from vllm.v1.worker.request_owned_offload import (
+    OwnerOffloadIdentity,
+    OwnerOffloadPlan,
+    RequestOwnedBulkOffloadAdapter,
+    make_request_owned_offload_keys,
+)
+from vllm.v1.worker.request_owned_restore_runtime import (
+    RequestOwnedBulkRestoreWork,
+    RequestOwnedRestoreGuard,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -189,6 +222,27 @@ class WorkerBase:
         """Should be called immediately after execute_model iff it returned None."""
         raise NotImplementedError
 
+    def set_request_owned_step_metadata(
+        self, metadata: RequestOwnedStepMetadata | None
+    ) -> None:
+        """Worker-private handoff of the G3 step metadata.
+
+        Called by the wrapper with ``None`` at the start of every
+        request-owned call to actively clear stale runner state, and with
+        the immutable batch immediately after a successful
+        ``build_step_metadata`` for this rank's step.  The metadata is
+        fully detached and is delivered as a plain method call: it is never
+        attached to a SchedulerOutput or any other wire object, and no wire
+        object is mutated.  Unsupported workers fail closed: the default
+        raises instead of silently dropping the handoff.  No computed
+        progress is marked from this hook; completion is declared later,
+        after token sampling."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support the request-owned G3 "
+            "step metadata handoff; request-owned attention requires a "
+            "worker that implements set_request_owned_step_metadata."
+        )
+
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in
         speculative decoding.
@@ -215,6 +269,89 @@ class WorkerBase:
     def shutdown(self) -> None:
         """Clean up resources held by the worker."""
         return
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestOwnedDeferredStep:
+    """One deferred request-owned sampling step awaiting ``sample_tokens``.
+
+    Captured when the underlying ``execute_model`` returns ``None`` under
+    ``enable_request_owned_sampling``: the exact step fence, the trial
+    logical manager that must be committed only on success, and the exact
+    immutable step metadata that must be marked exactly once.  Nothing is
+    marked, flushed, emitted, or committed until ``sample_tokens``
+    completes the step; a failed completion never clears the record.
+    """
+
+    step_seq: int
+    trial_manager: AttentionLeaseManager
+    metadata: RequestOwnedStepMetadata
+    wait_for_drain: bool
+    restore_guard: RequestOwnedRestoreGuard | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.step_seq, bool)
+            or not isinstance(self.step_seq, int)
+            or self.step_seq <= 0
+        ):
+            raise TypeError(
+                f"step_seq must be a positive non-bool int, got {self.step_seq!r}."
+            )
+        if not isinstance(self.trial_manager, AttentionLeaseManager):
+            raise TypeError(
+                "trial_manager must be an AttentionLeaseManager, got "
+                f"{type(self.trial_manager).__name__}."
+            )
+        if not isinstance(self.metadata, RequestOwnedStepMetadata):
+            raise TypeError(
+                "metadata must be a RequestOwnedStepMetadata, got "
+                f"{type(self.metadata).__name__}."
+            )
+        if not isinstance(self.wait_for_drain, bool):
+            raise TypeError("wait_for_drain must be a bool")
+        if self.restore_guard is not None and not isinstance(
+            self.restore_guard, RequestOwnedRestoreGuard
+        ):
+            raise TypeError("restore_guard must be a RequestOwnedRestoreGuard or None")
+
+
+def _normalize_request_owned_kv_cache_config(
+    kv_cache_config: KVCacheConfig,
+) -> KVCacheConfig:
+    """Rank-local manager config for the request-owned KV store (G4).
+
+    The store's ``KVCacheManager`` needs the same concrete per-group specs
+    the scheduler uses (``generate_scheduler_kv_cache_config`` semantics): a
+    ``UniformTypeKVCacheSpecs`` wrapper has no registered manager and no
+    ``compress_ratio``, so it cannot size the block pool or report
+    ``effective_tokens_per_block``.  This helper deep-copies the worker's raw
+    config only when uniform groups exist (otherwise the original object is
+    returned unchanged so plain configs keep identity) and binds each uniform
+    group to its allocation-binding inner spec: the one with the smallest
+    positive integer ``compress_ratio`` (absent field defaults to 1), i.e.
+    the largest storage footprint.  The raw config handed to the underlying
+    worker is never mutated.
+    """
+    if not any(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_config.kv_cache_groups
+    ):
+        return kv_cache_config
+
+    normalized = deepcopy(kv_cache_config)
+    for group in normalized.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            continue
+        try:
+            group.kv_cache_spec = request_owned_allocation_binding_spec(spec)
+        except ValueError as exc:
+            raise ValueError(
+                "Cannot build the request-owned KV store for uniform KV cache "
+                f"group {group.layer_names!r}: {exc}"
+            ) from exc
+    return normalized
 
 
 class WorkerWrapperBase:
@@ -247,6 +384,40 @@ class WorkerWrapperBase:
         # Initialized after init_worker is called
         self.worker: WorkerBase
         self.vllm_config: VllmConfig
+        self._request_owned_control_manager: AttentionLeaseManager | None = None
+        self._request_owned_kv_store: RequestOwnedKVStore | None = None
+        self._request_owned_offload_adapter: RequestOwnedBulkOffloadAdapter | None = (
+            None
+        )
+        self._request_owned_kv_drain: RequestOwnedKVDrainController | None = None
+        #: Immutable worker-local G3 execution metadata of the last step
+        #: whose command+publication validation succeeded.  Cleared at the
+        #: start of every request-owned call (the concrete worker is
+        #: actively cleared with a ``None`` handoff) and handed to the
+        #: worker through its private hook; never attached to a scheduler
+        #: wire.
+        self._request_owned_step_metadata: RequestOwnedStepMetadata | None = None
+
+        #: Pending deferred request-owned sampling step (G3).  Set exactly
+        #: when the underlying ``execute_model`` returns ``None`` under
+        #: ``enable_request_owned_sampling``; consumed (cleared) only by a
+        #: fully successful ``sample_tokens`` completion.  A pending record
+        #: rejects the next ``execute_model`` call and any replay without a
+        #: pending record, and is never cleared by a failed completion.
+        self._request_owned_deferred: _RequestOwnedDeferredStep | None = None
+
+        #: Irreversible request-owned fail-stop latch (G3).  Set only when
+        #: the computed-batch mark succeeded but the terminal completion
+        #: (flush/emit/pool snapshot) failed afterwards: the step is already
+        #: marked in the store and can never be retried, so every further
+        #: request-owned call fails closed instead of risking a duplicate
+        #: mark.
+        self._request_owned_fail_stop: str | None = None
+
+        #: Exact destinations of a bulk RESTORE whose H2D may be in flight
+        #: while unrelated work executes and whose control step has not
+        #: committed yet. The wrapper fences DMA before rollback/recycling.
+        self._request_owned_restore_guard: RequestOwnedRestoreGuard | None = None
 
     def shutdown(self) -> None:
         if self.worker is not None:
@@ -357,6 +528,102 @@ class WorkerWrapperBase:
         with set_current_vllm_config(self.vllm_config):
             self.worker.initialize_from_config(kv_cache_config)  # type: ignore
 
+            # G2: after the underlying worker initializes, bind this rank's
+            # physical store when request-owned attention is enabled.  The
+            # store reuses one real KVCacheManager over this rank's
+            # KVCacheConfig; prefix caching, Eagle, events, and stats are all
+            # disabled because the scheduler-side manager stays the only
+            # prefix/Eagle authority and this store never publishes block IDs.
+            if self.vllm_config.scheduler_config.enable_request_owned_attention:
+                self._request_owned_kv_store = self._create_request_owned_kv_store(
+                    kv_cache_config
+                )
+            if getattr(
+                self.vllm_config.scheduler_config,
+                "enable_request_owned_kv_offload",
+                False,
+            ):
+                self._request_owned_offload_adapter = (
+                    self._create_request_owned_offload_adapter()
+                )
+
+    def _create_request_owned_offload_adapter(
+        self,
+    ) -> RequestOwnedBulkOffloadAdapter:
+        """Take exclusive ownership of the registered offload substrate."""
+
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            request_owned_offloading_connector,
+        )
+
+        RequestOwnedOffloadingConnector = (
+            request_owned_offloading_connector.RequestOwnedOffloadingConnector
+        )
+
+        connector = get_kv_transfer_group()
+        if not isinstance(connector, RequestOwnedOffloadingConnector):
+            raise RuntimeError(
+                "enable_request_owned_kv_offload requires the exclusive "
+                "RequestOwnedOffloadingConnector worker, got "
+                f"{type(connector).__name__}."
+            )
+        return connector.build_request_owned_adapter(self.global_rank)
+
+    def _create_request_owned_kv_store(
+        self, kv_cache_config: KVCacheConfig
+    ) -> RequestOwnedKVStore:
+        """Build the rank-local physical KV store (G2).
+
+        Scheduler/hash block sizes, DCP/PCP world sizes, and max batched
+        tokens come from the same vllm_config facts the scheduler uses, so
+        the store's block pool accounting matches the coordinator's.
+        The rank-local manager runs on the normalized config (uniform
+        wrapper groups bound to their allocation-binding inner spec), never
+        on the raw config the underlying worker initialized with.
+        """
+        kv_cache_config = _normalize_request_owned_kv_cache_config(kv_cache_config)
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, self.vllm_config
+        )
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            max_model_len=self.vllm_config.model_config.max_model_len,
+            scheduler_block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+            max_num_batched_tokens=(
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            enable_caching=False,
+            use_eagle=False,
+            log_stats=False,
+            enable_kv_cache_events=False,
+            dcp_world_size=(
+                self.vllm_config.parallel_config.decode_context_parallel_size
+            ),
+            pcp_world_size=(
+                self.vllm_config.parallel_config.prefill_context_parallel_size
+            ),
+        )
+        return RequestOwnedKVStore(kv_cache_manager, owner_rank=self.global_rank)
+
+    def _request_owned_logical_capacity(self) -> int:
+        """Nonphysical logical token budget for the reference lease manager.
+
+        G2 keeps the logical manager only as the protocol fence/outbox
+        engine; the rank-local physical store is the actual capacity
+        authority.  This documented upper bound (max_model_len *
+        max_num_seqs) is deliberately not a physical capacity claim: it is
+        large enough that every command a physically-capable store could
+        accept is also granted logically, so no capacity decision is made on
+        logical grounds.
+        """
+        assert self.vllm_config is not None
+        return (
+            self.vllm_config.model_config.max_model_len
+            * self.vllm_config.scheduler_config.max_num_seqs
+        )
+
     def init_device(self):
         assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
@@ -379,9 +646,857 @@ class WorkerWrapperBase:
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if self.vllm_config.scheduler_config.enable_request_owned_attention:
+            return self._execute_request_owned_control_step(scheduler_output)
+
         self._apply_mm_cache(scheduler_output)
 
         return self.worker.execute_model(scheduler_output)
+
+    def _execute_request_owned_control_step(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | None:
+        """Run one strict control step with whole-step RESTORE rollback."""
+
+        if self._request_owned_restore_guard is not None:
+            raise RuntimeError(
+                "request-owned attention found an unclosed RESTORE guard "
+                "before starting the next control step"
+            )
+        try:
+            result = self._execute_request_owned_control_step_impl(scheduler_output)
+        except BaseException as exc:
+            if self._request_owned_kv_drain is not None:
+                self._request_owned_kv_drain.fail_uncommitted(
+                    f"control step failed before PREEMPT receipt commit ({exc!r})"
+                )
+            self._rollback_request_owned_restore_guard()
+            raise
+        if self._request_owned_restore_guard is not None:
+            # A RESTORE may not escape into deferred sampling or any other
+            # path that has not durably committed the control manager.
+            self._rollback_request_owned_restore_guard()
+            raise RuntimeError(
+                "request-owned RESTORE control step returned before its "
+                "terminal receipt committed"
+            )
+        return result
+
+    def _execute_request_owned_control_step_impl(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | None:
+        """Execute the G2 worker boundary over the rank-local physical store.
+
+        Commands are composed failure-atomically: a deep-copied logical
+        candidate is the preflight (fence/outbox), the physical store is
+        consulted only when the candidate accepts, and a physical refusal
+        advances the authoritative fences through the external-reject seam
+        without any logical transition.
+
+        G3 sampling (``enable_request_owned_sampling``, default off):
+        the flag admits structurally valid token-bearing schedules through
+        the same store/lease/metadata checks.  A step whose underlying
+        ``execute_model`` returns ``None`` stores exactly one pending
+        deferred record (trial manager + exact metadata) keyed by
+        ``step_seq`` and returns ``None`` without marking, flushing,
+        emitting, or committing anything; the explicit :meth:`sample_tokens`
+        then runs the shared terminal path.  A synchronous
+        :class:`ModelRunnerOutput` takes the same terminal path
+        immediately.  The flag-off path preserves the control-only token
+        and split-return rejections byte-for-byte.  A failure after the
+        computed-batch mark is irreversible (the step is already marked)
+        and latches a fail-stop state that rejects all further
+        request-owned calls.
+        """
+        # G3 lifecycle: fail-closed latch for an irreversible post-mark
+        # failure (the step is already marked and cannot be retried) must
+        # reject before any state is touched.
+        self._request_owned_fail_stop_guard()
+
+        # G3 lifecycle: a prior deferred step must complete through
+        # sample_tokens before any next execute call.  Fail closed before
+        # touching any state (including the start-of-call None handoff) so
+        # the pending record and its exact metadata stay intact.
+        if self._request_owned_deferred is not None:
+            raise RuntimeError(
+                "request-owned attention has a pending deferred sampling "
+                f"step (step_seq={self._request_owned_deferred.step_seq}): "
+                "sample_tokens must complete before the next execute_model "
+                "call."
+            )
+
+        sampling_enabled = self._request_owned_sampling_enabled()
+
+        # G3 lifecycle: actively clear stale worker-private metadata at the
+        # start of every request-owned call, before any validation.  The
+        # ``None`` handoff clears the concrete worker's runner state too,
+        # so a failure before the next successful build can never expose
+        # the previous step's metadata.
+        self._request_owned_step_metadata = None
+        self._deliver_request_owned_step_metadata(None)
+
+        step_seq = scheduler_output.step_seq
+        if isinstance(step_seq, bool) or not isinstance(step_seq, int) or step_seq <= 0:
+            raise RuntimeError(
+                "request-owned control step requires a positive non-bool "
+                f"step_seq, got {step_seq!r}."
+            )
+
+        total_tokens = scheduler_output.total_num_scheduled_tokens
+        per_request_tokens = scheduler_output.num_scheduled_tokens
+        if not sampling_enabled:
+            # Flag-off control-only gate (byte-for-byte unchanged): every
+            # token-bearing schedule is refused before the underlying worker
+            # runs.
+            if (
+                isinstance(total_tokens, bool)
+                or not isinstance(total_tokens, int)
+                or total_tokens != 0
+                or any(
+                    isinstance(count, bool) or not isinstance(count, int) or count < 0
+                    for count in per_request_tokens.values()
+                )
+                or sum(per_request_tokens.values()) != 0
+            ):
+                raise RuntimeError(
+                    "request-owned attention G1 is control-only: refusing to "
+                    "execute a nonempty or inconsistent token schedule through "
+                    "replicated KV before the G2 owner-local allocator/routing "
+                    "prerequisite exists."
+                )
+        else:
+            # G3 sampling: admit structurally valid token-bearing schedules
+            # (non-bool int types, nonnegativity, total == sum of per-request
+            # counts, the scheduler invariant) through the same store/lease/
+            # metadata checks; inconsistent envelopes still fail before the
+            # underlying worker runs.
+            if (
+                isinstance(total_tokens, bool)
+                or not isinstance(total_tokens, int)
+                or total_tokens < 0
+                or any(
+                    isinstance(count, bool) or not isinstance(count, int) or count < 0
+                    for count in per_request_tokens.values()
+                )
+                or sum(per_request_tokens.values()) != total_tokens
+            ):
+                raise RuntimeError(
+                    "request-owned attention sampling admits only a "
+                    "consistent non-bool token schedule, got "
+                    f"total={total_tokens!r} per_request="
+                    f"{dict(per_request_tokens)!r}."
+                )
+
+        # Apply the step to a trial copy.  Manager fences/outbox become durable
+        # only after a concrete synchronous output is available, so an
+        # underlying exception/None/async result cannot poison the next step.
+        store = self._request_owned_kv_store
+        if store is None:
+            raise RuntimeError(
+                "request-owned attention worker store is not initialized: "
+                "initialize_from_config must construct the rank-local "
+                "RequestOwnedKVStore before execution."
+            )
+
+        manager = self._request_owned_control_manager
+        if manager is None:
+            manager = AttentionLeaseManager(
+                owner_rank=self.global_rank,
+                capacity=self._request_owned_logical_capacity(),
+            )
+        trial_manager = deepcopy(manager)
+        restore_work: list[RequestOwnedBulkRestoreWork] = []
+        restore_commands: list[OwnerCommand] = []
+        restore_build_checkpoint: RequestOwnedStepBuildCheckpoint | None = None
+
+        restore_control_step = any(
+            command.kind is OwnerCommandKind.RESTORE
+            for command in scheduler_output.owner_commands
+        )
+        drain = self._request_owned_kv_drain
+        if drain is not None and drain.advance(store):
+            store.flush()
+        restore_keys = {
+            command.key
+            for command in scheduler_output.owner_commands
+            if command.kind is OwnerCommandKind.RESTORE
+        }
+        scheduled_restore_keys = restore_keys.intersection(
+            token.key for token in scheduler_output.scheduled_owner_leases
+        )
+        if scheduled_restore_keys:
+            raise RuntimeError(
+                "request-owned background RESTORE cannot schedule its target "
+                "before the terminal H2D receipt"
+            )
+
+        # Commands form one reliable in-order stream per owner.  Every worker
+        # receives the global envelope but consumes only its own commands.
+        # Per own-rank command, failure-atomic composition: the candidate is
+        # a deep copy of the current trial logical manager; its apply() is the
+        # logical preflight.  A logical refusal adopts the candidate (its
+        # fences/outbox are durable) and never touches the physical store.  A
+        # logical accept invokes the corresponding physical operation; a
+        # physical accept adopts the candidate, while a physical refusal
+        # discards the candidate and advances the authoritative fences via
+        # external_reject_error, without any logical transition.
+        for command in scheduler_output.owner_commands:
+            if command.owner_id != self.global_rank:
+                continue
+            candidate = deepcopy(trial_manager)
+            preflight = candidate.apply(command)
+            if not preflight.accepted:
+                trial_manager = candidate
+                continue
+            if (
+                command.kind is OwnerCommandKind.RELEASE
+                and drain is not None
+                and drain.has_key(command.key)
+            ):
+                drain.wait_key(command.key, store)
+                store.flush()
+                drain.discard_receipt(command.key)
+            physical, pending_restore = self._apply_request_owned_physical(
+                command, store, step_seq
+            )
+            drain = self._request_owned_kv_drain
+            if physical.accepted:
+                if pending_restore is not None:
+                    restore_work.append(pending_restore)
+                    restore_commands.append(command)
+                    if restore_build_checkpoint is None:
+                        restore_build_checkpoint = store.checkpoint_step_build()
+                    # Arm immediately: a later command in the same owner
+                    # batch can still fail before the H2D hook runs.
+                    self._request_owned_restore_guard = RequestOwnedRestoreGuard(
+                        work=tuple(restore_work),
+                        commands=tuple(restore_commands),
+                        store=store,
+                        build_checkpoint=restore_build_checkpoint,
+                        step_seq=step_seq,
+                    )
+                trial_manager = candidate
+                continue
+            reject_error = physical.error or (
+                "physical request-owned KV store rejected the command without an error"
+            )
+            trial_manager.apply(command, external_reject_error=reject_error)
+
+        if restore_work:
+            self._execute_request_owned_bulk_restore(tuple(restore_work))
+
+        for token in scheduler_output.scheduled_owner_leases:
+            if token.owner_id == self.global_rank:
+                trial_manager.record_published(token)
+
+        # G3 seam: after command+publication validation, freeze the
+        # immutable worker-local execution metadata for this step.  No
+        # computed progress is marked here; completion is declared by the
+        # shared terminal path (mark -> flush -> emit -> commit) once the
+        # executing GPU step finished, synchronously or through
+        # sample_tokens.
+        metadata = self._build_request_owned_step_metadata(
+            store, step_seq, scheduler_output
+        )
+        if self._request_owned_restore_guard is not None:
+            self._request_owned_restore_guard.note_step_build(
+                nonempty=bool(metadata.entries)
+            )
+        self._request_owned_step_metadata = metadata
+        # G3 handoff: deliver the immutable metadata to the concrete worker
+        # through its private hook, without attaching it to or mutating any
+        # scheduler wire object; unsupported workers fail closed.
+        self._deliver_request_owned_step_metadata(metadata)
+
+        self._apply_mm_cache(scheduler_output)
+        output = self.worker.execute_model(scheduler_output)
+
+        from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+
+        if sampling_enabled and output is None:
+            if restore_control_step and total_tokens == 0:
+                # Close every global RESTORE step in this collective RPC so
+                # a zero-token heartbeat needs no grammar round trip. H2D
+                # remains in flight through model execution and sampling,
+                # then its exact receipt is fenced below.
+                output = self.worker.sample_tokens(None)
+            else:
+                # Deferred sampling: keep the trial manager and the exact
+                # metadata in one pending record keyed by step_seq. A mixed
+                # RESTORE transfers its guard too, so H2D can keep running
+                # without replacing the executor's real grammar payload.
+                restore_guard = self._request_owned_restore_guard
+                self._request_owned_restore_guard = None
+                self._request_owned_deferred = _RequestOwnedDeferredStep(
+                    step_seq=step_seq,
+                    trial_manager=trial_manager,
+                    metadata=metadata,
+                    wait_for_drain=total_tokens == 0,
+                    restore_guard=restore_guard,
+                )
+                return None
+
+        if output is None:
+            if sampling_enabled and restore_control_step and total_tokens == 0:
+                raise RuntimeError("request-owned RESTORE sample_tokens returned None")
+            raise RuntimeError(
+                "request-owned attention G1 does not support split sampling: "
+                "execute_model returned None and no exact receipt FIFO exists."
+            )
+
+        # Async outputs can overlap subsequent steps.  Until receipt state is
+        # kept in a step-keyed FIFO, decorating them here could drain events
+        # into the wrong step, so fail explicitly rather than guessing.
+        if isinstance(output, AsyncModelRunnerOutput):
+            raise RuntimeError(
+                "request-owned attention G1 does not support async model "
+                "runner outputs without a step-keyed receipt FIFO."
+            )
+        if not isinstance(output, ModelRunnerOutput):
+            raise RuntimeError(
+                "request-owned attention worker returned an unexpected "
+                f"output type {type(output).__name__}."
+            )
+
+        if self._request_owned_restore_guard is not None:
+            self._request_owned_restore_guard.finish(trial_manager)
+
+        if sampling_enabled:
+            # Synchronous token output: same terminal path as the deferred
+            # sample_tokens completion (mark -> flush -> emit -> commit).
+            result = self._complete_request_owned_step(
+                step_seq,
+                trial_manager,
+                metadata,
+                output,
+                wait_for_drain=total_tokens == 0,
+            )
+            self._request_owned_restore_guard = None
+            return result
+
+        # Never mutate a worker-owned output or EMPTY_MODEL_RUNNER_OUTPUT.
+        result = copy(output)
+        # Post-execute completion fence: only now that the executing GPU step
+        # finished are deferred physical PREEMPT/RELEASE frees returned to the
+        # shared pool, so the receipt certifies physical free.  The attached
+        # capacity snapshot is block-ID-free and is taken after the flush.
+        self._finish_request_owned_drains(store, wait=total_tokens == 0)
+        store.flush()
+        batch = trial_manager.emit_batch(step_seq)
+        if self._request_owned_kv_drain is not None:
+            batch = self._request_owned_kv_drain.decorate_batch(batch)
+        result.owner_receipt_batches = [
+            replace(batch, cache_pool=store.pool_snapshot())
+        ]
+        self._request_owned_control_manager = trial_manager
+        self._request_owned_restore_guard = None
+        return result
+
+    def _rollback_request_owned_restore_guard(self) -> None:
+        """Discard every uncommitted restored destination, retaining host KV."""
+
+        guard = self._request_owned_restore_guard
+        self._request_owned_restore_guard = None
+        if guard is None:
+            return
+        if guard.nonempty_step_built and self._request_owned_fail_stop is None:
+            self._request_owned_fail_stop = (
+                "background RESTORE overlapped a nonempty step that failed; "
+                "the executed step cannot be retried safely"
+            )
+        guard.rollback()
+
+    def _request_owned_sampling_enabled(self) -> bool:
+        """G3 sampling gate, default off.
+
+        The config field lands separately, so the wrapper reads it safely
+        with ``getattr(..., False)``: until then (and on every default
+        config) the flag-off control-only path is preserved unchanged.
+        The gate is strict: only a real ``bool`` admits the deferred
+        sampling protocol, so accidental truthy values (``1``,
+        ``"true"``) fail closed instead of silently enabling it.
+        """
+        value = getattr(
+            self.vllm_config.scheduler_config,
+            "enable_request_owned_sampling",
+            False,
+        )
+        if not isinstance(value, bool):
+            raise RuntimeError(
+                "enable_request_owned_sampling must be a bool, got "
+                f"{type(value).__name__} ({value!r})."
+            )
+        return value
+
+    def _request_owned_fail_stop_guard(self) -> None:
+        """Reject every request-owned call once the fail-stop latch is set.
+
+        The latch is set only after a successful computed-batch mark was
+        followed by a terminal completion failure: the step is already
+        marked in the store and can never be retried (a retry would hit a
+        duplicate mark), so further calls must fail closed instead of
+        risking duplicate or out-of-order marks."""
+        if self._request_owned_fail_stop is not None:
+            raise RuntimeError(
+                "request-owned attention is in an irreversible fail-stop "
+                f"state: {self._request_owned_fail_stop}"
+            )
+
+    def _apply_request_owned_physical(
+        self,
+        command: OwnerCommand,
+        store: RequestOwnedKVStore,
+        step_seq: int,
+    ) -> tuple[
+        AllocationResult | DeferredFreeResult,
+        RequestOwnedBulkRestoreWork | None,
+    ]:
+        """Dispatch one own-rank command to the corresponding physical
+        store operation.  The store rejects any kind/state mismatch itself,
+        so this seam never duplicates the logical state machine."""
+        if command.kind is OwnerCommandKind.RESERVE:
+            restored = bool(
+                self._request_owned_offload_adapter is not None
+                and store.is_restore_ready(command.key)
+            )
+            result = store.reserve(command)
+            if result.accepted and restored:
+                adapter = self._require_request_owned_offload_adapter()
+                snapshot = store.snapshot(command.key)
+                if snapshot is None:
+                    raise RuntimeError("restored RESERVE lost its physical record")
+                identity = OwnerOffloadIdentity.from_snapshot(snapshot)
+                adapter.activate(identity)
+                if not store.mark_reactivated(
+                    command.key, snapshot.allocation_generation
+                ):
+                    raise RuntimeError(
+                        "restored RESERVE could not close its physical HOT state"
+                    )
+            return result, None
+        if command.kind is OwnerCommandKind.EXTEND:
+            return store.extend(command), None
+        if command.kind is OwnerCommandKind.PREEMPT:
+            if self._request_owned_offload_adapter is None:
+                return store.preempt(command), None
+            return self._store_request_owned_preempt(command, store), None
+        if command.kind is OwnerCommandKind.RELEASE:
+            snapshot = (
+                store.snapshot(command.key)
+                if self._request_owned_offload_adapter is not None
+                else None
+            )
+            result = store.release(command)
+            if (
+                result.accepted
+                and snapshot is not None
+                and self._request_owned_offload_adapter is not None
+            ):
+                self._request_owned_offload_adapter.release(snapshot)
+            if result.accepted and self._request_owned_offload_adapter is not None:
+                self._request_owned_offload_adapter.evict_owned_host_keys(command.key)
+            return result, None
+        if command.kind is OwnerCommandKind.RESTORE:
+            result = store.restore(command)
+            if not result.accepted:
+                return result, None
+            snapshot = store.snapshot(command.key)
+            computed = store.computed_prefix_snapshot(command.key)
+            if snapshot is None or computed is None:
+                raise RuntimeError("accepted RESTORE did not create a destination")
+            adapter = self._require_request_owned_offload_adapter()
+            identity = OwnerOffloadIdentity.from_snapshot(computed)
+            bound = False
+            try:
+                adapter.bind(computed, active=False)
+                bound = True
+                keys = make_request_owned_offload_keys(
+                    computed, store.group_block_sizes
+                )
+                source_block_indices = store.restore_source_block_indices(
+                    command.key, computed.allocation_generation
+                )
+                if source_block_indices is None:
+                    raise RuntimeError(
+                        "RESTORE destination lost its durable source block mask"
+                    )
+                plan = OwnerOffloadPlan.from_snapshot(
+                    computed,
+                    keys,
+                    logical_block_indices=source_block_indices,
+                )
+                work = RequestOwnedBulkRestoreWork(
+                    step_seq=step_seq,
+                    adapter=adapter,
+                    plan=plan,
+                    zero_block_ids=snapshot.tables,
+                )
+            except BaseException:
+                if bound:
+                    adapter.abort(identity)
+                store.abort_restore(command.key, snapshot.allocation_generation)
+                raise
+            return result, work
+        raise RuntimeError(f"unknown owner command kind {command.kind}")
+
+    def _require_request_owned_offload_adapter(
+        self,
+    ) -> RequestOwnedBulkOffloadAdapter:
+        adapter = self._request_owned_offload_adapter
+        if adapter is None:
+            raise RuntimeError(
+                "request-owned KV offload command requires the exclusive adapter"
+            )
+        return adapter
+
+    def _require_request_owned_kv_drain(self) -> RequestOwnedKVDrainController:
+        controller = self._request_owned_kv_drain
+        adapter = self._require_request_owned_offload_adapter()
+        if controller is None:
+            controller = RequestOwnedKVDrainController(adapter)
+            self._request_owned_kv_drain = controller
+        elif controller.adapter is not adapter:
+            raise RuntimeError("request-owned KV drain adapter changed during runtime")
+        return controller
+
+    def _store_request_owned_preempt(
+        self, command: OwnerCommand, store: RequestOwnedKVStore
+    ) -> DeferredFreeResult:
+        return self._require_request_owned_kv_drain().start(command, store)
+
+    def _finish_request_owned_drains(
+        self, store: RequestOwnedKVStore, *, wait: bool
+    ) -> None:
+        controller = self._request_owned_kv_drain
+        if controller is None:
+            return
+        if wait:
+            controller.wait(store)
+        else:
+            controller.advance(store)
+
+    def _execute_request_owned_bulk_restore(
+        self,
+        work: tuple[RequestOwnedBulkRestoreWork, ...],
+    ) -> None:
+        hook = getattr(self.worker, "execute_request_owned_bulk_restore", None)
+        if not callable(hook):
+            raise RuntimeError(
+                "request-owned bulk RESTORE requires the worker's post-zero "
+                "pre-forward restore hook"
+            )
+        hook(work)
+        for item in work:
+            if not item.submitted:
+                raise RuntimeError(
+                    "bulk RESTORE hook returned without submitting exact H2D"
+                )
+
+    def _build_request_owned_step_metadata(
+        self,
+        store: RequestOwnedKVStore,
+        step_seq: int,
+        scheduler_output: SchedulerOutput,
+    ) -> RequestOwnedStepMetadata:
+        """G3 wrapper seam: build the one-step immutable worker-local
+        execution metadata after command+publication validation.  Execution
+        tokens/counts are derived only from positive
+        ``scheduler_output.num_scheduled_tokens`` for own-rank grants: a
+        zero-token G2 heartbeat may carry newly published grants but builds
+        empty execution metadata and retains allocation deltas for the later
+        token-bearing step, while a token-bearing step must match own-rank
+        authorization tokens and own-rank positive counts exactly.  The
+        builder itself rejects wrong/missing/extra/duplicate/stale/
+        pending-free/out-of-horizon lease and count state and is one-step
+        fenced; a rejection here is fail-stop because the store retains
+        every pending delta and the step is retryable.  No scheduler wire
+        object is mutated."""
+        own_rank_tokens = [
+            token
+            for token in scheduler_output.scheduled_owner_leases
+            if token.owner_id == self.global_rank
+        ]
+        build = store.build_step_metadata(
+            step_seq,
+            own_rank_tokens,
+            scheduler_output.num_scheduled_tokens,
+            scheduler_output.scheduled_spec_decode_tokens,
+        )
+        if not build.accepted:
+            raise RuntimeError(
+                "request-owned step metadata build failed: "
+                f"{build.error or 'unknown error'}"
+            )
+        if build.metadata is None:
+            raise RuntimeError(
+                "request-owned step metadata build accepted without metadata"
+            )
+        return build.metadata
+
+    def _deliver_request_owned_step_metadata(
+        self, metadata: RequestOwnedStepMetadata | None
+    ) -> None:
+        """Hand the G3 step metadata to the concrete worker.
+
+        ``None`` clears the worker's stale runner state at the start of a
+        request-owned call; the immutable batch is delivered after a
+        successful build.  The hook is a worker-private method call: the
+        metadata is never attached to a SchedulerOutput or any other wire
+        object, and no wire object is mutated.  Workers that do not
+        implement the hook fail closed with an explicit error rather than
+        silently dropping the handoff."""
+        handoff = getattr(self.worker, "set_request_owned_step_metadata", None)
+        if not callable(handoff):
+            raise RuntimeError(
+                f"worker {type(self.worker).__name__} does not support the "
+                "request-owned G3 step metadata handoff; unsupported "
+                "workers fail closed."
+            )
+        handoff(metadata)
+
+    def sample_tokens(
+        self, grammar_output: GrammarOutput
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Explicit wrapper sampling seam.
+
+        Default (request-owned attention disabled) delegates to the
+        underlying worker exactly like the historical ``__getattr__``
+        delegation.  With request-owned attention enabled, split sampling
+        is only supported under ``enable_request_owned_sampling`` with a
+        pending deferred step: the completion runs the same terminal path
+        as a synchronous token output.  Calls after an irreversible
+        post-mark failure also fail closed.  Any other call fails
+        closed."""
+        if not self.vllm_config.scheduler_config.enable_request_owned_attention:
+            return self.worker.sample_tokens(grammar_output)
+        # Irreversible post-mark failure latch: reject before any state.
+        self._request_owned_fail_stop_guard()
+        if not self._request_owned_sampling_enabled():
+            raise RuntimeError(
+                "request-owned attention does not support split sampling "
+                "without enable_request_owned_sampling: execute_model never "
+                "defers in this mode, so sample_tokens must not be called."
+            )
+        return self._sample_request_owned(grammar_output)
+
+    def _sample_request_owned(
+        self, grammar_output: GrammarOutput
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Complete one pending deferred request-owned sampling step.
+
+        Requires exactly one pending record (replay after success and
+        out-of-order calls fail closed), calls the underlying worker's
+        ``sample_tokens``, rejects ``None``/async/unexpected outputs, then
+        runs the shared terminal path (mark exactly once, flush, emit the
+        exact receipt batch with the post-flush pool snapshot, commit the
+        trial manager) on a copy of the worker output.  Worker-emitted
+        ``owner_sampling_batches`` ride the copied output untouched.  Any
+        failure leaves the pending record intact and the logical manager
+        uncommitted; only full success clears the pending record.  A
+        post-mark failure latches the wrapper fail-stop state: the step
+        is already marked in the store and cannot be retried, and the
+        pending record is never cleared."""
+        pending = self._request_owned_deferred
+        if pending is None:
+            raise RuntimeError(
+                "request-owned sample_tokens requires a pending deferred "
+                "step: execute_model returned None but no deferred record "
+                "exists (replay or out-of-order call)."
+            )
+
+        self._request_owned_restore_guard = pending.restore_guard
+        try:
+            output = self.worker.sample_tokens(grammar_output)
+
+            from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+
+            if output is None:
+                raise RuntimeError(
+                    "request-owned deferred sampling failed: "
+                    "worker.sample_tokens returned None."
+                )
+            if isinstance(output, AsyncModelRunnerOutput):
+                raise RuntimeError(
+                    "request-owned attention does not support async model "
+                    "runner outputs from sample_tokens without a step-keyed "
+                    "receipt FIFO."
+                )
+            if not isinstance(output, ModelRunnerOutput):
+                raise RuntimeError(
+                    "request-owned attention worker returned an unexpected "
+                    f"output type {type(output).__name__} from sample_tokens."
+                )
+
+            if pending.restore_guard is not None:
+                pending.restore_guard.finish(pending.trial_manager)
+            result = self._complete_request_owned_step(
+                pending.step_seq,
+                pending.trial_manager,
+                pending.metadata,
+                output,
+                wait_for_drain=pending.wait_for_drain,
+            )
+        except BaseException:
+            self._rollback_request_owned_restore_guard()
+            raise
+        self._request_owned_restore_guard = None
+        # Clear the pending record only after the terminal path fully
+        # succeeded (manager committed); a failure above leaves it intact.
+        self._request_owned_deferred = None
+        return result
+
+    def _complete_request_owned_step(
+        self,
+        step_seq: int,
+        trial_manager: AttentionLeaseManager,
+        metadata: RequestOwnedStepMetadata,
+        output: ModelRunnerOutput,
+        *,
+        wait_for_drain: bool = False,
+    ) -> ModelRunnerOutput:
+        """Shared terminal decoration for request-owned sampling.
+
+        Never mutates a worker-owned output or the shared empty singleton:
+        the output is copied first.  Then the exact step metadata is marked
+        exactly once (all-or-nothing in the store; marking the empty
+        metadata of a zero-token heartbeat step is a valid accepted no-op),
+        deferred physical frees are flushed, and the exact receipt batch
+        with the post-flush pool snapshot is attached before the trial
+        logical manager is committed.  A rejection of the mark fails
+        atomically: the logical manager stays uncommitted and (for the
+        deferred path) the pending record stays intact.  A failure after a
+        real computed mark is irreversible and latches fail-stop. An empty
+        RESTORE heartbeat remains reversible under its armed guard; a mixed
+        token-bearing RESTORE step still fail-stops after any real mark."""
+        store = self._request_owned_kv_store
+        if store is None:
+            raise RuntimeError(
+                "request-owned attention worker store is not initialized: "
+                "the request-owned sampling completion requires the "
+                "rank-local RequestOwnedKVStore."
+            )
+
+        # Never mutate a worker-owned output or EMPTY_MODEL_RUNNER_OUTPUT.
+        result = copy(output)
+        # Atomic computed-batch mark: validates every entry and full
+        # coverage of the step's expectations before any record advances; a
+        # rejection fails closed with no partial logical commit.  Marking
+        # empty execution metadata (a zero-token heartbeat step) is a valid
+        # no-op accepted by the store.
+        committed_num_tokens = self._request_owned_committed_num_tokens(
+            metadata, result
+        )
+        mark = store.mark_computed_batch(metadata, committed_num_tokens)
+        if not mark.accepted:
+            raise RuntimeError(
+                "request-owned computed batch mark failed: "
+                f"{mark.error or 'unknown error'}"
+            )
+        try:
+            # Post-execute completion fence: only now that the executing GPU
+            # step finished are deferred physical PREEMPT/RELEASE frees
+            # returned to the shared pool, so the receipt certifies physical
+            # free.  The attached capacity snapshot is block-ID-free and is
+            # taken after the flush.
+            self._finish_request_owned_drains(store, wait=wait_for_drain)
+            store.flush()
+            batch = trial_manager.emit_batch(step_seq)
+            if self._request_owned_kv_drain is not None:
+                batch = self._request_owned_kv_drain.decorate_batch(batch)
+            result.owner_receipt_batches = [
+                replace(batch, cache_pool=store.pool_snapshot())
+            ]
+        except BaseException as exc:
+            # A real computed batch is irreversible and must latch fail-stop.
+            # Only an empty RESTORE heartbeat can roll back its scalar build
+            # fence together with the physical destination.
+            if metadata.entries or self._request_owned_restore_guard is None:
+                self._request_owned_fail_stop = (
+                    "computed batch mark succeeded but the irreversible "
+                    f"terminal completion failed ({exc!r}); the step is "
+                    "already marked and cannot be retried."
+                )
+            raise
+        self._request_owned_control_manager = trial_manager
+        return result
+
+    @staticmethod
+    def _request_owned_committed_num_tokens(
+        metadata: RequestOwnedStepMetadata,
+        output: ModelRunnerOutput,
+    ) -> dict[OwnerLeaseKey, int]:
+        """Derive verified logical KV commits from a terminal output.
+
+        Execution writes the complete speculative target horizon, while
+        sampling returns only the accepted prefix plus one terminal token.
+        The returned mapping advances spec entries by exactly that emitted
+        count.  Non-spec entries retain the store's exact-post contract and
+        therefore need no override.
+        """
+        speculative_entries = tuple(
+            entry for entry in metadata.entries if entry.num_speculative_tokens > 0
+        )
+        if not speculative_entries:
+            return {}
+
+        req_ids = output.req_ids
+        sampled_token_ids = output.sampled_token_ids
+        req_id_to_index = output.req_id_to_index
+        if len(sampled_token_ids) != len(req_ids):
+            raise RuntimeError(
+                "request-owned speculative completion requires sampled-token "
+                "rows to align 1:1 with req_ids."
+            )
+        if not isinstance(req_id_to_index, dict) or len(req_id_to_index) != len(
+            req_ids
+        ):
+            raise RuntimeError(
+                "request-owned speculative completion requires req_id_to_index "
+                "to be bijective over req_ids."
+            )
+        seen_req_ids: set[str] = set()
+        for expected_index, req_id in enumerate(req_ids):
+            if not isinstance(req_id, str) or req_id in seen_req_ids:
+                raise RuntimeError(
+                    "request-owned speculative completion requires unique "
+                    "string req_ids."
+                )
+            seen_req_ids.add(req_id)
+            mapped_index = req_id_to_index.get(req_id)
+            if (
+                isinstance(mapped_index, bool)
+                or not isinstance(mapped_index, int)
+                or mapped_index != expected_index
+            ):
+                raise RuntimeError(
+                    "request-owned speculative completion requires req_id_to_index "
+                    "to be bijective and aligned with req_ids."
+                )
+
+        commits: dict[OwnerLeaseKey, int] = {}
+        for entry in speculative_entries:
+            req_id = entry.key.request_id
+            index = req_id_to_index.get(req_id)
+            if index is None:
+                raise RuntimeError(
+                    "request-owned speculative completion is missing the "
+                    f"terminal output for {req_id!r}."
+                )
+            tokens = sampled_token_ids[index]
+            if not isinstance(tokens, list):
+                raise RuntimeError(
+                    "request-owned speculative completion requires a list "
+                    f"of sampled tokens for {req_id!r}, got "
+                    f"{type(tokens).__name__}."
+                )
+            if not 1 <= len(tokens) <= entry.num_speculative_tokens + 1:
+                raise RuntimeError(
+                    "request-owned speculative completion emitted an "
+                    f"invalid token count for {req_id!r}: got {len(tokens)}, "
+                    f"expected 1..{entry.num_speculative_tokens + 1}."
+                )
+            commits[entry.key] = entry.pre_step_num_computed_tokens + len(tokens)
+        return commits
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache

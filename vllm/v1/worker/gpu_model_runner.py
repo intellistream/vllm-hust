@@ -140,6 +140,14 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.owner_layout import (
+    OwnerRowLayout,
+    RequestOwnedGraphSignature,
+    build_owner_row_layout,
+)
+from vllm.v1.core.sched.physical_owner_arena import (
+    select_request_owned_decode_graph_envelope,
+)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -869,6 +877,9 @@ class GPUModelRunner(
             self._num_valid_draft_tokens_copy_stream = torch.cuda.Stream()
 
         self._draft_token_req_ids: list[str] | None = None
+        # G1 request-owned attention: per-step owner row layout built from
+        # the true flattened execution order; None when the feature is off.
+        self._request_owner_layout: OwnerRowLayout | None = None
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -1918,6 +1929,31 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _build_request_owner_layout(
+        self,
+        scheduler_output: "SchedulerOutput",
+        req_indices: np.ndarray,
+        positions_np: np.ndarray,
+    ) -> "OwnerRowLayout | None":
+        """Build the per-step owner row layout from the flattened order.
+
+        Maps the flattened ``req_indices`` back through
+        ``input_batch.req_ids`` and the matching absolute token positions,
+        then cross-checks them against the scheduler's published
+        ``scheduled_owner_leases``.  Returns ``None`` (no work) when
+        request-owned attention is disabled, so profiling and default-off
+        runs never build or carry a layout.
+        """
+        if not self.scheduler_config.enable_request_owned_attention:
+            return None
+        return build_owner_row_layout(
+            step_seq=scheduler_output.step_seq,
+            request_ids=[self.input_batch.req_ids[i] for i in req_indices],
+            token_positions=positions_np.tolist(),
+            leases=scheduler_output.scheduled_owner_leases,
+            group_ranks=get_tp_group().ranks,
+        )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1953,6 +1989,14 @@ class GPUModelRunner(
         positions_np = (
             self.input_batch.num_computed_tokens_cpu[req_indices]
             + self.query_pos.np[: cu_num_tokens[-1]]
+        )
+
+        # G1 request-owned attention: build the per-step owner row layout
+        # from the true flattened execution order and the scheduler's
+        # published lease tokens.  Default-off does no work and clears any
+        # prior layout so a stale layout can never leak into a later step.
+        self._request_owner_layout = self._build_request_owner_layout(
+            scheduler_output, req_indices, positions_np
         )
 
         # Calculate M-RoPE positions.
@@ -3912,6 +3956,28 @@ class GPUModelRunner(
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
 
+        request_owned_signature = None
+        request_owned_full_ineligible = False
+        if self.scheduler_config.enable_request_owned_attention:
+            if self._request_owner_layout is None:
+                request_owned_full_ineligible = True
+            else:
+                (
+                    request_owned_signature,
+                    physical_plan,
+                ) = select_request_owned_decode_graph_envelope(
+                    self._request_owner_layout,
+                    rows_per_owner=(
+                        self.scheduler_config.request_owned_decode_rows_per_owner
+                    ),
+                    num_reqs=num_reqs,
+                    num_tokens=num_tokens,
+                    uniform_decode=uniform_decode,
+                )
+                if physical_plan is not None:
+                    num_tokens_padded = physical_plan.capacity
+                request_owned_full_ineligible = request_owned_signature is None
+
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
@@ -3919,7 +3985,12 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes=(
+                    {CUDAGraphMode.FULL}
+                    if disable_full or request_owned_full_ineligible
+                    else None
+                ),
+                request_owned_signature=request_owned_signature,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -4391,6 +4462,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                request_owner_layout=self._request_owner_layout,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -7031,8 +7103,26 @@ class GPUModelRunner(
         )
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
+        request_owned_full_signature = None
+        if (
+            self.scheduler_config.enable_request_owned_attention
+            and cudagraph_mode.has_full_cudagraphs()
+        ):
+            world_size = self.parallel_config.tensor_parallel_size
+            rows_per_owner = (
+                self.scheduler_config.request_owned_decode_rows_per_owner
+            )
+            token_rows_per_owner = rows_per_owner * self.uniform_decode_query_len
+            request_owned_full_signature = RequestOwnedGraphSignature(
+                owner_counts=(token_rows_per_owner,) * world_size,
+                canonical_to_owner=tuple(
+                    range(world_size * token_rows_per_owner)
+                ),
+            )
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode,
+            self.uniform_decode_query_len,
+            request_owned_full_signature=request_owned_full_signature,
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.

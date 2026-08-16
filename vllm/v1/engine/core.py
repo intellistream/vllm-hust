@@ -560,6 +560,26 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def _request_owned_sampling_enabled(self) -> bool:
+        """Strict G3 sampling gate for the engine step.
+
+        Only a real ``bool`` admits the synchronous request-owned sampling
+        transport.  ``VllmConfig`` validates the flag at construction, but
+        a value mutated after validation must fail closed here (never be
+        treated as truthy) before any model dispatch.
+        """
+        value = getattr(
+            self.vllm_config.scheduler_config,
+            "enable_request_owned_sampling",
+            False,
+        )
+        if not isinstance(value, bool):
+            raise RuntimeError(
+                "enable_request_owned_sampling must be a bool, got "
+                f"{type(value).__name__} ({value!r})."
+            )
+        return value
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -572,15 +592,33 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+        if self._request_owned_sampling_enabled():
+            # G3 request-owned sampling transport: execute synchronously so
+            # the Multiproc executor returns the concrete worker result (a
+            # ModelRunnerOutput, or None for a deferred sampling step)
+            # without a Future -- never call .result() on it here.  A
+            # deferred None is completed immediately through sample_tokens
+            # on this step's grammar output.
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            with (
+                self.log_error_detail(scheduler_output),
+                self.log_iteration_details(scheduler_output),
+            ):
+                model_output = self.model_executor.execute_model(
+                    scheduler_output, non_block=False
+                )
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+        else:
+            future = self.model_executor.execute_model(scheduler_output, non_block=True)
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            with (
+                self.log_error_detail(scheduler_output),
+                self.log_iteration_details(scheduler_output),
+            ):
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

@@ -363,7 +363,13 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
     def dp_engines_running(self) -> bool:
-        return False
+        # ``LLMEngine.has_unfinished_requests`` also uses this hook as the
+        # engine-core liveness signal.  Usually the output processor and the
+        # scheduler become idle together, but internal control-plane work can
+        # outlive the final user-visible output (for example, a receipt-gated
+        # request-owned RELEASE).  Keep the synchronous in-process driver
+        # stepping until the scheduler has drained that work.
+        return self.engine_core.scheduler.has_requests()
 
 
 @dataclass

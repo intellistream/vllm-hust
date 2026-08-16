@@ -166,6 +166,112 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    enable_request_owned_attention: bool = False
+    """Experimental per-request attention ownership.
+
+    Defaults to False. The supported G2 envelope enables receipt-gated
+    scheduling and worker-local physical KV allocation in eager Multiproc
+    mode. Token-bearing execution remains fail-closed until the G3 owner-local
+    Q/KV/O routing path is connected; unsupported features are rejected by
+    ``VllmConfig`` validation."""
+
+    enable_request_owned_q_wkv_fanin: bool = False
+    """Experimental fused Q/latent-KV owner fan-in for request-owned attention.
+
+    Defaults to False. When enabled, the Ascend request-owned DSA leaf
+    replaces its separate E1 Q and E2 latent-KV all-to-owner exchanges plus
+    owner-side concatenations with one native fused communication operator.
+    ``VllmConfig`` requires ``enable_request_owned_attention=True``. The flag
+    changes the attention execution path and is therefore included in
+    :meth:`compute_hash`."""
+
+    enable_request_owned_sampling: bool = False
+    """Experimental request-owned sampling transport (G3).
+
+    Defaults to False.  When enabled together with
+    ``enable_request_owned_attention``, the Multiproc executor makes the
+    owner-sampling aggregator authoritative across the deferred
+    ``execute_model -> None -> sample_tokens`` flow: the per-step adapter
+    bound during ``execute_model`` is reused for the immediate
+    ``sample_tokens`` round and cleared only after successful terminal
+    aggregation.  ``VllmConfig`` validation requires the existing
+    request-owned attention envelope and
+    ``distributed_executor_backend='mp'``; UniProc (even at world_size=1),
+    Ray, ``external_launcher``, and custom executor classes are rejected.
+    The flag changes no computation graph structure, so it is deliberately
+    not part of :meth:`compute_hash`."""
+
+    enable_request_owned_kv_offload: bool = False
+    """Experimental exclusive bulk host-KV oracle for request ownership.
+
+    Defaults to False.  When enabled, the native CPU offload medium is owned
+    exclusively by the request-owned worker adapter; the generic scheduler
+    connector must not submit jobs into the same manager/worker or job-id
+    namespace.  This is a correctness gate, not the streaming restore path.
+    """
+
+    enable_request_owned_graph: bool = False
+    """Experimental graph pilot for request-owned execution.
+
+    Defaults to False.  Mixed and prefill shapes reuse PIECEWISE compilation
+    but execute without a request-owned graph key.  The first FULL lane is a
+    finite, startup-captured pure-decode signature with an explicit fixed
+    number of rows per owner; its runner-owned metadata arena and ACL graph
+    entry are sealed before service.  Other FULL shapes remain fail-closed.
+    The flag changes the compiled graph partition and is therefore included
+    in :meth:`compute_hash`."""
+
+    enable_request_owned_windows: bool = False
+    """Experimental scheduler-owned prefill/decode windows.
+
+    Defaults to False.  When enabled with request-owned attention and graph
+    execution, the scheduler keeps an owner-ordered decode cohort stable
+    across acknowledged token steps (FULL graph when the cohort is exact,
+    non-FULL fallback when partial) and schedules prefills in separate bounded
+    waves.  Window transitions are committed only from
+    ``update_from_output`` after the step has completed; owners receive no
+    scheduling or preemption authority.  This is a scheduling policy only and
+    does not change the compiled model graph."""
+
+    request_owned_decode_rows_per_owner: int = Field(default=1, ge=1)
+    """Uniform decode requests contributed by each owner to the FULL lane.
+
+    The default preserves the first one-row-per-owner graph. Values greater
+    than one require request-owned windows so the scheduler can hold an exact
+    owner-balanced cohort matching the single startup-captured signature.
+    The value changes compiled graph geometry and is ignored when
+    request-owned attention is disabled."""
+
+    request_owned_decode_window_steps: int = Field(default=32, ge=1)
+    """Acknowledged decode steps between controller observations.
+
+    This is a conservative observation interval, not a prefill/decode service
+    ratio. Device evidence found no distinguishable bounded phase-switch cost
+    at one step versus two, but did not model continuous arrivals. The value
+    is ignored unless ``enable_request_owned_windows`` is true."""
+
+    request_owned_hot_low_watermark: int = Field(default=1, ge=0)
+    """Per-owner HOT decode-spare threshold that permits replenishment."""
+
+    request_owned_hot_high_watermark: int = Field(default=2, ge=1)
+    """Per-owner HOT decode-spare target for a bounded prefill wave."""
+
+    request_owned_prefill_wave_steps: int = Field(default=1, ge=1)
+    """Maximum positive-token invocations in one frozen prefill wave."""
+
+    request_owned_prefill_max_wait_steps: int = Field(default=32, ge=1)
+    """Scheduler-step wait guardrail independent of the HOT watermarks."""
+
+    request_owned_decode_reservation_tokens: int | None = Field(default=None, ge=1)
+    """Optional decode-token chunk for request-owned physical reservations.
+
+    ``None`` preserves the optimized graph lane's existing behavior: reserve
+    the request's complete known prompt-plus-generation lifetime on first
+    admission. A positive value instead reserves the full prompt plus at most
+    this many decode tokens, then grows the exclusive runnable horizon through
+    receipt-gated command-only EXTEND steps. This is an experimental capacity
+    policy and does not change model computation or graph structure."""
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -225,6 +331,14 @@ class SchedulerConfig:
         #   https://github.com/vllm-project/vllm/issues/29585
         factors.append(self.max_num_batched_tokens)
 
+        # Request-owned attention selects a different attention execution path
+        # (per-request attention) when enabled, which changes the structure of
+        # the computation graph (attention kernel selection and shapes).
+        factors.append(self.enable_request_owned_attention)
+        factors.append(self.enable_request_owned_q_wkv_fanin)
+        factors.append(self.enable_request_owned_graph)
+        factors.append(self.request_owned_decode_rows_per_owner)
+
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -233,6 +347,77 @@ class SchedulerConfig:
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
         """Skip validation if the value is `None` when initialisation is delayed."""
         return None if value is None else handler(value)
+
+    @field_validator("enable_request_owned_sampling", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_sampling(cls, value: Any) -> Any:
+        """Reject non-bool values before pydantic coercion.
+
+        The experimental flag is a strict bool gate: integer/string truthy
+        values such as ``1`` or ``"true"`` must fail closed instead of being
+        silently coerced into the enabled state.
+        """
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_sampling must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
+
+    @field_validator("enable_request_owned_kv_offload", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_kv_offload(cls, value: Any) -> Any:
+        """Keep owner-local host KV behind an exact exclusive opt-in."""
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_kv_offload must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
+
+    @field_validator("enable_request_owned_graph", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_graph(cls, value: Any) -> Any:
+        """Keep the experimental graph lane behind an exact bool opt-in."""
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_graph must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
+
+    @field_validator("request_owned_decode_rows_per_owner", mode="before")
+    @classmethod
+    def _reject_bool_request_owned_decode_rows_per_owner(cls, value: Any) -> Any:
+        """Keep the fixed graph geometry out of the bool-as-int alias."""
+        if isinstance(value, bool):
+            raise ValueError(
+                "request_owned_decode_rows_per_owner must be a positive int, "
+                f"got bool ({value!r})."
+            )
+        return value
+
+    @field_validator("enable_request_owned_windows", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_windows(cls, value: Any) -> Any:
+        """Keep scheduler windows behind an exact bool opt-in."""
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_windows must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
+
+    @field_validator("enable_request_owned_q_wkv_fanin", mode="before")
+    @classmethod
+    def _reject_non_bool_request_owned_q_wkv_fanin(cls, value: Any) -> Any:
+        """Keep the native fused fan-in behind an exact bool opt-in."""
+        if isinstance(value, bool):
+            return value
+        raise ValueError(
+            "enable_request_owned_q_wkv_fanin must be a bool, got "
+            f"{type(value).__name__} ({value!r})."
+        )
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
         if is_encoder_decoder:

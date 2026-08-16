@@ -3,6 +3,7 @@
 from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
+from typing import TYPE_CHECKING
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
@@ -10,6 +11,9 @@ from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.owner_layout import RequestOwnedGraphSignature
 
 
 class CudagraphDispatcher:
@@ -135,6 +139,7 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
+        request_owned_signature: "RequestOwnedGraphSignature | None" = None,
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         uniform_decode_query_len = self.uniform_decode_query_len
@@ -153,6 +158,7 @@ class CudagraphDispatcher:
             uniform=uniform_decode,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
+            request_owned_signature=request_owned_signature,
         )
 
     def add_cudagraph_key(
@@ -164,11 +170,24 @@ class CudagraphDispatcher:
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
     def initialize_cudagraph_keys(
-        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        uniform_decode_query_len: int = 1,
+        request_owned_full_signature: "RequestOwnedGraphSignature | None" = None,
     ):
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
         self.cudagraph_mode = cudagraph_mode
+
+        if request_owned_full_signature is not None and not (
+            cudagraph_mode.separate_routine()
+            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE
+        ):
+            raise ValueError(
+                "request-owned FULL graphs require a FULL decode / PIECEWISE "
+                "mixed-batch compile mode"
+            )
 
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:
@@ -186,7 +205,10 @@ class CudagraphDispatcher:
         # Note: we create all valid keys for cudagraph here but do not
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
-        if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
+        if (
+            cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE
+            and request_owned_full_signature is None
+        ):
             assert self.compilation_config.cudagraph_capture_sizes is not None, (
                 "Cudagraph capture sizes must be set when mixed mode is enabled."
             )
@@ -194,7 +216,15 @@ class CudagraphDispatcher:
                 self.compilation_config.cudagraph_capture_sizes, lora_cases
             ):
                 batch_desc = self._create_padded_batch_descriptor(
-                    bs, False, num_active_loras > 0, num_active_loras
+                    bs,
+                    False,
+                    num_active_loras > 0,
+                    num_active_loras,
+                    request_owned_signature=(
+                        request_owned_full_signature
+                        if cudagraph_mode.mixed_mode() == CUDAGraphMode.FULL
+                        else None
+                    ),
                 )
                 # Only relax for PIECEWISE mode. FULL mode needs exact num_reqs
                 # because FA3's scheduler_metadata computation depends on it.
@@ -220,13 +250,24 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens and x >= uniform_decode_query_len
             ]
+            if request_owned_full_signature is not None:
+                fixed_num_tokens = sum(request_owned_full_signature.owner_counts)
+                cudagraph_capture_sizes_for_decode = [
+                    x
+                    for x in cudagraph_capture_sizes_for_decode
+                    if x == fixed_num_tokens
+                ]
             for bs, num_active_loras in product(
                 cudagraph_capture_sizes_for_decode, lora_cases
             ):
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
                     self._create_padded_batch_descriptor(
-                        bs, True, num_active_loras > 0, num_active_loras
+                        bs,
+                        True,
+                        num_active_loras > 0,
+                        num_active_loras,
+                        request_owned_signature=request_owned_full_signature,
                     ),
                 )
 
@@ -240,6 +281,7 @@ class CudagraphDispatcher:
         num_active_loras: int = 0,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
+        request_owned_signature: "RequestOwnedGraphSignature | None" = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -259,6 +301,10 @@ class CudagraphDispatcher:
                 valid_modes to compute allowed modes. (e.g., {FULL} for
                 features like cascade attention not supported by full
                 cudagraphs). None means no modes are excluded.
+            request_owned_signature: Exact request-owned FULL graph envelope.
+                ``None`` denotes a baseline/non-owner batch. Callers with an
+                ineligible owner layout must exclude FULL rather than pass
+                ``None`` and accidentally alias a baseline graph.
         """
         allowed_modes = valid_modes or CUDAGraphMode.valid_runtime_modes()
 
@@ -301,7 +347,11 @@ class CudagraphDispatcher:
 
         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
         batch_desc = self._create_padded_batch_descriptor(
-            num_tokens, normalized_uniform, has_lora, effective_num_active_loras
+            num_tokens,
+            normalized_uniform,
+            has_lora,
+            effective_num_active_loras,
+            request_owned_signature=request_owned_signature,
         )
 
         if CUDAGraphMode.FULL in allowed_modes:
@@ -313,7 +363,12 @@ class CudagraphDispatcher:
         if CUDAGraphMode.PIECEWISE in allowed_modes:
             # also check if the relaxed key exists for more "general"
             # piecewise cudagraph
-            batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
+            batch_desc_to_check = replace(
+                batch_desc,
+                num_reqs=None,
+                uniform=False,
+                request_owned_signature=None,
+            )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
                 return CUDAGraphMode.PIECEWISE, batch_desc_to_check
 
@@ -338,6 +393,11 @@ class CudagraphDispatcher:
         result = []
         # Return in order: PIECEWISE first, then FULL
         for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
+            # Every dispatchable graph belongs to the loaded-model capture
+            # epoch.  Backends that attach a request-owned signature must
+            # provide synthetic, explicitly owned inputs for that descriptor;
+            # they may not defer capture to the first live request after
+            # READY.
             descs = list(self.cudagraph_keys[mode])
             if descs:
                 # Sort by (num_tokens, num_active_loras) descending

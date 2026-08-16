@@ -11,6 +11,8 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.owner_layout import GlobalRowId
+from vllm.v1.core.sched.ownership import OwnerReceiptBatch
 from vllm.v1.kv_cache_compression import KVCacheCompressionPlan
 
 if TYPE_CHECKING:
@@ -229,6 +231,65 @@ class ECConnectorOutput:
     finished_recving: set[str] | None = None
 
 
+@dataclass(frozen=True)
+class OwnerSamplingBatch:
+    """One sampling envelope a worker emits per step for request-owned
+    attention.
+
+    Identity-only: :attr:`row_ids` carries the generation-fenced terminal
+    :class:`GlobalRowId` of the logits-producing execution row for each
+    request in the worker's partial :class:`ModelRunnerOutput`, aligned
+    exactly 1:1 with that output's ``req_ids``.  Chunked prefill of one
+    request still yields exactly one row identity, not one per scheduled
+    token.  Token/logprob payload is NOT duplicated here; it rides the
+    partial output payload fields, so the envelope stays small and
+    unambiguous.
+
+    ``row_ids`` is empty for an owner with no scheduled requests.  An
+    enabled worker always emits exactly one batch per step, even when
+    ``row_ids`` is empty, so a missing response is distinguishable from an
+    empty one.  The batch is immutable and picklable (the transport wire
+    format for the multiproc MQs).
+    """
+
+    owner_rank: int
+    emitted_step_seq: int
+    #: One terminal GlobalRowId per request in the partial output, aligned
+    #: 1:1 with ``ModelRunnerOutput.req_ids`` of the enclosing worker output.
+    row_ids: tuple[GlobalRowId, ...] = ()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.owner_rank, bool) or not isinstance(
+            self.owner_rank, int
+        ):
+            raise TypeError(
+                f"owner_rank must be a non-bool int, got {self.owner_rank!r}."
+            )
+        if self.owner_rank < 0:
+            raise ValueError(
+                f"owner_rank must be nonnegative, got {self.owner_rank}."
+            )
+        if (
+            isinstance(self.emitted_step_seq, bool)
+            or not isinstance(self.emitted_step_seq, int)
+            or self.emitted_step_seq <= 0
+        ):
+            raise TypeError(
+                "emitted_step_seq must be a positive non-bool int, got "
+                f"{self.emitted_step_seq!r}."
+            )
+        if not isinstance(self.row_ids, tuple):
+            raise TypeError(
+                "row_ids must be a tuple of GlobalRowId, got "
+                f"{type(self.row_ids).__name__}."
+            )
+        for row_id in self.row_ids:
+            if not isinstance(row_id, GlobalRowId):
+                raise TypeError(
+                    f"row_ids must contain GlobalRowId, got {row_id!r}."
+                )
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -289,6 +350,22 @@ class ModelRunnerOutput:
     # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
+
+    # G0 request-owned attention: per-worker owner receipt envelope(s) emitted
+    # for the current step. ``None`` means the feature is disabled on this
+    # worker (or the worker is not participating); an enabled worker always
+    # emits exactly one OwnerReceiptBatch even when ``events`` is empty.
+    # Carried on ModelRunnerOutput so the existing all-worker outputs list and
+    # transport aggregate receipts with zero new IPC.
+    owner_receipt_batches: list[OwnerReceiptBatch] | None = None
+
+    # G3 request-owned attention: per-worker sampling envelope(s) emitted for
+    # the current step. ``None`` means the feature is disabled on this worker
+    # (or the worker is not participating); an enabled worker always emits
+    # exactly one OwnerSamplingBatch even when ``row_ids`` is empty. Carried
+    # on ModelRunnerOutput so the existing all-worker outputs list and
+    # transport aggregate sampling envelopes with zero new IPC.
+    owner_sampling_batches: list[OwnerSamplingBatch] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

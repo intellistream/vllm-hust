@@ -20,6 +20,7 @@ from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest
+from vllm.v1.executor.output_aggregator import ModelRunnerOutputAggregator
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -110,6 +111,88 @@ class Executor(ABC):
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
         self.kv_output_aggregator: KVOutputAggregator | None = None
+        # G0 request-owned attention: generic all-worker aggregator, built only
+        # when the feature gate is enabled. Composes owner receipt batches
+        # (and the KV aggregator when a connector is configured).
+        self.model_runner_output_aggregator: ModelRunnerOutputAggregator | None = None
+        self._build_model_runner_output_aggregator()
+
+    def _expected_owner_ranks(self) -> list[int]:
+        """Process-global ranks of the workers whose outputs reach this
+        executor, i.e. the owner ranks that must each emit exactly one
+        OwnerReceiptBatch per step when request-owned attention is enabled."""
+        return list(range(self.parallel_config.world_size))
+
+    def _build_model_runner_output_aggregator(self) -> None:
+        """(Re)build the generic aggregator from the current config.
+
+        Called from ``__init__`` (gate may already be on) and again from
+        ``init_kv_output_aggregator`` once a KV connector aggregator exists,
+        so owner + KV composition always sees the latest KV aggregator.
+        """
+        if not self.scheduler_config.enable_request_owned_attention:
+            self.model_runner_output_aggregator = None
+            return
+        self.model_runner_output_aggregator = ModelRunnerOutputAggregator(
+            expected_owner_ranks=self._expected_owner_ranks(),
+            kv_aggregator=self.kv_output_aggregator,
+            # G3 request-owned sampling: when enabled, every process-global
+            # owner rank must emit exactly one OwnerSamplingBatch per
+            # terminal round, and the aggregator tolerates the deferred
+            # all-None execute round.  Sampling disabled (the default) keeps
+            # the aggregator byte-for-byte unchanged.
+            expected_sampling_owner_ranks=(
+                self._expected_owner_ranks()
+                if self.scheduler_config.enable_request_owned_sampling
+                else None
+            ),
+        )
+
+    def _validate_request_owned_control_only_step(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Reject token execution before any executor transport in G1.
+
+        This also protects against mutating the nested scheduler config after
+        ``VllmConfig`` validation: no backend may dispatch replicated token KV
+        merely because its remote worker retained an older disabled config.
+        """
+        if not self.scheduler_config.enable_request_owned_attention:
+            return
+        sampling_enabled = getattr(
+            self.scheduler_config, "enable_request_owned_sampling", False
+        )
+        if not isinstance(sampling_enabled, bool):
+            raise RuntimeError(
+                "request-owned sampling gate must remain a bool after "
+                f"configuration validation, got {sampling_enabled!r}; "
+                "refusing a mutated config from bypassing the control-only "
+                "token gate."
+            )
+        if sampling_enabled:
+            # G3 request-owned sampling transport: the owner-sampling
+            # aggregator is authoritative across the deferred execute ->
+            # sample_tokens flow, so the G1 control-only gate lifts.  With
+            # the sampling flag off (the default) the gate below stays
+            # byte-for-byte unchanged.
+            return
+        total = scheduler_output.total_num_scheduled_tokens
+        per_request = scheduler_output.num_scheduled_tokens
+        if (
+            isinstance(total, bool)
+            or not isinstance(total, int)
+            or total != 0
+            or any(
+                isinstance(count, bool) or not isinstance(count, int) or count < 0
+                for count in per_request.values()
+            )
+            or sum(per_request.values()) != 0
+        ):
+            raise RuntimeError(
+                "request-owned attention G1 is control-only: refusing to "
+                "dispatch a nonempty or inconsistent token schedule before "
+                "the G2 owner-local allocator/routing prerequisite exists."
+            )
 
     @abstractmethod
     def _init_executor(self) -> None:
@@ -221,6 +304,7 @@ class Executor(ABC):
     def execute_model(
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        self._validate_request_owned_control_only_step(scheduler_output)
         output = self.collective_rpc(  # type: ignore[call-overload]
             "execute_model", args=(scheduler_output,), non_block=non_block
         )
@@ -282,6 +366,9 @@ class Executor(ABC):
         self.kv_output_aggregator = KVOutputAggregator.from_connector(
             connector, self.parallel_config.world_size
         )
+        # Rebuild the generic aggregator so owner-receipt aggregation composes
+        # the newly available KV aggregator when request-owned attention is on.
+        self._build_model_runner_output_aggregator()
 
     @cached_property  # Avoid unnecessary RPC calls
     def supported_tasks(self) -> tuple[SupportedTask, ...]:
