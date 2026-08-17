@@ -312,6 +312,54 @@ def test_cache_partial_block_uses_fine_grained_boundary_hash():
     assert pool.get_cached_block(expected, [kv_cache_group_id]) == [blocks[1]]
 
 
+def test_move_block_hashes_preserves_primary_and_partial_aliases():
+    hash_block_size = 2
+    block_size = 6
+    group_id = 0
+    req = make_request("move", list(range(12)), hash_block_size, sha256)
+    pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    source, destination = pool.get_new_blocks(2)
+    pool.cache_full_blocks(
+        request=req,
+        blocks=[source],
+        num_cached_blocks=0,
+        num_full_blocks=1,
+        block_size=block_size,
+        kv_cache_group_id=group_id,
+    )
+    partial_hash = pool.cache_partial_block(
+        request=req,
+        block=source,
+        num_tokens=4,
+        kv_cache_group_id=group_id,
+        block_size=block_size,
+    )
+    assert partial_hash is not None
+    full_hash = BlockHashListWithBlockSize(
+        req.block_hashes, hash_block_size, block_size
+    )[0]
+    assert pool.get_cached_block(full_hash, [group_id]) == [source]
+    assert pool.get_cached_block(
+        boundary_hash(req, hash_block_size, 4), [group_id]
+    ) == [source]
+
+    pool.move_block_hashes(source, destination)
+
+    assert source.block_hash is None
+    assert source.block_hash_num_tokens is None
+    assert destination.block_hash_num_tokens == block_size
+    assert pool.get_cached_block(full_hash, [group_id]) == [destination]
+    assert pool.get_cached_block(
+        boundary_hash(req, hash_block_size, 4), [group_id]
+    ) == [destination]
+    assert source.block_id not in pool.cached_block_hashes_by_block
+    assert partial_hash in pool.cached_block_hashes_by_block[destination.block_id]
+
+
 def test_cache_partial_block_requires_hash_boundary():
     hash_block_size = 2
     block_size = 4

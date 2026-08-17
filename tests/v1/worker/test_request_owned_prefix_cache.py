@@ -6,6 +6,10 @@ import pytest
 import torch
 
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlockCopy,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.core.request_owned_prefix import OwnerPrefixDescriptor
 from vllm.v1.core.sched.ownership import (
     OwnerAdmissionStatus,
@@ -158,9 +162,7 @@ def test_reserve_never_publishes_uncomputed_blocks_and_commit_enables_hit():
     assert decorated.events[0].prefix_cache_hit_tokens == 4
     store.acknowledge_prefix_cache_receipts(decorated)
     assert (
-        store.decorate_prefix_cache_receipts(logical)
-        .events[0]
-        .prefix_cache_hit_tokens
+        store.decorate_prefix_cache_receipts(logical).events[0].prefix_cache_hit_tokens
         is None
     )
 
@@ -316,3 +318,72 @@ def test_prefix_hit_is_capped_by_partial_reserve_horizon():
     assert snapshot is not None
     assert snapshot.num_computed_tokens == 4
     assert snapshot.num_computed_tokens < partial.required_num_tokens
+
+
+def test_forward_prefix_cow_copy_consumes_only_its_allocation_delta(monkeypatch):
+    manager = _manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    command = _reserve("forward-cow", 1)
+    allocation = store.reserve(command)
+    assert allocation.accepted and allocation.delta is not None
+    destination_id = allocation.delta[0][0]
+    destination = manager.block_pool.blocks[destination_id]
+    source = manager.block_pool.get_new_blocks(1)[0]
+    manager.block_pool._insert_block_hash(
+        make_block_hash_with_group_id(b"forward-source", 0),
+        source,
+        num_tokens=4,
+    )
+    destination.ref_cnt += 1  # worker-copy retention beyond request ownership
+    copies = [KVCacheBlockCopy(source.block_id, destination.block_id)]
+    retained = [source, destination]
+    monkeypatch.setattr(
+        manager,
+        "take_kv_cache_block_copies",
+        lambda: (copies, retained),
+    )
+
+    prepared = store.prepare_prefix_cache_block_copies()
+    assert prepared == tuple(copies)
+    store.complete_prefix_cache_block_copies(prepared)
+
+    record = store._records[command.key]
+    assert record.pending_delta is not None
+    assert all(destination_id not in group for group in record.pending_delta)
+    assert source.ref_cnt == 0
+    assert destination.ref_cnt == 1
+
+
+def test_reverse_prefix_cow_snapshot_preserves_request_delta(monkeypatch):
+    manager = _manager()
+    store = RequestOwnedKVStore(manager, owner_rank=0)
+    command = _reserve("reverse-cow", 1)
+    allocation = store.reserve(command)
+    assert (
+        allocation.accepted
+        and allocation.delta is not None
+        and allocation.tables is not None
+    )
+    original_delta = allocation.delta
+    source_id = allocation.tables[0][0]
+    source = manager.block_pool.blocks[source_id]
+    destination = manager.block_pool.get_new_blocks(1)[0]
+    snapshot_hash = make_block_hash_with_group_id(b"snapshot", 0)
+    manager.block_pool._insert_block_hash(snapshot_hash, destination, num_tokens=4)
+    source.ref_cnt += 1  # copy retention beyond request ownership
+    copies = [KVCacheBlockCopy(source.block_id, destination.block_id)]
+    retained = [source, destination]
+    monkeypatch.setattr(
+        manager,
+        "take_kv_cache_block_copies",
+        lambda: (copies, retained),
+    )
+
+    prepared = store.prepare_prefix_cache_block_copies()
+    store.complete_prefix_cache_block_copies(prepared)
+
+    record = store._records[command.key]
+    assert record.pending_delta == original_delta
+    assert source.ref_cnt == 1
+    assert destination.ref_cnt == 0
+    assert manager.block_pool.get_cached_block(b"snapshot", [0]) == [destination]

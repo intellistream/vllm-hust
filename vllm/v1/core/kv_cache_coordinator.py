@@ -718,7 +718,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         aligned_num_computed_tokens = (
             num_computed_tokens // self.scheduler_block_size * self.scheduler_block_size
         )
-        cached_blocks_per_manager = []
+        cached_blocks_per_manager: list[int] = []
         for manager in self.single_type_managers:
             num_tokens_to_cache = aligned_num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop

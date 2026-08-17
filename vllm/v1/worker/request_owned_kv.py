@@ -77,6 +77,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.core.sched.ownership import (
     OwnerAdmissionStatus,
     OwnerCacheGroupSnapshot,
@@ -191,6 +192,20 @@ class _Record:
     #: blocks where the source hybrid table carried null placeholders; H2D
     #: must still address only the original concrete positions.
     restore_source_block_indices: tuple[tuple[int, ...], ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingPrefixCopyBatch:
+    copies: tuple[KVCacheBlockCopy, ...]
+    retained_blocks: tuple[KVCacheBlock, ...]
+    delta_destination_ids: frozenset[int]
+
+    def __post_init__(self) -> None:
+        if not self.copies or len(self.retained_blocks) != 2 * len(self.copies):
+            raise ValueError(
+                "a pending prefix-copy batch requires two retained endpoints "
+                "per nonempty copy"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,6 +509,10 @@ class RequestOwnedKVStore:
         #: Step fence of the last successfully marked batch (each step may
         #: be marked at most once; a duplicate mark attempt is rejected).
         self._marked_step_seq: int | None = None
+        #: CoW endpoints drained from the real manager but not yet certified
+        #: copied by the concrete worker. Keeping the objects referenced and
+        #: ref-counted prevents either physical ID from being recycled.
+        self._pending_prefix_copy_batch: _PendingPrefixCopyBatch | None = None
 
     def reserve(self, command: OwnerCommand) -> AllocationResult:
         """Physically reserve the chunk of a RESERVE command; request
@@ -542,10 +561,7 @@ class RequestOwnedKVStore:
         if not prefix_allocation.accepted:
             return _reject_allocation(command, "insufficient KV cache to reserve")
         blocks = prefix_allocation.blocks
-        computed = (
-            command.allocation.num_computed_tokens
-            + prefix_allocation.hit_tokens
-        )
+        computed = command.allocation.num_computed_tokens + prefix_allocation.hit_tokens
 
         self._generation_counter += 1
         record = _Record(
@@ -1496,6 +1512,10 @@ class RequestOwnedKVStore:
     def flush(self) -> tuple[OwnerLeaseKey, ...]:
         """Post-execute completion fence: free all deferred blocks now
         that the executing GPU step finished writing them."""
+        if self._pending_prefix_copy_batch is not None:
+            raise RuntimeError(
+                "request-owned KV flush found an uncompleted prefix CoW copy"
+            )
         freed: list[OwnerLeaseKey] = []
         for key, record in list(self._records.items()):
             if not record.pending_free:
@@ -1574,9 +1594,7 @@ class RequestOwnedKVStore:
                 allocated_blocks=allocated[index],
                 resident_blocks=allocated[index],
                 allocation_token_quantum=_request_owned_compress_ratio(spec),
-                fresh_allocation_block_cap=(
-                    self._fresh_allocation_block_cap(index)
-                ),
+                fresh_allocation_block_cap=(self._fresh_allocation_block_cap(index)),
             )
             for index, spec in enumerate(self._group_specs)
         )
@@ -1636,13 +1654,142 @@ class RequestOwnedKVStore:
 
         return self._prefix_cache.decorate_receipt_batch(batch)
 
+    def prepare_prefix_cache_block_copies(
+        self,
+    ) -> tuple[KVCacheBlockCopy, ...]:
+        """Drain real-manager CoW work into one fail-closed worker batch.
+
+        A forward-CoW destination must be a newly allocated delta of exactly
+        one live record; a reverse-CoW cache snapshot must be hashed and absent
+        from every request delta. The retained block objects remain owned by
+        this store until :meth:`complete_prefix_cache_block_copies` certifies
+        that the concrete worker copied the bytes.
+        """
+
+        if self._pending_prefix_copy_batch is not None:
+            raise RuntimeError(
+                "request-owned prefix CoW copy from an earlier step is incomplete"
+            )
+        copies, retained_blocks = self._manager.take_kv_cache_block_copies()
+        if not copies:
+            if retained_blocks:
+                raise RuntimeError(
+                    "prefix CoW manager returned retained blocks without copies"
+                )
+            return ()
+        if len(retained_blocks) != 2 * len(copies):
+            raise RuntimeError(
+                "prefix CoW manager must retain exactly two endpoints per copy"
+            )
+
+        destinations = [copy.dst_block_id for copy in copies]
+        if len(set(destinations)) != len(destinations):
+            raise RuntimeError("prefix CoW copy destinations must be unique")
+        delta_destination_ids: set[int] = set()
+        for index, copy in enumerate(copies):
+            if copy.src_block_id == copy.dst_block_id:
+                raise RuntimeError("prefix CoW copy cannot target its source")
+            source_block = retained_blocks[2 * index]
+            destination_block = retained_blocks[2 * index + 1]
+            if (
+                source_block.block_id != copy.src_block_id
+                or destination_block.block_id != copy.dst_block_id
+            ):
+                raise RuntimeError(
+                    "prefix CoW retained endpoints do not match the copy IDs"
+                )
+            if source_block.ref_cnt <= 0 or destination_block.ref_cnt <= 0:
+                raise RuntimeError(
+                    "prefix CoW copy endpoints must remain physically retained"
+                )
+            if (source_block.block_hash is None) == (
+                destination_block.block_hash is None
+            ):
+                raise RuntimeError(
+                    "prefix CoW copy must have exactly one hashed endpoint"
+                )
+            matches = sum(
+                block_id == copy.dst_block_id
+                for record in self._records.values()
+                for group in (record.pending_delta or ())
+                for block_id in group
+            )
+            if destination_block.block_hash is None:
+                if matches != 1:
+                    raise RuntimeError(
+                        "request-private prefix CoW destination must occur in "
+                        "exactly one pending allocation delta, got block "
+                        f"{copy.dst_block_id} in {matches} positions"
+                    )
+                delta_destination_ids.add(copy.dst_block_id)
+            elif matches != 0:
+                raise RuntimeError(
+                    "cache-snapshot prefix CoW destination must not occur in "
+                    "a request allocation delta, got block "
+                    f"{copy.dst_block_id} in {matches} positions"
+                )
+
+        batch = _PendingPrefixCopyBatch(
+            copies=tuple(copies),
+            retained_blocks=tuple(retained_blocks),
+            delta_destination_ids=frozenset(delta_destination_ids),
+        )
+        self._pending_prefix_copy_batch = batch
+        return batch.copies
+
+    def complete_prefix_cache_block_copies(
+        self, copies: tuple[KVCacheBlockCopy, ...]
+    ) -> None:
+        """Commit one concrete worker CoW completion and release its pins."""
+
+        batch = self._pending_prefix_copy_batch
+        if batch is None or copies != batch.copies:
+            raise RuntimeError(
+                "prefix CoW completion does not match the pending worker batch"
+            )
+
+        destinations = set(batch.delta_destination_ids)
+        removed: set[int] = set()
+        for record in self._records.values():
+            if record.pending_delta is None:
+                continue
+            groups: list[tuple[int, ...]] = []
+            for group in record.pending_delta:
+                kept: list[int] = []
+                for block_id in group:
+                    if block_id in destinations:
+                        if block_id in removed:
+                            raise RuntimeError(
+                                f"prefix CoW destination {block_id} was duplicated"
+                            )
+                        removed.add(block_id)
+                    else:
+                        kept.append(block_id)
+                groups.append(tuple(kept))
+            record.pending_delta = tuple(groups) if any(groups) else None
+        if removed != destinations:
+            raise RuntimeError(
+                "prefix CoW completion lost pending destinations: "
+                f"expected={sorted(destinations)} removed={sorted(removed)}"
+            )
+
+        # Drop one temporary reference from every source and destination.
+        # Source blocks then remain cached (ref_cnt=0); destinations remain
+        # owned by their requests (ref_cnt=1).
+        self._manager.block_pool.free_blocks(batch.retained_blocks)
+        self._pending_prefix_copy_batch = None
+
     def acknowledge_prefix_cache_receipts(self, batch) -> None:
         self._prefix_cache.acknowledge_receipt_batch(batch)
 
     def reset_prefix_cache(self) -> bool:
         """Reset published owner-local prefixes only after every lease drains."""
 
-        if self._records or self._pending_marks:
+        if (
+            self._records
+            or self._pending_marks
+            or self._pending_prefix_copy_batch is not None
+        ):
             return False
         return self._prefix_cache.reset()
 

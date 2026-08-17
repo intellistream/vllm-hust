@@ -542,6 +542,28 @@ class BlockPool:
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
 
+    def move_block_hashes(
+        self,
+        src_block: KVCacheBlock,
+        dst_block: KVCacheBlock,
+    ) -> None:
+        """Re-point one block's prefix-cache entries to a private copy.
+
+        The request owning ``src_block`` may keep writing into it while the
+        immutable prefix snapshot moves to ``dst_block``. The caller must
+        physically copy the block before publishing the destination as ready.
+        """
+
+        assert dst_block.block_hash is None
+        assert dst_block.block_id not in self.cached_block_hashes_by_block
+        num_tokens = src_block.block_hash_num_tokens
+        block_hashes = self._remove_cached_block_hashes(src_block)
+        assert block_hashes, "source block has no prefix-cache hashes to move"
+        for block_hash in block_hashes:
+            # ``num_tokens`` applies to the primary insertion only. Aliases
+            # retain their keys in ``cached_block_hashes_by_block``.
+            self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 

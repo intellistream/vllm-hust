@@ -98,6 +98,11 @@ class SingleTypeKVCacheManager(ABC):
         # determining the attention groups.
         self.use_eagle = False
 
+        # Fine-grained prefix managers may redirect a shared partial tail to
+        # a private block. Both endpoints stay retained until the worker has
+        # completed the physical copy.
+        self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
         return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
@@ -318,6 +323,39 @@ class SingleTypeKVCacheManager(ABC):
         ids = self.new_block_ids
         self.new_block_ids = []
         return ids
+
+    def take_pending_cow_copies(
+        self,
+    ) -> list[tuple[KVCacheBlock, KVCacheBlock]]:
+        """Drain pending copy-on-write source and destination pairs."""
+
+        pending_copies = self._pending_cow_copies
+        self._pending_cow_copies = []
+        return pending_copies
+
+    def _apply_cow(
+        self,
+        request_id: str,
+        block_idx: int,
+        source_block: KVCacheBlock,
+        cow_block: KVCacheBlock,
+    ) -> None:
+        """Redirect a shared partial prefix tail to a private block.
+
+        The source keeps the reference acquired by the prefix hit and the
+        destination takes one extra reference beyond the request's ownership.
+        The caller must keep both until the worker completes the physical
+        copy, then return one reference for each to the block pool.
+        """
+
+        req_blocks = self.req_to_blocks[request_id]
+        assert block_idx < len(req_blocks)
+        assert req_blocks[block_idx] is source_block
+        assert not source_block.is_null and source_block.ref_cnt > 0
+        assert not cow_block.is_null and cow_block.ref_cnt == 1
+        req_blocks[block_idx] = cow_block
+        self._pending_cow_copies.append((source_block, cow_block))
+        cow_block.ref_cnt += 1
 
     def cache_blocks(
         self,

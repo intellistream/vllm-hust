@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, NewType, TypeAlias, cast, overload
+from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -174,6 +174,13 @@ class KVCacheBlock:
             f"prev_free_block={prev_block_id}, "
             f"next_free_block={next_block_id})"
         )
+
+
+class KVCacheBlockCopy(NamedTuple):
+    """One physical KV block copied before its private suffix is written."""
+
+    src_block_id: int
+    dst_block_id: int
 
 
 class FreeKVCacheBlockQueue:

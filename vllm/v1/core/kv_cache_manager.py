@@ -13,7 +13,7 @@ from vllm.distributed.prefix_scheduler import PrefixCacheSnapshot
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_compression import (
     KVCacheCompressionError,
     KVCacheCompressionPlan,
@@ -1106,6 +1106,24 @@ class KVCacheManager:
         ids.extend(self._new_compression_destination_block_ids)
         self._new_compression_destination_block_ids = []
         return ids
+
+    def take_kv_cache_block_copies(
+        self,
+    ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
+        """Drain pending CoW copies and return their retained endpoints."""
+
+        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        for manager in self.coordinator.single_type_managers:
+            pending_copies.extend(manager.take_pending_cow_copies())
+        copies = [
+            KVCacheBlockCopy(
+                src_block_id=source_block.block_id,
+                dst_block_id=cow_block.block_id,
+            )
+            for source_block, cow_block in pending_copies
+        ]
+        retained_blocks = [block for pair in pending_copies for block in pair]
+        return copies, retained_blocks
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""

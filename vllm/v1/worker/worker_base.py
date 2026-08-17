@@ -18,7 +18,7 @@ from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.ownership import (
     AttentionLeaseManager,
     OwnerCommand,
@@ -241,6 +241,16 @@ class WorkerBase:
             f"{type(self).__name__} does not support the request-owned G3 "
             "step metadata handoff; request-owned attention requires a "
             "worker that implements set_request_owned_step_metadata."
+        )
+
+    def execute_request_owned_kv_block_copies(
+        self, copies: tuple[KVCacheBlockCopy, ...]
+    ) -> None:
+        """Copy owner-local partial-prefix blocks before suffix execution."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support request-owned KV block "
+            "copies; partial prefix-cache hits require a concrete worker hook."
         )
 
     def get_cache_block_size_bytes(self) -> int:
@@ -605,6 +615,20 @@ class WorkerWrapperBase:
                 self.vllm_config.parallel_config.prefill_context_parallel_size
             ),
         )
+        activate_partial_hits = getattr(
+            kv_cache_manager.coordinator,
+            "enable_request_owned_compressed_partial_prefix_hits",
+            None,
+        )
+        if (
+            self.vllm_config.cache_config.enable_prefix_caching
+            and callable(activate_partial_hits)
+            and not activate_partial_hits()
+        ):
+            raise RuntimeError(
+                "request-owned compressed prefix caching could not activate "
+                "its worker-local partial-hit protocol"
+            )
         return RequestOwnedKVStore(kv_cache_manager, owner_rank=self.global_rank)
 
     def _request_owned_logical_capacity(self) -> int:
@@ -798,6 +822,18 @@ class WorkerWrapperBase:
                 "RequestOwnedKVStore before execution."
             )
 
+        # A successful prior step may have published compressed partial-prefix
+        # metadata and queued the immutable reverse-CoW snapshot only at its
+        # terminal mark. Complete those copies before this step processes any
+        # owner command: RESERVE lookup must never observe an unfilled cache
+        # snapshot. The post-command drain below handles forward CoW generated
+        # by new hits in this same control step.
+        prior_prefix_copies = store.prepare_prefix_cache_block_copies()
+        if prior_prefix_copies:
+            self._execute_request_owned_prefix_cache_block_copies(
+                prior_prefix_copies, store
+            )
+
         manager = self._request_owned_control_manager
         if manager is None:
             manager = AttentionLeaseManager(
@@ -884,6 +920,10 @@ class WorkerWrapperBase:
 
         if restore_work:
             self._execute_request_owned_bulk_restore(tuple(restore_work))
+
+        prefix_copies = store.prepare_prefix_cache_block_copies()
+        if prefix_copies:
+            self._execute_request_owned_prefix_cache_block_copies(prefix_copies, store)
 
         for token in scheduler_output.scheduled_owner_leases:
             if token.owner_id == self.global_rank:
@@ -1199,6 +1239,22 @@ class WorkerWrapperBase:
                 raise RuntimeError(
                     "bulk RESTORE hook returned without submitting exact H2D"
                 )
+
+    def _execute_request_owned_prefix_cache_block_copies(
+        self,
+        copies: tuple[KVCacheBlockCopy, ...],
+        store: RequestOwnedKVStore,
+    ) -> None:
+        """Run one worker-private partial-prefix CoW batch to completion."""
+
+        hook = getattr(self.worker, "execute_request_owned_kv_block_copies", None)
+        if not callable(hook):
+            raise RuntimeError(
+                "request-owned partial prefix caching requires the worker's "
+                "KV block-copy hook"
+            )
+        hook(copies)
+        store.complete_prefix_cache_block_copies(copies)
 
     def _build_request_owned_step_metadata(
         self,
