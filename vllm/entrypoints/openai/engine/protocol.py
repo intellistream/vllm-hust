@@ -125,6 +125,7 @@ class ModelCard(OpenAIBaseModel):
     root: str | None = None
     parent: str | None = None
     max_model_len: int | None = None
+    speculative_capability: dict[str, Any] | None = None
     permission: list[ModelPermission] = Field(default_factory=list)
 
 

@@ -11,6 +11,11 @@ from vllm.config import LoadConfig
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.config.speculative_capability import (
+    SpeculativeCapability,
+    SpeculativeCapabilityError,
+    resolve_speculative_capability,
+)
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -179,6 +184,8 @@ class SpeculativeConfig:
     """The configuration of the draft model initialized internal."""
     draft_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
     """The parallel configuration for the draft model initialized internal."""
+    capability: SkipValidation[SpeculativeCapability] = None  # type: ignore
+    """Resolved checkpoint, platform, and proposer capability contract."""
 
     # Suffix decoding configuration
     suffix_decoding_max_tree_depth: int = 24
@@ -581,6 +588,8 @@ class SpeculativeConfig:
         # can not be detected, it will be considered as the "draft_model" by
         # default.
 
+        model_was_explicit = self.model is not None
+
         # infer method from user args
         # Check if the model field contains a custom module path (e.g., 'pkg.Mod')
         if (
@@ -848,6 +857,9 @@ class SpeculativeConfig:
                     self.draft_model_config.hf_config.architectures = [
                         "DSparkDraftModel"
                     ]
+                    self.draft_model_config.quantization = (
+                        self.target_model_config.quantization
+                    )
                     self.update_arch_()
 
                 if self.method in ("dflash", "dspark"):
@@ -904,6 +916,37 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+
+        # Resolve only after method inference has completed. SpeculativeConfig
+        # construction may inspect checkpoint metadata, but accelerator/device
+        # and model-weight allocation happen later, so an unavailable proposer
+        # still fails closed before expensive runtime initialization.
+        from vllm.platforms import current_platform
+
+        platform_name = (
+            getattr(current_platform, "device_name", None)
+            or current_platform.__class__.__name__
+        )
+        target_hf_config = (
+            self.target_model_config.hf_text_config
+            if self.target_model_config is not None
+            else {}
+        )
+        registered_proposers = current_platform.get_speculative_proposer_capabilities()
+        if self.method == "custom_class" and self.model is not None:
+            registered_proposers["custom_class"] = self.model
+        self.capability = resolve_speculative_capability(
+            requested_method=self.method,
+            hf_config=target_hf_config,
+            platform=platform_name,
+            registered_proposers=registered_proposers,
+            enforce_checkpoint_match=(
+                not model_was_explicit and self.target_model_config is not None
+            ),
+        )
+        if self.capability.status == "unavailable":
+            raise SpeculativeCapabilityError(self.capability)
+        logger.info("Resolved speculative capability: %s", self.capability.to_dict())
         return self
 
     def _validate_suffix_decoding(self):

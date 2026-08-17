@@ -34,6 +34,7 @@ from .device import DeviceConfig
 from .diffusion import DiffusionConfig
 from .ec_transfer import ECTransferConfig
 from .kernel import KernelConfig
+from .kv_cache_compression import KVCacheCompressionConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
@@ -54,6 +55,7 @@ from .weight_transfer import WeightTransferConfig
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from vllm.config.speculative_capability import SpeculativeCapability
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 else:
@@ -379,6 +381,8 @@ class VllmConfig:
     up to this amount of time to allow already-running requests to complete. Any
     remaining requests are aborted once the timeout is reached.
     """
+    kv_cache_compression_config: KVCacheCompressionConfig | None = None
+    """Optional KV cache compression provider configuration."""
 
     def compute_hash(self) -> str:
         """
@@ -466,6 +470,10 @@ class VllmConfig:
             vllm_factors.append(self.kv_transfer_config.compute_hash())
         else:
             vllm_factors.append("None")
+        # Preserve the historical disabled hash. Compression changes model
+        # execution only when it is explicitly configured.
+        if self.kv_cache_compression_config is not None:
+            vllm_factors.append(self.kv_cache_compression_config.compute_hash())
         if self.ec_transfer_config:
             vllm_factors.append(self.ec_transfer_config.compute_hash())
         else:
@@ -514,6 +522,33 @@ class VllmConfig:
         ):
             return self.diffusion_config.canvas_length
         return 0
+
+    @property
+    def speculative_capability(self) -> "SpeculativeCapability":
+        """Return the resolved capability for enabled and disabled engines."""
+        if self.speculative_config is not None:
+            return self.speculative_config.capability
+
+        from vllm.config.speculative_capability import (
+            resolve_speculative_capability,
+        )
+        from vllm.platforms import current_platform
+
+        platform_name = (
+            getattr(current_platform, "device_name", None)
+            or current_platform.__class__.__name__
+        )
+        hf_config = (
+            self.model_config.hf_text_config if self.model_config is not None else {}
+        )
+        return resolve_speculative_capability(
+            requested_method=None,
+            hf_config=hf_config,
+            platform=platform_name,
+            registered_proposers=(
+                current_platform.get_speculative_proposer_capabilities()
+            ),
+        )
 
     @property
     def use_v2_model_runner(self) -> bool:

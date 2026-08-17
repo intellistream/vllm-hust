@@ -171,6 +171,10 @@ class QoSSchedulingPolicy:
     def running_key(self, request: "Request") -> tuple[Any, ...]:
         is_prefill = request.num_computed_tokens < request.num_prompt_tokens
         priority = request.priority if self.base_priority_enabled else 0
+        has_active_deadline = (
+            request.qos_state is not None
+            and request.qos_state.has_active_deadline()
+        )
         deadline = (
             math.inf
             if request.qos_state is None
@@ -178,9 +182,15 @@ class QoSSchedulingPolicy:
         )
         hybrid_score = self._hybrid_score(deadline, self._remaining_work(request))
         return (
-            int(is_prefill),
+            # Deadline-active requests (0) outrank best-effort requests (1)
+            # so a QoS prefill with an urgent TTFT deadline is not stuck
+            # behind plain decodes that carry no SLO commitment.
+            0 if has_active_deadline else 1,
             priority,
             hybrid_score,
+            # Within the same deadline group, decode still precedes prefill
+            # to preserve stock phase ordering and avoid prefill starvation.
+            int(is_prefill),
             request.arrival_time,
             request.request_id,
         )

@@ -1967,9 +1967,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_KNORM_SCORE_AGGREGATION", "min"
     ),
     # How to reduce norms across heads: 'mean', 'max', or 'sum'.
-    "VLLM_KNORM_NORM_REDUCE_OP": lambda: os.getenv(
-        "VLLM_KNORM_NORM_REDUCE_OP", "mean"
-    ),
+    "VLLM_KNORM_NORM_REDUCE_OP": lambda: os.getenv("VLLM_KNORM_NORM_REDUCE_OP", "mean"),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).

@@ -7,8 +7,6 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-import numpy as np
-
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -36,6 +34,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.b134_events import emit
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
 )
@@ -57,7 +56,15 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.victim_selector import (
+    get_victim_selector,
+    infer_kv_utilization_from_scheduler,
+)
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.kv_cache_compression import (
+    KVCacheCompressionError,
+    KVCacheCompressionRuntimeSpec,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -82,6 +89,9 @@ class Scheduler(SchedulerInterface):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
+        kv_cache_compression_runtime_spec: (
+            KVCacheCompressionRuntimeSpec | None
+        ) = None,
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -102,6 +112,14 @@ class Scheduler(SchedulerInterface):
         # Validate the Phase 0-3 envelope before constructing unsupported
         # connectors or other scheduler-side resources.
         self.qos_policy = QoSSchedulingPolicy(vllm_config)
+        self.kv_cache_compression_runtime_spec = kv_cache_compression_runtime_spec
+        if (
+            vllm_config.kv_cache_compression_config is not None
+            and kv_cache_compression_runtime_spec is None
+        ):
+            raise KVCacheCompressionError(
+                "enabled KV cache compression has no worker runtime spec"
+            )
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -194,6 +212,9 @@ class Scheduler(SchedulerInterface):
         self.skipped_waiting = create_request_queue(self.policy, qos_queue_key)
         self.running: list[Request] = []
 
+        # Victim selector (pluggable via vllm.victim_selector entry point).
+        self.victim_selector = get_victim_selector(self.vllm_config)
+
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
         # requests so that they can free the cached states for those requests.
@@ -280,6 +301,11 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            kv_cache_compression_config=(vllm_config.kv_cache_compression_config),
+            kv_cache_compression_runtime_spec=(kv_cache_compression_runtime_spec),
+        )
+        self._pending_kv_cache_compression_block_table_updates: set[str] | None = (
+            set() if vllm_config.kv_cache_compression_config is not None else None
         )
         prefix_cache_snapshot = (
             self.kv_cache_manager.get_prefix_cache_snapshot(
@@ -295,6 +321,7 @@ class Scheduler(SchedulerInterface):
             self.parallel_config.data_parallel_index,
             initial_snapshot=prefix_cache_snapshot,
         )
+        self._inflight_kv_cache_compression_transactions: dict[str, int] = {}
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -458,6 +485,9 @@ class Scheduler(SchedulerInterface):
         preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        compression_destination_block_ids: dict[str, tuple[list[int], ...]] = {}
+        compression_transaction_ids: dict[str, int] = {}
+        fenced_compression_request_ids: list[str] = []
         num_scheduled_tokens: dict[str, int] = {}
         scheduled_timestamp = time.monotonic()
         qos_decision = self.qos_policy.start_step(
@@ -494,6 +524,13 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if request.request_id in self._inflight_kv_cache_compression_transactions:
+                # The final prefill has run, but its compressed block table is
+                # not committed yet. Other requests may still fill this batch.
+                fenced_compression_request_ids.append(request.request_id)
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -583,46 +620,69 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Schedule newly needed KV blocks for the request.
+            compression_destination_blocks = 0
+            final_compression_prefill = (
+                request.num_computed_tokens < request.num_prompt_tokens
+                and request.num_computed_tokens + num_new_tokens
+                == request.num_prompt_tokens
+                and self.kv_cache_manager.request_requires_compression(request)
+            )
+            if final_compression_prefill:
+                compression_destination_blocks = (
+                    self.kv_cache_manager.get_num_compression_destination_blocks(
+                        request
+                    )
+                )
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        reserved_blocks=compression_destination_blocks,
                     )
 
                     if new_blocks is not None:
+                        if compression_destination_blocks:
+                            compression_destination_block_ids[request.request_id] = (
+                                self.kv_cache_manager.reserve_compression_destination(
+                                    request
+                                )
+                            )
+                        if final_compression_prefill:
+                            self._arm_kv_cache_compression_transaction(
+                                request.request_id, compression_transaction_ids
+                            )
                         # The request can be scheduled.
                         break
 
-                    # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
+                    # A final compression prefill owns source/destination state
+                    # that cannot be reclaimed until its async output arrives.
+                    preempted_req = self._select_preemption_candidate(
+                        scheduled_timestamp
+                    )
+                    if preempted_req is None:
+                        break
+                    self.running.remove(preempted_req)
+                    if preempted_req in scheduled_running_reqs:
+                        preempted_req_id = preempted_req.request_id
+                        scheduled_running_reqs.remove(preempted_req)
+                        token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                        req_to_new_blocks.pop(preempted_req_id)
+                        compression_destination_block_ids.pop(preempted_req_id, None)
+                        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
                         )
-                        self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
+                        if preempted_encoder_inputs:
+                            # Restore encoder compute budget if the preempted
+                            # request had encoder inputs scheduled in this step.
+                            num_embeds_to_restore = sum(
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
                             )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
-                    else:
-                        preempted_req = self.running.pop()
+                            encoder_compute_budget += num_embeds_to_restore
+                        req_index -= 1
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
@@ -730,6 +790,10 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    if self.connector is not None:
+                        self.connector.observe_kv_recovery_requeue(
+                            request, "lora_capacity"
+                        )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -857,6 +921,10 @@ class Scheduler(SchedulerInterface):
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    if self.connector is not None:
+                        self.connector.observe_kv_recovery_requeue(
+                            request, "prefill_throttled"
+                        )
                     break
                 else:
                     # Number of tokens to be scheduled.
@@ -878,6 +946,10 @@ class Scheduler(SchedulerInterface):
                             or num_computed_tokens + num_new_tokens > self.max_model_len
                         ):
                             # Prefer to not schedule than schedule un-padded here.
+                            if self.connector is not None:
+                                self.connector.observe_kv_recovery_requeue(
+                                    request, "token_budget"
+                                )
                             break
                         pad_spec_decode = True
 
@@ -893,6 +965,10 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        if self.connector is not None:
+                            self.connector.observe_kv_recovery_requeue(
+                                request, "token_budget"
+                            )
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -914,6 +990,10 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            if self.connector is not None:
+                                self.connector.observe_kv_recovery_requeue(
+                                    request, "encoder_budget"
+                                )
                             break
 
                 # Skip block alignment when setting up async receive (no local work).
@@ -958,6 +1038,21 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                compression_destination_blocks = 0
+                final_compression_prefill = (
+                    num_computed_tokens < request.num_prompt_tokens
+                    and num_computed_tokens + num_new_tokens
+                    == request.num_prompt_tokens
+                    and self.kv_cache_manager.request_requires_compression(request)
+                )
+                if final_compression_prefill:
+                    compression_destination_blocks = (
+                        self.kv_cache_manager.get_num_compression_destination_blocks(
+                            request
+                        )
+                    )
+                    reserved_blocks += compression_destination_blocks
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -974,6 +1069,11 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+
+                    if self.connector is not None:
+                        self.connector.observe_kv_recovery_requeue(
+                            request, "block_capacity"
+                        )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -995,6 +1095,15 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                if compression_destination_blocks:
+                    compression_destination_block_ids[request_id] = (
+                        self.kv_cache_manager.reserve_compression_destination(request)
+                    )
+                if final_compression_prefill:
+                    self._arm_kv_cache_compression_transaction(
+                        request_id, compression_transaction_ids
+                    )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1040,10 +1149,14 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                if request.status == RequestStatus.PREEMPTED:
+                    emit("wakeup", request.request_id)
+                emit("admission", request.request_id)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
+                emit("scheduled", request.request_id)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
@@ -1138,6 +1251,10 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks,
             )
 
+        kv_cache_compression_block_table_updates = (
+            self._take_kv_cache_compression_block_table_updates(num_scheduled_tokens)
+        )
+
         # Record the request ids that were scheduled in this step (MRV1-only).
         if not self.use_v2_model_runner:
             self.prev_step_scheduled_req_ids.clear()
@@ -1171,10 +1288,24 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            kv_cache_compression_block_table_updates=(
+                kv_cache_compression_block_table_updates
+            ),
+            kv_cache_compression_destination_block_ids=(
+                compression_destination_block_ids or None
+            ),
+            kv_cache_compression_transaction_ids=(compression_transaction_ids or None),
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             kv_cache_usage=self.kv_cache_manager.usage,
         )
+        if fenced_compression_request_ids:
+            logger.debug(
+                "KV cache compression transaction fence: blocked_request_ids=%s "
+                "scheduled_request_ids=%s",
+                tuple(fenced_compression_request_ids),
+                tuple(num_scheduled_tokens),
+            )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1212,14 +1343,100 @@ class Scheduler(SchedulerInterface):
                     else (1, current_positions[request])
                 )
             )
+
+        if preempted_reqs:
+            self.victim_selector.emit_observability_log(logger, self.__class__.__name__)
+
         return scheduler_output
+
+    def _take_kv_cache_compression_block_table_updates(
+        self,
+        num_scheduled_tokens: dict[str, int],
+    ) -> dict[str, tuple[list[int], ...]] | None:
+        pending = self._pending_kv_cache_compression_block_table_updates
+        if not pending:
+            return None
+
+        scheduled_pending = pending.intersection(num_scheduled_tokens)
+        if not scheduled_pending:
+            return None
+        updates = {
+            request_id: self.kv_cache_manager.get_block_ids(request_id)
+            for request_id in scheduled_pending
+        }
+        pending.difference_update(scheduled_pending)
+        for request_id, block_ids in updates.items():
+            logger.info(
+                "KV cache compression commit ack: request_id=%s destination_blocks=%d",
+                request_id,
+                sum(len(group) for group in block_ids),
+            )
+        return updates
+
+    def _arm_kv_cache_compression_transaction(
+        self,
+        request_id: str,
+        step_transactions: dict[str, int],
+    ) -> None:
+        if request_id in self._inflight_kv_cache_compression_transactions:
+            raise RuntimeError(
+                f"request {request_id!r} already has an in-flight KV cache "
+                "compression transaction"
+            )
+        transaction_id = self.current_step
+        self._inflight_kv_cache_compression_transactions[request_id] = transaction_id
+        step_transactions[request_id] = transaction_id
+        logger.debug(
+            "KV cache compression transaction armed: request_id=%s transaction_id=%d",
+            request_id,
+            transaction_id,
+        )
+
+    def _cancel_kv_cache_compression_transaction(
+        self, request_id: str, reason: str
+    ) -> None:
+        transaction_id = self._inflight_kv_cache_compression_transactions.pop(
+            request_id, None
+        )
+        if transaction_id is not None:
+            logger.debug(
+                "KV cache compression transaction cancelled: request_id=%s "
+                "transaction_id=%d reason=%s",
+                request_id,
+                transaction_id,
+                reason,
+            )
+
+    def _select_preemption_candidate(
+        self, scheduled_timestamp: float
+    ) -> Request | None:
+        transactions = self._inflight_kv_cache_compression_transactions
+        candidates = [
+            request
+            for request in self.running
+            if request.request_id not in transactions
+        ]
+        if not candidates:
+            return None
+        return self.victim_selector.pick_victim(
+            candidates,
+            self.policy,
+            kv_utilization=infer_kv_utilization_from_scheduler(self),
+            now_s=scheduled_timestamp,
+        )
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
+    def _preempt_request(
+        self,
+        request: Request,
+        timestamp: float,
+        *,
+        allow_kv_cache_compression_cancel: bool = False,
+    ) -> None:
         """Preempt a request and put it back to the waiting queue.
 
         NOTE: The request should be popped from the running queue outside of this
@@ -1228,6 +1445,15 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if request.request_id in self._inflight_kv_cache_compression_transactions:
+            if not allow_kv_cache_compression_cancel:
+                raise RuntimeError(
+                    f"cannot preempt request {request.request_id!r} while its "
+                    "KV cache compression transaction is in flight"
+                )
+            self._cancel_kv_cache_compression_transaction(
+                request.request_id, "forced preemption"
+            )
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1238,6 +1464,7 @@ class Scheduler(SchedulerInterface):
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        emit("preempt", request.request_id)
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
@@ -1575,20 +1802,6 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
-    @staticmethod
-    def _get_generated_token_ids(
-        sampled_token_ids: list[list[int]] | np.ndarray,
-        req_index: int,
-        num_sampled_tokens: list[int] | np.ndarray | None,
-    ) -> list[int]:
-        if isinstance(sampled_token_ids, np.ndarray):
-            if num_sampled_tokens is None:
-                return sampled_token_ids[req_index].tolist()
-            num_tokens = int(num_sampled_tokens[req_index])
-            return sampled_token_ids[req_index, :num_tokens].tolist()
-
-        return sampled_token_ids[req_index] if sampled_token_ids else []
-
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1602,15 +1815,15 @@ class Scheduler(SchedulerInterface):
             submit_block_scores(knorm_scores)
 
         sampled_token_ids = model_runner_output.sampled_token_ids
-        num_sampled_tokens = model_runner_output.num_sampled_tokens
         logprobs = model_runner_output.logprobs
-
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        self._apply_kv_cache_compression_plans(scheduler_output, model_runner_output)
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -1678,10 +1891,8 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
-            generated_token_ids = self._get_generated_token_ids(
-                sampled_token_ids,
-                req_index,
-                num_sampled_tokens,
+            generated_token_ids = (
+                sampled_token_ids[req_index] if sampled_token_ids else []
             )
 
             scheduled_spec_token_ids = (
@@ -1935,6 +2146,22 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        if self.log_stats and model_runner_output.spec_decode_num_forwards > 0:
+            if spec_decoding_stats is None:
+                spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+            spec_decoding_stats.observe_step(
+                num_forwards=model_runner_output.spec_decode_num_forwards,
+                num_committed_tokens=sum(
+                    len(token_ids) for token_ids in (sampled_token_ids or [])
+                ),
+                proposer_latency_seconds=(
+                    model_runner_output.spec_decode_proposer_latency_seconds
+                ),
+                verification_latency_seconds=(
+                    model_runner_output.spec_decode_verification_latency_seconds
+                ),
+            )
+
         if (
             stats := self.make_stats(
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
@@ -1948,6 +2175,100 @@ class Scheduler(SchedulerInterface):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
+    def _apply_kv_cache_compression_plans(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        plans = model_runner_output.kv_cache_compression_plans or []
+        transactions = scheduler_output.kv_cache_compression_transaction_ids or {}
+        if not plans and not transactions:
+            return
+
+        pending = self._pending_kv_cache_compression_block_table_updates
+        if pending is None:
+            raise RuntimeError(
+                "received KV cache compression plans while the feature is disabled"
+            )
+        plans_by_request_id = {}
+        for returned_plan in plans:
+            if returned_plan.request_id in plans_by_request_id:
+                raise RuntimeError(
+                    "received duplicate KV cache compression plans for request "
+                    f"{returned_plan.request_id!r} in one model-runner output"
+                )
+            if returned_plan.request_id not in transactions:
+                raise RuntimeError(
+                    "received an unexpected KV cache compression plan for request "
+                    f"{returned_plan.request_id!r}"
+                )
+            plans_by_request_id[returned_plan.request_id] = returned_plan
+
+        live_plans = []
+        for request_id, transaction_id in transactions.items():
+            active_transaction_id = (
+                self._inflight_kv_cache_compression_transactions.get(request_id)
+            )
+            if active_transaction_id != transaction_id:
+                if request_id in plans_by_request_id:
+                    logger.debug(
+                        "Ignoring stale KV cache compression output: request_id=%s "
+                        "transaction_id=%d active_transaction_id=%s",
+                        request_id,
+                        transaction_id,
+                        active_transaction_id,
+                    )
+                continue
+            request = self.requests.get(request_id)
+            if request is None or request.is_finished():
+                raise RuntimeError(
+                    f"active KV cache compression transaction for request "
+                    f"{request_id!r} has no live request"
+                )
+            transaction_plan = plans_by_request_id.get(request_id)
+            if transaction_plan is None:
+                raise RuntimeError(
+                    "model runner did not return a KV cache compression plan for "
+                    f"active request {request_id!r} transaction {transaction_id}"
+                )
+            live_plans.append((request, transaction_plan, transaction_id))
+
+        # Validate the whole worker batch before releasing any block. This
+        # prevents a malformed later plan from leaving earlier requests partly
+        # committed.
+        for request, plan, _ in live_plans:
+            self.kv_cache_manager.validate_compression_plan(request, plan)
+
+        for request, plan, transaction_id in live_plans:
+            commit = self.kv_cache_manager.apply_compression_plan(request, plan)
+            active_transaction_id = (
+                self._inflight_kv_cache_compression_transactions.pop(
+                    plan.request_id, None
+                )
+            )
+            if active_transaction_id != transaction_id:
+                raise RuntimeError(
+                    f"KV cache compression transaction changed while committing "
+                    f"request {plan.request_id!r}"
+                )
+            pending.add(plan.request_id)
+            logger.info(
+                "Committed KV cache compression plan: provider=%s request_id=%s "
+                "transaction_id=%d "
+                "semantic_tokens=%d physical_tokens=%d source_blocks=%d "
+                "destination_blocks=%d released_blocks=%s "
+                "retained_hashed_source_blocks=%s commit_ack=pending",
+                plan.provider,
+                plan.request_id,
+                transaction_id,
+                plan.semantic_num_tokens,
+                plan.physical_num_tokens,
+                len(commit.source_block_ids),
+                len(commit.destination_block_ids),
+                commit.released_block_ids,
+                commit.retained_hashed_source_block_ids,
+            )
 
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
@@ -2250,6 +2571,13 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        self._cancel_kv_cache_compression_transaction(
+            request.request_id, "request blocks freed"
+        )
+        if self._pending_kv_cache_compression_block_table_updates is not None:
+            self._pending_kv_cache_compression_block_table_updates.discard(
+                request.request_id
+            )
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.
@@ -2332,7 +2660,11 @@ class Scheduler(SchedulerInterface):
             # running queue in FIFO order.
             while self.running:
                 request = self.running.pop()
-                self._preempt_request(request, timestamp)
+                self._preempt_request(
+                    request,
+                    timestamp,
+                    allow_kv_cache_compression_cancel=True,
+                )
                 # For async scheduling, any output frames already in flight at
                 # preemption time are now stale and must be discarded when they
                 # return. num_output_placeholders is exactly that count: 0 if

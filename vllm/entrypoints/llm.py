@@ -12,12 +12,6 @@ from pydantic import ValidationError
 from tqdm.auto import tqdm
 from typing_extensions import TypeVar, overload
 
-from vllm.entrypoints.generate.beam_search.utils import (
-    BeamSearchInstance,
-    BeamSearchOutput,
-    BeamSearchSequence,
-    create_sort_beams_key_function,
-)
 from vllm.config import (
     AttentionConfig,
     CompilationConfig,
@@ -45,6 +39,12 @@ from vllm.entrypoints.chat_utils import (
     ChatTemplateConfig,
     ChatTemplateContentFormatOption,
     load_chat_template,
+)
+from vllm.entrypoints.generate.beam_search.utils import (
+    BeamSearchInstance,
+    BeamSearchOutput,
+    BeamSearchSequence,
+    create_sort_beams_key_function,
 )
 from vllm.entrypoints.pooling.factories import init_pooling_io_processors
 from vllm.entrypoints.pooling.scoring.io_processor import ScoringIOProcessor
@@ -246,9 +246,7 @@ class LLM:
         attention_config: dict[str, Any] | AttentionConfig | None = None,
         kv_cache_memory_bytes: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
-        quantization_config: dict[str, Any]
-        | QuantizationConfigArgs
-        | None = None,
+        quantization_config: dict[str, Any] | QuantizationConfigArgs | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -1357,7 +1355,7 @@ class LLM:
             tokenization_kwargs=tokenization_kwargs,
         )
 
-        return EmbeddingRequestOutput.from_base_batch(items)
+        return [EmbeddingRequestOutput.from_base(item) for item in items]
 
     def classify(
         self,
@@ -1402,7 +1400,7 @@ class LLM:
             tokenization_kwargs=tokenization_kwargs,
         )
 
-        return ClassificationRequestOutput.from_base_batch(items)
+        return [ClassificationRequestOutput.from_base(item) for item in items]
 
     def reward(
         self,
@@ -1561,7 +1559,7 @@ class LLM:
             ctx=OfflineOutputsContext(outputs=outputs, n_queries=n_queries),
         )
 
-        return ScoringRequestOutput.from_base_batch(outputs)
+        return [ScoringRequestOutput.from_base(item) for item in outputs]
 
     def start_profile(self, profile_prefix: str | None = None) -> None:
         """Start profiling with optional custom trace prefix.

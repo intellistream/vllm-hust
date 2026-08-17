@@ -70,6 +70,22 @@ object; they are not an exhaustive schema reference.
 For more details, see the generated [engine arguments reference](../../configuration/engine_args.md)
 and the API docs for [vllm.config.SpeculativeConfig][].
 
+## Capability negotiation
+
+Before loading weights, vLLM resolves the requested method against checkpoint
+metadata and the active platform plugin's registered proposers. DSpark markers
+take precedence over generic MTP counters, so a DSpark checkpoint is never
+silently routed through legacy MTP. An incompatible explicit request fails with
+a structured `SpeculativeCapabilityError` containing the requested method,
+detected checkpoint method, missing capability, and remediation.
+
+The same machine-readable descriptor is available as
+`VllmConfig.speculative_capability` and in each `/v1/models` card under
+`speculative_capability`. Engines without speculative decoding report
+`status="disabled"`; a missing platform proposer raises a structured descriptor
+with `status="unavailable"` before the server starts. Deployment controllers
+should consume the descriptor instead of parsing log text.
+
 ### Common keys
 
 These keys are commonly used across speculative decoding setups, though some
