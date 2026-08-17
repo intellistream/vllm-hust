@@ -3,7 +3,8 @@ set -euo pipefail
 
 BENCHMARK_REPO_DIR=${BENCHMARK_REPO_DIR:?BENCHMARK_REPO_DIR is required}
 WEBSITE_REPO_DIR=${WEBSITE_REPO_DIR:?WEBSITE_REPO_DIR is required}
-CURRENT_SUBMISSION_DIR=${CURRENT_SUBMISSION_DIR:?CURRENT_SUBMISSION_DIR is required}
+CURRENT_SUBMISSION_DIR=${CURRENT_SUBMISSION_DIR:-}
+CURRENT_SUBMISSIONS_DIR=${CURRENT_SUBMISSIONS_DIR:-}
 VLLM_HUST_REPO_DIR=${VLLM_HUST_REPO_DIR:-${VLLM_HUST_REPO:-$BENCHMARK_REPO_DIR/../vllm-hust}}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 SNAPSHOT_TARGET_BRANCH=${SNAPSHOT_TARGET_BRANCH:-main}
@@ -38,6 +39,35 @@ required_snapshot_files=(
   leaderboard_compare.json
   last_updated.json
 )
+
+if [[ -n "$CURRENT_SUBMISSION_DIR" && -n "$CURRENT_SUBMISSIONS_DIR" ]]; then
+  echo "set only one of CURRENT_SUBMISSION_DIR or CURRENT_SUBMISSIONS_DIR" >&2
+  exit 2
+fi
+if [[ -z "$CURRENT_SUBMISSION_DIR" && -z "$CURRENT_SUBMISSIONS_DIR" ]]; then
+  echo "CURRENT_SUBMISSION_DIR or CURRENT_SUBMISSIONS_DIR is required" >&2
+  exit 2
+fi
+
+submission_source_dirs=()
+submission_names=()
+if [[ -n "$CURRENT_SUBMISSIONS_DIR" ]]; then
+  if [[ ! -d "$CURRENT_SUBMISSIONS_DIR" ]]; then
+    echo "current submissions directory not found: $CURRENT_SUBMISSIONS_DIR" >&2
+    exit 2
+  fi
+  while IFS= read -r -d '' submission_dir; do
+    submission_source_dirs+=("$submission_dir")
+    submission_names+=("$(basename "$submission_dir")")
+  done < <(find "$CURRENT_SUBMISSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+  if [[ "${#submission_source_dirs[@]}" -eq 0 ]]; then
+    echo "current submissions directory is empty: $CURRENT_SUBMISSIONS_DIR" >&2
+    exit 2
+  fi
+else
+  submission_source_dirs=("$CURRENT_SUBMISSION_DIR")
+  submission_names=("${RUN_ID:-$(basename "$CURRENT_SUBMISSION_DIR")}")
+fi
 
 write_github_env() {
   local key=$1
@@ -142,11 +172,13 @@ EOF
   echo "No benchmark repo credential configured outside GitHub Actions; using existing ${BENCHMARK_REPO_REMOTE} remote."
 }
 
-for file_name in "${required_submission_files[@]}"; do
-  if [[ ! -f "$CURRENT_SUBMISSION_DIR/$file_name" ]]; then
-    echo "missing current submission file: $CURRENT_SUBMISSION_DIR/$file_name" >&2
-    exit 2
-  fi
+for submission_dir in "${submission_source_dirs[@]}"; do
+  for file_name in "${required_submission_files[@]}"; do
+    if [[ ! -f "$submission_dir/$file_name" ]]; then
+      echo "missing current submission file: $submission_dir/$file_name" >&2
+      exit 2
+    fi
+  done
 done
 
 if [[ ! -d "$BENCHMARK_REPO_DIR/.git" ]]; then
@@ -169,9 +201,12 @@ if [[ "${GITHUB_ACTIONS:-}" != "true" && "${ALLOW_LOCAL_GIT_RESET:-0}" != "1" ]]
   exit 2
 fi
 
-run_id=${RUN_ID:-$(basename "$CURRENT_SUBMISSION_DIR")}
-target_submission_dir="$BENCHMARK_REPO_DIR/submissions/$run_id"
-relative_submission_dir="submissions/$run_id"
+run_id=${RUN_ID:-$(basename "${submission_source_dirs[0]}")}
+if [[ -n "$CURRENT_SUBMISSIONS_DIR" ]]; then
+  relative_submission_dir="submissions"
+else
+  relative_submission_dir="submissions/${submission_names[0]}"
+fi
 relative_snapshot_dir="leaderboard-data/snapshots"
 publication_staging_dir=$(mktemp -d "$BENCHMARK_REPO_DIR/.snapshot-publication.XXXXXX")
 staged_submission_dir="$publication_staging_dir/submissions"
@@ -221,9 +256,13 @@ prepare_publication_commit() {
 
   mkdir -p "$staged_submission_dir" || return $?
   cp -a "$BENCHMARK_REPO_DIR/submissions/." "$staged_submission_dir/" || return $?
-  mkdir -p "$staged_submission_dir/$run_id" || return $?
-  for file_name in "${required_submission_files[@]}"; do
-    cp "$CURRENT_SUBMISSION_DIR/$file_name" "$staged_submission_dir/$run_id/$file_name" || return $?
+  for index in "${!submission_source_dirs[@]}"; do
+    staged_current_submission_dir="$staged_submission_dir/${submission_names[$index]}"
+    mkdir -p "$staged_current_submission_dir" || return $?
+    for file_name in "${required_submission_files[@]}"; do
+      cp "${submission_source_dirs[$index]}/$file_name" \
+        "$staged_current_submission_dir/$file_name" || return $?
+    done
   done
 
   "$PYTHON_BIN" -m vllm_hust_benchmark.cli publish-website \
@@ -258,9 +297,14 @@ PY
     return 2
   fi
 
-  mkdir -p "$target_submission_dir" "$SNAPSHOT_OUTPUT_DIR" || return $?
-  for file_name in "${required_submission_files[@]}"; do
-    cp "$CURRENT_SUBMISSION_DIR/$file_name" "$target_submission_dir/$file_name" || return $?
+  mkdir -p "$BENCHMARK_REPO_DIR/submissions" "$SNAPSHOT_OUTPUT_DIR" || return $?
+  for index in "${!submission_source_dirs[@]}"; do
+    target_submission_dir="$BENCHMARK_REPO_DIR/submissions/${submission_names[$index]}"
+    mkdir -p "$target_submission_dir" || return $?
+    for file_name in "${required_submission_files[@]}"; do
+      cp "${submission_source_dirs[$index]}/$file_name" \
+        "$target_submission_dir/$file_name" || return $?
+    done
   done
   for file_name in "${required_snapshot_files[@]}"; do
     cp "$staged_snapshot_dir/$file_name" "$SNAPSHOT_OUTPUT_DIR/$file_name" || return $?
@@ -290,6 +334,8 @@ verify_published_benchmark_repo_state() {
   local expected_commit=$1
   local verified_commit
   local file_name
+  local index
+  local submission_path
 
   fetch_target_branch_with_retry verify || return $?
   verified_commit=$(git -C "$BENCHMARK_REPO_DIR" rev-parse "$BENCHMARK_REPO_REMOTE/$SNAPSHOT_TARGET_BRANCH") || return $?
@@ -299,13 +345,16 @@ verify_published_benchmark_repo_state() {
     return 1
   fi
 
-  for file_name in "${required_submission_files[@]}"; do
-    if ! git -C "$BENCHMARK_REPO_DIR" cat-file -e \
-      "$verified_commit:$relative_submission_dir/$file_name"; then
-      write_github_env GITHUB_SNAPSHOT_SYNC_VERIFICATION failed
-      echo "benchmark publication verification failed: missing $relative_submission_dir/$file_name" >&2
-      return 1
-    fi
+  for index in "${!submission_names[@]}"; do
+    submission_path="submissions/${submission_names[$index]}"
+    for file_name in "${required_submission_files[@]}"; do
+      if ! git -C "$BENCHMARK_REPO_DIR" cat-file -e \
+        "$verified_commit:$submission_path/$file_name"; then
+        write_github_env GITHUB_SNAPSHOT_SYNC_VERIFICATION failed
+        echo "benchmark publication verification failed: missing $submission_path/$file_name" >&2
+        return 1
+      fi
+    done
   done
 
   for file_name in "${required_snapshot_files[@]}"; do

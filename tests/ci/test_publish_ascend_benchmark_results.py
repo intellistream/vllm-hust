@@ -18,8 +18,16 @@ def _publisher(tmp_path: Path) -> tuple[Path, Path]:
     publisher.write_text(
         """#!/bin/bash
 set -euo pipefail
-printf '%s|%s|%s|%s\\n' "$RUN_ID" "$CURRENT_SUBMISSION_DIR" \\
-  "$BENCHMARK_REPO_GH_TOKEN" "$BENCHMARK_REPO_SSH_KEY" >> "$PUBLISHER_LOG"
+aggregate_entries=
+if [[ -n "${CURRENT_SUBMISSIONS_DIR:-}" ]]; then
+  for aggregate_path in "$CURRENT_SUBMISSIONS_DIR"/*; do
+    [[ -d "$aggregate_path" ]] || continue
+    aggregate_entries+="$(basename "$aggregate_path"),"
+  done
+fi
+printf '%s|%s|%s|%s|%s\\n' "$RUN_ID" "${CURRENT_SUBMISSION_DIR:-}" \\
+  "$aggregate_entries" "$BENCHMARK_REPO_GH_TOKEN" \\
+  "$BENCHMARK_REPO_SSH_KEY" >> "$PUBLISHER_LOG"
 """,
         encoding="utf-8",
     )
@@ -64,10 +72,12 @@ def test_single_submission_publishes_with_scoped_writer(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     log = (tmp_path / "publisher.log").read_text(encoding="utf-8")
-    assert log == f"single-run|{submission}|token-sentinel|key-sentinel\n"
+    assert log == f"single-run|{submission}||token-sentinel|key-sentinel\n"
 
 
-def test_multi_scenario_publishes_every_validated_submission(tmp_path: Path) -> None:
+def test_multi_scenario_publishes_all_validated_submissions_once(
+    tmp_path: Path,
+) -> None:
     result_root = tmp_path / "results"
     submission_a = result_root / "random/submissions/run-random"
     submission_b = result_root / "sharegpt/submissions/run-sharegpt"
@@ -87,7 +97,12 @@ def test_multi_scenario_publishes_every_validated_submission(tmp_path: Path) -> 
 
     assert result.returncode == 0, result.stdout + result.stderr
     lines = (tmp_path / "publisher.log").read_text(encoding="utf-8").splitlines()
-    assert [line.split("|", 1)[0] for line in lines] == ["run-random", "run-sharegpt"]
+    assert len(lines) == 1
+    fields = lines[0].split("|")
+    assert fields[0] == "single-run-multi"
+    assert fields[1] == ""
+    assert fields[2] == "run-random,run-sharegpt,"
+    assert fields[3:] == ["token-sentinel", "key-sentinel"]
 
 
 def test_multi_scenario_refuses_partial_publication(tmp_path: Path) -> None:

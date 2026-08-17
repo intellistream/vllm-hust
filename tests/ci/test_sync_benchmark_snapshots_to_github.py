@@ -316,6 +316,58 @@ def test_sync_benchmark_snapshots_verifies_published_commit(tmp_path):
     assert trend_input.parent.name.startswith(".snapshot-publication.")
 
 
+def test_multi_submission_sync_publishes_one_atomic_commit(tmp_path):
+    env, remote, benchmark_repo, _github_env = prepare_sync_environment(
+        tmp_path, "multi-ci"
+    )
+    submissions_dir = tmp_path / "multi-submissions"
+    write_submission_evidence(submissions_dir / "run-random")
+    write_submission_evidence(submissions_dir / "run-sharegpt")
+    env.pop("CURRENT_SUBMISSION_DIR")
+    env["CURRENT_SUBMISSIONS_DIR"] = str(submissions_dir)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT_PATH)],
+        cwd=tmp_path,
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    remote_head = run(
+        ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
+    ).stdout.strip()
+    parents = (
+        run(
+            ["git", "--git-dir", str(remote), "show", "-s", "--format=%P", remote_head],
+            tmp_path,
+        )
+        .stdout.strip()
+        .split()
+    )
+    assert len(parents) == 1
+    for run_id in ("run-random", "run-sharegpt"):
+        assert (
+            run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(remote),
+                    "cat-file",
+                    "-e",
+                    f"{remote_head}:submissions/{run_id}/STATUS",
+                ],
+                tmp_path,
+            ).returncode
+            == 0
+        )
+    assert (
+        benchmark_repo / "leaderboard-data/snapshots/leaderboard_single.json"
+    ).exists()
+
+
 @pytest.mark.parametrize(
     ("validator_environment", "failure_message"),
     [
