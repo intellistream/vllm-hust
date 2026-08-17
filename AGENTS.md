@@ -105,6 +105,16 @@ The line length limit for Python code is 88 characters. If you are not sure, use
 
 Use [Google-style docstrings](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings) (`Args:`/`Returns:`/`Raises:` sections), not reStructuredText/Sphinx fields (`:param:`, `:return:`, `:rtype:`).
 
+### KV cache pool quiescence
+
+`BlockPool.total_blocks` includes one permanent null placeholder that is not
+in the free queue. A quiescent pool therefore satisfies
+`free_blocks + 1 == total_blocks`, with every cache group's allocated and
+resident counts equal to zero. Do not classify that one-block delta as a leak,
+add a heartbeat to free it, or rerun hardware to make
+`free_blocks == total_blocks`; search for `BlockPool.null_block` when adapting
+capacity or cleanup checks.
+
 ### Coding style guidelines
 
 Follow these rules for all code changes in this repository:
