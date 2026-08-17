@@ -948,6 +948,11 @@ class AsyncLLM(EngineClient):
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
 
+    async def get_load_metrics(
+        self, data_parallel_rank: int | None = None
+    ) -> dict[str, int]:
+        return await self.engine_core.get_load_metrics_async(data_parallel_rank)
+
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         return await self.engine_core.add_lora_async(lora_request)

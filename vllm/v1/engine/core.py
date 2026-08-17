@@ -902,6 +902,14 @@ class EngineCore:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
+    def get_load_metrics(self) -> dict[str, int]:
+        """Return the local Scheduler load."""
+        num_running_reqs, num_waiting_reqs = self.scheduler.get_request_counts()
+        return {
+            "num_running_reqs": num_running_reqs,
+            "num_waiting_reqs": num_waiting_reqs,
+        }
+
     def execute_dummy_batch(self):
         self.model_executor.execute_dummy_batch()
 

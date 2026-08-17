@@ -5,8 +5,10 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import secrets
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -134,6 +136,16 @@ class PrefixRoutingConfig:
     event_sync_interval: float = 5.0
     max_request_body_size: int = DEFAULT_MAX_REQUEST_BODY_SIZE
     max_event_ingest_body_size: int = DEFAULT_MAX_EVENT_INGEST_BODY_SIZE
+    load_request_timeout: float = 1.0
+    load_poll_interval: float = 1.0
+    load_ttl: float = 3.0
+
+
+@dataclass(frozen=True)
+class NodeLoad:
+    num_running_reqs: int
+    num_waiting_reqs: int
+    updated_at: float
 
 
 @dataclass
@@ -155,6 +167,7 @@ class PrefixRoutingProxy:
         self.nodes = {node.node_id: node for node in config.nodes}
         self._tasks: list[asyncio.Task] = []
         self._session: aiohttp.ClientSession | None = None
+        self._node_loads: dict[str, NodeLoad] = {}
 
         vllm_config = app_state.vllm_config
         caching_hash_fn = get_hash_fn_by_name(
@@ -187,6 +200,8 @@ class PrefixRoutingProxy:
             task = asyncio.create_task(self._subscribe_node_events(node))
             self._tasks.append(task)
 
+        self._tasks.append(asyncio.create_task(self._poll_node_loads()))
+
     async def shutdown(self) -> None:
         for task in self._tasks:
             task.cancel()
@@ -202,6 +217,98 @@ class PrefixRoutingProxy:
         if self._session is None:
             raise RuntimeError("prefix routing HTTP session is not initialized")
         return self._session
+
+    @staticmethod
+    def _parse_node_load(payload: Any) -> NodeLoad:
+        if not isinstance(payload, Mapping):
+            raise ValueError("node load response must be an object")
+
+        num_running_reqs = payload.get("num_running_reqs")
+        if (
+            not isinstance(num_running_reqs, int)
+            or isinstance(num_running_reqs, bool)
+            or num_running_reqs < 0
+        ):
+            raise ValueError("num_running_reqs must be a non-negative integer")
+
+        num_waiting_reqs = payload.get("num_waiting_reqs")
+        if (
+            not isinstance(num_waiting_reqs, int)
+            or isinstance(num_waiting_reqs, bool)
+            or num_waiting_reqs < 0
+        ):
+            raise ValueError("num_waiting_reqs must be a non-negative integer")
+
+        return NodeLoad(
+            num_running_reqs=num_running_reqs,
+            num_waiting_reqs=num_waiting_reqs,
+            updated_at=time.monotonic(),
+        )
+
+    async def _fetch_node_load(self, node: PrefixRoutingNode) -> NodeLoad:
+        if node.local:
+            payload = await asyncio.wait_for(
+                self.app_state.engine_client.get_load_metrics(node.data_parallel_rank),
+                timeout=self.config.load_request_timeout,
+            )
+        else:
+            if node.url is None:
+                raise ValueError(f"node {node.node_id!r} has no URL")
+
+            headers: dict[str, str] | None = None
+            if node.data_parallel_rank is not None:
+                headers = {DATA_PARALLEL_RANK_HEADER: str(node.data_parallel_rank)}
+
+            timeout = aiohttp.ClientTimeout(total=self.config.load_request_timeout)
+            url = f"{node.url.rstrip('/')}/load"
+            async with self.session.get(
+                url,
+                headers=headers,
+                timeout=timeout,
+            ) as response:
+                response.raise_for_status()
+                payload = await response.json()
+
+        return self._parse_node_load(payload)
+
+    async def _fetch_all_node_loads(self) -> dict[str, NodeLoad]:
+        nodes = list(self.nodes.values())
+        results = await asyncio.gather(
+            *(self._fetch_node_load(node) for node in nodes),
+            return_exceptions=True,
+        )
+
+        loads: dict[str, NodeLoad] = {}
+        for node, result in zip(nodes, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Failed to fetch load from node %s: %s",
+                    node.node_id,
+                    result,
+                )
+                continue
+            loads[node.node_id] = result
+        return loads
+
+    async def _poll_node_loads(self) -> None:
+        while True:
+            fetched_loads = await self._fetch_all_node_loads()
+            now = time.monotonic()
+
+            next_loads = {
+                node_id: load
+                for node_id, load in self._node_loads.items()
+                if node_id in self.nodes
+                and now - load.updated_at <= self.config.load_ttl
+            }
+            for node_id, load in fetched_loads.items():
+                if now - load.updated_at <= self.config.load_ttl:
+                    next_loads[node_id] = load
+            self._node_loads = next_loads
+
+            await asyncio.sleep(self.config.load_poll_interval)
 
     async def choose_node_for_request(
         self, path: str, payload: Mapping[str, Any]
@@ -725,6 +832,33 @@ def _parse_prefix_routing_config(
     ):
         raise ValueError("prefix routing request_timeout must be positive")
 
+    load_request_timeout = raw_config.get("load_request_timeout", 1.0)
+    if (
+        not isinstance(load_request_timeout, int | float)
+        or isinstance(load_request_timeout, bool)
+        or not math.isfinite(load_request_timeout)
+        or load_request_timeout <= 0
+    ):
+        raise ValueError("prefix routing load_request_timeout must be positive")
+
+    load_poll_interval = raw_config.get("load_poll_interval", 1.0)
+    if (
+        not isinstance(load_poll_interval, int | float)
+        or isinstance(load_poll_interval, bool)
+        or not math.isfinite(load_poll_interval)
+        or load_poll_interval <= 0
+    ):
+        raise ValueError("prefix routing load_poll_interval must be positive")
+
+    load_ttl = raw_config.get("load_ttl", 3.0)
+    if (
+        not isinstance(load_ttl, int | float)
+        or isinstance(load_ttl, bool)
+        or not math.isfinite(load_ttl)
+        or load_ttl <= 0
+    ):
+        raise ValueError("prefix routing load_ttl must be positive")
+
     event_ingest_token = raw_config.get("event_ingest_token")
     if event_ingest_token is not None and (
         not isinstance(event_ingest_token, str) or not event_ingest_token
@@ -782,6 +916,9 @@ def _parse_prefix_routing_config(
         hash_block_size=hash_block_size,
         event_topic=str(raw_config.get("event_topic", "")),
         request_timeout=float(request_timeout),
+        load_request_timeout=float(load_request_timeout),
+        load_poll_interval=float(load_poll_interval),
+        load_ttl=float(load_ttl),
         event_ingest_token=event_ingest_token,
         routing_token=routing_token,
         event_replay_timeout=float(event_replay_timeout),

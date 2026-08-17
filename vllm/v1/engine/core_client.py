@@ -243,6 +243,11 @@ class EngineCoreClient(ABC):
     async def is_sleeping_async(self) -> bool:
         raise NotImplementedError
 
+    async def get_load_metrics_async(
+        self, data_parallel_rank: int | None = None
+    ) -> dict[str, int]:
+        raise NotImplementedError
+
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
@@ -1165,6 +1170,49 @@ class AsyncMPClient(MPClient):
 
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
         await self.call_utility_async("wake_up", tags)
+
+    async def get_load_metrics_async(
+        self, data_parallel_rank: int | None = None
+    ) -> dict[str, int]:
+        if data_parallel_rank is None:
+            if len(self.core_engines) != 1:
+                raise ValueError(
+                    "data_parallel_rank is required when multiple "
+                    "EngineCores are managed"
+                )
+            engine = self.core_engine
+        else:
+            try:
+                engine_index = self.engine_ranks_managed.index(data_parallel_rank)
+            except ValueError as exc:
+                raise ValueError(
+                    f"data parallel rank {data_parallel_rank} is not "
+                    "managed by this client"
+                ) from exc
+            engine = self.core_engines[engine_index]
+
+        load_tasks: dict[EngineIdentity, asyncio.Task[dict[str, int]]]
+        load_tasks = self.__dict__.setdefault("_load_metrics_tasks", {})
+
+        task = load_tasks.get(engine)
+        if task is None:
+            task = asyncio.create_task(
+                self._call_utility_async(
+                    "get_load_metrics",
+                    engine=engine,
+                )
+            )
+            load_tasks[engine] = task
+
+            def clear_task(completed: asyncio.Task[dict[str, int]]) -> None:
+                if load_tasks.get(engine) is completed:
+                    load_tasks.pop(engine, None)
+                if not completed.cancelled():
+                    completed.exception()
+
+            task.add_done_callback(clear_task)
+
+        return await asyncio.shield(task)
 
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")

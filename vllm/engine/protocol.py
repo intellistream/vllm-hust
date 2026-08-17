@@ -176,6 +176,13 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def get_load_metrics(
+        self, data_parallel_rank: int | None = None
+    ) -> dict[str, int]:
+        """Return load metrics for a data-parallel rank."""
+        ...
+
+    @abstractmethod
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         ...
