@@ -52,6 +52,7 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.metrics.server_events import emit
 
 logger = init_logger(__name__)
 
@@ -300,6 +301,8 @@ class AsyncLLM(EngineClient):
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
+        emit("server_request_received", request_id=request_id, client_request_id=request_id, payload={"arrival_time": arrival_time}, source_component="vllm.v1.engine.AsyncLLM", measurement_method="engine_api_boundary")
+
         if self.errored:
             raise EngineDeadError()
 
@@ -369,6 +372,7 @@ class AsyncLLM(EngineClient):
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
 
         self.input_processor.assign_request_id(request)
+        emit("engine_request_created", request_id=request.request_id, engine_request_id=request.request_id, client_request_id=request_id, payload={"prompt_tokens": len(request.prompt_token_ids or [])}, source_component="vllm.v1.engine.AsyncLLM")
 
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us

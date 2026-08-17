@@ -2656,6 +2656,10 @@ class AsyncEngineArgs(EngineArgs):
     """Arguments for asynchronous vLLM engine."""
 
     enable_log_requests: bool = False
+    enable_m0_server_events: bool = False
+    m0_server_event_dir: str | None = None
+    m0_server_event_sampling_rate: float = 1.0
+    m0_server_event_token_detail: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -2676,6 +2680,10 @@ class AsyncEngineArgs(EngineArgs):
             "- DEBUG: Prompt inputs (e.g: text, token IDs).\n"
             "You can set the minimum log level via `VLLM_LOGGING_LEVEL`.",
         )
+        parser.add_argument("--enable-m0-server-events", action=argparse.BooleanOptionalAction, default=False)
+        parser.add_argument("--m0-server-event-dir", default=None)
+        parser.add_argument("--m0-server-event-sampling-rate", type=float, default=1.0)
+        parser.add_argument("--m0-server-event-token-detail", action=argparse.BooleanOptionalAction, default=False)
         current_platform.pre_register_and_update(parser)
         return parser
 

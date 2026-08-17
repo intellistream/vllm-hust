@@ -80,7 +80,14 @@ async def build_async_engine_client(
     *,
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
     client_config: dict[str, Any] | None = None,
-) -> AsyncIterator[EngineClient]:
+ ) -> AsyncIterator[EngineClient]:
+    if getattr(args, "enable_m0_server_events", False):
+        os.environ["VLLM_M0_SERVER_EVENTS"] = "1"
+        os.environ["VLLM_M0_SERVER_EVENT_SAMPLING_RATE"] = str(getattr(args, "m0_server_event_sampling_rate", 1.0))
+        os.environ["VLLM_M0_SERVER_EVENT_TOKEN_DETAIL"] = "1" if getattr(args, "m0_server_event_token_detail", False) else "0"
+        if getattr(args, "m0_server_event_dir", None):
+            os.environ["VLLM_M0_SERVER_EVENT_DIR"] = args.m0_server_event_dir
+
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
         # Pre-import heavy modules in the forkserver process

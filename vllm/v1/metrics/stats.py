@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.metrics.server_events import emit, token_detail_enabled
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreEvent, EngineCoreOutput, FinishReason
@@ -394,6 +395,7 @@ class IterationStats:
         lora_name: str | None,
     ):
         num_new_generation_tokens = len(output.new_token_ids)
+        emit("request_prefill_scheduled" if is_prefilling else "request_decode_scheduled", request_id=output.request_id, iteration_id=getattr(self, "iteration_id", None), payload={"new_token_count": num_new_generation_tokens}, source_component="vllm.v1.metrics.IterationStats")
 
         self.num_generation_tokens += num_new_generation_tokens
         if is_prefilling:
@@ -429,11 +431,14 @@ class IterationStats:
         # Process the batch-level "new tokens" engine core event
         if is_prefilling:
             req_stats.first_token_ts = engine_core_timestamp
+            emit("request_first_token", request_id=output.request_id, iteration_id=getattr(self, "iteration_id", None), event_monotonic_ns=int(engine_core_timestamp * 1e9), payload={"output_tokens": num_new_generation_tokens})
         else:
             itl = engine_core_timestamp - req_stats.last_token_ts
             self.inter_token_latencies_iter.append(itl)
 
         req_stats.last_token_ts = engine_core_timestamp
+        if token_detail_enabled():
+            emit("request_token_emitted", request_id=output.request_id, iteration_id=getattr(self, "iteration_id", None), event_monotonic_ns=int(engine_core_timestamp * 1e9), payload={"token_count": num_new_generation_tokens})
 
     def update_from_events(
         self,
@@ -450,13 +455,16 @@ class IterationStats:
         for event in events:
             if event.type == EngineCoreEventType.QUEUED:
                 req_stats.queued_ts = event.timestamp
+                emit("engine_request_queued", request_id=req_id, event_monotonic_ns=int(event.timestamp * 1e9), payload={})
                 lora_states.request_waiting(req_id, lora_name)
             elif event.type == EngineCoreEventType.SCHEDULED:
                 if req_stats.scheduled_ts == 0.0:  # ignore preemptions
                     req_stats.scheduled_ts = event.timestamp
+                    emit("request_first_scheduled", request_id=req_id, event_monotonic_ns=int(event.timestamp * 1e9), payload={})
                 lora_states.request_running(req_id, lora_name)
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
+                emit("request_preempted", request_id=req_id, event_monotonic_ns=int(event.timestamp * 1e9), payload={})
                 lora_states.request_waiting(req_id, lora_name)
 
     def update_from_finished_request(
@@ -508,6 +516,16 @@ class IterationStats:
             num_cached_tokens=num_cached_tokens,
         )
         self.finished_requests.append(finished_req)
+        emit("request_finished", request_id=request_id, payload={
+            "finish_reason": str(finish_reason), "prompt_tokens": num_prompt_tokens,
+            "output_tokens": req_stats.num_generation_tokens, "cached_prompt_tokens": num_cached_tokens,
+            "computed_prompt_tokens": max(0, num_prompt_tokens - num_cached_tokens),
+            "queue_wait_ms": queued_time * 1000, "prefill_interval_ms": prefill_time * 1000,
+            "decode_interval_ms": decode_time * 1000, "service_residence_ms": inference_time * 1000,
+            "server_tpot_ms": mean_time_per_output_token * 1000})
+        emit("kv_tokens_queried", request_id=request_id, payload={"prompt_tokens": num_prompt_tokens})
+        emit("kv_tokens_hit", request_id=request_id, payload={"cached_prompt_tokens": num_cached_tokens})
+        emit("kv_tokens_computed", request_id=request_id, payload={"computed_prompt_tokens": max(0, num_prompt_tokens - num_cached_tokens)})
 
         # Count corrupted requests when they finish (only once per request)
         if req_stats.is_corrupted:

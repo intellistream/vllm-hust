@@ -12,6 +12,7 @@ import numpy as np
 import pybase64 as base64
 from fastapi import Request
 
+from vllm.v1.metrics.server_events import emit
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionLogProbs,
@@ -142,6 +143,8 @@ class OpenAIServingCompletion(OpenAIServing):
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
         created_time = int(time.time())
+        client_request_id = raw_request.headers.get("X-Request-Id") if raw_request else request.request_id
+        emit("server_request_received", request_id=request_id, client_request_id=client_request_id, payload={"endpoint": "/v1/completions"}, source_component="vllm.openai.completion", measurement_method="http_request_boundary")
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:

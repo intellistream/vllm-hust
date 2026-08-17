@@ -31,6 +31,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.metrics.server_events import emit, next_iteration_id
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -603,6 +604,9 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        iteration_id = next_iteration_id() if iteration_stats is not None else None
+        if iteration_id is not None:
+            emit("iteration_execution_started", iteration_id=iteration_id, payload={"batch_size": len(engine_core_outputs), "request_ids": [x.request_id for x in engine_core_outputs]}, source_component="vllm.v1.engine.OutputProcessor", measurement_method="engine_output_boundary")
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -687,6 +691,8 @@ class OutputProcessor:
                     if self.tracing_enabled:
                         self.do_tracing(engine_core_output, req_state, iteration_stats)
 
+        if iteration_id is not None:
+            emit("iteration_execution_finished", iteration_id=iteration_id, payload={"batch_size": len(engine_core_outputs), "request_ids": [x.request_id for x in engine_core_outputs], "scheduled_tokens": sum(len(x.new_token_ids) for x in engine_core_outputs)}, source_component="vllm.v1.engine.OutputProcessor", measurement_method="engine_output_boundary")
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
