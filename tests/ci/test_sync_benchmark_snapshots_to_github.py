@@ -368,6 +368,40 @@ def test_multi_submission_sync_publishes_one_atomic_commit(tmp_path):
     ).exists()
 
 
+def test_multi_submission_failure_after_staging_leaves_remote_unchanged(tmp_path):
+    env, remote, benchmark_repo, _github_env = prepare_sync_environment(
+        tmp_path, "multi-failure"
+    )
+    submissions_dir = tmp_path / "multi-submissions"
+    write_submission_evidence(submissions_dir / "run-random")
+    write_submission_evidence(submissions_dir / "run-sharegpt")
+    env.pop("CURRENT_SUBMISSION_DIR")
+    env["CURRENT_SUBMISSIONS_DIR"] = str(submissions_dir)
+    env["FAKE_PUBLIC_VALIDATOR_EXIT"] = "2"
+    remote_head = run(
+        ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
+    ).stdout.strip()
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT_PATH)],
+        cwd=tmp_path,
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert (
+        run(
+            ["git", "--git-dir", str(remote), "rev-parse", "main"], tmp_path
+        ).stdout.strip()
+        == remote_head
+    )
+    assert not (benchmark_repo / "submissions" / "run-random").exists()
+    assert not (benchmark_repo / "submissions" / "run-sharegpt").exists()
+
+
 @pytest.mark.parametrize(
     ("validator_environment", "failure_message"),
     [
