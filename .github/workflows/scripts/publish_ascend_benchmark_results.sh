@@ -87,7 +87,7 @@ if [[ -f "$summary_file" ]]; then
     exit 2
   fi
   aggregate_dir=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/benchmark-publication.XXXXXX")
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   cleanup_aggregate_dir() {
     rm -rf "$aggregate_dir"
   }
