@@ -290,13 +290,6 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_DEBUG_PREFIX_CACHE_TRACE: bool = False
-    VLLM_ADAPTIVE_STATE_PROBE_JSONL: str = ""
-    VLLM_TELEMETRY_RUN_ID: str = ""
-    VLLM_ADAPTIVE_STATE_PROBE_ALL_RANKS: bool = False
-    VLLM_ADAPTIVE_STATE_PROBE_EVERY: int = 64
-    VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS: int = 10_000
-    VLLM_ADAPTIVE_STATE_PROBE_MAX_BYTES: int = 16 * 1024 * 1024
-    VLLM_ADAPTIVE_STATE_PROBE_FLUSH_EVERY: int = 64
 
 
 def get_default_cache_root():
@@ -1092,33 +1085,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable verbose prefix-cache trace logs for local debugging.
     "VLLM_DEBUG_PREFIX_CACHE_TRACE": lambda: bool(
         int(os.environ.get("VLLM_DEBUG_PREFIX_CACHE_TRACE", "0"))
-    ),
-    # Optional JSONL destination for model-runner scheduling diagnostics.
-    # Empty (default) disables the probe.
-    "VLLM_ADAPTIVE_STATE_PROBE_JSONL": lambda: os.environ.get(
-        "VLLM_ADAPTIVE_STATE_PROBE_JSONL", ""
-    ),
-    # Shared identifier used to join opt-in telemetry components.
-    "VLLM_TELEMETRY_RUN_ID": lambda: os.environ.get("VLLM_TELEMETRY_RUN_ID", ""),
-    # Emit distinct per-rank files instead of the default global-rank-zero owner.
-    "VLLM_ADAPTIVE_STATE_PROBE_ALL_RANKS": lambda: bool(
-        int(os.environ.get("VLLM_ADAPTIVE_STATE_PROBE_ALL_RANKS", "0"))
-    ),
-    # Record one scheduling-state row every N model-runner steps.
-    "VLLM_ADAPTIVE_STATE_PROBE_EVERY": lambda: int(
-        os.environ.get("VLLM_ADAPTIVE_STATE_PROBE_EVERY", "64")
-    ),
-    # Maximum detailed rows per process. Zero writes only a summary.
-    "VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS": lambda: int(
-        os.environ.get("VLLM_ADAPTIVE_STATE_PROBE_MAX_RECORDS", "10000")
-    ),
-    # Maximum detailed JSONL bytes per process. Zero writes only a summary.
-    "VLLM_ADAPTIVE_STATE_PROBE_MAX_BYTES": lambda: int(
-        os.environ.get("VLLM_ADAPTIVE_STATE_PROBE_MAX_BYTES", str(16 * 1024 * 1024))
-    ),
-    # Flush the persistent file handle after this many records.
-    "VLLM_ADAPTIVE_STATE_PROBE_FLUSH_EVERY": lambda: int(
-        os.environ.get("VLLM_ADAPTIVE_STATE_PROBE_FLUSH_EVERY", "64")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

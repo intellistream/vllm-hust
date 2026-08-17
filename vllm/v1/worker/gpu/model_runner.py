@@ -34,8 +34,6 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
-    get_tp_group,
-    get_world_group,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -54,10 +52,6 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
-from vllm.v1.worker.gpu.adaptive_state_probe import (
-    AdaptiveStateProbe,
-    ProbeTopology,
-)
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
@@ -175,21 +169,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Data parallelism.
         self.dp_size = self.parallel_config.data_parallel_size
         self.dp_rank = self.parallel_config.data_parallel_rank
-        tp_group = get_tp_group()
-        pp_group = get_pp_group()
-        world_group = get_world_group()
-        self.adaptive_state_probe = AdaptiveStateProbe.from_env(
-            ProbeTopology(
-                world_rank=world_group.rank_in_group,
-                world_size=world_group.world_size,
-                dp_rank=self.dp_rank,
-                dp_size=self.dp_size,
-                pp_rank=pp_group.rank_in_group,
-                pp_size=pp_group.world_size,
-                tp_rank=tp_group.rank_in_group,
-                tp_size=tp_group.world_size,
-            )
-        )
 
         # Decode context parallelism.
         self.dcp_size = self.parallel_config.decode_context_parallel_size
@@ -1182,16 +1161,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
         )
-
-        if self.adaptive_state_probe is not None:
-            self.adaptive_state_probe.record_step(
-                scheduler_output=scheduler_output,
-                batch_desc=batch_desc,
-                max_query_len=max_query_len,
-                uniform_tok_count=uniform_tok_count,
-                dummy_run=dummy_run,
-                skip_compiled=skip_compiled,
-            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
