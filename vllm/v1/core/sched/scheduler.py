@@ -501,6 +501,10 @@ class Scheduler(SchedulerInterface):
             self._owner_layout_probe = OwnerLayoutProbe.from_env(
                 world_size=self.parallel_config.world_size
             )
+            if self._owner_layout_probe is not None:
+                self._owner_prefix.set_observation_sink(
+                    self._owner_layout_probe.record_prefix_observation
+                )
 
     def _should_get_num_common_prefix_blocks(self) -> bool:
         device_config = getattr(self.vllm_config, "device_config", None)

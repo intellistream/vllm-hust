@@ -8,6 +8,7 @@ import json
 import os
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 from vllm.v1.core.sched.ownership import (
@@ -16,12 +17,18 @@ from vllm.v1.core.sched.ownership import (
     OwnerLeaseToken,
     OwnerReceiptBatch,
 )
+from vllm.v1.core.sched.request_owned_prefix_observability import (
+    OwnerPrefixAdmissionObservation,
+    OwnerPrefixObservation,
+    OwnerPrefixPublicationObservation,
+    OwnerPrefixReserveObservation,
+)
 
 PROBE_DIR_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_DIR"
 RUN_ID_ENV = "VLLM_TELEMETRY_RUN_ID"
 MAX_RECORDS_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_MAX_RECORDS"
 MAX_BYTES_ENV = "VLLM_REQUEST_OWNER_LAYOUT_PROBE_MAX_BYTES"
-SCHEMA = "g5-request-owner-lifecycle-observation/v5"
+SCHEMA = "g5-request-owner-lifecycle-observation/v6"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 
@@ -262,6 +269,7 @@ class OwnerLayoutProbe:
                 "accepted": event.accepted,
                 "runnable_num_tokens": event.runnable_num_tokens,
                 "released": event.released,
+                "prefix_cache_hit_tokens": event.prefix_cache_hit_tokens,
                 "error": event.error,
             }
             for batch in receipt_batches
@@ -284,5 +292,30 @@ class OwnerLayoutProbe:
                     rank for rank, count in enumerate(owner_row_counts) if count == 0
                 ],
                 "owner_cache_pools": owner_cache_pools,
+            }
+        )
+
+    def record_prefix_observation(
+        self,
+        observation: OwnerPrefixObservation,
+    ) -> None:
+        """Write one anonymous placement, exact receipt, or publication fact."""
+
+        if isinstance(observation, OwnerPrefixAdmissionObservation):
+            kind = "prefix_admission"
+        elif isinstance(observation, OwnerPrefixReserveObservation):
+            kind = "prefix_reserve"
+        elif isinstance(observation, OwnerPrefixPublicationObservation):
+            kind = "prefix_publication"
+        else:
+            raise TypeError(
+                f"unsupported owner-prefix observation {type(observation).__name__}"
+            )
+        self._write(
+            {
+                "schema": SCHEMA,
+                "kind": kind,
+                "run_id": self.run_id,
+                **asdict(observation),
             }
         )

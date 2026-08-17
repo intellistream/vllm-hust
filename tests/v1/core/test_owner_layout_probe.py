@@ -21,6 +21,10 @@ from vllm.v1.core.sched.ownership import (
     OwnerReceipt,
     OwnerReceiptBatch,
 )
+from vllm.v1.core.sched.request_owned_prefix_observability import (
+    OwnerPrefixAdmissionObservation,
+    OwnerPrefixCandidateObservation,
+)
 
 
 def _lease(request_id: str, owner: int, step: int = 3) -> OwnerLeaseToken:
@@ -53,7 +57,7 @@ def test_probe_records_mixed_and_zero_owner_rows(tmp_path, monkeypatch) -> None:
     assert records[0] == {
         "kind": "header",
         "run_id": "owner-cell",
-        "schema": "g5-request-owner-lifecycle-observation/v5",
+        "schema": "g5-request-owner-lifecycle-observation/v6",
         "world_size": 4,
     }
     step = records[1]
@@ -122,11 +126,57 @@ def test_probe_records_matching_command_and_receipt(tmp_path) -> None:
             "error": None,
             "owner_epoch": 1,
             "owner_rank": 0,
+            "prefix_cache_hit_tokens": None,
             "released": False,
             "request_id": "req",
             "runnable_num_tokens": 10,
         }
     ]
+
+
+def test_probe_records_anonymous_prefix_admission(tmp_path) -> None:
+    probe = OwnerLayoutProbe(
+        path=tmp_path / "probe.jsonl",
+        run_id="prefix-cell",
+        world_size=2,
+        max_records=4,
+        max_bytes=4096,
+    )
+    probe.record_prefix_observation(
+        OwnerPrefixAdmissionObservation(
+            request_id="req",
+            prefix_digest="a" * 64,
+            prefix_tokens=128,
+            selected_owner=1,
+            selected_hinted_tokens=0,
+            reason="bounded_spill",
+            candidates=(
+                OwnerPrefixCandidateObservation(
+                    owner_id=0,
+                    projected_free=10,
+                    fresh_demand=4,
+                    live_leases=1,
+                    hinted_tokens=128,
+                    affinity_eligible=False,
+                ),
+                OwnerPrefixCandidateObservation(
+                    owner_id=1,
+                    projected_free=20,
+                    fresh_demand=4,
+                    live_leases=0,
+                    hinted_tokens=0,
+                    affinity_eligible=True,
+                ),
+            ),
+        )
+    )
+
+    record = json.loads((tmp_path / "probe.jsonl").read_text().splitlines()[1])
+    assert record["kind"] == "prefix_admission"
+    assert record["schema"] == "g5-request-owner-lifecycle-observation/v6"
+    assert record["prefix_digest"] == "a" * 64
+    assert record["reason"] == "bounded_spill"
+    assert [item["owner_id"] for item in record["candidates"]] == [0, 1]
 
 
 def _pool(rank: int, *, free_blocks: int) -> OwnerCachePoolSnapshot:

@@ -12,10 +12,20 @@ hit or over-admit physical capacity.
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.request_owned_prefix import OwnerPrefixDescriptor
 from vllm.v1.core.sched.ownership import OwnerCommandKind, OwnerReceipt
+from vllm.v1.core.sched.request_owned_prefix_observability import (
+    OwnerPrefixAdmissionObservation,
+    OwnerPrefixCandidateObservation,
+    OwnerPrefixObservation,
+    OwnerPrefixObservationSink,
+    OwnerPrefixPublicationObservation,
+    OwnerPrefixReserveObservation,
+    make_prefix_observation_identity,
+)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
@@ -106,6 +116,38 @@ class RequestOwnedPrefixDirectory:
     ) -> int:
         """Return the longest contiguous scheduler-aligned hinted prefix."""
 
+        return self._longest_match(
+            owner_id,
+            block_hashes,
+            num_prompt_tokens,
+            touch=True,
+        )
+
+    def peek_longest_match(
+        self,
+        owner_id: int,
+        block_hashes: Sequence[BlockHash],
+        num_prompt_tokens: int,
+    ) -> int:
+        """Inspect one advisory match without changing its LRU recency."""
+
+        return self._longest_match(
+            owner_id,
+            block_hashes,
+            num_prompt_tokens,
+            touch=False,
+        )
+
+    def _longest_match(
+        self,
+        owner_id: int,
+        block_hashes: Sequence[BlockHash],
+        num_prompt_tokens: int,
+        *,
+        touch: bool,
+    ) -> int:
+        """Return one match, optionally retaining the existing LRU touch."""
+
         self._validate_owner(owner_id)
         max_tokens = min(
             max(num_prompt_tokens - 1, 0),
@@ -121,7 +163,8 @@ class RequestOwnedPrefixDirectory:
                 block_hashes[boundary * self._hash_stride - 1]
             )
             if block_hash in owner_hashes:
-                owner_hashes.move_to_end(block_hash)
+                if touch:
+                    owner_hashes.move_to_end(block_hash)
                 return boundary * self.scheduler_block_size
         return 0
 
@@ -199,16 +242,23 @@ class RequestOwnedPrefixDirectory:
 class RequestOwnedPrefixScheduler:
     """Narrow scheduler adapter around the advisory directory and wire seal."""
 
+    _MAX_OBSERVED_REQUESTS = 16_384
+
     def __init__(
         self,
         enabled: bool,
         world_size: int,
         scheduler_block_size: int,
         hash_block_size: int,
+        observation_sink: OwnerPrefixObservationSink | None = None,
     ) -> None:
         self.enabled = enabled
         self.scheduler_block_size = scheduler_block_size
         self.hash_block_size = hash_block_size
+        self._observation_sink = observation_sink
+        self._pending_admissions: dict[str, OwnerPrefixAdmissionObservation] = {}
+        self._reserve_hits: dict[str, int] = {}
+        self._published_tokens: OrderedDict[str, int] = OrderedDict()
         self.directory = (
             RequestOwnedPrefixDirectory(
                 world_size, scheduler_block_size, hash_block_size
@@ -217,6 +267,17 @@ class RequestOwnedPrefixScheduler:
             else None
         )
 
+    def set_observation_sink(
+        self,
+        observation_sink: OwnerPrefixObservationSink | None,
+    ) -> None:
+        """Replace the optional exact-evidence sink at a clean boundary."""
+
+        self._observation_sink = observation_sink
+        self._pending_admissions.clear()
+        self._reserve_hits.clear()
+        self._published_tokens.clear()
+
     def observe_running(self, requests: Iterable[Request]) -> None:
         directory = self.directory
         if directory is None:
@@ -224,12 +285,18 @@ class RequestOwnedPrefixScheduler:
         for request in requests:
             owner_id = request.attention_owner
             if owner_id is not None and not request.skip_reading_prefix_cache:
+                previous_hint = directory.peek_longest_match(
+                    owner_id,
+                    request.block_hashes,
+                    request.num_prompt_tokens,
+                )
                 directory.observe_computed_prefix(
                     owner_id,
                     request.block_hashes,
                     request.num_computed_tokens,
                     request.num_prompt_tokens,
                 )
+                self._observe_publication(request, owner_id, previous_hint)
 
     def observe_scheduled(
         self,
@@ -272,6 +339,53 @@ class RequestOwnedPrefixScheduler:
             fresh_demand,
             live_leases,
         )
+        if placement is not None and self._observation_sink is not None:
+            owners = tuple(sorted(projected_free))
+            best_free = max(projected_free.values())
+            candidates = tuple(
+                OwnerPrefixCandidateObservation(
+                    owner_id=owner_id,
+                    projected_free=projected_free[owner_id],
+                    fresh_demand=fresh_demand[owner_id],
+                    live_leases=live_leases[owner_id],
+                    hinted_tokens=directory.peek_longest_match(
+                        owner_id,
+                        request.block_hashes,
+                        request.num_prompt_tokens,
+                    ),
+                    affinity_eligible=(
+                        best_free - projected_free[owner_id]
+                        <= max(fresh_demand[owner_id], 1)
+                    ),
+                )
+                for owner_id in owners
+            )
+            prefix_digest, prefix_tokens = make_prefix_observation_identity(
+                request.block_hashes,
+                request.num_prompt_tokens,
+                self.scheduler_block_size,
+                self.hash_block_size,
+            )
+            reason: Literal["affinity_hit", "bounded_spill", "cold_balance"]
+            if placement.matched_tokens > 0:
+                reason = "affinity_hit"
+            elif any(candidate.hinted_tokens > 0 for candidate in candidates):
+                reason = "bounded_spill"
+            else:
+                reason = "cold_balance"
+            observation = OwnerPrefixAdmissionObservation(
+                request_id=request.request_id,
+                prefix_digest=prefix_digest,
+                prefix_tokens=prefix_tokens,
+                selected_owner=placement.owner_id,
+                selected_hinted_tokens=placement.matched_tokens,
+                reason=reason,
+                candidates=candidates,
+            )
+            self._reserve_hits.pop(request.request_id, None)
+            self._published_tokens.pop(request.request_id, None)
+            self._pending_admissions[request.request_id] = observation
+            self._emit(observation)
         return placement.owner_id if placement is not None else None
 
     def validate_reserve_receipt(
@@ -286,7 +400,17 @@ class RequestOwnedPrefixScheduler:
             event.command_seq,
             OwnerCommandKind.RESERVE,
         )
-        if not event.accepted or not matching_reserve:
+        if not matching_reserve:
+            return None
+        admission = self._pending_admissions.pop(event.key.request_id, None)
+        if not event.accepted:
+            self._emit_reserve_observation(
+                event,
+                request,
+                admission,
+                exact_hit_tokens=None,
+                outcome="rejected_reserve",
+            )
             return None
         expects_hit = bool(
             self.enabled
@@ -324,6 +448,24 @@ class RequestOwnedPrefixScheduler:
                 "request-owned prefix hit regresses computed progress for "
                 f"{event.key}: {hit} < {request.num_computed_tokens}."
             )
+        hinted_tokens = admission.selected_hinted_tokens if admission is not None else 0
+        outcome: Literal["exact_hit", "cold_miss", "stale_hint_miss"]
+        if hit > 0:
+            outcome = "exact_hit"
+        elif hinted_tokens > 0:
+            outcome = "stale_hint_miss"
+        else:
+            outcome = "cold_miss"
+        self._emit_reserve_observation(
+            event,
+            request,
+            admission,
+            exact_hit_tokens=hit,
+            outcome=outcome,
+        )
+        if self._observation_sink is not None:
+            self._reserve_hits[event.key.request_id] = hit
+            self._record_published_tokens(event.key.request_id, hit)
         return hit
 
     def record_lookup(
@@ -350,3 +492,118 @@ class RequestOwnedPrefixScheduler:
         directory = self.directory
         if directory is not None:
             directory.reset()
+        self._pending_admissions.clear()
+        self._reserve_hits.clear()
+        self._published_tokens.clear()
+
+    def _observe_publication(
+        self,
+        request: Request,
+        owner_id: int,
+        previous_hint: int,
+    ) -> None:
+        if self._observation_sink is None:
+            return
+        prefix_digest, prefix_tokens = make_prefix_observation_identity(
+            request.block_hashes,
+            request.num_prompt_tokens,
+            self.scheduler_block_size,
+            self.hash_block_size,
+        )
+        if prefix_digest is None:
+            return
+        previous_tokens = self._published_tokens.get(
+            request.request_id,
+            self._reserve_hits.get(request.request_id, 0),
+        )
+        published_tokens = min(request.num_computed_tokens, prefix_tokens)
+        published_tokens = (
+            published_tokens // self.scheduler_block_size * self.scheduler_block_size
+        )
+        if published_tokens > previous_tokens:
+            self._emit(
+                OwnerPrefixPublicationObservation(
+                    request_id=request.request_id,
+                    owner_id=owner_id,
+                    prefix_digest=prefix_digest,
+                    previous_tokens=previous_tokens,
+                    published_tokens=published_tokens,
+                    exact_reserve_hit_tokens=self._reserve_hits.get(request.request_id),
+                    directory_hint_was_new=previous_hint < published_tokens,
+                )
+            )
+            self._record_published_tokens(
+                request.request_id,
+                published_tokens,
+            )
+        if published_tokens >= prefix_tokens:
+            self._reserve_hits.pop(request.request_id, None)
+
+    def _emit_reserve_observation(
+        self,
+        event: OwnerReceipt,
+        request: Request | None,
+        admission: OwnerPrefixAdmissionObservation | None,
+        *,
+        exact_hit_tokens: int | None,
+        outcome: Literal[
+            "exact_hit",
+            "cold_miss",
+            "stale_hint_miss",
+            "rejected_reserve",
+        ],
+    ) -> None:
+        if self._observation_sink is None:
+            return
+        if admission is not None:
+            prefix_digest = admission.prefix_digest
+            prefix_tokens = admission.prefix_tokens
+            hinted_tokens = admission.selected_hinted_tokens
+        elif request is not None:
+            prefix_digest, prefix_tokens = make_prefix_observation_identity(
+                request.block_hashes,
+                request.num_prompt_tokens,
+                self.scheduler_block_size,
+                self.hash_block_size,
+            )
+            directory = self.directory
+            hinted_tokens = (
+                directory.peek_longest_match(
+                    event.owner_id,
+                    request.block_hashes,
+                    request.num_prompt_tokens,
+                )
+                if directory is not None
+                else 0
+            )
+        else:
+            prefix_digest = None
+            prefix_tokens = 0
+            hinted_tokens = 0
+        self._emit(
+            OwnerPrefixReserveObservation(
+                request_id=event.key.request_id,
+                owner_epoch=event.key.owner_epoch,
+                owner_id=event.owner_id,
+                prefix_digest=prefix_digest,
+                prefix_tokens=prefix_tokens,
+                hinted_tokens=hinted_tokens,
+                accepted=event.accepted,
+                exact_hit_tokens=exact_hit_tokens,
+                outcome=outcome,
+            )
+        )
+
+    def _emit(self, observation: OwnerPrefixObservation) -> None:
+        if self._observation_sink is not None:
+            self._observation_sink(observation)
+
+    def _record_published_tokens(
+        self,
+        request_id: str,
+        published_tokens: int,
+    ) -> None:
+        self._published_tokens[request_id] = published_tokens
+        self._published_tokens.move_to_end(request_id)
+        while len(self._published_tokens) > self._MAX_OBSERVED_REQUESTS:
+            self._published_tokens.popitem(last=False)
