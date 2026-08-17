@@ -26,6 +26,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.engine.async_llm import _failurefirst_max_pending_tokens
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
@@ -1222,6 +1223,138 @@ async def test_request_output_collector():
     # Cumulative logprobs should be the last one.
     cumulative_logprob_expected = 1.0 * num_to_put
     assert output.outputs[0].cumulative_logprob == cumulative_logprob_expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_request_output_collector_backpressure_is_request_scoped():
+    def make_output(token_id: int, *, finished: bool = False) -> RequestOutput:
+        return RequestOutput(
+            request_id="external-request",
+            prompt=None,
+            prompt_token_ids=[1],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text=str(token_id),
+                    token_ids=[token_id],
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="abort" if finished else None,
+                )
+            ],
+            finished=finished,
+        )
+
+    collector = RequestOutputCollector(
+        RequestOutputKind.DELTA,
+        request_id="internal-request",
+        max_pending_tokens=2,
+    )
+
+    assert collector.put(make_output(1))
+    assert collector.put(make_output(2))
+    assert not collector.put(make_output(3))
+    assert collector.backpressure_triggered
+    assert collector.backpressure_observed_tokens == 3
+    assert collector.pending_tokens == 2
+
+    collector.replace_with_terminal(make_output(4, finished=True))
+    terminal = await collector.get()
+    assert terminal.finished
+    assert terminal.outputs[0].token_ids == [4]
+    assert collector.pending_tokens == 0
+    assert not collector.put(make_output(5))
+
+
+@pytest.mark.parametrize(
+    ("output_kind", "max_pending_tokens"),
+    [
+        (RequestOutputKind.DELTA, 0),
+        (RequestOutputKind.DELTA, True),
+        (RequestOutputKind.FINAL_ONLY, 1),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_request_output_collector_backpressure_fails_closed(
+    output_kind: RequestOutputKind, max_pending_tokens: int
+):
+    with pytest.raises(ValueError):
+        RequestOutputCollector(
+            output_kind,
+            request_id="internal-request",
+            max_pending_tokens=max_pending_tokens,
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_request_scoped_backpressure_option_fails_closed_for_parallel_sampling():
+    params = SamplingParams(
+        output_kind=RequestOutputKind.DELTA,
+        extra_args={"failurefirst_stream_max_pending_tokens": 12},
+    )
+    assert _failurefirst_max_pending_tokens(params) == 12
+
+    params.n = 2
+    with pytest.raises(ValueError, match="requires n=1"):
+        _failurefirst_max_pending_tokens(params)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_output_processor_routes_backpressure_to_native_abort():
+    request = EngineCoreRequest(
+        request_id="internal-request",
+        external_req_id="external-request",
+        prompt_token_ids=[1],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(
+            detokenize=False,
+            output_kind=RequestOutputKind.DELTA,
+            stop=[],
+        ),
+        pooling_params=None,
+    )
+    collector = RequestOutputCollector(
+        RequestOutputKind.DELTA,
+        request_id=request.request_id,
+        max_pending_tokens=1,
+    )
+    output_processor = OutputProcessor(
+        tokenizer=None,
+        log_stats=False,
+    )
+    output_processor.add_request(request, None, queue=collector)
+    engine_core = MockEngineCore(
+        tokens_list=[[2, 3, 4]],
+        prompts_list=[[1]],
+        request_ids=[request.request_id],
+    )
+
+    first = output_processor.process_outputs(engine_core.get_outputs())
+    assert first.reqs_to_abort == []
+    assert collector.pending_tokens == 1
+
+    second = output_processor.process_outputs(engine_core.get_outputs())
+    assert second.reqs_to_abort == [request.request_id]
+    assert not output_processor.has_unfinished_requests()
+    assert collector.backpressure_triggered
+
+    terminal = await collector.get()
+    assert terminal.finished
+    assert terminal.outputs[0].finish_reason == "abort"
+    assert terminal.outputs[0].token_ids == []
+
+    remaining_outputs = engine_core.get_outputs()
+    if remaining_outputs:
+        after_abort = output_processor.process_outputs(remaining_outputs)
+        assert after_abort.reqs_to_abort == []
+        assert collector.output is None
 
 
 @pytest.mark.asyncio

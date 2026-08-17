@@ -54,6 +54,19 @@ from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
 
+_FAILUREFIRST_MAX_PENDING_TOKENS = "failurefirst_stream_max_pending_tokens"
+
+
+def _failurefirst_max_pending_tokens(
+    params: SamplingParams | PoolingParams,
+) -> int | None:
+    if not isinstance(params, SamplingParams) or params.extra_args is None:
+        return None
+    max_pending_tokens = params.extra_args.get(_FAILUREFIRST_MAX_PENDING_TOKENS)
+    if max_pending_tokens is not None and params.n != 1:
+        raise ValueError("failurefirst_stream_max_pending_tokens requires n=1")
+    return max_pending_tokens
+
 
 class InputStreamError(Exception):
     """Wrapper for errors from the input stream generator.
@@ -372,11 +385,15 @@ class AsyncLLM(EngineClient):
         # to handle startup failure gracefully in the OpenAI server.
         self._run_output_handler()
 
-        # Create a new output collector for the request.
-        queue = RequestOutputCollector(params.output_kind, request.request_id)
-
         # Use cloned params that may have been updated in process_inputs()
         params = request.params
+
+        # Create a new output collector for the request.
+        queue = RequestOutputCollector(
+            params.output_kind,
+            request.request_id,
+            max_pending_tokens=_failurefirst_max_pending_tokens(params),
+        )
 
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_text, None, 0, queue)
@@ -453,7 +470,11 @@ class AsyncLLM(EngineClient):
         self.input_processor.assign_request_id(final_req)
         internal_req_id = final_req.request_id
 
-        queue = RequestOutputCollector(sampling_params.output_kind, internal_req_id)
+        queue = RequestOutputCollector(
+            sampling_params.output_kind,
+            internal_req_id,
+            max_pending_tokens=_failurefirst_max_pending_tokens(sampling_params),
+        )
 
         async def handle_inputs():
             cancelled = False
