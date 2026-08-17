@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
+import time
 from dataclasses import dataclass
 from typing import cast
 
@@ -29,6 +30,9 @@ from vllm.v1.sample.thinking_budget_state import (
 )
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
+from vllm.v1.worker.gpu.output_pathology_observer import (
+    get_output_pathology_observer,
+)
 
 
 @dataclass
@@ -1012,6 +1016,10 @@ class InputBatch:
         if self.sampling_metadata.output_token_ids:
             self.sampled_token_ids_cpu = sampled_token_ids_cpu
             self.async_copy_ready_event = async_copy_ready_event
+            if observer := get_output_pathology_observer():
+                observer.record_input_batch_retain(
+                    sampled_token_ids_cpu.data_ptr()
+                )
         else:
             self.sampled_token_ids_cpu = None
             self.async_copy_ready_event = None
@@ -1040,8 +1048,27 @@ class InputBatch:
                 continue
             if sampled_token_ids is None:
                 assert self.async_copy_ready_event is not None
+                observer = get_output_pathology_observer()
+                wait_start_ns = (
+                    time.perf_counter_ns() if observer is not None else 0
+                )
                 self.async_copy_ready_event.synchronize()
+                wait_ns = (
+                    time.perf_counter_ns() - wait_start_ns
+                    if observer is not None
+                    else 0
+                )
+                materialization_start_ns = (
+                    time.perf_counter_ns() if observer is not None else 0
+                )
                 sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+                if observer is not None:
+                    observer.record_input_batch_consume(
+                        self.sampled_token_ids_cpu.data_ptr(),
+                        wait_ns=wait_ns,
+                        materialization_ns=time.perf_counter_ns()
+                        - materialization_start_ns,
+                    )
             # Replace placeholder token id(s) with actual sampled id(s).
             new_ids: list[int] = sampled_token_ids[prev_index]
             if not new_ids:
