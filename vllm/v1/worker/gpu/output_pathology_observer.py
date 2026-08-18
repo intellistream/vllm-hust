@@ -40,6 +40,8 @@ class OutputPathologyObserver:
         self._events: list[dict[str, Any]] = []
         self._next_output_id = 0
         self._storage_to_output: dict[int, int] = {}
+        self._output_to_storage: dict[int, int] = {}
+        self._retained_storages: set[int] = set()
         self._event_count = 0
         self._dropped_events = 0
         self._write_errors = 0
@@ -87,15 +89,20 @@ class OutputPathologyObserver:
         dispatch_ns: int,
     ) -> None:
         with self._lock:
+            can_link_future_events = self._record_locked(
+                "fresh_cpu_tensor_copy_issued",
+                output_id=output_id,
+                storage_id=storage_id,
+                event_id=event_id,
+                nbytes=nbytes,
+                dispatch_ns=dispatch_ns,
+            )
+            if not can_link_future_events:
+                return
+            self._release_storage_locked(storage_id)
+            self._release_output_locked(output_id)
             self._storage_to_output[storage_id] = output_id
-        self._record(
-            "fresh_cpu_tensor_copy_issued",
-            output_id=output_id,
-            storage_id=storage_id,
-            event_id=event_id,
-            nbytes=nbytes,
-            dispatch_ns=dispatch_ns,
-        )
+            self._output_to_storage[output_id] = storage_id
 
     def record_output_wait(self, output_id: int, wait_ns: int) -> None:
         self._record("output_event_wait", output_id=output_id, wait_ns=wait_ns)
@@ -103,18 +110,29 @@ class OutputPathologyObserver:
     def record_output_materialization(
         self, output_id: int, materialization_ns: int
     ) -> None:
-        self._record(
-            "output_python_materialization",
-            output_id=output_id,
-            materialization_ns=materialization_ns,
-        )
+        with self._lock:
+            self._record_locked(
+                "output_python_materialization",
+                output_id=output_id,
+                materialization_ns=materialization_ns,
+            )
+            storage_id = self._output_to_storage.get(output_id)
+            if (
+                storage_id is not None
+                and storage_id not in self._retained_storages
+            ):
+                self._release_storage_locked(storage_id)
 
     def record_input_batch_retain(self, storage_id: int) -> None:
-        self._record(
-            "input_batch_retain",
-            output_id=self._output_for_storage(storage_id),
-            storage_id=storage_id,
-        )
+        with self._lock:
+            output_id = self._storage_to_output.get(storage_id)
+            can_link_future_events = self._record_locked(
+                "input_batch_retain",
+                output_id=output_id,
+                storage_id=storage_id,
+            )
+            if can_link_future_events and output_id is not None:
+                self._retained_storages.add(storage_id)
 
     def record_input_batch_consume(
         self,
@@ -123,13 +141,15 @@ class OutputPathologyObserver:
         wait_ns: int,
         materialization_ns: int,
     ) -> None:
-        self._record(
-            "input_batch_consume",
-            output_id=self._output_for_storage(storage_id),
-            storage_id=storage_id,
-            wait_ns=wait_ns,
-            materialization_ns=materialization_ns,
-        )
+        with self._lock:
+            self._record_locked(
+                "input_batch_consume",
+                output_id=self._storage_to_output.get(storage_id),
+                storage_id=storage_id,
+                wait_ns=wait_ns,
+                materialization_ns=materialization_ns,
+            )
+            self._release_storage_locked(storage_id)
 
     def record_exception(self, output_id: int, phase: str) -> None:
         self._record("observer_seam_exception", output_id=output_id, phase=phase)
@@ -138,29 +158,55 @@ class OutputPathologyObserver:
         with self._lock:
             self._flush_locked()
 
-    def _output_for_storage(self, storage_id: int) -> int | None:
-        with self._lock:
-            return self._storage_to_output.get(storage_id)
-
     def _record(self, event: str, **fields: Any) -> None:
         with self._lock:
-            if self._disabled:
-                return
-            if self._event_count >= self.max_events:
-                self._dropped_events += 1
-                self._checkpoint_dirty = True
-                return
-            self._event_count += 1
+            self._record_locked(event, **fields)
+
+    def _record_locked(self, event: str, **fields: Any) -> bool:
+        """Record an event and report whether future links remain useful."""
+        if self._disabled:
+            return False
+        if self._event_count >= self.max_events:
+            self._dropped_events += 1
             self._checkpoint_dirty = True
-            self._events.append(
-                {
-                    "event": event,
-                    "monotonic_ns": time.perf_counter_ns(),
-                    **fields,
-                }
-            )
-            if len(self._events) >= self.flush_events:
-                self._flush_locked()
+            self._clear_auxiliary_state_locked()
+            return False
+        self._event_count += 1
+        self._checkpoint_dirty = True
+        self._events.append(
+            {
+                "event": event,
+                "monotonic_ns": time.perf_counter_ns(),
+                **fields,
+            }
+        )
+        if self._event_count >= self.max_events:
+            self._clear_auxiliary_state_locked()
+        if len(self._events) >= self.flush_events:
+            self._flush_locked()
+        return not self._disabled and self._event_count < self.max_events
+
+    def _release_storage_locked(self, storage_id: int) -> None:
+        output_id = self._storage_to_output.pop(storage_id, None)
+        self._retained_storages.discard(storage_id)
+        if (
+            output_id is not None
+            and self._output_to_storage.get(output_id) == storage_id
+        ):
+            self._output_to_storage.pop(output_id, None)
+
+    def _release_output_locked(self, output_id: int) -> None:
+        storage_id = self._output_to_storage.pop(output_id, None)
+        if storage_id is None:
+            return
+        self._retained_storages.discard(storage_id)
+        if self._storage_to_output.get(storage_id) == output_id:
+            self._storage_to_output.pop(storage_id, None)
+
+    def _clear_auxiliary_state_locked(self) -> None:
+        self._storage_to_output.clear()
+        self._output_to_storage.clear()
+        self._retained_storages.clear()
 
     def _flush_locked(self) -> None:
         if self._disabled or not self._checkpoint_dirty:
@@ -203,7 +249,9 @@ class OutputPathologyObserver:
             # Observation must never alter serving correctness.
             self._write_errors += 1
             self._events.clear()
+            self._checkpoint_dirty = False
             self._disabled = True
+            self._clear_auxiliary_state_locked()
 
 
 _observer: OutputPathologyObserver | None = None

@@ -83,6 +83,31 @@ def test_event_ledger_links_both_consumers(
         "materialization_ns"
     ] == 200
     assert by_name["observer_checkpoint"]["dropped_events"] == 0
+    assert observer._storage_to_output == {}
+    assert observer._output_to_storage == {}
+    assert observer._retained_storages == set()
+
+
+def test_output_without_input_batch_consumer_releases_mapping(
+    tmp_path: Path,
+) -> None:
+    observer = OutputPathologyObserver(
+        str(tmp_path / "output-only.jsonl"), flush_events=100
+    )
+    output_id = observer.start_output(["a"], (1, 1), "int64")
+    observer.record_copy_issued(
+        output_id,
+        storage_id=1234,
+        event_id=5678,
+        nbytes=8,
+        dispatch_ns=1,
+    )
+
+    observer.record_output_materialization(output_id, 1)
+
+    assert observer._storage_to_output == {}
+    assert observer._output_to_storage == {}
+    assert observer._retained_storages == set()
 
 
 def test_request_fingerprint_is_order_sensitive(tmp_path: Path) -> None:
@@ -130,13 +155,54 @@ def test_drop_after_periodic_flush_updates_checkpoint(tmp_path: Path) -> None:
     assert checkpoint["dropped_events"] == 1
 
 
+def test_event_cap_prevents_auxiliary_state_growth(tmp_path: Path) -> None:
+    output_path = tmp_path / "bounded-after-cap.jsonl"
+    observer = OutputPathologyObserver(
+        str(output_path), max_events=1, flush_events=1
+    )
+
+    for value in range(10_000):
+        observer.record_copy_issued(
+            value,
+            storage_id=value,
+            event_id=value,
+            nbytes=8,
+            dispatch_ns=1,
+        )
+    observer.flush()
+
+    assert observer._event_count == 1
+    assert observer._dropped_events == 9_999
+    assert observer._storage_to_output == {}
+    assert observer._output_to_storage == {}
+    assert observer._retained_storages == set()
+
+
 def test_write_failure_never_escapes_to_serving(tmp_path: Path) -> None:
     observer = OutputPathologyObserver(str(tmp_path), flush_events=100)
-    observer.start_output(["a"], (1, 1), "int64")
+    observer.record_copy_issued(
+        0,
+        storage_id=1,
+        event_id=1,
+        nbytes=8,
+        dispatch_ns=1,
+    )
 
     observer.flush()
-    observer.record_output_wait(0, 1)
+    for value in range(2, 1_002):
+        observer.record_copy_issued(
+            value,
+            storage_id=value,
+            event_id=value,
+            nbytes=8,
+            dispatch_ns=1,
+        )
     observer.flush()
+
+    assert observer._disabled is True
+    assert observer._storage_to_output == {}
+    assert observer._output_to_storage == {}
+    assert observer._retained_storages == set()
 
 
 def test_invalid_environment_limits_disable_observer(
