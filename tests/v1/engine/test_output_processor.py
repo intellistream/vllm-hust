@@ -1268,6 +1268,55 @@ async def test_request_output_collector_backpressure_is_request_scoped():
     assert not collector.put(make_output(5))
 
 
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_request_output_collector_holds_credit_until_consumer_progress():
+    def make_output(*token_ids: int) -> RequestOutput:
+        return RequestOutput(
+            request_id="external-request",
+            prompt=None,
+            prompt_token_ids=[1],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="".join(map(str, token_ids)),
+                    token_ids=list(token_ids),
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason=None,
+                )
+            ],
+            finished=False,
+        )
+
+    collector = RequestOutputCollector(
+        RequestOutputKind.DELTA,
+        request_id="internal-request",
+        max_pending_tokens=3,
+    )
+
+    assert collector.put(make_output(1, 2))
+    first = await collector.get()
+    assert first.outputs[0].token_ids == [1, 2]
+    assert collector.pending_tokens == 2
+    assert collector.inflight_tokens == 2
+
+    # Producer progress while the downstream handoff is outstanding must
+    # still consume the same request-scoped credit budget.
+    assert collector.put(make_output(3))
+    assert collector.pending_tokens == 3
+    collector.acknowledge_consumer_progress()
+    assert collector.pending_tokens == 1
+    assert collector.inflight_tokens == 0
+
+    second = await collector.get()
+    assert second.outputs[0].token_ids == [3]
+    assert collector.pending_tokens == 1
+    collector.acknowledge_consumer_progress()
+    assert collector.pending_tokens == 0
+
+
 @pytest.mark.parametrize(
     ("output_kind", "max_pending_tokens"),
     [

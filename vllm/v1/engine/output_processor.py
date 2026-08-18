@@ -75,6 +75,7 @@ class RequestOutputCollector:
         self.request_id = request_id
         self.max_pending_tokens = max_pending_tokens
         self.pending_tokens = 0
+        self.inflight_tokens = 0
         self.backpressure_triggered = False
         self.backpressure_observed_tokens: int | None = None
         self.output: RequestOutput | PoolingRequestOutput | Exception | None = None
@@ -134,15 +135,45 @@ class RequestOutputCollector:
         if not output.finished:
             raise ValueError("replacement output must be terminal")
         self.output = output
-        self.pending_tokens = 0
+        # Drop only unpublished tokens. A chunk already handed to the
+        # downstream consumer remains charged until that consumer resumes.
+        self.pending_tokens = self.inflight_tokens
         self.ready.set()
+
+    def _begin_handoff(
+        self,
+        output: RequestOutput | PoolingRequestOutput | Exception,
+    ) -> None:
+        if self.max_pending_tokens is None:
+            self.pending_tokens = 0
+            return
+        if self.inflight_tokens:
+            raise RuntimeError(
+                "consumer requested a new output before acknowledging handoff"
+            )
+        self.inflight_tokens = self._count_tokens(output)
+
+    def acknowledge_consumer_progress(self) -> None:
+        """Release credit after the downstream consumer resumes.
+
+        In the OpenAI streaming path, ``AsyncLLM.generate()`` resumes only
+        after the caller has processed the previously yielded output. This
+        keeps the output charged across the downstream handoff instead of
+        releasing credit as soon as it leaves this collector.
+        """
+        if self.max_pending_tokens is None:
+            return
+        if self.inflight_tokens > self.pending_tokens:
+            raise RuntimeError("inflight token accounting exceeds pending credit")
+        self.pending_tokens -= self.inflight_tokens
+        self.inflight_tokens = 0
 
     async def get(self) -> RequestOutput | PoolingRequestOutput:
         """Get operation blocks on put event."""
         while (output := self.output) is None:
             await self.ready.wait()
+        self._begin_handoff(output)
         self.output = None
-        self.pending_tokens = 0
         self.ready.clear()
         if isinstance(output, Exception):
             raise output
@@ -152,8 +183,8 @@ class RequestOutputCollector:
         """Non-blocking get operation."""
         output = self.output
         if output is not None:
+            self._begin_handoff(output)
             self.output = None
-            self.pending_tokens = 0
             self.ready.clear()
         if isinstance(output, Exception):
             raise output

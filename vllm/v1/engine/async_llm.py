@@ -607,7 +607,12 @@ class AsyncLLM(EngineClient):
                 assert isinstance(out, RequestOutput)
                 finished = out.finished
                 if out is not STREAM_FINISHED:
-                    yield out
+                    try:
+                        yield out
+                    finally:
+                        # Keep native stream credit charged until the
+                        # downstream consumer resumes after this handoff.
+                        q.acknowledge_consumer_progress()
 
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
