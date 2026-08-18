@@ -51,6 +51,10 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.sched.token_budget_reservation import (
+    priority_prefill_reservation_tokens,
+    read_priority_prefill_reservation_tokens,
+)
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -184,6 +188,9 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self.priority_prefill_reservation_tokens = (
+            read_priority_prefill_reservation_tokens()
+        )
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -460,6 +467,40 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        priority_prefill_reservation = 0
+        has_request_slot = (
+            len(self.running) + self.num_waiting_for_streaming_input
+            < self.max_num_running_reqs
+        )
+        if (
+            token_budget > 0
+            and has_request_slot
+            and self.waiting
+            and not defer_prefills
+        ):
+            selected_request = self.waiting.peek_request()
+            priority_prefill_reservation = priority_prefill_reservation_tokens(
+                configured_tokens=self.priority_prefill_reservation_tokens,
+                scheduling_policy=self.policy.value,
+                request_priority=selected_request.priority,
+                remaining_prefill_tokens=max(
+                    0,
+                    selected_request.num_prompt_tokens
+                    - selected_request.num_computed_tokens,
+                ),
+                max_step_tokens=token_budget,
+                enable_chunked_prefill=self.scheduler_config.enable_chunked_prefill,
+            )
+            if priority_prefill_reservation:
+                logger.debug(
+                    "Reserved %d prefill tokens for selected request %s "
+                    "with priority %d",
+                    priority_prefill_reservation,
+                    selected_request.request_id,
+                    selected_request.priority,
+                )
+                token_budget -= priority_prefill_reservation
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -655,6 +696,9 @@ class Scheduler(SchedulerInterface):
                 if req.lora_request and req.lora_request.lora_int_id > 0
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
+
+        # Restore selected-prefill capacity immediately before the waiting pass.
+        token_budget += priority_prefill_reservation
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
