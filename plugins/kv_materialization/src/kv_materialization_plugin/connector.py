@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from dataclasses import replace
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -140,6 +139,7 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
             mode=materialization_mode,
         )
         self._decisions: dict[str, MaterializationDecision] = {}
+        self._decision_active_path_counts: dict[str, int] = {}
         self._decision_hit_tokens: dict[str, int] = {}
         self._decision_times: dict[str, float] = {}
         self._recompute_remaining_tokens: dict[str, int] = {}
@@ -167,18 +167,25 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
             return hit_tokens, is_async
 
         hit_blocks = max(1, self._estimate_hit_blocks(hit_tokens))
+        active_load_count = sum(
+            decision.mode == "load" for decision in self._decisions.values()
+        )
+        active_recompute_count = sum(
+            decision.mode == "recompute" for decision in self._decisions.values()
+        )
         observation = self._telemetry.snapshot(
             hit_tokens,
             hit_blocks,
             kv_bytes=hit_blocks * self._kv_bytes_per_block,
             max_age_ms=self._decision_config.max_observation_age_ms,
-        )
-        observation = replace(
-            observation,
-            active_materialization_count=len(self._decisions),
+            active_load_count=active_load_count,
+            active_recompute_count=active_recompute_count,
         )
         decision = choose_materialization(observation, self._decision_config)
         self._decisions[request.request_id] = decision
+        self._decision_active_path_counts[request.request_id] = (
+            active_load_count if decision.mode == "load" else active_recompute_count
+        )
         self._decision_hit_tokens[request.request_id] = hit_tokens
         self._decision_times[request.request_id] = time.monotonic()
         self._audit.start(
@@ -461,6 +468,7 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
                 continue
             extra_wait_ms = total_ms - service_ms
             queue_wait_ms = max(0.0, float(critical_sample.queue_wait_ms))
+            active_path_count = self._decision_active_path_counts.get(request_id, 0)
             if is_load:
                 self._telemetry.observe_load(
                     critical_sample.size,
@@ -468,6 +476,7 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
                     service_ms,
                     critical_sample.kv_bytes,
                     queue_wait_ms=queue_wait_ms,
+                    active_path_count=active_path_count,
                 )
             else:
                 self._telemetry.observe_recompute(
@@ -475,6 +484,7 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
                     total_ms,
                     service_ms,
                     queue_wait_ms=queue_wait_ms,
+                    active_path_count=active_path_count,
                 )
             self._audit.complete(
                 request_id,
@@ -489,6 +499,7 @@ class DynamicSimpleCPUOffloadConnector(_SimpleCPUOffloadConnector):
     def _clear_request_state(self, request_id: str) -> None:
         """Release scheduler-side state after a request is decided/completed."""
         self._decisions.pop(request_id, None)
+        getattr(self, "_decision_active_path_counts", {}).pop(request_id, None)
         self._decision_hit_tokens.pop(request_id, None)
         self._decision_times.pop(request_id, None)
         self._recompute_remaining_tokens.pop(request_id, None)

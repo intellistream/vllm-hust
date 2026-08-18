@@ -26,6 +26,10 @@ class AuditRecord:
     fallback: bool
     kv_bytes: int = 0
     active_materialization_count: int = 0
+    active_load_count: int = 0
+    active_recompute_count: int = 0
+    estimate_source: str = "unavailable"
+    confidence_guard: str | None = None
     timing_scope: str = (
         "decision_to_worker_sample_return;"
         " phase_queue=admission_to_service_start"
@@ -98,6 +102,12 @@ class AuditLog:
             active_materialization_count=(
                 observation.active_materialization_count if observation else 0
             ),
+            active_load_count=observation.active_load_count if observation else 0,
+            active_recompute_count=(
+                observation.active_recompute_count if observation else 0
+            ),
+            estimate_source=decision.estimate_source,
+            confidence_guard=decision.confidence_guard,
             queue_wait_isolated=bool(
                 observation
                 and observation.load_queue_wait_ms is not None

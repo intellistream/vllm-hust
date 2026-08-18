@@ -61,39 +61,39 @@ def test_equal_prediction_deterministically_chooses_recompute() -> None:
     assert decision.reason == "predicted_recompute_is_not_slower"
 
 
-def test_overlapping_materialization_falls_back() -> None:
-    """M1 does not reuse a single-request estimate during overlap."""
+def test_concurrency_conditioned_recompute_can_win_during_overlap() -> None:
+    """A matching concurrent bucket can make a normal dynamic choice."""
     decision = choose_materialization(
-        make_observation(active_materialization_count=1),
+        make_observation(
+            active_materialization_count=5,
+            active_load_count=4,
+            active_recompute_count=1,
+            load_total_ms=30.0,
+            recompute_total_ms=20.0,
+        ),
+        MaterializationDecisionConfig(enabled=True),
+    )
+
+    assert decision.mode == "recompute"
+    assert decision.fallback is False
+    assert decision.reason == "predicted_recompute_is_not_slower"
+
+
+def test_inconsistent_active_path_counts_fall_back() -> None:
+    """Corrupt concurrency context cannot silently select a path."""
+    decision = choose_materialization(
+        make_observation(
+            active_materialization_count=3,
+            active_load_count=1,
+            active_recompute_count=1,
+        ),
         MaterializationDecisionConfig(enabled=True),
     )
 
     assert decision.mode == "load"
     assert decision.fallback is True
-    assert decision.reason == "unsupported_concurrent_context"
+    assert decision.reason == "invalid_or_missing_observation"
     assert decision.invalid_fields == ("active_materialization_count",)
-
-
-def test_only_first_overlapping_request_uses_dynamic_estimate() -> None:
-    """Later overlap cannot repeat the first request's recompute decision."""
-    config = MaterializationDecisionConfig(enabled=True)
-    first = choose_materialization(
-        make_observation(load_total_ms=30.0, recompute_total_ms=10.0),
-        config,
-    )
-    second = choose_materialization(
-        make_observation(
-            load_total_ms=30.0,
-            recompute_total_ms=10.0,
-            active_materialization_count=1,
-        ),
-        config,
-    )
-
-    assert first.mode == "recompute"
-    assert first.fallback is False
-    assert second.mode == "load"
-    assert second.fallback is True
 
 
 @pytest.mark.parametrize("forced_mode", ["load", "recompute"])
@@ -142,6 +142,8 @@ def test_disabled_dynamic_preserves_load_fallback() -> None:
         ("load_total_ms", -1.0),
         ("load_queue_wait_ms", -1.0),
         ("active_materialization_count", -1),
+        ("active_load_count", -1),
+        ("active_recompute_count", -1),
     ],
 )
 def test_invalid_or_stale_observation_falls_back(field: str, value: object) -> None:
@@ -166,7 +168,9 @@ def test_end_to_end_prediction_is_recorded() -> None:
     )
 
     assert decision.mode == "load"
-    assert decision.estimate_source == "path_completion_mean"
+    assert decision.estimate_source == (
+        "workload_calibrated_path_completion_mean"
+    )
     assert decision.predicted_load_ms == pytest.approx(11.24)
 
 

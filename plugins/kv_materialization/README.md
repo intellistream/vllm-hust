@@ -21,22 +21,26 @@ select a mode in `kv_connector_extra_config`:
   together again.
 
 Dynamic mode is conservative about data quality: only measurements for the
-exact same token/block-size buckets are reused. Missing, stale, or invalid
+exact same token/block size from a matched calibration workload are reused.
+All admission positions in that workload remain in one path bucket so the
+mean captures batching and queueing behavior. Missing, stale, or invalid
 measurements use the configured fallback. Every decision records the selected
-branch, reason, predictions, observation counts/ages, measured service/wait
-components, and completion cost in the connector audit log.
+branch, reason, predictions, both active-path counts, observation counts/ages,
+measured service/wait components, and completion cost in the connector audit
+log.
 
 The dynamic confidence gate requires both branches to have fresh samples and
 requires each sample to carry an explicit phase wait measurement. A missing
-old calibration file therefore falls back to `load` with reason
+old calibration file therefore uses the configured fallback with reason
 `insufficient_observation_confidence`; it is never treated as a zero wait.
 
-M1 dynamic estimates are valid only when no other materialization request is
-active. If a second request overlaps an unfinished load or recompute attempt,
-the plugin records `unsupported_concurrent_context` and uses the configured
-fallback (`load` in the M1 configuration). Forced modes remain available for
-matched baselines. Maintaining copy-byte or recompute-token backlog across
-requests is intentionally outside the M1 scope.
+Each completed sample still records how many requests were already active on
+its selected path when admitted, but this count is diagnostic rather than a
+bucket key. Greedily comparing isolated path depths is unsafe for batched
+recompute: a cheap first load can look attractive even when the all-load
+workload is slower. Forced load and forced recompute lifecycles therefore
+calibrate one workload-wide completion mean per exact prefix size. Existing
+calibration files without an active-path field remain compatible.
 
 The audit field `queue_wait_ms` is measured separately from service time. Its
 scope is the plugin's admission-to-first-service-start interval: for load it
@@ -45,8 +49,9 @@ scheduler decision to the first compute step. This is an observed runtime
 admission queue, not a claim about an opaque device driver's internal queue.
 `extra_wait_ms` remains a residual between scheduler-observed total time and
 worker service time, and may still include dispatch, process communication,
-and metadata return. The decision estimator uses the explicit phase wait
-field and the service field; it does not mistake the residual for queue time.
+and metadata return. The decision compares the observed end-to-end total; the
+explicit phase wait is a confidence requirement and diagnostic, not a term
+added to the total a second time.
 
 Recompute timing follows a request across chunked-prefill steps and completes
 only after all CPU-hit prefix tokens have actually been recomputed. Worker

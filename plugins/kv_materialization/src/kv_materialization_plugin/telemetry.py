@@ -15,6 +15,15 @@ from typing import Any
 
 from kv_materialization_plugin.decision import MaterializationObservation
 
+Stats = tuple[
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    int,
+]
+
 
 @dataclass(frozen=True, slots=True)
 class TimingSample:
@@ -30,6 +39,9 @@ class TimingSample:
     # runtime-observed admission/queue interval, not a claim about a device
     # driver's internal queue.
     queue_wait_ms: float | None = None
+    # Number of already-active requests on this same materialization path when
+    # this request was admitted.  Zero keeps older calibration JSON compatible.
+    active_path_count: int = 0
 
 
 class TelemetryWindow:
@@ -45,6 +57,9 @@ class TelemetryWindow:
         self._recompute: dict[int, deque[TimingSample]] = defaultdict(
             lambda: deque(maxlen=max_samples)
         )
+        self._stats_cache: dict[
+            tuple[str, int, float | None], tuple[float, float, Stats]
+        ] = {}
 
     def observe_load(
         self,
@@ -54,6 +69,7 @@ class TelemetryWindow:
         kv_bytes: int = 0,
         queue_wait_ms: float | None = None,
         timestamp: float | None = None,
+        active_path_count: int = 0,
     ) -> None:
         """Record a completed CPU-to-device load."""
         self._observe(
@@ -64,6 +80,7 @@ class TelemetryWindow:
             kv_bytes,
             queue_wait_ms,
             timestamp,
+            active_path_count,
         )
 
     def observe_recompute(
@@ -73,6 +90,7 @@ class TelemetryWindow:
         service_ms: float,
         queue_wait_ms: float | None = None,
         timestamp: float | None = None,
+        active_path_count: int = 0,
     ) -> None:
         """Record a completed prefix recompute."""
         self._observe(
@@ -83,6 +101,7 @@ class TelemetryWindow:
             0,
             queue_wait_ms,
             timestamp,
+            active_path_count,
         )
 
     def snapshot(
@@ -91,26 +110,44 @@ class TelemetryWindow:
         hit_blocks: int,
         kv_bytes: int = 0,
         max_age_ms: float | None = None,
+        active_load_count: int = 0,
+        active_recompute_count: int = 0,
     ) -> MaterializationObservation:
         """Create a decision observation from exact-size recent buckets.
 
         End-to-end materialization time is not safely transferable between
-        arbitrary prefix sizes. Missing exact buckets are therefore exposed as
-        missing observations and handled by the decision fallback.
+        arbitrary prefix sizes. Samples from different admission positions in
+        the matched workload remain in one bucket so the estimator captures
+        batching and queueing without a greedy per-request concurrency model.
         """
         now = time.time()
         if max_age_ms is not None and (
             not math.isfinite(max_age_ms) or max_age_ms < 0.0
         ):
             raise ValueError("max_age_ms must be finite and non-negative")
+        for field_name, value in (
+            ("active_load_count", active_load_count),
+            ("active_recompute_count", active_recompute_count),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
         load = self._load.get(hit_blocks)
         recompute = self._recompute.get(hit_tokens)
-        load_stats = self._stats(load, now, max_age_ms)
-        recompute_stats = self._stats(recompute, now, max_age_ms)
+        load_stats = self._cached_stats(
+            "load", hit_blocks, load, now, max_age_ms
+        )
+        recompute_stats = self._cached_stats(
+            "recompute", hit_tokens, recompute, now, max_age_ms
+        )
         return MaterializationObservation(
             hit_tokens=hit_tokens,
             hit_blocks=hit_blocks,
             kv_bytes=kv_bytes,
+            active_materialization_count=(
+                active_load_count + active_recompute_count
+            ),
+            active_load_count=active_load_count,
+            active_recompute_count=active_recompute_count,
             load_total_ms=load_stats[0],
             load_service_ms=load_stats[1],
             load_queue_wait_ms=load_stats[2],
@@ -161,6 +198,7 @@ class TelemetryWindow:
         source = Path(path)
         if not source.is_file():
             return
+        self._stats_cache.clear()
         value = json.loads(source.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError(f"Telemetry state must be an object: {source}")
@@ -184,6 +222,7 @@ class TelemetryWindow:
         kv_bytes: int,
         queue_wait_ms: float | None,
         timestamp: float | None,
+        active_path_count: int,
     ) -> None:
         if timestamp is None:
             timestamp = time.time()
@@ -196,9 +235,11 @@ class TelemetryWindow:
             timestamp=timestamp,
             kv_bytes=kv_bytes,
             queue_wait_ms=queue_wait_ms,
+            active_path_count=active_path_count,
         )
         self._validate_sample(sample)
         buckets[size].append(sample)
+        self._stats_cache.clear()
 
     @staticmethod
     def _validate_sample(sample: TimingSample) -> None:
@@ -215,6 +256,9 @@ class TelemetryWindow:
             or not isinstance(sample.kv_bytes, int)
             or isinstance(sample.kv_bytes, bool)
             or sample.kv_bytes < 0
+            or not isinstance(sample.active_path_count, int)
+            or isinstance(sample.active_path_count, bool)
+            or sample.active_path_count < 0
             or any(
                 not isinstance(value, int | float) or isinstance(value, bool)
                 for value in numeric_values
@@ -236,19 +280,44 @@ class TelemetryWindow:
                 "Telemetry measurements must be finite, non-negative numbers"
             )
 
+    def _cached_stats(
+        self,
+        branch: str,
+        size: int,
+        samples: deque[TimingSample] | None,
+        now: float,
+        max_age_ms: float | None,
+    ) -> Stats:
+        """Reuse bucket means until samples mutate or the next sample expires."""
+        key = (branch, size, max_age_ms)
+        cached = self._stats_cache.get(key)
+        if cached is not None and now < cached[1]:
+            cached_at, _, stats = cached
+            age_ms = stats[4]
+            if age_ms is not None:
+                age_ms += max(0.0, (now - cached_at) * 1000.0)
+            return (*stats[:4], age_ms, stats[5])
+
+        stats = self._stats(samples, now, max_age_ms)
+        valid_until = math.inf
+        if samples and max_age_ms is not None:
+            max_age_seconds = max_age_ms / 1000.0
+            expirations = [
+                sample.timestamp + max_age_seconds
+                for sample in samples
+                if sample.timestamp + max_age_seconds >= now
+            ]
+            if expirations:
+                valid_until = min(expirations)
+        self._stats_cache[key] = (now, valid_until, stats)
+        return stats
+
     @staticmethod
     def _stats(
         samples: deque[TimingSample] | None,
         now: float,
         max_age_ms: float | None,
-    ) -> tuple[
-        float | None,
-        float | None,
-        float | None,
-        float | None,
-        float | None,
-        int,
-    ]:
+    ) -> Stats:
         if not samples:
             return None, None, None, None, None, 0
         eligible = [

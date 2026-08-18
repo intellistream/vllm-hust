@@ -24,12 +24,15 @@ def test_audit_record_contains_prediction_and_actual_branch(tmp_path) -> None:
             reason="predicted_load_is_lower",
             predicted_load_ms=5.0,
             predicted_recompute_ms=22.0,
+            estimate_source="workload_calibrated_path_completion_mean",
         ),
         observation=MaterializationObservation(
             hit_tokens=256,
             hit_blocks=2,
             kv_bytes=1024,
             active_materialization_count=2,
+            active_load_count=1,
+            active_recompute_count=1,
             load_total_ms=5.0,
             load_service_ms=4.0,
             load_queue_wait_ms=1.0,
@@ -61,6 +64,11 @@ def test_audit_record_contains_prediction_and_actual_branch(tmp_path) -> None:
     assert record.extra_wait_ms == 1.5
     assert record.kv_bytes == 1024
     assert record.active_materialization_count == 2
+    assert record.active_load_count == 1
+    assert record.active_recompute_count == 1
+    assert record.estimate_source == (
+        "workload_calibrated_path_completion_mean"
+    )
     assert "phase_queue=admission_to_service_start" in record.timing_scope
     assert record.queue_wait_isolated is True
     assert record.queue_wait_ms == 1.0

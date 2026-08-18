@@ -41,6 +41,7 @@ def test_request_completion_releases_active_materialization_state() -> None:
     """A completed request cannot keep later dynamic decisions in fallback."""
     connector = object.__new__(DynamicSimpleCPUOffloadConnector)
     connector._decisions = {"req-1": object()}
+    connector._decision_active_path_counts = {"req-1": 2}
     connector._decision_hit_tokens = {"req-1": 256}
     connector._decision_times = {"req-1": 1.0}
     connector._recompute_remaining_tokens = {"req-1": 256}
@@ -49,6 +50,7 @@ def test_request_completion_releases_active_materialization_state() -> None:
     connector._clear_request_state("req-1")
 
     assert connector._decisions == {}
+    assert connector._decision_active_path_counts == {}
     assert connector._decision_hit_tokens == {}
     assert connector._decision_times == {}
     assert connector._recompute_remaining_tokens == {}
@@ -61,6 +63,7 @@ def test_request_finished_clears_plugin_state_after_native_cleanup(
     """Cancellation cannot leave a recompute decision reusable by a later request."""
     connector = object.__new__(DynamicSimpleCPUOffloadConnector)
     connector._decisions = {"req-1": object()}
+    connector._decision_active_path_counts = {"req-1": 2}
     connector._decision_hit_tokens = {"req-1": 256}
     connector._decision_times = {"req-1": 1.0}
     connector._recompute_remaining_tokens = {"req-1": 256}
@@ -77,6 +80,7 @@ def test_request_finished_clears_plugin_state_after_native_cleanup(
 
     assert result == (False, None)
     assert connector._decisions == {}
+    assert connector._decision_active_path_counts == {}
     assert connector._recompute_remaining_tokens == {}
 
 
@@ -94,6 +98,7 @@ def test_worker_sample_returns_actual_cost_to_scheduler_telemetry() -> None:
     """The non-device transport closes the scheduler-to-worker loop."""
     connector = object.__new__(DynamicSimpleCPUOffloadConnector)
     connector._decision_times = {"req-1": 10.0}
+    connector._decision_active_path_counts = {"req-1": 3}
     connector._decisions = {
         "req-1": MaterializationDecision(
             mode="load",
@@ -139,7 +144,7 @@ def test_worker_sample_returns_actual_cost_to_scheduler_telemetry() -> None:
     assert record.actual_branch == "cpu_kv_load"
     assert record.actual_cost_ms is not None
     assert record.queue_wait_ms == pytest.approx(1.0)
-    observation = connector._telemetry.snapshot(256, 2)
+    observation = connector._telemetry.snapshot(256, 2, active_load_count=3)
     assert observation.load_service_ms == pytest.approx(4.0)
     assert observation.load_queue_wait_ms == pytest.approx(1.0)
 
@@ -150,6 +155,7 @@ def test_failed_timing_is_not_reused_as_complete_kv(
     """Interrupted/invalid service evidence is audited but never calibrated."""
     connector = object.__new__(DynamicSimpleCPUOffloadConnector)
     connector._decision_times = {"req-failed": 10.0}
+    connector._decision_active_path_counts = {"req-failed": 2}
     connector._decisions = {
         "req-failed": MaterializationDecision(mode="load", reason="forced")
     }
@@ -177,3 +183,4 @@ def test_failed_timing_is_not_reused_as_complete_kv(
     assert record.status == "invalid"
     assert connector._telemetry.snapshot(256, 2).load_sample_count == 0
     assert "req-failed" not in connector._decisions
+    assert "req-failed" not in connector._decision_active_path_counts

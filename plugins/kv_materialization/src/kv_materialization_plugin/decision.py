@@ -50,6 +50,8 @@ class MaterializationObservation:
     hit_blocks: int
     kv_bytes: int = 0
     active_materialization_count: int = 0
+    active_load_count: int = 0
+    active_recompute_count: int = 0
     load_total_ms: float | None = None
     load_service_ms: float | None = None
     load_queue_wait_ms: float | None = None
@@ -110,6 +112,18 @@ def _validate_observation(
         or observation.active_materialization_count < 0
     ):
         invalid.append("active_materialization_count")
+    for field_name in ("active_load_count", "active_recompute_count"):
+        value = getattr(observation, field_name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            invalid.append(field_name)
+    if (
+        "active_materialization_count" not in invalid
+        and "active_load_count" not in invalid
+        and "active_recompute_count" not in invalid
+        and observation.active_materialization_count
+        != observation.active_load_count + observation.active_recompute_count
+    ):
+        invalid.append("active_materialization_count")
 
     if not _finite_nonnegative(observation.load_total_ms):
         invalid.append("load_total_ms")
@@ -161,13 +175,6 @@ def choose_materialization(
     if not config.enabled:
         return MaterializationDecision(mode=config.fallback_mode, reason="disabled")
 
-    if observation.active_materialization_count > 0:
-        return _fallback(
-            config,
-            "unsupported_concurrent_context",
-            ("active_materialization_count",),
-        )
-
     invalid_fields = _validate_observation(observation, config)
     if invalid_fields:
         confidence_fields = {
@@ -202,12 +209,12 @@ def choose_materialization(
             reason="predicted_load_is_lower",
             predicted_load_ms=predicted_load_ms,
             predicted_recompute_ms=predicted_recompute_ms,
-            estimate_source="path_completion_mean",
+            estimate_source="workload_calibrated_path_completion_mean",
         )
     return MaterializationDecision(
         mode="recompute",
         reason="predicted_recompute_is_not_slower",
         predicted_load_ms=predicted_load_ms,
         predicted_recompute_ms=predicted_recompute_ms,
-        estimate_source="path_completion_mean",
+        estimate_source="workload_calibrated_path_completion_mean",
     )
