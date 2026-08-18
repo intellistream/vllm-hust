@@ -15,6 +15,7 @@ from vllm.compilation.breakable_cudagraph import (
     is_breakable_cudagraph_enabled,
 )
 from vllm.compilation.counter import compilation_counter
+from vllm.compilation.trace import emit_compilation_trace
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
@@ -349,12 +350,77 @@ class CudaGraphManager:
                     uniform_token_count,
                     effective_loras,
                 ):
+                    self._trace_dispatch(
+                        num_reqs=num_reqs,
+                        num_tokens=num_tokens,
+                        uniform_token_count=uniform_token_count,
+                        num_active_loras=num_active_loras,
+                        effective_loras=effective_loras,
+                        selected=desc,
+                    )
                     return desc
-        return BatchExecutionDescriptor(
+        fallback = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_active_loras=effective_loras,
+        )
+        if not self._graphs_captured:
+            fallback_reason = "graphs_not_captured"
+        elif num_tokens <= 0:
+            fallback_reason = "empty_batch"
+        elif key not in self._candidates:
+            fallback_reason = "no_candidate_for_shape"
+        else:
+            fallback_reason = "candidate_incompatible"
+        self._trace_dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            uniform_token_count=uniform_token_count,
+            num_active_loras=num_active_loras,
+            effective_loras=effective_loras,
+            selected=fallback,
+            fallback_reason=fallback_reason,
+        )
+        return fallback
+
+    def _trace_dispatch(
+        self,
+        *,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+        effective_loras: int,
+        selected: BatchExecutionDescriptor,
+        fallback_reason: str | None = None,
+    ) -> None:
+        """Record the actual v2 graph dispatch decision when tracing is enabled.
+
+        This is deliberately best-effort and tensor-free.  In particular, it
+        exposes the decode query length (``K + 1`` for speculative decode), so
+        graph/eager transitions can be attributed to a concrete batch shape.
+        """
+        emit_compilation_trace(
+            "cudagraph_v2_dispatch",
+            requested={
+                "num_reqs": num_reqs,
+                "num_tokens": num_tokens,
+                "uniform_token_count": uniform_token_count,
+                "num_active_loras": num_active_loras,
+                "effective_loras": effective_loras,
+                "decode_query_len": self.decode_query_len,
+            },
+            selected={
+                "mode": selected.cg_mode.name,
+                "num_reqs": selected.num_reqs,
+                "num_tokens": selected.num_tokens,
+                "uniform_token_count": selected.uniform_token_count,
+                "num_active_loras": selected.num_active_loras,
+            },
+            hit=selected.cg_mode != CUDAGraphMode.NONE,
+            fallback_reason=fallback_reason,
+            configured_candidate_count=len(self._candidates),
         )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
