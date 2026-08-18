@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+import json
+import os
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, overload
 
 from vllm import envs
@@ -27,7 +31,55 @@ def _prefix_cache_trace_enabled() -> bool:
     return envs.VLLM_DEBUG_PREFIX_CACHE_TRACE
 
 
-def _kvplane_allows_prefix_cache_write(request: Request) -> bool:
+_kvplane_pressure_epoch_provider: Callable[[], int] | None = None
+_kvplane_last_publication_sequence: dict[tuple[str, str, int], tuple[int, int]] = {}
+_kvplane_observed_pressure_epoch: int | None = None
+_KVPLANE_PRESSURE_EPOCH_FILE_ENV = "VLLM_KVPLANE_PRESSURE_EPOCH_FILE"
+_KVPLANE_PRESSURE_EPOCH_SCHEMA = "kvplane-pressure-epoch.v1"
+
+
+class _KVPlaneFilePressureEpochProvider:
+    """Read a versioned pressure epoch atomically published by the controller."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+
+    def __call__(self) -> int:
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        if payload.get("schema") != _KVPLANE_PRESSURE_EPOCH_SCHEMA:
+            raise ValueError("unsupported KVPlane pressure epoch schema")
+        epoch = payload.get("pressure_epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise ValueError("invalid KVPlane pressure epoch")
+        return epoch
+
+
+def _resolve_kvplane_pressure_epoch_provider() -> Callable[[], int] | None:
+    global _kvplane_pressure_epoch_provider
+    if _kvplane_pressure_epoch_provider is not None:
+        return _kvplane_pressure_epoch_provider
+    epoch_file = os.getenv(_KVPLANE_PRESSURE_EPOCH_FILE_ENV)
+    if not epoch_file:
+        return None
+    _kvplane_pressure_epoch_provider = _KVPlaneFilePressureEpochProvider(epoch_file)
+    return _kvplane_pressure_epoch_provider
+
+
+def install_kvplane_pressure_epoch_provider(
+    provider: Callable[[], int] | None,
+) -> None:
+    """Install the runtime-owned pressure epoch source."""
+    global _kvplane_observed_pressure_epoch, _kvplane_pressure_epoch_provider
+    _kvplane_pressure_epoch_provider = provider
+    _kvplane_observed_pressure_epoch = None
+    _kvplane_last_publication_sequence.clear()
+
+
+def _kvplane_allows_prefix_cache_write(
+    request: Request,
+    *,
+    publication_sequence: int | None = None,
+) -> bool:
     """Return whether KVPlane allows this request to write reusable KV state."""
     sampling_params = getattr(request, "sampling_params", None)
     extra_args = getattr(sampling_params, "extra_args", None) or {}
@@ -37,12 +89,79 @@ def _kvplane_allows_prefix_cache_write(request: Request) -> bool:
     if value is None:
         return True
     if isinstance(value, str):
-        return value.strip().lower() not in {"0", "false", "no", "deny", "skip"}
-    return bool(value)
+        allowed = value.strip().lower() not in {"0", "false", "no", "deny", "skip"}
+    else:
+        allowed = bool(value)
+    if not allowed:
+        return False
+
+    lease_id = extra_args.get("kvplane_admission_lease_id")
+    if lease_id is None:
+        return True
+    pressure_epoch_provider = _resolve_kvplane_pressure_epoch_provider()
+    if pressure_epoch_provider is None:
+        return False
+    if str(extra_args.get("kvplane_admission_request_id", "")) != request.request_id:
+        return False
+    try:
+        lease_epoch = int(extra_args["kvplane_admission_epoch"])
+        issued_at_ns = int(extra_args["kvplane_admission_issued_at_ns"])
+        expires_at_ns = int(extra_args["kvplane_admission_expires_at_ns"])
+        current_epoch = int(pressure_epoch_provider())
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    now_ns = time.monotonic_ns()
+    global _kvplane_observed_pressure_epoch
+    if current_epoch != _kvplane_observed_pressure_epoch:
+        _kvplane_last_publication_sequence.clear()
+        _kvplane_observed_pressure_epoch = current_epoch
+    expired = [
+        key
+        for key, (_sequence, expiry_ns) in _kvplane_last_publication_sequence.items()
+        if expiry_ns <= now_ns
+    ]
+    for key in expired:
+        _kvplane_last_publication_sequence.pop(key, None)
+    if lease_epoch != current_epoch:
+        return False
+    if now_ns < issued_at_ns or now_ns >= expires_at_ns:
+        return False
+    lease_key = (request.request_id, str(lease_id), lease_epoch)
+    if publication_sequence is not None:
+        if publication_sequence is None or publication_sequence < 0:
+            return False
+        previous = _kvplane_last_publication_sequence.get(lease_key)
+        if previous is not None and publication_sequence <= previous[0]:
+            return False
+    return True
 
 
-def _kvplane_denies_prefix_cache_write(request: Request) -> bool:
-    return not _kvplane_allows_prefix_cache_write(request)
+def _kvplane_record_prefix_cache_publication(
+    request: Request, publication_sequence: int
+) -> None:
+    """Record a lease publication only after the native cache mutation succeeds."""
+    extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+    lease_id = extra_args.get("kvplane_admission_lease_id")
+    if lease_id is None:
+        return
+    lease_epoch = int(extra_args["kvplane_admission_epoch"])
+    expires_at_ns = int(extra_args["kvplane_admission_expires_at_ns"])
+    lease_key = (request.request_id, str(lease_id), lease_epoch)
+    _kvplane_last_publication_sequence[lease_key] = (
+        publication_sequence,
+        expires_at_ns,
+    )
+
+
+def _kvplane_denies_prefix_cache_write(
+    request: Request,
+    *,
+    publication_sequence: int | None = None,
+) -> bool:
+    return not _kvplane_allows_prefix_cache_write(
+        request,
+        publication_sequence=publication_sequence,
+    )
 
 
 def _count_block_groups(block_groups: Sequence[Sequence[KVCacheBlock]]) -> int:
@@ -713,7 +832,10 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
-            if _kvplane_denies_prefix_cache_write(request):
+            if _kvplane_denies_prefix_cache_write(
+                request,
+                publication_sequence=num_computed_tokens,
+            ):
                 logger.info(
                     "KVPlane prefix cache write denied request_id=%s "
                     "num_tokens=%d num_computed_tokens=%d",
@@ -725,6 +847,7 @@ class KVCacheManager:
             num_cached_blocks = self.coordinator.cache_blocks(
                 request, num_computed_tokens
             )
+            _kvplane_record_prefix_cache_publication(request, num_computed_tokens)
             if _prefix_cache_trace_enabled():
                 logger.info(
                     "Prefix cache trace commit request_id=%s num_tokens=%d "
