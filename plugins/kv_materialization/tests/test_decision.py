@@ -48,6 +48,19 @@ def test_dynamic_load_uses_end_to_end_time() -> None:
     assert decision.fallback is False
 
 
+def test_dynamic_recompute_uses_end_to_end_time_without_overlap() -> None:
+    """Recompute wins in an ordinary serial observation when it is faster."""
+    decision = choose_materialization(
+        make_observation(load_total_ms=25.0, recompute_total_ms=20.0),
+        MaterializationDecisionConfig(enabled=True),
+    )
+
+    assert decision.mode == "recompute"
+    assert decision.fallback is False
+    assert decision.predicted_load_ms == pytest.approx(25.0)
+    assert decision.predicted_recompute_ms == pytest.approx(20.0)
+
+
 def test_equal_prediction_deterministically_chooses_recompute() -> None:
     """Equal predictions use one deterministic side of the boundary."""
     decision = choose_materialization(
@@ -94,6 +107,23 @@ def test_inconsistent_active_path_counts_fall_back() -> None:
     assert decision.fallback is True
     assert decision.reason == "invalid_or_missing_observation"
     assert decision.invalid_fields == ("active_materialization_count",)
+
+
+def test_large_consistent_active_counts_do_not_change_the_choice() -> None:
+    """Current concurrency counts are diagnostic, not prediction inputs."""
+    decision = choose_materialization(
+        make_observation(
+            active_materialization_count=100,
+            active_load_count=40,
+            active_recompute_count=60,
+            load_total_ms=5.0,
+            recompute_total_ms=22.0,
+        ),
+        MaterializationDecisionConfig(enabled=True),
+    )
+
+    assert decision.mode == "load"
+    assert decision.fallback is False
 
 
 @pytest.mark.parametrize("forced_mode", ["load", "recompute"])
@@ -156,6 +186,60 @@ def test_invalid_or_stale_observation_falls_back(field: str, value: object) -> N
     assert decision.mode == "load"
     assert decision.fallback is True
     assert decision.invalid_fields
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"load_total_ms": None, "load_sample_count": 0},
+        {"recompute_total_ms": None, "recompute_sample_count": 0},
+    ],
+)
+def test_one_missing_branch_uses_configured_fallback(
+    overrides: dict[str, object],
+) -> None:
+    """The selector never compares one prediction against a missing branch."""
+    decision = choose_materialization(
+        make_observation(**overrides),
+        MaterializationDecisionConfig(enabled=True, fallback_mode="recompute"),
+    )
+
+    assert decision.mode == "recompute"
+    assert decision.fallback is True
+
+
+def test_minimum_sample_boundary_is_inclusive() -> None:
+    """Exactly the configured number of samples is sufficient."""
+    config = MaterializationDecisionConfig(
+        enabled=True,
+        min_copy_samples=3,
+        min_recompute_samples=3,
+    )
+
+    accepted = choose_materialization(make_observation(), config)
+    rejected = choose_materialization(
+        make_observation(load_sample_count=2),
+        config,
+    )
+
+    assert accepted.fallback is False
+    assert rejected.fallback is True
+    assert rejected.reason == "insufficient_observation_confidence"
+
+
+def test_service_diagnostics_do_not_replace_total_time() -> None:
+    """Only total path-completion means determine the selected branch."""
+    decision = choose_materialization(
+        make_observation(
+            load_total_ms=10.0,
+            load_service_ms=1000.0,
+            recompute_total_ms=20.0,
+            recompute_service_ms=1.0,
+        ),
+        MaterializationDecisionConfig(enabled=True),
+    )
+
+    assert decision.mode == "load"
 
 
 def test_end_to_end_prediction_is_recorded() -> None:

@@ -56,6 +56,38 @@ def test_snapshot_does_not_reuse_a_different_size_bucket() -> None:
     assert observation.recompute_sample_count == 0
 
 
+def test_same_load_block_bucket_does_not_reuse_recompute_tokens() -> None:
+    """Load and recompute retain their actual, different size keys."""
+    telemetry = TelemetryWindow()
+    telemetry.observe_load(2, total_ms=5.0, service_ms=4.0, queue_wait_ms=1.0)
+    telemetry.observe_recompute(
+        256, total_ms=22.0, service_ms=20.0, queue_wait_ms=2.0
+    )
+
+    observation = telemetry.snapshot(300, 2)
+
+    assert observation.load_total_ms == pytest.approx(5.0)
+    assert observation.load_sample_count == 1
+    assert observation.recompute_total_ms is None
+    assert observation.recompute_sample_count == 0
+
+
+def test_same_recompute_token_bucket_does_not_reuse_load_blocks() -> None:
+    """A recompute token match cannot fill a missing load-size bucket."""
+    telemetry = TelemetryWindow()
+    telemetry.observe_load(2, total_ms=5.0, service_ms=4.0, queue_wait_ms=1.0)
+    telemetry.observe_recompute(
+        256, total_ms=22.0, service_ms=20.0, queue_wait_ms=2.0
+    )
+
+    observation = telemetry.snapshot(256, 3)
+
+    assert observation.load_total_ms is None
+    assert observation.load_sample_count == 0
+    assert observation.recompute_total_ms == pytest.approx(22.0)
+    assert observation.recompute_sample_count == 1
+
+
 def test_snapshot_aggregates_admission_positions_in_the_matched_workload() -> None:
     """The estimator captures the workload instead of one greedy queue depth."""
     telemetry = TelemetryWindow()
@@ -152,6 +184,42 @@ def test_many_overlapping_requests_can_keep_choosing_recompute() -> None:
     assert active_recompute_count == 8
 
 
+def test_many_overlapping_requests_can_keep_choosing_load() -> None:
+    """A lower workload-wide load mean applies at every admission position."""
+    telemetry = TelemetryWindow()
+    for depth in range(8):
+        telemetry.observe_load(
+            2,
+            20.0 + depth,
+            18.0,
+            queue_wait_ms=2.0 + depth,
+            active_path_count=depth,
+        )
+        telemetry.observe_recompute(
+            256,
+            50.0 + depth,
+            45.0,
+            queue_wait_ms=5.0 + depth,
+            active_path_count=depth,
+        )
+
+    config = MaterializationDecisionConfig(enabled=True)
+    decisions = [
+        choose_materialization(
+            telemetry.snapshot(
+                256,
+                2,
+                active_load_count=depth,
+                active_recompute_count=0,
+            ),
+            config,
+        ).mode
+        for depth in range(8)
+    ]
+
+    assert decisions == ["load"] * 8
+
+
 def test_workload_mean_avoids_greedy_low_depth_load_choices() -> None:
     """A cheap first load cannot override worse load behavior for the batch."""
     telemetry = TelemetryWindow()
@@ -215,6 +283,48 @@ def test_cached_stats_are_invalidated_by_a_new_sample() -> None:
     telemetry.observe_load(2, 15.0, 14.0, queue_wait_ms=1.0)
 
     assert telemetry.snapshot(256, 2).load_total_ms == pytest.approx(10.0)
+
+
+def test_bucket_window_evicts_the_oldest_samples() -> None:
+    """Each exact-size bucket retains only the configured recent window."""
+    telemetry = TelemetryWindow(max_samples=2)
+    telemetry.observe_load(2, 100.0, 90.0, queue_wait_ms=10.0)
+    telemetry.observe_load(2, 20.0, 18.0, queue_wait_ms=2.0)
+    telemetry.observe_load(2, 10.0, 9.0, queue_wait_ms=1.0)
+
+    observation = telemetry.snapshot(256, 2)
+
+    assert observation.load_sample_count == 2
+    assert observation.load_total_ms == pytest.approx(15.0)
+
+
+def test_mixed_sizes_remain_independent_during_overlap() -> None:
+    """Concurrent diagnostics do not merge distinct exact-size buckets."""
+    telemetry = TelemetryWindow()
+    telemetry.observe_load(2, 5.0, 4.0, queue_wait_ms=1.0)
+    telemetry.observe_load(4, 15.0, 13.0, queue_wait_ms=2.0)
+    telemetry.observe_recompute(256, 22.0, 20.0, queue_wait_ms=2.0)
+    telemetry.observe_recompute(512, 12.0, 10.0, queue_wait_ms=2.0)
+
+    short = telemetry.snapshot(
+        256,
+        2,
+        active_load_count=1,
+        active_recompute_count=1,
+    )
+    long = telemetry.snapshot(
+        512,
+        4,
+        active_load_count=1,
+        active_recompute_count=1,
+    )
+
+    assert choose_materialization(
+        short, MaterializationDecisionConfig(enabled=True)
+    ).mode == "load"
+    assert choose_materialization(
+        long, MaterializationDecisionConfig(enabled=True)
+    ).mode == "recompute"
 
 
 def test_cached_stats_expire_at_the_sample_freshness_boundary(

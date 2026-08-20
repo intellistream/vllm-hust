@@ -72,6 +72,62 @@ Example extra configuration:
 }
 ```
 
+## Enable the calibrated-mean decision
+
+Put both the plugin source tree and the matching `vllm-hust` checkout on
+`PYTHONPATH`, then select the external connector in `--kv-transfer-config`.
+Dynamic mode also needs a telemetry file containing fresh samples for both
+forced branches at the exact workload sizes that will be served:
+
+```bash
+export PYTHONPATH=/path/to/vllm-hust/plugins/kv_materialization/src:/path/to/vllm-hust
+
+vllm serve /path/to/model \
+  --enable-prefix-caching \
+  --kv-transfer-config '{
+    "kv_connector":"DynamicSimpleCPUOffloadConnector",
+    "kv_connector_module_path":"kv_materialization_plugin.connector",
+    "kv_role":"kv_both",
+    "kv_connector_extra_config":{
+      "materialization_mode":"dynamic",
+      "fallback_mode":"load",
+      "min_copy_samples":3,
+      "min_recompute_samples":3,
+      "max_observation_age_ms":7200000,
+      "sample_window_size":256,
+      "cpu_bytes_to_use":34359738368,
+      "telemetry_input_path":"/path/to/calibration.json",
+      "telemetry_output_path":"/path/to/runtime-telemetry.json",
+      "audit_enabled":true,
+      "audit_output_path":"/path/to/audit.jsonl"
+    }
+  }'
+```
+
+`materialization_mode=load` and `materialization_mode=recompute` force one
+branch and collect its measurements. Dynamic mode cannot infer the missing
+branch during cold start: if either exact-size bucket lacks enough fresh
+samples, it uses `fallback_mode`. The parent repository runner performs the
+required forced-load/forced-recompute calibration, freezes the merged
+telemetry, and then starts dynamic mode with that file:
+
+```bash
+python experiments/scripts/kv_materialization/run_m1.py \
+  --suite --run \
+  --config experiments/configs/kv_materialization/m1_saturated.json \
+  --workload experiments/workloads/kv_materialization/m1_short_single_request.json \
+  --model /path/to/model \
+  --model-id Qwen/Qwen2.5-3B-Instruct \
+  --suite-repetitions 3 \
+  --calibration-repetitions 3
+```
+
+Calibration is workload-specific. Serial and concurrent workloads must use
+separate calibration files, and a concurrent workload must keep the same
+request-size multiset and concurrency pattern across forced and dynamic
+lifecycles. Active-path counts are audited but do not alter the prediction;
+the decision compares exact-size workload means.
+
 Set `kv_bytes_per_block` when the deployment can provide the KV footprint per
 scheduler block. The value is retained in telemetry for audit and later
 calibration; it is not used to replace the measured end-to-end cost.
