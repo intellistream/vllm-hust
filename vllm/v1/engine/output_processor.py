@@ -38,6 +38,10 @@ from vllm.v1.engine import (
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.request_lifecycle_hooks import (
+    observe_abort_attempt,
+    observe_request_terminal,
+)
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -482,7 +486,13 @@ class OutputProcessor:
             assert state.queue is not None
             state.queue.put(e)
 
-    def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
+    def abort_requests(
+        self,
+        request_ids: Iterable[str],
+        internal: bool,
+        *,
+        terminal_cause: str = "explicit_cancel",
+    ) -> list[str]:
         """Abort a list of requests.
 
         The request_ids may be either external request IDs (those passed to
@@ -516,8 +526,10 @@ class OutputProcessor:
 
         request_ids_to_abort = []
         for request_id in internal_req_ids:
+            observe_abort_attempt(request_id)
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
+                observe_request_terminal(request_id, terminal_cause)
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
@@ -539,7 +551,11 @@ class OutputProcessor:
                 # Abort children prior to removing the parent.
                 if parent.child_requests:
                     child_reqs = list(parent.child_requests)
-                    child_reqs = self.abort_requests(child_reqs, internal=True)
+                    child_reqs = self.abort_requests(
+                        child_reqs,
+                        internal=True,
+                        terminal_cause=terminal_cause,
+                    )
                     request_ids_to_abort.extend(child_reqs)
                 self.parent_requests.pop(request_id, None)
         return request_ids_to_abort
@@ -739,6 +755,20 @@ class OutputProcessor:
                     else:
                         req_state.input_chunk_queue = None
                 else:
+                    generated_tokens_total = (
+                        len(req_state.detokenizer.output_token_ids)
+                        if req_state.detokenizer is not None
+                        else 0
+                    )
+                    observe_request_terminal(
+                        req_id,
+                        (
+                            "explicit_cancel"
+                            if finish_reason == FinishReason.ABORT
+                            else "complete"
+                        ),
+                        generated_tokens_total=generated_tokens_total,
+                    )
                     self._finish_request(req_state)
                     if not engine_core_output.finished:
                         # If req not finished in EngineCore, but Detokenizer

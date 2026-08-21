@@ -43,6 +43,11 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.request_lifecycle_hooks import (
+    observe_engine_failure,
+    observe_request_started,
+    observe_request_terminal,
+)
 from vllm.v1.executor import Executor
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
@@ -407,6 +412,7 @@ class AsyncLLM(EngineClient):
     ):
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        observe_request_started(request.request_id)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
@@ -590,13 +596,19 @@ class AsyncLLM(EngineClient):
         # we abort the request if we end up here.
         except (asyncio.CancelledError, GeneratorExit):
             if q is not None:
-                await self.abort(q.request_id, internal=True)
+                await self.abort(
+                    q.request_id,
+                    internal=True,
+                    terminal_cause="client_disconnect",
+                )
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
             raise
 
         # Engine is dead. Do not abort since we shut down.
         except EngineDeadError:
+            if q is not None:
+                observe_request_terminal(q.request_id, "engine_failure")
             if self.log_requests:
                 logger.info("Request %s failed (engine dead).", request_id)
             raise
@@ -610,7 +622,7 @@ class AsyncLLM(EngineClient):
         # Error from input stream generator - propagate directly.
         except InputStreamError as e:
             if q is not None:
-                await self.abort(q.request_id, internal=True)
+                await self.abort(q.request_id, internal=True, terminal_cause="error")
             if self.log_requests:
                 logger.info("Request %s failed (input error): %s.", request_id, e)
             raise e.cause from e
@@ -618,7 +630,7 @@ class AsyncLLM(EngineClient):
         # Unexpected error in the generate() task (possibly recoverable).
         except Exception as e:
             if q is not None:
-                await self.abort(q.request_id, internal=True)
+                await self.abort(q.request_id, internal=True, terminal_cause="error")
             if self.log_requests:
                 try:
                     s = f"{e.__class__.__name__}: {e}"
@@ -702,19 +714,26 @@ class AsyncLLM(EngineClient):
                         )
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
+                observe_engine_failure(tuple(output_processor.request_states))
                 output_processor.propagate_error(e)
 
         self.output_handler = asyncio.create_task(output_handler())
 
     async def abort(
-        self, request_id: str | Iterable[str], internal: bool = False
+        self,
+        request_id: str | Iterable[str],
+        internal: bool = False,
+        *,
+        terminal_cause: str = "explicit_cancel",
     ) -> None:
         """Abort RequestId in OutputProcessor and EngineCore."""
 
         request_ids = (
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
         )
-        all_request_ids = self.output_processor.abort_requests(request_ids, internal)
+        all_request_ids = self.output_processor.abort_requests(
+            request_ids, internal, terminal_cause=terminal_cause
+        )
         await self.engine_core.abort_requests_async(all_request_ids)
 
         if self.log_requests:

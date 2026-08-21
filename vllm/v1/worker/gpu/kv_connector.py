@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,6 +17,7 @@ from vllm.forward_context import (
     is_forward_context_available,
     set_forward_context,
 )
+from vllm.logger import init_logger
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     KVConnectorOutput,
@@ -25,11 +27,18 @@ from vllm.v1.outputs import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
+logger = init_logger(__name__)
+
 
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
 
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
+        pass
+
+    def observe_kv_recovery_first_compute(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
         pass
 
     def post_forward(
@@ -73,6 +82,20 @@ class ActiveKVConnector(KVConnector):
         else:
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(get_forward_context())
+
+    def observe_kv_recovery_first_compute(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        if self._disabled:
+            return
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KV-recovery model-runner observe called, scheduled=%s",
+                sorted(scheduler_output.num_scheduled_tokens),
+            )
+        self.kv_connector.observe_kv_recovery_first_compute(
+            scheduler_output.num_scheduled_tokens,
+        )
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True

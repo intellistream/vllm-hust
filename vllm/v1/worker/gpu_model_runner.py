@@ -4278,6 +4278,7 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            self.observe_kv_recovery_first_compute(scheduler_output)
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

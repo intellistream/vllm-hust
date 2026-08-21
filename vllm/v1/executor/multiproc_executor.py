@@ -59,6 +59,9 @@ from vllm.utils.system_utils import (
     set_process_title,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.engine.request_lifecycle_hooks import (
+    observe_worker_generation_exit,
+)
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
@@ -280,7 +283,13 @@ class MultiprocExecutor(Executor):
                 logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
                 return
             _self.is_failed = True
-            proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
+            dead_worker = next(h for h in workers if h.proc.sentinel == died[0])
+            proc_name = dead_worker.proc.name
+            observe_worker_generation_exit(
+                proc_name,
+                worker_pid=dead_worker.proc.pid,
+                exit_code=dead_worker.proc.exitcode,
+            )
             logger.error(
                 "Worker proc %s died unexpectedly, shutting down executor.", proc_name
             )
