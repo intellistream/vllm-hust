@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from collections import defaultdict
 from unittest.mock import MagicMock
 
@@ -445,3 +446,62 @@ def test_register_kv_caches_uniform_type(backend):
     assert group_refs[1] == CanonicalKVCacheRef(
         tensor_idx=1, page_size_bytes=spec_b.page_size_bytes
     )
+
+
+@pytest.mark.skip_global_cleanup
+def test_register_kv_caches_with_separate_kv_tensors():
+    """Canonicalize Ascend's separately allocated K and V tensors."""
+    layer_name = "model.layers.0.self_attn"
+    attn_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    component_shape = (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+    component_numel = math.prod(component_shape)
+
+    # Ascend aligns each allocation and slices it back, so the resulting
+    # tensor can have a non-zero storage offset and trailing storage padding.
+    k_storage = torch.empty(component_numel + 5, dtype=DTYPE)
+    v_storage = torch.empty(component_numel + 7, dtype=DTYPE)
+    k_cache = k_storage[3 : 3 + component_numel].view(component_shape)
+    v_cache = v_storage[4 : 4 + component_numel].view(component_shape)
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=attn_spec.page_size_bytes * NUM_BLOCKS,
+                shared_by=[layer_name],
+            )
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=[layer_name],
+                kv_cache_spec=attn_spec,
+            )
+        ],
+    )
+
+    worker, spec = _make_worker(kv_cache_config)
+    worker.register_kv_caches({layer_name: (k_cache, v_cache)})
+
+    canonical = spec.get_handlers.call_args[0][0]
+    component_page_size = attn_spec.page_size_bytes // 2
+    assert [entry.tensor.shape for entry in canonical.tensors] == [
+        (NUM_BLOCKS, component_page_size),
+        (NUM_BLOCKS, component_page_size),
+    ]
+    assert [entry.page_size_bytes for entry in canonical.tensors] == [
+        component_page_size,
+        component_page_size,
+    ]
+    assert canonical.tensors[0].tensor.data_ptr() == k_cache.data_ptr()
+    assert canonical.tensors[1].tensor.data_ptr() == v_cache.data_ptr()
+    assert canonical.group_data_refs == [
+        [
+            CanonicalKVCacheRef(0, component_page_size),
+            CanonicalKVCacheRef(1, component_page_size),
+        ]
+    ]

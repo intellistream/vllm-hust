@@ -270,16 +270,20 @@ class OffloadingConnectorWorker:
             self.worker.register_handler(src_cls, dst_cls, handler)
 
     def register_kv_caches(
-        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+        self,
+        kv_caches: dict[
+            str,
+            torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+        ],
     ):
         num_blocks = self.spec.kv_cache_config.num_blocks
 
         # layer_name -> (num_blocks, page_size_bytes) tensor
         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
-        # layer_name -> size of (un-padded) page in bytes
-        unpadded_page_size_bytes: dict[str, int] = {}
-        # layer_name -> size of page in bytes
-        page_size_bytes: dict[str, int] = {}
+        # layer_name -> per-tensor size of (un-padded) page in bytes
+        unpadded_page_size_bytes: dict[str, tuple[int, ...]] = {}
+        # layer_name -> per-tensor size of page in bytes
+        page_size_bytes: dict[str, tuple[int, ...]] = {}
         for kv_cache_group in self.spec.kv_cache_config.kv_cache_groups:
             group_layer_names = kv_cache_group.layer_names
             group_kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -293,24 +297,67 @@ class OffloadingConnectorWorker:
                 )
                 if isinstance(layer_kv_cache_spec, AttentionSpec):
                     layer_kv_cache = kv_caches[layer_name]
-                    assert isinstance(layer_kv_cache, torch.Tensor)
-                    assert layer_kv_cache.storage_offset() == 0
+                    if isinstance(layer_kv_cache, torch.Tensor):
+                        assert layer_kv_cache.storage_offset() == 0
 
-                    storage = layer_kv_cache.untyped_storage()
-                    page = layer_kv_cache_spec.page_size_bytes
-                    tensors_per_block[layer_name] = (
-                        torch.tensor(
-                            [],
-                            dtype=torch.int8,
-                            device=layer_kv_cache.device,
+                        storage = layer_kv_cache.untyped_storage()
+                        page = layer_kv_cache_spec.page_size_bytes
+                        tensors_per_block[layer_name] = (
+                            torch.tensor(
+                                [],
+                                dtype=torch.int8,
+                                device=layer_kv_cache.device,
+                            )
+                            .set_(storage)
+                            .view(num_blocks, page),
                         )
-                        .set_(storage)
-                        .view(num_blocks, page),
-                    )
-                    page_size_bytes[layer_name] = layer_kv_cache_spec.page_size_bytes
-                    unpadded_page_size_bytes[layer_name] = (
-                        layer_kv_cache_spec.real_page_size_bytes
-                    )
+                        page_size_bytes[layer_name] = (page,)
+                        unpadded_page_size_bytes[layer_name] = (
+                            layer_kv_cache_spec.real_page_size_bytes,
+                        )
+                    else:
+                        # Ascend exposes K and V as separately allocated,
+                        # blocks-outermost tensors. Preserve every component
+                        # and ignore alignment padding outside the tensor view.
+                        assert isinstance(layer_kv_cache, tuple)
+                        assert layer_kv_cache
+                        block_tensors = []
+                        padded_sizes = []
+                        unpadded_sizes = []
+                        for tensor in layer_kv_cache:
+                            assert isinstance(tensor, torch.Tensor)
+                            assert tensor.ndim >= 1
+                            assert tensor.shape[0] >= num_blocks
+                            assert tensor[0].is_contiguous()
+
+                            element_size = tensor.element_size()
+                            padded_size = tensor.stride(0) * element_size
+                            unpadded_size = tensor[0].numel() * element_size
+                            assert unpadded_size <= padded_size
+                            storage_offset = tensor.storage_offset() * element_size
+                            block_tensor = torch.empty(
+                                0,
+                                dtype=torch.int8,
+                                device=tensor.device,
+                            ).set_(
+                                tensor.untyped_storage(),
+                                storage_offset,
+                                (num_blocks, padded_size),
+                                (padded_size, 1),
+                            )
+                            block_tensors.append(block_tensor)
+                            padded_sizes.append(padded_size)
+                            unpadded_sizes.append(unpadded_size)
+
+                        assert sum(padded_sizes) == (
+                            layer_kv_cache_spec.page_size_bytes
+                        )
+                        assert sum(unpadded_sizes) == (
+                            layer_kv_cache_spec.real_page_size_bytes
+                        )
+                        tensors_per_block[layer_name] = tuple(block_tensors)
+                        page_size_bytes[layer_name] = tuple(padded_sizes)
+                        unpadded_page_size_bytes[layer_name] = tuple(unpadded_sizes)
 
                 elif isinstance(layer_kv_cache_spec, MambaSpec):
                     state_tensors = kv_caches[layer_name]
@@ -332,10 +379,13 @@ class OffloadingConnectorWorker:
                     )
                     tensors_per_block[layer_name] = (tensor,)
 
-                    page_size_bytes[layer_name] = layer_kv_cache_spec.page_size_bytes
-                    unpadded_page_size_bytes[layer_name] = replace(
-                        layer_kv_cache_spec, page_size_padded=None
-                    ).page_size_bytes
+                    page_size_bytes[layer_name] = (layer_kv_cache_spec.page_size_bytes,)
+                    unpadded_page_size_bytes[layer_name] = (
+                        replace(
+                            layer_kv_cache_spec,
+                            page_size_padded=None,
+                        ).page_size_bytes,
+                    )
 
                 else:
                     raise NotImplementedError
@@ -356,21 +406,38 @@ class OffloadingConnectorWorker:
 
             # verify all layers in the group reference the exact same tensors
             assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-            assert (
-                len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
-                == 1
-            )
-            assert (
-                len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
-            )
+            tensor_count = len(tensors_per_block[tensor_layer_names[0]])
+            for tensor_idx in range(tensor_count):
+                assert (
+                    len(
+                        {
+                            tensors_per_block[n][tensor_idx].data_ptr()
+                            for n in tensor_layer_names
+                        }
+                    )
+                    == 1
+                )
+                assert (
+                    len(
+                        {
+                            tensors_per_block[n][tensor_idx].stride()
+                            for n in tensor_layer_names
+                        }
+                    )
+                    == 1
+                )
 
             # pick the first layer to represent the group
             first_layer_name = tensor_layer_names[0]
-            for tensor in tensors_per_block[first_layer_name]:
+            tensor_entries = zip(
+                tensors_per_block[first_layer_name],
+                page_size_bytes[first_layer_name],
+            )
+            for data_ref_idx, (tensor, tensor_page_size) in enumerate(tensor_entries):
                 block_tensors.append(
                     CanonicalKVCacheTensor(
                         tensor=tensor,
-                        page_size_bytes=page_size_bytes[first_layer_name],
+                        page_size_bytes=tensor_page_size,
                     )
                 )
 
@@ -379,7 +446,9 @@ class OffloadingConnectorWorker:
                     block_data_refs[layer_name].append(
                         CanonicalKVCacheRef(
                             tensor_idx=curr_tensor_idx,
-                            page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                            page_size_bytes=(
+                                unpadded_page_size_bytes[layer_name][data_ref_idx]
+                            ),
                         )
                     )
 
