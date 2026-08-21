@@ -46,7 +46,7 @@ class RecordingSchedulerObserver:
         self.admission_starts: list[tuple[str, int]] = []
         self.admissions: list[tuple[str, int, str]] = []
         self.requeues: list[tuple[str, int, str]] = []
-        self.terminals: list[str] = []
+        self.terminals: list[tuple[str, str, int]] = []
         self.runtime_events: list[tuple[str, str, int | None]] = []
         self.receipt_ready_request_ids: set[str] = set()
         self.reset_thresholds: list[int] = []
@@ -165,8 +165,12 @@ class RecordingSchedulerObserver:
         self.requeues.append((runtime_request_id, recovery_epoch, reason))
         self.runtime_events.append(("requeued", runtime_request_id, recovery_epoch))
 
-    def request_terminal(self, runtime_request_id):
-        self.terminals.append(runtime_request_id)
+    def request_terminal(
+        self, runtime_request_id, terminal_cause, generated_tokens_total
+    ):
+        self.terminals.append(
+            (runtime_request_id, terminal_cause, generated_tokens_total)
+        )
         self.runtime_events.append(("terminal", runtime_request_id, None))
 
     def reset(self, stale_job_threshold):
@@ -445,6 +449,7 @@ def test_pressure_preemption_preserves_identity_through_real_connector_path(
     assert event_names.index("admission_started") < event_names.index("admitted")
 
 
+@pytest.mark.skip_global_cleanup
 def test_scheduler_observer_failure_is_fail_open(
     request_runner,
     monkeypatch: pytest.MonkeyPatch,
@@ -473,7 +478,7 @@ def test_scheduler_observer_failure_is_fail_open(
     )
 
     assert factory.worker.contexts == []
-    assert factory.scheduler.terminals == ["0"]
+    assert factory.scheduler.terminals == [("0", "complete", 1)]
 
 
 def test_post_wakeup_requeue_requires_matching_ready_epoch():

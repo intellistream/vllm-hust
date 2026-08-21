@@ -444,7 +444,12 @@ class KVRecoverySchedulerObserver(Protocol):
         prompt_tokens_cached: int,
     ) -> KVRecoveryComputeContext | None: ...
 
-    def request_terminal(self, runtime_request_id: str) -> None: ...
+    def request_terminal(
+        self,
+        runtime_request_id: str,
+        terminal_cause: str,
+        generated_tokens_total: int,
+    ) -> None: ...
 
     def reset(self, stale_job_threshold: int) -> None: ...
 

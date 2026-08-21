@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -1312,8 +1313,20 @@ class OffloadingConnectorScheduler:
         observer = self._kv_recovery_observer
         if observer is not None:
             self._kv_recovery_receipt_ready.pop(request.request_id, None)
+            finish_reason = request.get_finished_reason()
+            terminal_cause = (
+                "explicit_cancel"
+                if finish_reason == FinishReason.ABORT
+                else "error"
+                if finish_reason == FinishReason.ERROR
+                else "complete"
+            )
             with suppress(Exception):
-                observer.request_terminal(request.request_id)
+                observer.request_terminal(
+                    request.request_id,
+                    terminal_cause,
+                    request.num_output_tokens,
+                )
 
         # TODO(orozery): possibly kickoff offload for last block
         # which may have been deferred due to async scheduling
