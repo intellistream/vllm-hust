@@ -35,11 +35,34 @@ from vllm.v1.kv_offload.worker.worker import (
 logger = init_logger(__name__)
 
 
+def _npu_swap_blocks_batch(
+    batch_src: torch.Tensor,
+    batch_dst: torch.Tensor,
+    batch_sizes: torch.Tensor,
+    *,
+    direction: int,
+    **_kwargs,
+) -> None:
+    """Dispatch pointer batches through the Ascend plugin's DMA operator."""
+
+    torch.ops._C_ascend.swap_blocks_batch(
+        batch_src,
+        batch_dst,
+        batch_sizes,
+        direction,
+    )
+
+
 def _select_swap_blocks_fn(
     kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
     gpu_to_cpu: bool,
 ):
     """Resolve the swap_blocks function for a handler at init time."""
+    if current_platform.device_type == "npu":
+        return functools.partial(
+            _npu_swap_blocks_batch,
+            direction=1 if gpu_to_cpu else 0,
+        )
     # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
     if gpu_to_cpu:
         return ops.swap_blocks_batch
@@ -203,7 +226,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         for gpu_tensor, cpu_tensor in zip(gpu_tensors, cpu_tensors):
             assert gpu_tensor.dtype == torch.int8
             assert gpu_tensor.ndim == 2
-            assert gpu_tensor.is_cuda or gpu_tensor.is_xpu
+            assert gpu_tensor.device.type in {"cuda", "xpu", "npu"}
             assert cpu_tensor.dtype == torch.int8
             assert cpu_tensor.ndim == 2
             assert cpu_tensor.device.type == "cpu"

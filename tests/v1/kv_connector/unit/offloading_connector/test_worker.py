@@ -505,3 +505,31 @@ def test_register_kv_caches_with_separate_kv_tensors():
             CanonicalKVCacheRef(1, component_page_size),
         ]
     ]
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(("gpu_to_cpu", "direction"), [(True, 1), (False, 0)])
+def test_select_swap_blocks_uses_ascend_dma_direction(
+    monkeypatch: pytest.MonkeyPatch,
+    gpu_to_cpu: bool,
+    direction: int,
+):
+    from vllm.v1.kv_offload.cpu import gpu_worker
+
+    swap_blocks = MagicMock()
+    monkeypatch.setattr(gpu_worker.current_platform, "device_type", "npu")
+    monkeypatch.setattr(gpu_worker, "_npu_swap_blocks_batch", swap_blocks)
+
+    selected = gpu_worker._select_swap_blocks_fn([], gpu_to_cpu)
+    src = torch.empty(1, dtype=torch.int64)
+    dst = torch.empty(1, dtype=torch.int64)
+    sizes = torch.empty(1, dtype=torch.int64)
+    selected(src, dst, sizes, is_src_access_order_any=not gpu_to_cpu)
+
+    swap_blocks.assert_called_once_with(
+        src,
+        dst,
+        sizes,
+        direction=direction,
+        is_src_access_order_any=not gpu_to_cpu,
+    )

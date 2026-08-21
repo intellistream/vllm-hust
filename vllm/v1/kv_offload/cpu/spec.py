@@ -107,10 +107,14 @@ class CPUOffloadingSpec(OffloadingSpec):
         self, kv_caches: CanonicalKVCaches
     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
         if not self._handlers:
-            if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
+            if not (
+                current_platform.is_cuda_alike()
+                or current_platform.is_xpu()
+                or current_platform.device_type == "npu"
+            ):
                 raise Exception(
                     "CPU Offloading is currently only supported on CUDA-alike "
-                    "and XPU GPUs"
+                    "GPUs, XPU GPUs, and Ascend NPUs"
                 )
             self._handlers = self.create_handlers(kv_caches)
 
