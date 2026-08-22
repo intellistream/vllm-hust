@@ -74,6 +74,21 @@ def observe_worker_generation_exit(
     )
 
 
+def close_engine_failure_observers() -> None:
+    """Fail-open close of optional process-local observers before core death."""
+
+    if not os.environ.get(TRACE_EXPORT_ENV, "").strip():
+        return
+    try:
+        from vllm_request_lifecycle_profiler.plugin import (
+            close_engine_failure_observers as close_plugin_observers,
+        )
+
+        close_plugin_observers()
+    except Exception:
+        return
+
+
 def observe_resource_transition(
     runtime_request_id: str,
     resource_type: str,

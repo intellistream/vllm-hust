@@ -62,3 +62,21 @@ def test_all_observer_callbacks_are_forwarded_and_fail_open(monkeypatch) -> None
         )(),
     )
     hooks.observe_request_started("request-0")
+
+
+def test_engine_failure_close_is_disabled_by_default_and_forwarded_when_enabled(
+    monkeypatch,
+) -> None:
+    from vllm_request_lifecycle_profiler import plugin
+
+    calls: list[str] = []
+    monkeypatch.delenv(hooks.TRACE_EXPORT_ENV, raising=False)
+    monkeypatch.setattr(
+        plugin, "close_engine_failure_observers", lambda: calls.append("close")
+    )
+    hooks.close_engine_failure_observers()
+    assert calls == []
+
+    monkeypatch.setenv(hooks.TRACE_EXPORT_ENV, "/tmp/trace")
+    hooks.close_engine_failure_observers()
+    assert calls == ["close"]

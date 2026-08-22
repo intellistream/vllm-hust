@@ -68,6 +68,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.request_lifecycle_hooks import close_engine_failure_observers
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -1201,6 +1202,7 @@ class EngineCoreProc(EngineCore):
                 logger.exception("EngineCore failed to start.")
             else:
                 logger.exception("EngineCore encountered a fatal error.")
+                close_engine_failure_observers()
                 engine_core._send_engine_dead()
             raise e
         finally:
