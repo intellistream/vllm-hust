@@ -122,13 +122,15 @@ class NoopEvidenceSink:
     def __init__(self):
         self.failures: list[str] = []
         self.close_calls = 0
+        self.failure_close_calls: list[bool] = []
+        self.not_submitted = []
         self.first_compute_observations: list[tuple[object, int]] = []
 
     def transfer_submitted(self, attempt, timestamp_ns):
         return None
 
     def transfer_not_submitted(self, attempt):
-        return None
+        self.not_submitted.append(attempt)
 
     def transfer_completed(
         self,
@@ -159,6 +161,9 @@ class NoopEvidenceSink:
     ):
         self.failures.append(reason)
 
+    def transfer_invalidated(self, attempt, timestamp_ns):
+        self.invalidated = (attempt, timestamp_ns)
+
     def wait_completed(self, attempt):
         return None
 
@@ -170,6 +175,9 @@ class NoopEvidenceSink:
 
     def close(self, open_attempts, evidence_disabled):
         self.close_calls += 1
+
+    def close_for_worker_failure(self, evidence_disabled):
+        self.failure_close_calls.append(evidence_disabled)
 
 
 def test_recovery_abi_round_trips_through_pickle():
@@ -669,7 +677,7 @@ def test_foreign_run_transfer_cannot_enter_wait_membership():
 def test_connector_flush_invalidates_pending_context_exactly_once(operation):
     sink = NoopEvidenceSink()
     observer = BoundedKVRecoveryWorkerObserver(
-        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
+        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink, clock_ns=lambda: 20
     )
     attempt = observer.begin_transfer(7, make_context(operation=operation))
     assert attempt is not None
@@ -681,20 +689,59 @@ def test_connector_flush_invalidates_pending_context_exactly_once(operation):
     assert observer.prepared_transfer_count == 0
     assert observer.pending_h2d_count == 0
     assert observer.pending_d2h_count == 0
-    # A scheduler discard handoff is an expected lifecycle transition, not a
-    # state-capacity failure. The invalidated contexts fail closed, but the
-    # observer remains usable so later H2D restore evidence is still captured.
+    # A scheduler discard handoff is an observed cancellation, not missing
+    # evidence, and the observer remains usable for later restores.
     assert not observer.evidence_disabled
-    assert sink.failures == ["connector_flush_invalidation"]
-    # A late completion for the invalidated context is now observable as an
-    # unknown completion instead of being silently swallowed by the latch.
+    assert sink.failures == []
+    assert sink.invalidated == (attempt, 20)
+    # The bounded tombstone consumes a late callback without manufacturing an
+    # unknown-completion loss.
     assert observer.transfer_completed(7, 20, True, 128, 5) is None
-    assert sink.failures == [
-        "connector_flush_invalidation",
-        "unknown_completion",
-    ]
+    assert sink.failures == []
     later = observer.begin_transfer(9, make_context())
     assert later is not None
+
+
+def test_connector_flush_tombstones_fail_closed_at_bounded_capacity(monkeypatch):
+    sink = NoopEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver(
+        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink, clock_ns=lambda: 20
+    )
+    monkeypatch.setattr(
+        "vllm.v1.kv_recovery_profile.MAX_INVALIDATED_TRANSFER_TOMBSTONES_PER_PROCESS",
+        1,
+    )
+    first = observer.begin_transfer(7, make_context(operation="d2h_preserve"))
+    second = observer.begin_transfer(8, make_context(operation="d2h_preserve"))
+    assert first is not None and second is not None
+    observer.transfer_submitted(first, 10)
+    observer.transfer_submitted(second, 11)
+
+    observer.invalidate_transfers({7, 8})
+
+    assert observer.evidence_disabled
+    assert sink.failures == ["invalidation_tombstone_capacity"]
+    assert sink.invalidated[0].connector_job_id in {7, 8}
+
+
+def test_prepare_worker_failure_closes_prepared_and_pending_without_loss():
+    sink = NoopEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver(
+        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink, clock_ns=lambda: 20
+    )
+    prepared = observer.begin_transfer(7, make_context(operation="d2h_preserve"))
+    pending = observer.begin_transfer(8, make_context(operation="d2h_preserve"))
+    assert prepared is not None and pending is not None
+    observer.transfer_submitted(pending, 10)
+
+    observer.prepare_worker_failure()
+
+    assert sink.not_submitted == [prepared]
+    assert sink.invalidated == (pending, 20)
+    assert sink.failure_close_calls == [False]
+    assert sink.failures == []
+    observer.close()
+    assert sink.close_calls == 0
 
 
 @pytest.mark.parametrize(

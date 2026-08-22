@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
 import logging
 import math
+import os
+import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import replace
 from itertools import islice
+from pathlib import Path
 
 import torch
 
@@ -52,6 +57,67 @@ from vllm.v1.kv_recovery_profile import (
 
 logger = init_logger(__name__)
 
+_ISSUE19_FAILURE_SENTINEL_ENV = "VLLM_RLP_WORKER_FAILURE_SENTINEL_DIR"
+_ISSUE19_FAILURE_EXIT_CODE = 86
+
+
+class _Issue19WorkerFailureInjector:
+    """Default-off watchdog for a deterministic real Worker process exit."""
+
+    def __init__(
+        self,
+        observer: KVRecoveryWorkerObserver,
+        sentinel_dir: Path,
+        *,
+        exit_function: Callable[[int], None] = os._exit,
+        poll_seconds: float = 0.01,
+    ) -> None:
+        self._observer = observer
+        self._sentinel_dir = sentinel_dir
+        self._exit_function = exit_function
+        self._poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self.pid = os.getpid()
+        self.trigger_path = sentinel_dir / f"{self.pid}.trigger"
+        self.closed_path = sentinel_dir / f"{self.pid}.observer-closed"
+        self._thread = threading.Thread(
+            target=self._watch,
+            name=f"issue19-worker-failure-{self.pid}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @classmethod
+    def from_environment(
+        cls, observer: KVRecoveryWorkerObserver | None
+    ) -> _Issue19WorkerFailureInjector | None:
+        raw = os.environ.get(_ISSUE19_FAILURE_SENTINEL_ENV, "").strip()
+        if observer is None or not raw:
+            return None
+        sentinel_dir = Path(raw)
+        if not sentinel_dir.is_absolute() or not sentinel_dir.is_dir():
+            logger.error("Invalid Issue #19 worker failure sentinel dir: %s", raw)
+            return None
+        return cls(observer, sentinel_dir)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=1.0)
+
+    def _watch(self) -> None:
+        while not self._stop.wait(self._poll_seconds):
+            if not self.trigger_path.is_file():
+                continue
+            try:
+                self._observer.prepare_worker_failure()
+                self.closed_path.touch(exist_ok=False)
+            except Exception:
+                logger.exception("Issue #19 worker observer close failed")
+            finally:
+                self._exit_function(_ISSUE19_FAILURE_EXIT_CODE)
+            return
+
 
 class OffloadingConnectorWorker:
     """Implementation of Worker side methods"""
@@ -65,6 +131,9 @@ class OffloadingConnectorWorker:
         self.worker = OffloadingWorker()
         self.kv_connector_stats = OffloadingConnectorStats()
         self._kv_recovery_observer = kv_recovery_observer
+        self._issue19_failure_injector = _Issue19WorkerFailureInjector.from_environment(
+            kv_recovery_observer
+        )
 
         self._load_jobs: dict[int, ReqId] = {}
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
@@ -717,6 +786,8 @@ class OffloadingConnectorWorker:
         return kv_connector_stats
 
     def shutdown(self) -> None:
+        if self._issue19_failure_injector is not None:
+            self._issue19_failure_injector.stop()
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
         if self._kv_recovery_store_contexts is not None:

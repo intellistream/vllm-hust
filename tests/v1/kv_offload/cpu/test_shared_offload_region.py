@@ -546,6 +546,34 @@ def test_cleanup_non_creator_all_effects(iid):
         _cleanup_file(path)
 
 
+def test_cleanup_owner_removes_file_created_by_dead_peer(iid):
+    """The scheduler-side joiner removes a worker-created file at teardown."""
+    creator = _make_region(iid)
+    owner = SharedOffloadRegion(
+        instance_id=iid,
+        num_blocks=4,
+        rank=None,
+        kv_bytes_per_block=PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        cleanup_owner=True,
+    )
+    path = creator.mmap_path
+    try:
+        # Model abrupt worker death: close its local handles without executing
+        # the creator-only pathname removal.
+        creator._creator = False
+        creator.cleanup()
+        assert os.path.exists(path)
+
+        owner.cleanup()
+
+        assert not os.path.exists(path)
+    finally:
+        creator.cleanup()
+        owner.cleanup()
+        _cleanup_file(path)
+
+
 def test_cleanup_idempotent(iid):
     """Calling cleanup() twice must not raise any exception."""
     r = _make_region(iid)

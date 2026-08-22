@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Set
+import time
+from collections.abc import Callable, Set
 from dataclasses import dataclass
 from threading import Lock
 from typing import Literal, Protocol
@@ -30,6 +31,7 @@ MAX_LOGICAL_BLOCKS_PER_SET = 4096
 MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS = 4096
 MAX_PENDING_H2D_CONTEXTS_PER_PROCESS = 4096
 MAX_PENDING_D2H_CONTEXTS_PER_PROCESS = 4096
+MAX_INVALIDATED_TRANSFER_TOMBSTONES_PER_PROCESS = 4096
 MAX_H2D_RECEIPTS_PER_WORKER_STEP = 4096
 MAX_RUNTIME_REQUEST_ID_BYTES = 128
 MAX_TRANSFER_IDS_PER_WAIT_SET = 4096
@@ -516,6 +518,8 @@ class KVRecoveryWorkerObserver(Protocol):
 
     def close(self) -> None: ...
 
+    def prepare_worker_failure(self) -> None: ...
+
 
 class KVRecoveryWorkerEvidenceSink(Protocol):
     """Nonblocking evidence sink used by the bounded worker observer."""
@@ -557,6 +561,12 @@ class KVRecoveryWorkerEvidenceSink(Protocol):
         timestamp_ns: int | None,
     ) -> None: ...
 
+    def transfer_invalidated(
+        self,
+        attempt: KVRecoveryTransferAttempt,
+        timestamp_ns: int,
+    ) -> None: ...
+
     def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None: ...
 
     def h2d_receipt_capacity_exhausted(
@@ -577,6 +587,8 @@ class KVRecoveryWorkerEvidenceSink(Protocol):
         evidence_disabled: bool,
     ) -> None: ...
 
+    def close_for_worker_failure(self, evidence_disabled: bool) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class _PendingKVRecoveryTransfer:
@@ -593,6 +605,8 @@ class BoundedKVRecoveryWorkerObserver:
         run_id: str,
         clock_domain_id: str,
         sink: KVRecoveryWorkerEvidenceSink,
+        *,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         if not _is_lower_hex32(process_uuid):
             raise ValueError("process_uuid must be 32 lowercase hex characters")
@@ -604,11 +618,13 @@ class BoundedKVRecoveryWorkerObserver:
         self._run_id = run_id
         self._clock_domain_id = clock_domain_id
         self._sink = sink
+        self._clock_ns = clock_ns
         self._transfer_seq = 0
         self._prepared_by_job_id: dict[int, KVRecoveryTransferAttempt] = {}
         self._pending_h2d_by_transfer_id: dict[str, _PendingKVRecoveryTransfer] = {}
         self._h2d_transfer_id_by_connector_job_id: dict[int, str] = {}
         self._pending_d2h_by_job_id: dict[int, _PendingKVRecoveryTransfer] = {}
+        self._invalidated_job_ids: set[int] = set()
         # The first state-capacity failure makes formal evidence fail closed.
         # This single bit replaces an otherwise unbounded dropped-ID table;
         # serving continues and later untracked completions are ignored.
@@ -680,6 +696,7 @@ class BoundedKVRecoveryWorkerObserver:
                         connector_job_id in self._prepared_by_job_id
                         or connector_job_id in self._h2d_transfer_id_by_connector_job_id
                         or connector_job_id in self._pending_d2h_by_job_id
+                        or connector_job_id in self._invalidated_job_ids
                     )
                     if context.identity.run_id != self._run_id:
                         failure_reason = "foreign_run_transfer"
@@ -799,6 +816,9 @@ class BoundedKVRecoveryWorkerObserver:
         with self._lifecycle_lock:
             with self._state_lock:
                 if self._closed:
+                    return None
+                if connector_job_id in self._invalidated_job_ids:
+                    self._invalidated_job_ids.remove(connector_job_id)
                     return None
                 valid_measurement = (
                     _is_uint64(connector_job_id)
@@ -1000,12 +1020,10 @@ class BoundedKVRecoveryWorkerObserver:
             with self._state_lock:
                 if self._closed:
                     return
-                invalidated: list[KVRecoveryTransferAttempt] = []
+                invalidated: list[_PendingKVRecoveryTransfer] = []
                 for connector_job_id in tuple(self._prepared_by_job_id):
                     if connector_job_id in connector_job_ids:
-                        invalidated.append(
-                            self._prepared_by_job_id.pop(connector_job_id)
-                        )
+                        self._prepared_by_job_id.pop(connector_job_id)
                 for connector_job_id, transfer_id in tuple(
                     self._h2d_transfer_id_by_connector_job_id.items()
                 ):
@@ -1016,26 +1034,41 @@ class BoundedKVRecoveryWorkerObserver:
                         transfer_id, None
                     )
                     if pending_h2d is not None:
-                        invalidated.append(pending_h2d.attempt)
+                        invalidated.append(pending_h2d)
                 for connector_job_id in tuple(self._pending_d2h_by_job_id):
                     if connector_job_id in connector_job_ids:
                         invalidated.append(
-                            self._pending_d2h_by_job_id.pop(connector_job_id).attempt
+                            self._pending_d2h_by_job_id.pop(connector_job_id)
                         )
-                # A scheduler discard handoff is an expected lifecycle
-                # transition (preemption, terminal, or cache reset), not a
-                # state-capacity failure. The invalidated contexts fail closed
-                # individually below, but the observer must remain usable so
-                # later H2D restore evidence (the recovery that follows a
-                # preemption) is still captured.
+                # A scheduler discard is an observed cancellation, not missing
+                # evidence. Keep bounded tombstones so late device callbacks
+                # cannot be mistaken for unknown completions.
+                tombstone_overflow: list[_PendingKVRecoveryTransfer] = []
+                for pending in invalidated:
+                    if len(self._invalidated_job_ids) >= (
+                        MAX_INVALIDATED_TRANSFER_TOMBSTONES_PER_PROCESS
+                    ):
+                        self._evidence_disabled = True
+                        tombstone_overflow.append(pending)
+                    else:
+                        self._invalidated_job_ids.add(pending.attempt.connector_job_id)
             if invalidated:
-                invalidated.sort(key=lambda attempt: attempt.connector_job_id)
+                invalidated.sort(key=lambda pending: pending.attempt.connector_job_id)
+                for pending in invalidated:
+                    timestamp_ns = max(
+                        self._clock_ns(), pending.submit_timestamp_ns + 1
+                    )
+                    self._sink.transfer_invalidated(pending.attempt, timestamp_ns)
+            if tombstone_overflow:
                 self._sink.evidence_failure(
-                    reason="connector_flush_invalidation",
+                    reason="invalidation_tombstone_capacity",
                     connector_job_ids=tuple(
-                        attempt.connector_job_id for attempt in invalidated
+                        pending.attempt.connector_job_id
+                        for pending in tombstone_overflow
                     ),
-                    transfer_ids=tuple(attempt.transfer_id for attempt in invalidated),
+                    transfer_ids=tuple(
+                        pending.attempt.transfer_id for pending in tombstone_overflow
+                    ),
                     timestamp_ns=None,
                 )
 
@@ -1135,7 +1168,50 @@ class BoundedKVRecoveryWorkerObserver:
                 self._pending_h2d_by_transfer_id.clear()
                 self._h2d_transfer_id_by_connector_job_id.clear()
                 self._pending_d2h_by_job_id.clear()
+                self._invalidated_job_ids.clear()
             self._sink.close(open_attempts, evidence_disabled)
+
+    def prepare_worker_failure(self) -> None:
+        """Close observable state before the harness terminates this worker.
+
+        This path is used only by the explicit Issue #19 fault injector.  It
+        preserves a real non-zero worker-process exit while making every
+        already-submitted transfer end in an observed cancellation and giving
+        the process-local writer time to commit both summaries.
+        """
+
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._closed:
+                    return
+                self._closed = True
+                prepared = tuple(
+                    sorted(
+                        self._prepared_by_job_id.values(),
+                        key=lambda attempt: attempt.transfer_id,
+                    )
+                )
+                pending = tuple(
+                    sorted(
+                        (
+                            *self._pending_h2d_by_transfer_id.values(),
+                            *self._pending_d2h_by_job_id.values(),
+                        ),
+                        key=lambda item: item.attempt.transfer_id,
+                    )
+                )
+                evidence_disabled = self._evidence_disabled
+                self._prepared_by_job_id.clear()
+                self._pending_h2d_by_transfer_id.clear()
+                self._h2d_transfer_id_by_connector_job_id.clear()
+                self._pending_d2h_by_job_id.clear()
+                self._invalidated_job_ids.clear()
+            for attempt in prepared:
+                self._sink.transfer_not_submitted(attempt)
+            for item in pending:
+                timestamp_ns = max(self._clock_ns(), item.submit_timestamp_ns + 1)
+                self._sink.transfer_invalidated(item.attempt, timestamp_ns)
+            self._sink.close_for_worker_failure(evidence_disabled)
 
 
 class KVRecoveryObserverFactory(Protocol):

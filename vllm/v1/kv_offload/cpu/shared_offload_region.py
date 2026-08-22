@@ -45,6 +45,7 @@ class SharedOffloadRegion:
         rank: int | None,
         kv_bytes_per_block: int,
         cpu_page_size: int,
+        cleanup_owner: bool = False,
     ) -> None:
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_block % self.page_size == 0
@@ -55,6 +56,10 @@ class SharedOffloadRegion:
 
         self.mmap_path = f"/dev/shm/vllm_offload_{instance_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
+        # The scheduler may join a file created earlier by a worker.  It still
+        # owns instance teardown and must remove the pathname if that worker
+        # exits without running cleanup (for example, after SIGKILL).
+        self._cleanup_owner = cleanup_owner
         self.rank = rank
         if rank is not None:
             # byte offset to this worker's first slot within each block row
@@ -201,12 +206,15 @@ class SharedOffloadRegion:
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
             self.fd = None
-        if self._creator and getattr(self, "mmap_path", None):
+        if (self._creator or self._cleanup_owner) and getattr(self, "mmap_path", None):
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)
+            except FileNotFoundError:
+                pass
             except Exception:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True
                 )
             self._creator = False
+            self._cleanup_owner = False

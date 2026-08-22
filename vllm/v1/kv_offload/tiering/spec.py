@@ -104,6 +104,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 rank=None,
                 kv_bytes_per_block=self.kv_bytes_per_offloaded_block,
                 cpu_page_size=self.cpu_page_size_per_worker,
+                cleanup_owner=True,
             )
             self._scheduler_mmap = scheduler_mmap
 

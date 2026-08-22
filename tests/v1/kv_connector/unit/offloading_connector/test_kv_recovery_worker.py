@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pickle
+import threading
 from collections.abc import Iterable
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +39,14 @@ from vllm.v1.kv_recovery_profile import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+class _FailureObserver:
+    def __init__(self) -> None:
+        self.prepared = threading.Event()
+
+    def prepare_worker_failure(self) -> None:
+        self.prepared.set()
 
 
 class CPULoadStoreSpec(LoadStoreSpec):
@@ -209,6 +219,7 @@ class RecordingEvidenceSink:
         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
         self.close_calls: list[tuple[tuple[KVRecoveryTransferAttempt, ...], bool]] = []
         self.first_compute_observations: list[tuple[object, int]] = []
+        self.invalidations: list[tuple[KVRecoveryTransferAttempt, int]] = []
 
     def transfer_submitted(self, attempt, timestamp_ns):
         self.submissions.append((attempt, timestamp_ns))
@@ -267,6 +278,10 @@ class RecordingEvidenceSink:
         self.failures.append((reason, connector_job_ids))
         self.wait_invalidation_events.append(("failure", reason))
 
+    def transfer_invalidated(self, attempt, timestamp_ns):
+        self.invalidations.append((attempt, timestamp_ns))
+        self.wait_invalidation_events.append(("invalidate", attempt.transfer_id))
+
     def wait_completed(self, attempt):
         self.waits.append(attempt)
         self.wait_invalidation_events.append(("wait", attempt.transfer_ids))
@@ -279,6 +294,9 @@ class RecordingEvidenceSink:
 
     def close(self, open_attempts, evidence_disabled):
         self.close_calls.append((open_attempts, evidence_disabled))
+
+    def close_for_worker_failure(self, evidence_disabled):
+        self.close_calls.append(((), evidence_disabled))
 
 
 def make_context(operation: str) -> KVRecoveryTransferContext:
@@ -346,6 +364,24 @@ def make_worker(observer=None):
     )
     worker.worker = backend  # type: ignore[assignment]
     return worker, backend, events
+
+
+def test_issue19_failure_injector_closes_observer_before_exit(tmp_path: Path):
+    observer = _FailureObserver()
+    exit_codes: list[int] = []
+    injector = worker_module._Issue19WorkerFailureInjector(
+        observer,  # type: ignore[arg-type]
+        tmp_path,
+        exit_function=exit_codes.append,
+        poll_seconds=0.001,
+    )
+
+    injector.trigger_path.touch()
+
+    assert observer.prepared.wait(timeout=1.0)
+    injector._thread.join(timeout=1.0)
+    assert injector.closed_path.is_file()
+    assert exit_codes == [worker_module._ISSUE19_FAILURE_EXIT_CODE]
 
 
 def metadata(
@@ -1000,8 +1036,10 @@ def test_bounded_observer_wait_precedes_explicit_discard_invalidation():
 
     assert sink.wait_invalidation_events == [
         ("wait", (f"{'a' * 32}:t:0",)),
-        ("failure", "connector_flush_invalidation"),
+        ("invalidate", f"{'a' * 32}:t:0"),
     ]
+    assert len(sink.invalidations) == 1
+    assert sink.invalidations[0][0].connector_job_id == 3
     assert sink.completions == []
     assert observer.pending_d2h_count == 0
     # The discard handoff invalidates the named context but must not disable
