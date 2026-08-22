@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import pickle
 import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -38,7 +40,7 @@ from vllm.v1.kv_recovery_profile import (
     canonical_block_set_id,
 )
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
 class _FailureObserver:
@@ -382,6 +384,43 @@ def test_issue19_failure_injector_closes_observer_before_exit(tmp_path: Path):
     injector._thread.join(timeout=1.0)
     assert injector.closed_path.is_file()
     assert exit_codes == [worker_module._ISSUE19_FAILURE_EXIT_CODE]
+
+
+def test_issue19_failure_injector_witnesses_pending_transfer(tmp_path: Path):
+    observer = _FailureObserver()
+    injector = worker_module._Issue19WorkerFailureInjector(
+        observer,  # type: ignore[arg-type]
+        tmp_path,
+        exit_function=lambda _code: None,
+        poll_seconds=0.001,
+    )
+    injector.pending_arm_path.touch()
+    transfer_id = f"{'a' * 32}:t:0"
+    attempt = KVRecoveryTransferAttempt(7, transfer_id, make_context("h2d_restore"))
+
+    thread = threading.Thread(
+        target=injector.pause_if_pending_transfer_is_armed,
+        args=(attempt, 123),
+    )
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while not injector.pending_witness_path.is_file() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    injector.stop()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    witness = json.loads(injector.pending_witness_path.read_text())
+    assert witness == {
+        "connector_job_id": 7,
+        "operation": "h2d_restore",
+        "pid": injector.pid,
+        "runtime_request_id": "request-0",
+        "schema_version": "issue19-pending-transfer-witness/v1",
+        "timestamp_ns": 123,
+        "transfer_id": transfer_id,
+        "worker_generation": f"VllmWorker-0:{injector.pid}",
+    }
 
 
 def metadata(

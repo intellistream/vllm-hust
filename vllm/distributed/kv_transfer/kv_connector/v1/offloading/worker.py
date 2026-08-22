@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -80,6 +81,11 @@ class _Issue19WorkerFailureInjector:
         self.pid = os.getpid()
         self.trigger_path = sentinel_dir / f"{self.pid}.trigger"
         self.closed_path = sentinel_dir / f"{self.pid}.observer-closed"
+        self.pending_arm_path = sentinel_dir / f"{self.pid}.pending-transfer-arm"
+        self.pending_witness_path = (
+            sentinel_dir / f"{self.pid}.pending-transfer.json"
+        )
+        self._pending_witness_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._watch,
             name=f"issue19-worker-failure-{self.pid}",
@@ -117,6 +123,53 @@ class _Issue19WorkerFailureInjector:
             finally:
                 self._exit_function(_ISSUE19_FAILURE_EXIT_CODE)
             return
+
+    def pause_if_pending_transfer_is_armed(
+        self,
+        attempt: KVRecoveryTransferAttempt,
+        timestamp_ns: int,
+    ) -> None:
+        """Expose a submitted transfer, then wait briefly for harness SIGKILL.
+
+        The Issue #19 harness creates the arm file only for its verified Worker
+        child. Once a real backend submission is observable, this method
+        durably records that exact pending transfer and pauses the calling
+        Worker thread. The harness then sends SIGKILL to the same PID. If the
+        harness disappears, the bounded wait expires and serving resumes.
+        """
+
+        if not self.pending_arm_path.is_file():
+            return
+        with self._pending_witness_lock:
+            if self.pending_witness_path.exists():
+                return
+            context = attempt.context
+            witness = {
+                "schema_version": "issue19-pending-transfer-witness/v1",
+                "pid": self.pid,
+                "timestamp_ns": timestamp_ns,
+                "connector_job_id": attempt.connector_job_id,
+                "transfer_id": attempt.transfer_id,
+                "operation": context.operation,
+                "runtime_request_id": context.identity.runtime_request_id,
+                "worker_generation": f"VllmWorker-0:{self.pid}",
+            }
+            try:
+                descriptor = os.open(
+                    self.pending_witness_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                try:
+                    payload = (json.dumps(witness, sort_keys=True) + "\n").encode()
+                    os.write(descriptor, payload)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            except Exception:
+                logger.exception("Issue #19 pending-transfer witness failed")
+                return
+        self._stop.wait(30.0)
 
 
 class OffloadingConnectorWorker:
@@ -227,6 +280,12 @@ class OffloadingConnectorWorker:
                 assert attempt is not None
                 assert self._kv_recovery_profiled_attempts is not None
                 self._kv_recovery_profiled_attempts[job_id] = attempt
+                injector = self._issue19_failure_injector
+                if injector is not None:
+                    injector.pause_if_pending_transfer_is_armed(
+                        attempt,
+                        time.monotonic_ns(),
+                    )
         self._unsubmitted_store_jobs.clear()
 
     def _prepare_kv_recovery_wait(
@@ -642,6 +701,12 @@ class OffloadingConnectorWorker:
                 assert attempt is not None
                 assert self._kv_recovery_profiled_attempts is not None
                 self._kv_recovery_profiled_attempts[job_id] = attempt
+                injector = self._issue19_failure_injector
+                if injector is not None:
+                    injector.pause_if_pending_transfer_is_armed(
+                        attempt,
+                        time.monotonic_ns(),
+                    )
 
     def observe_kv_recovery_first_compute(
         self,
