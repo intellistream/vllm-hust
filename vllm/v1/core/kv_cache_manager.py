@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -11,6 +13,10 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.engine.request_lifecycle_hooks import (
+    is_resource_observation_enabled,
+    observe_resource_transition,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -134,6 +140,12 @@ class KVCacheManager:
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
+        self._observed_kv_leases: dict[str, tuple[str, str]] | None = (
+            {} if is_resource_observation_enabled() else None
+        )
+        self._observed_kv_lease_sequence: int | None = (
+            0 if self._observed_kv_leases is not None else None
+        )
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
@@ -171,6 +183,67 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    def _observe_kv_lease_acquired(self, request_id: str) -> None:
+        leases = self._observed_kv_leases
+        sequence = self._observed_kv_lease_sequence
+        if leases is None or sequence is None or request_id in leases:
+            return
+        self._observed_kv_lease_sequence = sequence + 1
+        request_key = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:24]
+        resource_id = f"kv-lease:{request_key}:{sequence}"
+        owner_generation = f"EngineCore:{os.getpid()}"
+        leases[request_id] = (resource_id, owner_generation)
+        resource_units = self._observed_request_block_count(request_id)
+        observe_resource_transition(
+            request_id,
+            "kv_capacity_lease",
+            resource_id,
+            "acquire",
+            owner_generation,
+            resource_units,
+        )
+
+    def _observed_request_block_count(self, request_id: str) -> int:
+        try:
+            return max(1, sum(map(len, self.get_block_ids(request_id))))
+        except Exception:
+            return 1
+
+    def _observe_kv_lease_released(self, request_id: str, resource_units: int) -> None:
+        leases = self._observed_kv_leases
+        if leases is None:
+            return
+        lease = leases.pop(request_id, None)
+        if lease is None:
+            return
+        resource_id, owner_generation = lease
+        observe_resource_transition(
+            request_id,
+            "kv_capacity_lease",
+            resource_id,
+            "release",
+            owner_generation,
+            resource_units,
+        )
+
+    def invalidate_observed_kv_leases(self) -> None:
+        """Close request leases before a fatal EngineCore observer flush."""
+
+        leases = self._observed_kv_leases
+        if leases is None:
+            return
+        for request_id, (resource_id, owner_generation) in tuple(leases.items()):
+            resource_units = self._observed_request_block_count(request_id)
+            observe_resource_transition(
+                request_id,
+                "kv_capacity_lease",
+                resource_id,
+                "invalidate",
+                owner_generation,
+                resource_units,
+            )
+        leases.clear()
 
     @property
     def usage(self) -> float:
@@ -416,6 +489,8 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if self._observed_kv_leases is not None:
+            self._observe_kv_lease_acquired(request.request_id)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -443,7 +518,14 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        resource_units = (
+            self._observed_request_block_count(request.request_id)
+            if self._observed_kv_leases is not None
+            else 1
+        )
         self.coordinator.free(request.request_id)
+        if self._observed_kv_leases is not None:
+            self._observe_kv_lease_released(request.request_id, resource_units)
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.engine.request_lifecycle_hooks import observe_resource_transition
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     MambaSpec,
@@ -82,9 +83,7 @@ class _Issue19WorkerFailureInjector:
         self.trigger_path = sentinel_dir / f"{self.pid}.trigger"
         self.closed_path = sentinel_dir / f"{self.pid}.observer-closed"
         self.pending_arm_path = sentinel_dir / f"{self.pid}.pending-transfer-arm"
-        self.pending_witness_path = (
-            sentinel_dir / f"{self.pid}.pending-transfer.json"
-        )
+        self.pending_witness_path = sentinel_dir / f"{self.pid}.pending-transfer.json"
         self._pending_witness_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._watch,
@@ -201,6 +200,21 @@ class OffloadingConnectorWorker:
         ) = {} if kv_recovery_observer is not None else None
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
+    @staticmethod
+    def _observe_transfer_resource(
+        attempt: KVRecoveryTransferAttempt | None,
+        transition: str,
+    ) -> None:
+        if attempt is None:
+            return
+        observe_resource_transition(
+            attempt.context.identity.runtime_request_id,
+            "offload_transfer",
+            attempt.transfer_id,
+            transition,
+            f"VllmWorker-0:{os.getpid()}",
+        )
+
     def _begin_kv_recovery_transfer(
         self,
         job_id: int,
@@ -280,6 +294,8 @@ class OffloadingConnectorWorker:
                 assert attempt is not None
                 assert self._kv_recovery_profiled_attempts is not None
                 self._kv_recovery_profiled_attempts[job_id] = attempt
+                self._observe_transfer_resource(attempt, "acquire")
+                self._observe_transfer_resource(attempt, "transfer_pending")
                 injector = self._issue19_failure_injector
                 if injector is not None:
                     injector.pause_if_pending_transfer_is_armed(
@@ -701,6 +717,8 @@ class OffloadingConnectorWorker:
                 assert attempt is not None
                 assert self._kv_recovery_profiled_attempts is not None
                 self._kv_recovery_profiled_attempts[job_id] = attempt
+                self._observe_transfer_resource(attempt, "acquire")
+                self._observe_transfer_resource(attempt, "transfer_pending")
                 injector = self._issue19_failure_injector
                 if injector is not None:
                     injector.pause_if_pending_transfer_is_armed(
@@ -812,6 +830,7 @@ class OffloadingConnectorWorker:
                     transfer_time=transfer_result.transfer_time,
                     attempt=attempt,
                 )
+            self._observe_transfer_resource(attempt, "release")
             if (
                 transfer_result.transfer_time
                 and transfer_result.transfer_size is not None
@@ -858,6 +877,8 @@ class OffloadingConnectorWorker:
         if self._kv_recovery_store_contexts is not None:
             self._kv_recovery_store_contexts.clear()
         if self._kv_recovery_profiled_attempts is not None:
+            for attempt in self._kv_recovery_profiled_attempts.values():
+                self._observe_transfer_resource(attempt, "invalidate")
             self._kv_recovery_profiled_attempts.clear()
         if self._kv_recovery_compute_contexts is not None:
             self._fail_unobserved_first_compute()

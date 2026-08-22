@@ -26,6 +26,7 @@ def test_disabled_seam_does_not_resolve_optional_profiler(monkeypatch) -> None:
     assert hooks.get_request_lifecycle_observer() is None
     hooks.observe_request_started("request-0")
     hooks.observe_request_terminal("request-0", "complete")
+    assert hooks.is_resource_observation_enabled() is False
 
 
 def test_all_observer_callbacks_are_forwarded_and_fail_open(monkeypatch) -> None:
@@ -78,5 +79,6 @@ def test_engine_failure_close_is_disabled_by_default_and_forwarded_when_enabled(
     assert calls == []
 
     monkeypatch.setenv(hooks.TRACE_EXPORT_ENV, "/tmp/trace")
+    assert hooks.is_resource_observation_enabled() is True
     hooks.close_engine_failure_observers()
     assert calls == ["close"]

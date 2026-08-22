@@ -681,8 +681,14 @@ def test_submit_clock_failure_releases_prepared_attempt(
     assert not observer.evidence_disabled
 
 
-def test_h2d_sidecar_reaches_submit_completion_and_scheduler_receipt():
+def test_h2d_sidecar_reaches_submit_completion_and_scheduler_receipt(monkeypatch):
     events: list[tuple] = []
+    resource_events: list[tuple] = []
+    monkeypatch.setattr(
+        worker_module,
+        "observe_resource_transition",
+        lambda *args: resource_events.append(args),
+    )
     observer = RecordingObserver(events)
     worker, backend, _ = make_worker(observer)
     backend.events = events
@@ -713,6 +719,13 @@ def test_h2d_sidecar_reaches_submit_completion_and_scheduler_receipt():
     assert receipt.identity == context.identity
     assert receipt.block_set_id == context.block_set_id
     assert events[-1] == ("observer_completed", 7, True, 128, 250_000_000)
+    assert [row[3] for row in resource_events] == [
+        "acquire",
+        "transfer_pending",
+        "release",
+    ]
+    assert {row[1] for row in resource_events} == {"offload_transfer"}
+    assert {row[2] for row in resource_events} == {receipt.transfer_id}
 
 
 def test_submit_and_completion_clocks_are_first_profile_observations(

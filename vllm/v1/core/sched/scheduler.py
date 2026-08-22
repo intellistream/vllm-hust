@@ -2106,6 +2106,11 @@ class Scheduler(SchedulerInterface):
 
         logger.debug_once("[shutdown] Scheduler: complete")
 
+    def invalidate_observed_resource_leases(self) -> None:
+        """Persist fatal-shutdown closure for the optional ownership ledger."""
+
+        self.kv_cache_manager.invalidate_observed_kv_leases()
+
     ########################################################################
     # KV Connector Related Methods
     ########################################################################

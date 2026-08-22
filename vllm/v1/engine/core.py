@@ -9,7 +9,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -1202,6 +1202,8 @@ class EngineCoreProc(EngineCore):
                 logger.exception("EngineCore failed to start.")
             else:
                 logger.exception("EngineCore encountered a fatal error.")
+                with suppress(Exception):
+                    engine_core.scheduler.invalidate_observed_resource_leases()
                 close_engine_failure_observers()
                 engine_core._send_engine_dead()
             raise e

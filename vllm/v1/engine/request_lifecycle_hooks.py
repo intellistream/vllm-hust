@@ -95,6 +95,7 @@ def observe_resource_transition(
     resource_id: str,
     transition: str,
     worker_generation: str,
+    resource_units: int = 1,
 ) -> None:
     _observe(
         "resource_transition",
@@ -103,4 +104,11 @@ def observe_resource_transition(
         resource_id,
         transition,
         worker_generation,
+        resource_units,
     )
+
+
+def is_resource_observation_enabled() -> bool:
+    """Return whether the optional lifecycle exporter was explicitly enabled."""
+
+    return bool(os.environ.get(TRACE_EXPORT_ENV, "").strip())
