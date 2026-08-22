@@ -977,14 +977,6 @@ class BoundedKVRecoveryWorkerObserver:
                     else:
                         entry = self._pending_d2h_by_job_id.get(job_id)
                     pending.append(entry)
-            if any(entry is None for entry in pending):
-                self._sink.evidence_failure(
-                    reason="invalid_wait_membership",
-                    connector_job_ids=tuple(sorted(connector_job_ids)),
-                    transfer_ids=(),
-                    timestamp_ns=None,
-                )
-                return None
             if any(
                 entry is not None
                 and (
@@ -1002,15 +994,16 @@ class BoundedKVRecoveryWorkerObserver:
                     timestamp_ns=None,
                 )
                 return None
-            return KVRecoveryWaitMembership(
-                tuple(
-                    sorted(
-                        entry.attempt.transfer_id
-                        for entry in pending
-                        if entry is not None
-                    )
+            transfer_ids = tuple(
+                sorted(
+                    entry.attempt.transfer_id for entry in pending if entry is not None
                 )
             )
+            # Connector flush fences may name jobs that completed before this
+            # observer call, as well as jobs without a request-sidecar.  Only
+            # still-pending, observed transfers belong in the wait evidence.
+            # An empty observed subset means there is no wait to record.
+            return KVRecoveryWaitMembership(transfer_ids) if transfer_ids else None
 
     def invalidate_transfers(self, connector_job_ids: Set[int]) -> None:
         """Consume bounded contexts named by an explicit discard handoff."""

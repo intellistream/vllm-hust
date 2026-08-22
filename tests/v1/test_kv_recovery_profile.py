@@ -669,8 +669,31 @@ def test_foreign_run_transfer_cannot_enter_wait_membership():
         ),
     )
     assert observer.begin_transfer(8, foreign_context) is None
-    assert observer.prepare_wait(frozenset({7, 8})) is None
-    assert sink.failures == ["foreign_run_transfer", "invalid_wait_membership"]
+    membership = observer.prepare_wait(frozenset({7, 8}))
+    assert membership is not None
+    assert membership.transfer_ids == (local_attempt.transfer_id,)
+    assert sink.failures == ["foreign_run_transfer"]
+
+
+def test_wait_ignores_completed_and_unobserved_connector_jobs():
+    sink = NoopEvidenceSink()
+    observer = BoundedKVRecoveryWorkerObserver(
+        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
+    )
+    completed = observer.begin_transfer(7, make_context(operation="d2h_preserve"))
+    pending = observer.begin_transfer(8, make_context(operation="d2h_preserve"))
+    assert completed is not None and pending is not None
+    observer.transfer_submitted(completed, 10)
+    observer.transfer_submitted(pending, 11)
+    assert observer.transfer_completed(7, 20, True, 128, 5) is None
+
+    membership = observer.prepare_wait(frozenset({7, 8, 9}))
+
+    assert membership is not None
+    assert membership.transfer_ids == (pending.transfer_id,)
+    assert sink.failures == []
+    assert observer.prepare_wait(frozenset({7, 9})) is None
+    assert sink.failures == []
 
 
 @pytest.mark.parametrize("operation", ["h2d_restore", "d2h_preserve"])
