@@ -609,20 +609,26 @@ class EngineCore:
 
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
-        self.structured_output_manager.clear_backend()
-        if self.model_executor:
-            self.model_executor.shutdown()
-        if self.scheduler:
-            self.scheduler.shutdown()
-
-        # Undo the gc.freeze() from __init__ so that the objects allocated
-        # during engine startup (model weights, KV caches, etc.) become
-        # visible to the garbage collector again. Without this, deleting
-        # the engine in-process (e.g. unit tests) leaks GPU memory.
-        gc.unfreeze()
-        # Tear down distributed state initialized in this EngineCore process
-        # before it exits and release cached memory.
-        cleanup_dist_env_and_memory()
+        try:
+            self.structured_output_manager.clear_backend()
+            if self.model_executor:
+                self.model_executor.shutdown()
+        finally:
+            # Worker-death monitoring may already be shutting the executor
+            # down on another thread.  Even if that teardown fails, the
+            # scheduler still owns connector resources and observer writers
+            # that must be closed before EngineCore exits.
+            try:
+                if self.scheduler:
+                    self.scheduler.shutdown()
+            finally:
+                # Undo the gc.freeze() from __init__ so that the objects
+                # allocated during engine startup become visible to the
+                # garbage collector again.
+                gc.unfreeze()
+                # Tear down distributed state initialized in this EngineCore
+                # process before it exits and release cached memory.
+                cleanup_dist_env_and_memory()
         logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
