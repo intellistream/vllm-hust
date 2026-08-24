@@ -377,9 +377,7 @@ class GlobalPrefixScheduler:
             ),
         )
         key = (snapshot.node_id, snapshot.data_parallel_rank)
-        strict_generation = (
-            cache_generation if self._strict_cache_generation else None
-        )
+        strict_generation = cache_generation if self._strict_cache_generation else None
         state = self._nodes.get(key)
         if state is None:
             self._discard_unranked_placeholder(snapshot.node_id)

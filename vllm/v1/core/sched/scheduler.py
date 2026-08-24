@@ -2304,9 +2304,7 @@ class Scheduler(SchedulerInterface):
                 return state
         return None
 
-    def _record_local_prefix_cache_route_fence_events(
-        self, events: list[Any]
-    ) -> None:
+    def _record_local_prefix_cache_route_fence_events(self, events: list[Any]) -> None:
         for publisher in (
             self.prefix_cache_event_uploader,
             self.kv_event_publisher,

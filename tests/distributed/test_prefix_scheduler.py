@@ -1621,9 +1621,7 @@ def test_prefix_routing_forward_request_fence_reject_falls_back_before_response(
         routing_token="outgoing-secret",
     )
 
-    forwarded = asyncio.run(
-        _forward_request(scope, b"{}", send, node, ClientSession())
-    )
+    forwarded = asyncio.run(_forward_request(scope, b"{}", send, node, ClientSession()))
 
     assert forwarded is False
     assert read_called is True

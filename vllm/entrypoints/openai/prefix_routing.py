@@ -60,9 +60,7 @@ ROUTE_VALIDATION_MODES = frozenset(
 PREFIX_ROUTING_VALIDATION_MODE_HEADER = "x-vllm-prefix-routing-validation-mode"
 EXPECTED_NODE_ID_HEADER = "x-vllm-prefix-routing-expected-node-id"
 EXPECTED_GENERATION_HEADER = "x-vllm-prefix-routing-expected-generation"
-EXPECTED_WORKER_INCARNATION_HEADER = (
-    "x-vllm-prefix-routing-expected-worker-incarnation"
-)
+EXPECTED_WORKER_INCARNATION_HEADER = "x-vllm-prefix-routing-expected-worker-incarnation"
 FENCE_RESULT_HEADER = "x-vllm-prefix-routing-fence"
 FENCE_RESULT_REJECTED = "rejected"
 ACK_GENERATION_HEADER = "x-vllm-prefix-routing-ack-generation"
@@ -204,8 +202,7 @@ class PrefixRoutingProxy:
         self.scheduler = GlobalPrefixScheduler(
             view_ttl_seconds=config.view_ttl_seconds,
             strict_cache_generation=(
-                config.route_validation_mode
-                == ROUTE_VALIDATION_MODE_GENERATION_SCOPED
+                config.route_validation_mode == ROUTE_VALIDATION_MODE_GENERATION_SCOPED
             ),
         )
         self.nodes = {node.node_id: node for node in config.nodes}
@@ -1315,8 +1312,7 @@ def _route_fence_state_matches(
         return False
 
     return (
-        current_generation == view_epoch
-        and current_incarnation == worker_incarnation
+        current_generation == view_epoch and current_incarnation == worker_incarnation
     )
 
 
@@ -1395,9 +1391,7 @@ async def _forward_request(
         ROUTE_WORKER_INCARNATION_HEADER,
     }
     headers = [
-        (key, value)
-        for key, value in headers
-        if key.lower() not in stripped_headers
+        (key, value) for key, value in headers if key.lower() not in stripped_headers
     ]
     headers.append((PREFIX_ROUTING_BYPASS_HEADER, node.routing_token))
     if data_parallel_rank is not None:
