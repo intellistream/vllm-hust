@@ -3,7 +3,7 @@
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 
@@ -35,7 +35,7 @@ class PauseState(enum.IntEnum):
 
 
 class SchedulerInterface(ABC):
-    available_kv_cache_memory_bytes: int | None
+    available_kv_cache_memory_bytes: int | None = None
 
     @abstractmethod
     def __init__(
@@ -253,4 +253,7 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     def get_kv_connector(self) -> "KVConnectorBase_V1 | None":
+        return None
+
+    def get_prefix_cache_route_fence_state(self) -> dict[str, Any] | None:
         return None
