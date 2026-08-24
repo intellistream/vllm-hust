@@ -43,6 +43,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_ep_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -236,6 +237,17 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+def _should_check_ep_fault(dp_size: int, is_moe: bool) -> bool:
+    if dp_size <= 1 or not is_moe:
+        return False
+
+    device_communicator = get_ep_group().device_communicator
+    if device_communicator is None:
+        return False
+    all2all_manager = getattr(device_communicator, "all2all_manager", None)
+    return all2all_manager is not None and all2all_manager.support_fault_tolerance
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -458,9 +470,9 @@ class GPUModelRunner(
         self.device = device
         self.dtype = self.model_config.dtype
 
-        self.check_ep_fault = False
-        if parallel_config.data_parallel_size > 1 and self.model_config.is_moe:
-            self.check_ep_fault = get_ep_all2all_manager().support_fault_tolerance
+        self.check_ep_fault = _should_check_ep_fault(
+            parallel_config.data_parallel_size, self.model_config.is_moe
+        )
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
