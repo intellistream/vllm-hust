@@ -192,7 +192,6 @@ def test_ascend_server_readiness_windows_allow_cold_start():
 
 
 def test_same_spec_readiness_timeout_reaches_runner_in_both_execution_modes():
-    workflow = workflow_text()
     benchmark_text = script_text("run_ascend_benchmark_ci.sh")
     same_spec_block = benchmark_text[
         benchmark_text.index("run_same_spec_current_benchmark() {") :
@@ -203,7 +202,6 @@ def test_same_spec_readiness_timeout_reaches_runner_in_both_execution_modes():
         )
     ]
 
-    assert 'SAME_SPEC_READY_TIMEOUT_SECONDS: "2400"' in workflow
     assert (
         "local same_spec_ready_timeout_seconds=${SAME_SPEC_READY_TIMEOUT_SECONDS:-1200}"
     ) in same_spec_block

@@ -39,12 +39,12 @@ def test_npu_pr_workflows_gate_on_current_labels_not_label_event():
         assert "github.event.label.name" not in text
 
 
-def test_npu_pr_workflows_target_dedicated_npu_two():
+def test_npu_pr_workflows_submit_to_the_central_evaluation_queue():
     for workflow_path in NPU_WORKFLOWS:
         text = workflow_path.read_text(encoding="utf-8")
 
-        assert "github.event_name == 'pull_request'" in text
-        assert "'npu-2'" in text
+        assert "evaluation-request.yml@main" in text
+        assert "self-hosted" not in text
 
 
 def test_pre_commit_uses_available_github_hosted_runner():
@@ -64,19 +64,13 @@ def test_pre_commit_uses_available_github_hosted_runner():
     assert "PRE_COMMIT_TO_REF:" in text
 
 
-def test_benchmark_detection_uses_logical_zero_for_isolated_runner():
+def test_benchmark_workflow_does_not_manage_devices_in_actions():
     workflow_path = REPO_ROOT / ".github/workflows/ascend-benchmark-leaderboard.yml"
     text = workflow_path.read_text(encoding="utf-8")
-    detection_step = text[
-        text.index("      - name: Detect runner user and Ascend devices") : text.index(
-            "      - name: Pre-clean stale checkout state"
-        )
-    ]
 
-    assert "ASCEND_CI_DETECTED_DEVICES=" in detection_step
-    assert 'echo "ASCEND_VISIBLE_DEVICES=0"' in detection_step
-    assert 'echo "ASCEND_RT_VISIBLE_DEVICES=0"' in detection_step
-    assert '"${#runner_devnodes[@]}" -eq 1' in detection_step
+    assert "ASCEND_VISIBLE_DEVICES" not in text
+    assert "npu-smi" not in text
+    assert "evaluation-request.yml@main" in text
 
 
 def test_actionlint_knows_ascend_runner_labels():
