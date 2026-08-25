@@ -2,14 +2,22 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.core import kv_cache_manager
+from vllm.v1.request import Request
 
 
-def _request(*, request_id: str = "cmpl-request-a", **overrides: object):
+def _request(
+    *,
+    request_id: str = "cmpl-request-a",
+    external_req_id: str | None = None,
+    **overrides: object,
+):
     extra_args: dict[str, object] = {
         "kvplane_admit_prefix_cache": "admit",
         "kvplane_admission_lease_id": "lease-a",
-        "kvplane_admission_request_id": request_id,
+        "kvplane_admission_request_id": external_req_id or request_id,
         "kvplane_admission_epoch": 7,
         "kvplane_admission_issued_at_ns": 1_000,
         "kvplane_admission_expires_at_ns": 2_000,
@@ -17,6 +25,7 @@ def _request(*, request_id: str = "cmpl-request-a", **overrides: object):
     extra_args.update(overrides)
     return SimpleNamespace(
         request_id=request_id,
+        external_req_id=external_req_id,
         sampling_params=SimpleNamespace(extra_args=extra_args),
     )
 
@@ -102,6 +111,65 @@ def test_request_identity_mismatch_fails_closed(
         _request(kvplane_admission_request_id="cmpl-other"),
         publication_sequence=16,
     )
+
+
+def test_external_request_identity_allows_randomized_internal_id(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    epoch_file = tmp_path / "pressure-epoch.json"
+    _write_epoch(epoch_file, 7)
+    monkeypatch.setenv("VLLM_KVPLANE_PRESSURE_EPOCH_FILE", str(epoch_file))
+
+    request = _request(
+        request_id="cmpl-request-a-deadbeef",
+        external_req_id="cmpl-request-a",
+    )
+    assert request.request_id != request.external_req_id
+    assert kv_cache_manager._kvplane_allows_prefix_cache_write(
+        request, publication_sequence=16
+    )
+    kv_cache_manager._kvplane_record_prefix_cache_publication(request, 16)
+    assert not kv_cache_manager._kvplane_allows_prefix_cache_write(
+        request, publication_sequence=16
+    )
+
+
+def test_external_request_identity_mismatch_fails_closed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    epoch_file = tmp_path / "pressure-epoch.json"
+    _write_epoch(epoch_file, 7)
+    monkeypatch.setenv("VLLM_KVPLANE_PRESSURE_EPOCH_FILE", str(epoch_file))
+
+    request = _request(
+        request_id="cmpl-request-a-deadbeef",
+        external_req_id="cmpl-other",
+        kvplane_admission_request_id="cmpl-request-a",
+    )
+    assert not kv_cache_manager._kvplane_allows_prefix_cache_write(
+        request, publication_sequence=16
+    )
+
+
+def test_engine_core_request_preserves_external_identity() -> None:
+    params = SamplingParams(max_tokens=1)
+    engine_request = EngineCoreRequest(
+        request_id="cmpl-request-a-deadbeef",
+        external_req_id="cmpl-request-a",
+        prompt_token_ids=[1],
+        mm_features=None,
+        sampling_params=params,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+
+    request = Request.from_engine_core_request(engine_request, block_hasher=None)
+
+    assert request.request_id == "cmpl-request-a-deadbeef"
+    assert request.external_req_id == "cmpl-request-a"
 
 
 def test_native_failure_does_not_consume_publication_sequence(

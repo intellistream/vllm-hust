@@ -75,6 +75,10 @@ def install_kvplane_pressure_epoch_provider(
     _kvplane_last_publication_sequence.clear()
 
 
+def _kvplane_request_identity(request: Request) -> str:
+    return getattr(request, "external_req_id", None) or request.request_id
+
+
 def _kvplane_allows_prefix_cache_write(
     request: Request,
     *,
@@ -101,7 +105,8 @@ def _kvplane_allows_prefix_cache_write(
     pressure_epoch_provider = _resolve_kvplane_pressure_epoch_provider()
     if pressure_epoch_provider is None:
         return False
-    if str(extra_args.get("kvplane_admission_request_id", "")) != request.request_id:
+    request_identity = _kvplane_request_identity(request)
+    if str(extra_args.get("kvplane_admission_request_id", "")) != request_identity:
         return False
     try:
         lease_epoch = int(extra_args["kvplane_admission_epoch"])
@@ -126,7 +131,7 @@ def _kvplane_allows_prefix_cache_write(
         return False
     if now_ns < issued_at_ns or now_ns >= expires_at_ns:
         return False
-    lease_key = (request.request_id, str(lease_id), lease_epoch)
+    lease_key = (request_identity, str(lease_id), lease_epoch)
     if publication_sequence is not None:
         if publication_sequence is None or publication_sequence < 0:
             return False
@@ -146,7 +151,7 @@ def _kvplane_record_prefix_cache_publication(
         return
     lease_epoch = int(extra_args["kvplane_admission_epoch"])
     expires_at_ns = int(extra_args["kvplane_admission_expires_at_ns"])
-    lease_key = (request.request_id, str(lease_id), lease_epoch)
+    lease_key = (_kvplane_request_identity(request), str(lease_id), lease_epoch)
     _kvplane_last_publication_sequence[lease_key] = (
         publication_sequence,
         expires_at_ns,

@@ -77,8 +77,10 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        external_req_id: str | None = None,
     ) -> None:
         self.request_id = request_id
+        self.external_req_id = external_req_id
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -219,6 +221,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            external_req_id=request.external_req_id,
         )
 
     def append_output_token_ids(
