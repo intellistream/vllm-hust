@@ -200,7 +200,8 @@ class PrefixRoutingProxy:
             task = asyncio.create_task(self._subscribe_node_events(node))
             self._tasks.append(task)
 
-        self._tasks.append(asyncio.create_task(self._poll_node_loads()))
+        if self.config.load_poll_interval > 0:
+            self._tasks.append(asyncio.create_task(self._poll_node_loads()))
 
     async def shutdown(self) -> None:
         for task in self._tasks:
@@ -222,6 +223,23 @@ class PrefixRoutingProxy:
     def _parse_node_load(payload: Any) -> NodeLoad:
         if not isinstance(payload, Mapping):
             raise ValueError("node load response must be an object")
+
+        if "num_running_reqs" not in payload and "num_waiting_reqs" not in payload:
+            server_load = payload.get("server_load")
+            if (
+                not isinstance(server_load, int)
+                or isinstance(server_load, bool)
+                or server_load < 0
+            ):
+                raise ValueError(
+                    "node load response must include request counts or "
+                    "a non-negative integer server_load"
+                )
+            return NodeLoad(
+                num_running_reqs=server_load,
+                num_waiting_reqs=0,
+                updated_at=time.monotonic(),
+            )
 
         num_running_reqs = payload.get("num_running_reqs")
         if (
@@ -321,6 +339,12 @@ class PrefixRoutingProxy:
             return None
 
         supported_tasks = await self.app_state.engine_client.get_supported_tasks()
+        now = time.monotonic()
+        node_loads = {
+            node_id: load.num_running_reqs + load.num_waiting_reqs
+            for node_id, load in self._node_loads.items()
+            if now - load.updated_at <= self.config.load_ttl
+        }
 
         best_decision: PrefixRouteDecision | None = None
         for engine_input in engine_inputs:
@@ -332,6 +356,7 @@ class PrefixRoutingProxy:
             decision = self.scheduler.choose_node(
                 block_hashes=cache_key_request.block_hashes,
                 prompt_num_tokens=cache_key_request.num_prompt_tokens,
+                node_loads=node_loads or None,
             )
             if decision is None:
                 continue
@@ -846,9 +871,8 @@ def _parse_prefix_routing_config(
         not isinstance(load_poll_interval, int | float)
         or isinstance(load_poll_interval, bool)
         or not math.isfinite(load_poll_interval)
-        or load_poll_interval <= 0
     ):
-        raise ValueError("prefix routing load_poll_interval must be positive")
+        raise ValueError("prefix routing load_poll_interval must be a finite number")
 
     load_ttl = raw_config.get("load_ttl", 3.0)
     if (
@@ -858,6 +882,12 @@ def _parse_prefix_routing_config(
         or load_ttl <= 0
     ):
         raise ValueError("prefix routing load_ttl must be positive")
+
+    if load_poll_interval > 0 and load_request_timeout + load_poll_interval >= load_ttl:
+        raise ValueError(
+            "prefix routing load_request_timeout + load_poll_interval "
+            "must be less than load_ttl when polling is enabled"
+        )
 
     event_ingest_token = raw_config.get("event_ingest_token")
     if event_ingest_token is not None and (

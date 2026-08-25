@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
+from concurrent.futures import InvalidStateError as ConcurrentInvalidStateError
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.queues import Queue
@@ -66,6 +67,13 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
+
+
+def _aggregate_load_metrics(loads: Sequence[dict[str, int]]) -> dict[str, int]:
+    return {
+        "num_running_reqs": sum(load["num_running_reqs"] for load in loads),
+        "num_waiting_reqs": sum(load["num_waiting_reqs"] for load in loads),
+    }
 
 
 class EngineCoreClient(ABC):
@@ -298,6 +306,20 @@ class InprocClient(EngineCoreClient):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.engine_core.get_supported_tasks()
+
+    async def get_load_metrics_async(
+        self, data_parallel_rank: int | None = None
+    ) -> dict[str, int]:
+        if data_parallel_rank is not None:
+            managed_rank = (
+                self.engine_core.vllm_config.parallel_config.data_parallel_index
+            )
+            if data_parallel_rank != managed_rank:
+                raise ValueError(
+                    f"data parallel rank {data_parallel_rank} is not "
+                    "managed by this client"
+                )
+        return self.engine_core.get_load_metrics()
 
     def add_request(self, request: EngineCoreRequest) -> None:
         req, request_wave = self.engine_core.preprocess_add_request(request)
@@ -691,6 +713,20 @@ class MPClient(EngineCoreClient):
     def dp_engines_running(self) -> bool:
         return self.engines_running
 
+    def _engines_for_data_parallel_rank(
+        self, data_parallel_rank: int | None
+    ) -> tuple[EngineIdentity, ...]:
+        if data_parallel_rank is None:
+            return tuple(self.core_engines)
+
+        try:
+            engine_index = self.engine_ranks_managed.index(data_parallel_rank)
+        except ValueError as exc:
+            raise ValueError(
+                f"data parallel rank {data_parallel_rank} is not managed by this client"
+            ) from exc
+        return (self.core_engines[engine_index],)
+
     def start_engine_core_monitor(self):
         """Start a monitor thread for engine core processes."""
         engine_manager = self.resources.engine_manager
@@ -767,7 +803,10 @@ def _process_utility_output(
     output: UtilityOutput, utility_results: dict[int, AnyFuture]
 ):
     """Set the result from a utility method in the waiting future."""
-    future = utility_results.pop(output.call_id)
+    future = utility_results.pop(output.call_id, None)
+    if future is None:
+        # The caller may have been cancelled after the request was sent.
+        return
     failure_message = output.failure_message
     try:
         if failure_message is not None:
@@ -775,7 +814,7 @@ def _process_utility_output(
         else:
             assert output.result is not None
             future.set_result(output.result.result)
-    except asyncio.InvalidStateError:
+    except (asyncio.InvalidStateError, ConcurrentInvalidStateError):
         # This can happen if the future is cancelled due to the
         # original calling task being cancelled.
         if failure_message is not None:
@@ -867,11 +906,18 @@ class SyncMPClient(MPClient):
             self.engines_running = False
         return outputs
 
-    def _send_input(self, request_type: EngineCoreRequestType, request: Any):
+    def _send_input(
+        self,
+        request_type: EngineCoreRequestType,
+        request: Any,
+        engine: EngineIdentity | None = None,
+    ):
         self.ensure_alive()
         self.free_pending_messages()
+        if engine is None:
+            engine = self.core_engine
         # (Identity, RequestType, SerializedRequest)
-        msg = (self.core_engine, request_type.value, *self.encoder.encode(request))
+        msg = (engine, request_type.value, *self.encoder.encode(request))
 
         if len(msg) <= 3:
             # No auxiliary buffers => no tensor backing buffers in request.
@@ -881,13 +927,43 @@ class SyncMPClient(MPClient):
         tracker = self.input_socket.send_multipart(msg, copy=False, track=True)
         self.add_pending_message(tracker, request)
 
-    def call_utility(self, method: str, *args) -> Any:
+    def _start_utility(
+        self, method: str, *args: Any, engine: EngineIdentity
+    ) -> tuple[int, Future[Any]]:
         call_id = uuid.uuid1().int >> 64
         future: Future[Any] = Future()
         self.utility_results[call_id] = future
-        self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
+        try:
+            self._send_input(
+                EngineCoreRequestType.UTILITY,
+                (0, call_id, method, args),
+                engine,
+            )
+        except BaseException:
+            self.utility_results.pop(call_id, None)
+            raise
+        return call_id, future
 
+    def call_utility(self, method: str, *args) -> Any:
+        _, future = self._start_utility(method, *args, engine=self.core_engine)
         return future.result()
+
+    async def get_load_metrics_async(
+        self, data_parallel_rank: int | None = None
+    ) -> dict[str, int]:
+        engines = self._engines_for_data_parallel_rank(data_parallel_rank)
+        calls: list[tuple[int, Future[Any]]] = []
+        try:
+            for engine in engines:
+                calls.append(self._start_utility("get_load_metrics", engine=engine))
+            loads = await asyncio.gather(
+                *(asyncio.wrap_future(future) for _, future in calls)
+            )
+            return _aggregate_load_metrics(loads)
+        finally:
+            for call_id, future in calls:
+                if self.utility_results.get(call_id) is future:
+                    self.utility_results.pop(call_id, None)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.call_utility("get_supported_tasks")
@@ -1120,9 +1196,13 @@ class AsyncMPClient(MPClient):
             EngineCoreRequestType.UTILITY.value,
             *self.encoder.encode((self.client_index, call_id, method, args)),
         )
-        await self._send_input_message(message, engine, args)
-        self._ensure_output_queue_task()
-        return await future
+        try:
+            await self._send_input_message(message, engine, args)
+            self._ensure_output_queue_task()
+            return await future
+        finally:
+            if self.utility_results.get(call_id) is future:
+                self.utility_results.pop(call_id, None)
 
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         return await self.call_utility_async("get_supported_tasks")
@@ -1174,45 +1254,24 @@ class AsyncMPClient(MPClient):
     async def get_load_metrics_async(
         self, data_parallel_rank: int | None = None
     ) -> dict[str, int]:
-        if data_parallel_rank is None:
-            if len(self.core_engines) != 1:
-                raise ValueError(
-                    "data_parallel_rank is required when multiple "
-                    "EngineCores are managed"
-                )
-            engine = self.core_engine
-        else:
-            try:
-                engine_index = self.engine_ranks_managed.index(data_parallel_rank)
-            except ValueError as exc:
-                raise ValueError(
-                    f"data parallel rank {data_parallel_rank} is not "
-                    "managed by this client"
-                ) from exc
-            engine = self.core_engines[engine_index]
-
-        load_tasks: dict[EngineIdentity, asyncio.Task[dict[str, int]]]
-        load_tasks = self.__dict__.setdefault("_load_metrics_tasks", {})
-
-        task = load_tasks.get(engine)
-        if task is None:
-            task = asyncio.create_task(
+        engines = self._engines_for_data_parallel_rank(data_parallel_rank)
+        tasks = [
+            asyncio.create_task(
                 self._call_utility_async(
                     "get_load_metrics",
                     engine=engine,
                 )
             )
-            load_tasks[engine] = task
-
-            def clear_task(completed: asyncio.Task[dict[str, int]]) -> None:
-                if load_tasks.get(engine) is completed:
-                    load_tasks.pop(engine, None)
-                if not completed.cancelled():
-                    completed.exception()
-
-            task.add_done_callback(clear_task)
-
-        return await asyncio.shield(task)
+            for engine in engines
+        ]
+        try:
+            loads = await asyncio.gather(*tasks)
+            return _aggregate_load_metrics(loads)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")
