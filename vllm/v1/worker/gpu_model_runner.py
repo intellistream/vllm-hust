@@ -105,6 +105,7 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.multimodal.utils import get_mm_features_in_window, group_and_batch_mm_kwargs
+from vllm.observability import worker_events
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
@@ -203,9 +204,6 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
-from vllm.v1.worker.gpu.output_pathology_observer import (
-    get_output_pathology_observer,
-)
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -268,13 +266,17 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._logprobs_tensors = logprobs_tensors
         self._routed_experts = routed_experts
         self._has_fault: torch.Tensor | None = None
-        self._pathology_observer = get_output_pathology_observer()
-        self._pathology_output_id: int | None = None
-        if self._pathology_observer is not None:
-            self._pathology_output_id = self._pathology_observer.start_output(
-                model_runner_output.req_ids,
-                sampled_token_ids.shape,
-                str(sampled_token_ids.dtype),
+        self._worker_lifecycle_events_enabled = (
+            worker_events.has_worker_lifecycle_listeners()
+        )
+        self._worker_lifecycle_id = id(self)
+        if self._worker_lifecycle_events_enabled:
+            worker_events.emit_worker_lifecycle_event(
+                worker_events.ASYNC_OUTPUT_CREATED,
+                lifecycle_id=self._worker_lifecycle_id,
+                request_ids=tuple(model_runner_output.req_ids),
+                shape=tuple(sampled_token_ids.shape),
+                dtype=str(sampled_token_ids.dtype),
             )
 
         # Initiate the copy on a separate stream, but do not synchronize it.
@@ -283,7 +285,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             async_output_copy_stream.wait_stream(default_stream)
             copy_start_ns = (
                 time.perf_counter_ns()
-                if self._pathology_observer is not None
+                if self._worker_lifecycle_events_enabled
                 else 0
             )
             try:
@@ -291,20 +293,17 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                     "cpu", non_blocking=True
                 )
             except Exception:
-                if (
-                    self._pathology_observer is not None
-                    and self._pathology_output_id is not None
-                ):
-                    self._pathology_observer.record_exception(
-                        self._pathology_output_id, "sampled_token_d2h"
+                if self._worker_lifecycle_events_enabled:
+                    worker_events.emit_worker_lifecycle_event(
+                        worker_events.ASYNC_OUTPUT_COPY_FAILED,
+                        lifecycle_id=self._worker_lifecycle_id,
+                        phase="sampled_token_d2h",
                     )
                 raise
-            if (
-                self._pathology_observer is not None
-                and self._pathology_output_id is not None
-            ):
-                self._pathology_observer.record_copy_issued(
-                    self._pathology_output_id,
+            if self._worker_lifecycle_events_enabled:
+                worker_events.emit_worker_lifecycle_event(
+                    worker_events.ASYNC_OUTPUT_COPY_ISSUED,
+                    lifecycle_id=self._worker_lifecycle_id,
                     storage_id=self.sampled_token_ids_cpu.data_ptr(),
                     event_id=id(self.async_copy_ready_event),
                     nbytes=(
@@ -335,17 +334,15 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def synchronize(self) -> None:
         wait_start_ns = (
             time.perf_counter_ns()
-            if self._pathology_observer is not None
+            if self._worker_lifecycle_events_enabled
             else 0
         )
         self.async_copy_ready_event.synchronize()
-        if (
-            self._pathology_observer is not None
-            and self._pathology_output_id is not None
-        ):
-            self._pathology_observer.record_output_wait(
-                self._pathology_output_id,
-                time.perf_counter_ns() - wait_start_ns,
+        if self._worker_lifecycle_events_enabled:
+            worker_events.emit_worker_lifecycle_event(
+                worker_events.ASYNC_OUTPUT_WAIT_COMPLETE,
+                lifecycle_id=self._worker_lifecycle_id,
+                wait_ns=time.perf_counter_ns() - wait_start_ns,
             )
 
     def get_output(self) -> ModelRunnerOutput:
@@ -359,7 +356,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def get_output_without_sync(self) -> ModelRunnerOutput:
         materialization_start_ns = (
             time.perf_counter_ns()
-            if self._pathology_observer is not None
+            if self._worker_lifecycle_events_enabled
             else 0
         )
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
@@ -398,13 +395,13 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 f"Mask: {mask.cpu().tolist()}"
             )
 
-        if (
-            self._pathology_observer is not None
-            and self._pathology_output_id is not None
-        ):
-            self._pathology_observer.record_output_materialization(
-                self._pathology_output_id,
-                time.perf_counter_ns() - materialization_start_ns,
+        if self._worker_lifecycle_events_enabled:
+            worker_events.emit_worker_lifecycle_event(
+                worker_events.ASYNC_OUTPUT_MATERIALIZED,
+                lifecycle_id=self._worker_lifecycle_id,
+                materialization_ns=(
+                    time.perf_counter_ns() - materialization_start_ns
+                ),
             )
         return output
 
