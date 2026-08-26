@@ -11,7 +11,13 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
-from vllm.v1.b134_events import EVENTS_ENABLED, emit
+from vllm.v1.events import (
+    EventBus,
+    KVTransferCopyDone,
+    KVTransferGatherH2D,
+    KVTransferSubmit,
+    KVTransferSwapD2H,
+)
 from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
     CanonicalKVCacheRef,
@@ -365,16 +371,17 @@ class AscendSingleDirectionOffloadingHandler:
             start_event.record(self._stream)
             if num_copy_ops:
                 if self.npu_to_cpu:
-                    swap_started_at = time.monotonic() if EVENTS_ENABLED else 0.0
+                    swap_started_at = time.monotonic() if EventBus.enabled else 0.0
                     torch.ops._C_ascend.swap_blocks_batch(src, dst, sizes, 1)
-                    if EVENTS_ENABLED:
-                        emit(
-                            "swap_d2h_submit",
-                            f"job{job_id}",
-                            descriptors=num_copy_ops,
-                            duration_us=round(
-                                (time.monotonic() - swap_started_at) * 1e6
-                            ),
+                    if EventBus.enabled:
+                        EventBus.emit(
+                            KVTransferSwapD2H(
+                                f"job{job_id}",
+                                descriptors=num_copy_ops,
+                                duration_us=round(
+                                    (time.monotonic() - swap_started_at) * 1e6
+                                ),
+                            )
                         )
                 else:
                     assert staging_buffer is not None
@@ -389,7 +396,7 @@ class AscendSingleDirectionOffloadingHandler:
                     ):
                         chunk_src = all_src[chunk_start:chunk_end]
                         chunk_sizes = all_sizes[chunk_start:chunk_end]
-                        gather_started_at = time.monotonic() if EVENTS_ENABLED else 0.0
+                        gather_started_at = time.monotonic() if EventBus.enabled else 0.0
                         chunk_dma_ops = _coalesce_host_pages(
                             chunk_src,
                             chunk_sizes,
@@ -398,7 +405,7 @@ class AscendSingleDirectionOffloadingHandler:
                             all_dma_dst[dma_offset:],
                             all_dma_sizes[dma_offset:],
                         )
-                        if EVENTS_ENABLED:
+                        if EventBus.enabled:
                             gather_seconds += time.monotonic() - gather_started_at
                         offsets = (
                             chunk_sizes.cumsum(dtype=chunk_sizes.dtype) - chunk_sizes
@@ -419,25 +426,31 @@ class AscendSingleDirectionOffloadingHandler:
                         )
                         dma_offset = dma_end
                     num_dma_ops = dma_offset
-                    if EVENTS_ENABLED:
-                        emit(
-                            "gather_h2d",
-                            f"job{job_id}",
-                            dma_runs=num_dma_ops,
-                            duration_us=round(gather_seconds * 1e6),
+                    if EventBus.enabled:
+                        EventBus.emit(
+                            KVTransferGatherH2D(
+                                f"job{job_id}",
+                                dma_runs=num_dma_ops,
+                                duration_us=round(gather_seconds * 1e6),
+                            )
                         )
             end_event.record(self._stream)
-        submitted_at = time.monotonic() if EVENTS_ENABLED else None
+        submitted_at = time.monotonic() if EventBus.enabled else None
         if submitted_at is not None:
-            emit(
-                "transfer_submit",
-                f"job{job_id}",
-                bytes=num_transfer_bytes,
-                dependency_us=round((dependencies_done_at - descriptors_done_at) * 1e6),
-                descriptor_us=round((descriptors_done_at - transfer_started_at) * 1e6),
-                descriptors=num_copy_ops,
-                direction="d2h" if self.npu_to_cpu else "h2d",
-                submit_us=round((submitted_at - dependencies_done_at) * 1e6),
+            EventBus.emit(
+                KVTransferSubmit(
+                    f"job{job_id}",
+                    bytes=num_transfer_bytes,
+                    dependency_us=round(
+                        (dependencies_done_at - descriptors_done_at) * 1e6
+                    ),
+                    descriptor_us=round(
+                        (descriptors_done_at - transfer_started_at) * 1e6
+                    ),
+                    descriptors=num_copy_ops,
+                    direction="d2h" if self.npu_to_cpu else "h2d",
+                    submit_us=round((submitted_at - dependencies_done_at) * 1e6),
+                )
             )
 
         if num_copy_ops and not self.npu_to_cpu:
@@ -474,16 +487,17 @@ class AscendSingleDirectionOffloadingHandler:
             transfer = self._transfers.popleft()
             event_seconds = transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
             if transfer.submitted_at is not None:
-                emit(
-                    "copy_observed_complete",
-                    f"job{transfer.job_id}",
-                    bytes=transfer.num_bytes,
-                    completion_observed_ms=round(
-                        (time.monotonic() - transfer.submitted_at) * 1e3,
-                        3,
-                    ),
-                    device_event_ms=round(event_seconds * 1e3, 3),
-                    direction="d2h" if self.npu_to_cpu else "h2d",
+                EventBus.emit(
+                    KVTransferCopyDone(
+                        f"job{transfer.job_id}",
+                        bytes=transfer.num_bytes,
+                        completion_observed_ms=round(
+                            (time.monotonic() - transfer.submitted_at) * 1e3,
+                            3,
+                        ),
+                        device_event_ms=round(event_seconds * 1e3, 3),
+                        direction="d2h" if self.npu_to_cpu else "h2d",
+                    )
                 )
             results.append(
                 TransferResult(

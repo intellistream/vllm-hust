@@ -103,7 +103,7 @@ def kv_offload_env():
     # Snapshot EVERY key we are about to touch — the stubs plus all modules
     # dynamically loaded below — BEFORE overwriting anything.
     dynamic_names = {
-        "vllm.v1.b134_events",
+        "vllm.v1.events",
         "vllm.v1.kv_offload.base",
         "vllm.v1.kv_offload.cpu.common",
         "vllm.v1.kv_offload.cpu.policies.base",
@@ -116,10 +116,10 @@ def kv_offload_env():
 
     try:
         kv_offload_root = REPO_ROOT / "vllm" / "v1" / "kv_offload"
-        # b134_events is pure stdlib — load the real module.
+        # events.py is pure stdlib — load the real module.
         _load_module(
-            "vllm.v1.b134_events",
-            REPO_ROOT / "vllm" / "v1" / "b134_events.py",
+            "vllm.v1.events",
+            REPO_ROOT / "vllm" / "v1" / "events.py",
             sys.modules,
         )
         base = _load_module(
@@ -163,29 +163,46 @@ def kv_offload_env():
     return {"base": base, "manager": manager}
 
 
+def _register_collector(manager_mod) -> list:
+    """Register a collecting sink on the EventBus and return the log."""
+    emitted: list = []
+
+    class _Sink:
+        def emit(self, event):
+            emitted.append(event)
+
+    manager_mod.EventBus.register_sink(_Sink())
+    return emitted
+
+
 def test_prepare_store_emits_cpu_store(kv_offload_env, monkeypatch) -> None:
     """prepare_store() must emit cpu_store with the expected payload."""
     manager_mod = kv_offload_env["manager"]
     base_mod = kv_offload_env["base"]
 
-    emitted: list[tuple] = []
-    monkeypatch.setattr(manager_mod, "emit", lambda *a, **k: emitted.append((a, k)))
-    monkeypatch.setattr(manager_mod, "EVENTS_ENABLED", True)
+    emitted = _register_collector(manager_mod)
+    try:
+        mgr = manager_mod.CPUOffloadingManager(num_blocks=4)
+        keys = [base_mod.make_offload_key(f"block{i}".encode(), 0) for i in range(2)]
+        req_context = base_mod.ReqContext(req_id="request-1")
 
-    mgr = manager_mod.CPUOffloadingManager(num_blocks=4)
-    keys = [base_mod.make_offload_key(f"block{i}".encode(), 0) for i in range(2)]
-    req_context = base_mod.ReqContext(req_id="request-1")
+        out = mgr.prepare_store(keys, req_context)
+        assert out is not None
+        assert [k for k in out.keys_to_store] == keys
 
-    out = mgr.prepare_store(keys, req_context)
-    assert out is not None
-    assert [k for k in out.keys_to_store] == keys
-
-    cpu_store_events = [e for e in emitted if e[0][0] == "cpu_store"]
-    assert len(cpu_store_events) == 1, f"expected one cpu_store emit, got {emitted}"
-    event_args, event_kwargs = cpu_store_events[0]
-    assert event_args[1] == "request-1"
-    assert event_kwargs["stored_keys"] == 2
-    assert event_kwargs["evicted_keys"] == 0
+        cpu_store_events = [
+            e for e in emitted if type(e).__name__ == "KVOffloadStore"
+        ]
+        assert len(cpu_store_events) == 1, (
+            f"expected one cpu_store event, got {emitted}"
+        )
+        ev = cpu_store_events[0]
+        assert ev.request_id == "request-1"
+        assert ev.stored_keys == 2
+        assert ev.evicted_keys == 0
+    finally:
+        manager_mod.EventBus._sinks = []
+        manager_mod.EventBus.enabled = False
 
 
 def test_prepare_store_emits_nothing_when_all_keys_already_stored(
@@ -195,23 +212,24 @@ def test_prepare_store_emits_nothing_when_all_keys_already_stored(
     manager_mod = kv_offload_env["manager"]
     base_mod = kv_offload_env["base"]
 
-    emitted: list[tuple] = []
-    monkeypatch.setattr(manager_mod, "emit", lambda *a, **k: emitted.append((a, k)))
-    monkeypatch.setattr(manager_mod, "EVENTS_ENABLED", True)
+    emitted = _register_collector(manager_mod)
+    try:
+        mgr = manager_mod.CPUOffloadingManager(num_blocks=4)
+        keys = [base_mod.make_offload_key(f"block{i}".encode(), 0) for i in range(2)]
+        req_context = base_mod.ReqContext(req_id="request-1")
 
-    mgr = manager_mod.CPUOffloadingManager(num_blocks=4)
-    keys = [base_mod.make_offload_key(f"block{i}".encode(), 0) for i in range(2)]
-    req_context = base_mod.ReqContext(req_id="request-1")
+        out1 = mgr.prepare_store(keys, req_context)
+        assert out1 is not None
+        # Complete the store so the policy marks them stored.
+        mgr.complete_store(keys, req_context)
 
-    out1 = mgr.prepare_store(keys, req_context)
-    assert out1 is not None
-    # Complete the store so the policy marks them stored.
-    mgr.complete_store(keys, req_context)
-
-    emitted.clear()
-    out2 = mgr.prepare_store(keys, req_context)
-    assert out2 is not None
-    assert not out2.keys_to_store  # already stored -> nothing new
-    assert all(e[0][0] != "cpu_store" for e in emitted), (
-        f"unexpected emits on already-stored keys: {emitted}"
-    )
+        emitted.clear()
+        out2 = mgr.prepare_store(keys, req_context)
+        assert out2 is not None
+        assert not out2.keys_to_store  # already stored -> nothing new
+        assert all(type(e).__name__ != "KVOffloadStore" for e in emitted), (
+            f"unexpected events on already-stored keys: {emitted}"
+        )
+    finally:
+        manager_mod.EventBus._sinks = []
+        manager_mod.EventBus.enabled = False

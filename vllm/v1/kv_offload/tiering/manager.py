@@ -34,7 +34,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
 from vllm.logger import init_logger
-from vllm.v1.b134_events import EVENTS_ENABLED, emit
+from vllm.v1.events import (
+    EventBus,
+    KVOffloadRestoreDone,
+    KVOffloadRestoreStart,
+    KVOffloadSchedStep,
+    KVOffloadTierEvict,
+)
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
@@ -886,7 +892,8 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
-        emit("restore_start", req_context.req_id, keys=len(keys))
+        if EventBus.enabled:
+            EventBus.emit(KVOffloadRestoreStart(req_context.req_id, len(keys)))
         self._lifecycle.record_request_keys(req_context, keys)
         # Process completed promotions to ensure blocks are ready
         self._maybe_process_finished_jobs()
@@ -922,7 +929,8 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Blocks that finished loading.
             req_context: Per-request context.
         """
-        emit("restore_done", req_context.req_id, keys=len(keys))
+        if EventBus.enabled:
+            EventBus.emit(KVOffloadRestoreDone(req_context.req_id, len(keys)))
         self.primary_tier.complete_load(keys, req_context)
         if self._track_residency:
             self._lifecycle.residency.finish_transfer(keys, "cpu", "device")
@@ -960,14 +968,17 @@ class TieringOffloadingManager(OffloadingManager):
         # Cascading of these newly-stored blocks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
-        eviction_started_at = time.monotonic() if EVENTS_ENABLED else 0.0
+        eviction_started_at = time.monotonic() if EventBus.enabled else 0.0
         primary_result = self.primary_tier.prepare_store(keys, req_context)
-        if EVENTS_ENABLED and primary_result is not None:
-            emit(
-                "evict",
-                req_context.req_id,
-                duration_us=round((time.monotonic() - eviction_started_at) * 1e6),
-                keys=len(primary_result.evicted_keys),
+        if EventBus.enabled and primary_result is not None:
+            EventBus.emit(
+                KVOffloadTierEvict(
+                    req_context.req_id,
+                    duration_us=round(
+                        (time.monotonic() - eviction_started_at) * 1e6
+                    ),
+                    keys=len(primary_result.evicted_keys),
+                )
             )
 
         if primary_result is None:
@@ -1300,17 +1311,17 @@ class TieringOffloadingManager(OffloadingManager):
         Called once per scheduler step from
         OffloadingConnectorScheduler.build_connector_meta().
         """
-        schedule_started_at = time.monotonic() if EVENTS_ENABLED else 0.0
+        schedule_started_at = time.monotonic() if EventBus.enabled else 0.0
         self._maybe_process_finished_jobs()
         self._processed_jobs_this_step = False
         self._flush_pending_promotions()
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
-        if EVENTS_ENABLED:
-            emit(
-                "sched_step",
-                "step",
-                duration_us=round((time.monotonic() - schedule_started_at) * 1e6),
+        if EventBus.enabled:
+            EventBus.emit(
+                KVOffloadSchedStep(
+                    round((time.monotonic() - schedule_started_at) * 1e6)
+                )
             )
 
         protected_keys = {
