@@ -5,10 +5,9 @@ from dataclasses import replace
 from itertools import product
 
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import BatchDescriptor
+from vllm.forward_context import BatchDescriptor, CUDAGraphRuntimeMetadata
 from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
-from vllm.v1.cudagraph_key_strategy import resolve_cudagraph_key_strategy
 
 logger = init_logger(__name__)
 
@@ -69,11 +68,6 @@ class CudagraphDispatcher:
         )
         # Default cudagraph_mode to NONE until initialize_cudagraph_keys is called
         self.cudagraph_mode = CUDAGraphMode.NONE
-        # Extended (split-batch / dual-stream) key policy is pluggable.
-        # The default strategy replicates the previous inline DUAL_INPLACE
-        # behavior; platforms may own it via
-        # Platform.get_cudagraph_key_strategy().
-        self.key_strategy = resolve_cudagraph_key_strategy(vllm_config)
 
     def _compute_bs_to_padded_graph_size(self) -> None:
         """Pre-compute the mapping from batch size to padded graph size."""
@@ -141,10 +135,6 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
-        start_num_tokens: int = 0,
-        graph_variant: str = "",
-        attention_backend: str = "",
-        capture_metadata_mode: str = "",
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         uniform_decode_query_len = self.uniform_decode_query_len
@@ -163,11 +153,65 @@ class CudagraphDispatcher:
             uniform=uniform_decode,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
-            start_num_tokens=start_num_tokens,
-            graph_variant=graph_variant,
-            attention_backend=attention_backend,
-            capture_metadata_mode=capture_metadata_mode,
         )
+
+    def _create_runtime_batch_descriptor(
+        self,
+        num_tokens: int,
+        runtime_metadata: CUDAGraphRuntimeMetadata,
+    ) -> BatchDescriptor:
+        """Create an exact descriptor for a validated runtime graph key."""
+        return BatchDescriptor(
+            num_tokens=num_tokens,
+            num_reqs=num_tokens // self.uniform_decode_query_len,
+            uniform=True,
+            runtime_metadata=runtime_metadata,
+        )
+
+    def _dispatch_runtime_key(
+        self,
+        num_tokens: int,
+        uniform_decode: bool,
+        has_lora: bool,
+        num_active_loras: int,
+        allowed_modes: AbstractSet[CUDAGraphMode],
+        runtime_metadata: CUDAGraphRuntimeMetadata,
+        allow_runtime_key_registration: bool,
+    ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+        """Dispatch an explicitly registered runtime graph key.
+
+        The key is registered only after the request is validated. Any
+        unsupported / malformed / non-opt-in request fails closed to eager
+        execution (``CUDAGraphMode.NONE``) without mutating the key registry:
+        a registered key is always a key that was explicitly admitted through
+        this gate, so backends can rely on it being safely captureable.
+        """
+        fallback = BatchDescriptor(
+            num_tokens=num_tokens,
+            runtime_metadata=runtime_metadata,
+        )
+        runtime_mode = self.cudagraph_mode.decode_mode()
+        invalid_request = (
+            not allow_runtime_key_registration
+            or not isinstance(runtime_metadata, CUDAGraphRuntimeMetadata)
+            or not runtime_metadata.is_valid()
+            or not uniform_decode
+            or has_lora
+            or num_active_loras != 0
+            or num_tokens <= 0
+            or num_tokens % self.uniform_decode_query_len != 0
+            or runtime_metadata.token_offset % self.uniform_decode_query_len != 0
+            or num_tokens // self.uniform_decode_query_len
+            > self.vllm_config.scheduler_config.max_num_seqs
+            or runtime_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE)
+            or runtime_mode not in allowed_modes
+        )
+        if invalid_request:
+            return CUDAGraphMode.NONE, fallback
+
+        descriptor = self._create_runtime_batch_descriptor(num_tokens, runtime_metadata)
+        self.add_cudagraph_key(runtime_mode, descriptor)
+        return runtime_mode, descriptor
 
     def add_cudagraph_key(
         self, runtime_mode: CUDAGraphMode, batch_descriptor: BatchDescriptor
@@ -183,6 +227,10 @@ class CudagraphDispatcher:
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
         self.cudagraph_mode = cudagraph_mode
+        # The caller may override the query length (e.g. spec decode or split
+        # replay); sync it to the instance used by descriptor building and
+        # runtime-key alignment validation.
+        self.uniform_decode_query_len = uniform_decode_query_len
 
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:
@@ -254,11 +302,8 @@ class CudagraphDispatcher:
         num_active_loras: int = 0,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
-        start_num_tokens: int = 0,
-        allow_inplace_lazy_key: bool = False,
-        graph_variant: str = "",
-        attention_backend: str = "",
-        capture_metadata_mode: str = "",
+        runtime_metadata: CUDAGraphRuntimeMetadata | None = None,
+        allow_runtime_key_registration: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -278,25 +323,13 @@ class CudagraphDispatcher:
                 valid_modes to compute allowed modes. (e.g., {FULL} for
                 features like cascade attention not supported by full
                 cudagraphs). None means no modes are excluded.
-            start_num_tokens: Extended key metadata (split-batch / dual-stream):
-                the starting token offset for an offset view (e.g. the second
-                split of an inplace replay). When 0 (default), the key is not
-                an offset key and normal dispatch is used.
-            allow_inplace_lazy_key: Extended key metadata: whether lazy capture
-                of a missing offset / variant key is allowed. When False and
-                extended metadata is present, the key strategy fails closed to
-                CUDAGraphMode.NONE.
-            graph_variant: Extended key metadata: the split mode variant tag
-                (e.g. "inplace_serial", "inplace_parallel").
-            attention_backend: Extended key metadata: the attention backend tag
-                (e.g. "fia", "pa").
-            capture_metadata_mode: Extended key metadata: the metadata mode used
-                during graph capture.
-
-        Policy note: construction and dispatch of extended keys is owned by the
-        pluggable key strategy (see ``CudagraphKeyStrategy``); core only runs
-        the standard padded-key path and fails closed when no strategy (or
-        no registered key) applies.
+            runtime_metadata: Opaque metadata for a runtime graph key. None
+                keeps the static dispatch path unchanged. Core validates the
+                generic schema (``is_valid``) but does not interpret
+                platform-specific ``variant`` / ``backend_tag`` values.
+            allow_runtime_key_registration: Whether a validated runtime key
+                may be registered. False fails closed to eager execution and
+                never mutates the key registry.
         """
         allowed_modes = valid_modes or CUDAGraphMode.valid_runtime_modes()
 
@@ -318,36 +351,19 @@ class CudagraphDispatcher:
         ):
             return CUDAGraphMode.NONE, BatchDescriptor(
                 num_tokens=num_tokens,
-                start_num_tokens=start_num_tokens,
-                graph_variant=graph_variant,
-                attention_backend=attention_backend,
-                capture_metadata_mode=capture_metadata_mode,
+                runtime_metadata=runtime_metadata,
             )
 
-        # Extended (split-batch / dual-stream) key policy is owned by the
-        # pluggable key strategy. The strategy either returns a
-        # (mode, batch descriptor) pair or None to fall through to the
-        # standard padded-key dispatch path below (fail-closed).
-        if (
-            start_num_tokens > 0
-            or graph_variant
-            or attention_backend
-            or capture_metadata_mode
-        ):
-            strategy_result = self.key_strategy.dispatch(
-                dispatcher=self,
+        if runtime_metadata is not None:
+            return self._dispatch_runtime_key(
                 num_tokens=num_tokens,
                 uniform_decode=uniform_decode,
                 has_lora=has_lora,
                 num_active_loras=num_active_loras,
-                start_num_tokens=start_num_tokens,
-                allow_inplace_lazy_key=allow_inplace_lazy_key,
-                graph_variant=graph_variant,
-                attention_backend=attention_backend,
-                capture_metadata_mode=capture_metadata_mode,
+                allowed_modes=allowed_modes,
+                runtime_metadata=runtime_metadata,
+                allow_runtime_key_registration=allow_runtime_key_registration,
             )
-            if strategy_result is not None:
-                return strategy_result
 
         # Standard dispatch path
         effective_num_active_loras = num_active_loras

@@ -19,7 +19,11 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.lora import LoRAConfig
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    CUDAGraphRuntimeMetadata,
+    set_forward_context,
+)
 from vllm.platforms import current_platform
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 
@@ -266,6 +270,166 @@ class TestCudagraphDispatcher:
         # Don't initialize keys
 
         assert dispatcher.get_capture_descs() == []
+
+    def test_runtime_key_registration_is_explicit(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 8],
+        )
+        dispatcher = CudagraphDispatcher(
+            _create_vllm_config(comp_config, max_num_seqs=8)
+        )
+        dispatcher.initialize_cudagraph_keys(
+            comp_config.cudagraph_mode, uniform_decode_query_len=1
+        )
+        metadata = CUDAGraphRuntimeMetadata(
+            token_offset=4,
+            variant="parallel_replay",
+            backend_tag="test_backend",
+        )
+        initial_keys = dispatcher.cudagraph_keys[CUDAGraphMode.FULL].copy()
+
+        mode, descriptor = dispatcher.dispatch(
+            num_tokens=4,
+            uniform_decode=True,
+            runtime_metadata=metadata,
+        )
+        assert mode == CUDAGraphMode.NONE
+        assert descriptor == BatchDescriptor(num_tokens=4, runtime_metadata=metadata)
+        assert dispatcher.cudagraph_keys[CUDAGraphMode.FULL] == initial_keys
+
+        mode, descriptor = dispatcher.dispatch(
+            num_tokens=4,
+            uniform_decode=True,
+            runtime_metadata=metadata,
+            allow_runtime_key_registration=True,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert descriptor == BatchDescriptor(
+            num_tokens=4,
+            num_reqs=4,
+            uniform=True,
+            runtime_metadata=metadata,
+        )
+        assert descriptor in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+
+    @pytest.mark.parametrize(
+        ("metadata", "dispatch_kwargs"),
+        [
+            ("invalid_metadata", {}),
+            (
+                CUDAGraphRuntimeMetadata(0, "parallel_replay", "test_backend"),
+                {},
+            ),
+            (
+                CUDAGraphRuntimeMetadata(True, "parallel_replay", "test_backend"),
+                {},
+            ),
+            (CUDAGraphRuntimeMetadata(4, "", "test_backend"), {}),
+            (CUDAGraphRuntimeMetadata(4, "parallel_replay", ""), {}),
+            (
+                CUDAGraphRuntimeMetadata(4, " parallel_replay", "test_backend"),
+                {},
+            ),
+            (
+                CUDAGraphRuntimeMetadata(4, "parallel replay", "test_backend"),
+                {},
+            ),
+            (
+                CUDAGraphRuntimeMetadata(
+                    4, "parallel_replay", "test_backend", " metadata"
+                ),
+                {},
+            ),
+            (
+                CUDAGraphRuntimeMetadata(4, "parallel_replay", "test_backend"),
+                {"uniform_decode": False},
+            ),
+            (
+                CUDAGraphRuntimeMetadata(4, "parallel_replay", "test_backend"),
+                {"has_lora": True},
+            ),
+            (
+                CUDAGraphRuntimeMetadata(4, "parallel_replay", "test_backend"),
+                {"num_active_loras": 1},
+            ),
+            (
+                CUDAGraphRuntimeMetadata(4, "parallel_replay", "test_backend"),
+                {"invalid_modes": {CUDAGraphMode.FULL}},
+            ),
+        ],
+    )
+    def test_invalid_runtime_key_fails_without_mutation(
+        self,
+        metadata: object,
+        dispatch_kwargs: dict,
+    ):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 8],
+        )
+        dispatcher = CudagraphDispatcher(
+            _create_vllm_config(comp_config, max_num_seqs=8)
+        )
+        dispatcher.initialize_cudagraph_keys(
+            comp_config.cudagraph_mode, uniform_decode_query_len=1
+        )
+        initial_keys = {
+            mode: keys.copy() for mode, keys in dispatcher.cudagraph_keys.items()
+        }
+
+        kwargs = {
+            "num_tokens": 4,
+            "uniform_decode": True,
+            "runtime_metadata": metadata,
+            "allow_runtime_key_registration": True,
+        }
+        kwargs.update(dispatch_kwargs)
+        mode, _ = dispatcher.dispatch(
+            **kwargs,
+        )
+
+        assert mode == CUDAGraphMode.NONE
+        assert dispatcher.cudagraph_keys == initial_keys
+
+    @pytest.mark.parametrize(
+        ("num_tokens", "token_offset"),
+        [(3, 2), (4, 3), (10, 2)],
+    )
+    def test_runtime_key_alignment_and_capacity_fail_closed(
+        self, num_tokens: int, token_offset: int
+    ):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[2, 10],
+        )
+        dispatcher = CudagraphDispatcher(
+            _create_vllm_config(comp_config, max_num_seqs=4)
+        )
+        dispatcher.initialize_cudagraph_keys(
+            comp_config.cudagraph_mode, uniform_decode_query_len=2
+        )
+        initial_keys = {
+            mode: keys.copy() for mode, keys in dispatcher.cudagraph_keys.items()
+        }
+        metadata = CUDAGraphRuntimeMetadata(
+            token_offset=token_offset,
+            variant="parallel_replay",
+            backend_tag="test_backend",
+        )
+
+        mode, _ = dispatcher.dispatch(
+            num_tokens=num_tokens,
+            uniform_decode=True,
+            runtime_metadata=metadata,
+            allow_runtime_key_registration=True,
+        )
+
+        assert mode == CUDAGraphMode.NONE
+        assert dispatcher.cudagraph_keys == initial_keys
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
