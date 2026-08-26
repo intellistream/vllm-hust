@@ -25,7 +25,7 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 import time
-from vllm.v1.b134_events import emit  # B134
+from vllm.v1.events import EventBus, KVOffloadEvict, KVOffloadStore
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 
@@ -246,7 +246,14 @@ class CPUOffloadingManager(OffloadingManager):
             store_spec=store_spec,
             evicted_keys=to_evict,
         )
-        emit("cpu_store", req_context.req_id, f"us={(time.monotonic() - _t0) * 1e6:.0f} n={len(keys_to_store)} evict={len(to_evict)}")
+        EventBus.emit(
+            KVOffloadStore(
+                req_context.req_id,
+                elapsed_us=(time.monotonic() - _t0) * 1e6,
+                num_keys=len(keys_to_store),
+                evicted=len(to_evict),
+            )
+        )
 
     @override
     def complete_store(
@@ -303,7 +310,13 @@ class CPUOffloadingManager(OffloadingManager):
                     removed=True,
                 )
             )
-        emit("cpu_evict", "cpu", f"us={(time.monotonic() - _t0) * 1e6:.0f} n={len(evicted)}")
+        EventBus.emit(
+            KVOffloadEvict(
+                "cpu",
+                elapsed_us=(time.monotonic() - _t0) * 1e6,
+                num_keys=len(evicted),
+            )
+        )
         return evicted
 
     @override

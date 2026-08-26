@@ -3,10 +3,17 @@
 
 import os
 import time
-from vllm.v1.b134_events import emit  # B134
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
+
+from vllm.v1.events import (
+    EventBus,
+    KVTransferCopyDone,
+    KVTransferGatherH2D,
+    KVTransferPhase,
+    KVTransferSwapD2H,
+)
 
 import torch
 
@@ -339,7 +346,13 @@ class AscendSingleDirectionOffloadingHandler:
                 if self.npu_to_cpu:
                     _t_sw = time.monotonic()  # B134
                     torch.ops._C_ascend.swap_blocks_batch(src, dst, sizes, 1)
-                    emit("swap_d2h", f"job{job_id}", f"n={num_copy_ops} us={(time.monotonic() - _t_sw) * 1e6:.0f}")
+                    EventBus.emit(
+                        KVTransferSwapD2H(
+                            f"job{job_id}",
+                            num_ops=num_copy_ops,
+                            elapsed_us=(time.monotonic() - _t_sw) * 1e6,
+                        )
+                    )
                 else:
                     assert staging_buffer is not None
                     assert dma_src is not None
@@ -382,10 +395,26 @@ class AscendSingleDirectionOffloadingHandler:
                         )
                         dma_offset = dma_end
                     num_dma_ops = dma_offset
-                    emit("gather_h2d", f"job{job_id}", f"us={_t_gather_total * 1e6:.0f} chunks={num_dma_ops}")
+                    EventBus.emit(
+                        KVTransferGatherH2D(
+                            f"job{job_id}",
+                            elapsed_us=_t_gather_total * 1e6,
+                            num_dma_ops=num_dma_ops,
+                        )
+                    )
             end_event.record(self._stream)
         _t_submit = time.monotonic()  # B134
-        emit("transfer_phase", f"job{job_id}", f"dir={'d2h' if self.npu_to_cpu else 'h2d'} bytes={num_transfer_bytes} n_ops={num_copy_ops} desc_us={(_t_desc - _t0) * 1e6:.0f} sync_us={(_t_sync - _t_desc) * 1e6:.0f} submit_us={(_t_submit - _t_sync) * 1e6:.0f}")
+        EventBus.emit(
+            KVTransferPhase(
+                f"job{job_id}",
+                direction="d2h" if self.npu_to_cpu else "h2d",
+                bytes=num_transfer_bytes,
+                num_ops=num_copy_ops,
+                desc_us=(_t_desc - _t0) * 1e6,
+                sync_us=(_t_sync - _t_desc) * 1e6,
+                submit_us=(_t_submit - _t_sync) * 1e6,
+            )
+        )
 
         if num_copy_ops and not self.npu_to_cpu:
             logger.debug(
@@ -422,7 +451,15 @@ class AscendSingleDirectionOffloadingHandler:
             transfer.end_event.synchronize()  # B134: ensure completion ts is real
             _wall_ms = (time.monotonic() - transfer.submitted_at) * 1e3
             _evt_ms = transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
-            emit("copy_done", f"job{transfer.job_id}", f"dir={'d2h' if self.npu_to_cpu else 'h2d'} bytes={transfer.num_bytes} copy_ms_wall={_wall_ms:.3f} copy_ms_event={_evt_ms:.3f} note=wall_authoritative")
+            EventBus.emit(
+                KVTransferCopyDone(
+                    f"job{transfer.job_id}",
+                    direction="d2h" if self.npu_to_cpu else "h2d",
+                    bytes=transfer.num_bytes,
+                    wall_ms=_wall_ms,
+                    event_ms=_evt_ms,
+                )
+            )
             results.append(
                 TransferResult(
                     job_id=transfer.job_id,

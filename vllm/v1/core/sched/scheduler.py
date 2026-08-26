@@ -8,7 +8,14 @@ from dataclasses import replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.v1.b134_events import emit  # B134
+from vllm.v1.events import (
+    EventBus,
+    RequestAdmitted,
+    RequestFinished,
+    RequestPreempted,
+    RequestResumed,
+    RequestScheduled,
+)
 
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -619,7 +626,7 @@ class Scheduler(SchedulerInterface):
                         req_index -= 1
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
-                    emit("preempt", preempted_req.request_id)
+                    EventBus.emit(RequestPreempted(preempted_req.request_id))
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -1032,17 +1039,17 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
-                emit("admission", request.request_id)
+                EventBus.emit(RequestAdmitted(request.request_id))
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
-                    emit("scheduled", request.request_id)
+                    EventBus.emit(RequestScheduled(request.request_id))
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
-                    emit("wakeup", request.request_id)
+                    EventBus.emit(RequestResumed(request.request_id))
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -1766,8 +1773,12 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
-                    emit("finish", request.request_id,
-                         f"out_tokens={len(request._output_token_ids)}")
+                    EventBus.emit(
+                        RequestFinished(
+                            request.request_id,
+                            output_tokens=len(request._output_token_ids),
+                        )
+                    )
                     kv_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:

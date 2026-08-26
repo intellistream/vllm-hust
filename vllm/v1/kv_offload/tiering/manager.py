@@ -61,7 +61,13 @@ from vllm.v1.kv_offload.tiering.lifecycle import (
     has_stable_session_id,
 )
 from vllm.v1.kv_offload.tiering.residency import TieringMetrics
-from vllm.v1.b134_events import emit  # B134
+from vllm.v1.events import (
+    EventBus,
+    KVOffloadRestoreDone,
+    KVOffloadRestoreStart,
+    KVOffloadSchedStep,
+    KVOffloadTierEvict,
+)
 
 logger = init_logger(__name__)
 
@@ -886,7 +892,7 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
-        emit("restore_start", req_context.req_id, str(len(keys)))
+        EventBus.emit(KVOffloadRestoreStart(req_context.req_id, len(keys)))
         self._lifecycle.record_request_keys(req_context, keys)
         # Process completed promotions to ensure blocks are ready
         self._maybe_process_finished_jobs()
@@ -922,7 +928,7 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Blocks that finished loading.
             req_context: Per-request context.
         """
-        emit("restore_done", req_context.req_id, str(len(keys)))
+        EventBus.emit(KVOffloadRestoreDone(req_context.req_id, len(keys)))
         self.primary_tier.complete_load(keys, req_context)
         if self._track_residency:
             self._lifecycle.residency.finish_transfer(keys, "cpu", "device")
@@ -963,7 +969,13 @@ class TieringOffloadingManager(OffloadingManager):
         _t_ev = time.monotonic()  # B134
         primary_result = self.primary_tier.prepare_store(keys, req_context)
         if primary_result is not None:
-            emit("evict", req_context.req_id, f"n={len(primary_result.evicted_keys)} us={(time.monotonic() - _t_ev) * 1e6:.0f}")
+            EventBus.emit(
+                KVOffloadTierEvict(
+                    req_context.req_id,
+                    num_keys=len(primary_result.evicted_keys),
+                    elapsed_us=(time.monotonic() - _t_ev) * 1e6,
+                )
+            )
 
         if primary_result is None:
             return None
@@ -1301,7 +1313,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._flush_pending_promotions()
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
-        emit("sched_step", "step", f"us={(time.monotonic() - _t0) * 1e6:.0f}")
+        EventBus.emit(KVOffloadSchedStep((time.monotonic() - _t0) * 1e6))
 
         protected_keys = {
             key for metadata in self._transfer_jobs.values() for key in metadata.keys
