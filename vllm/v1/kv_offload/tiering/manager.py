@@ -199,6 +199,7 @@ class PendingPromotion:
 @dataclass(slots=True)
 class RequestState:
     req_context: ReqContext
+    lifecycle_session_id: str
     pending_primary_stores: int = 0
     is_finished: bool = False
     request_level_tiers: set[SecondaryTierManager] | None = None
@@ -340,6 +341,11 @@ class TieringOffloadingManager(OffloadingManager):
         # Secondary tiers are finalized only after pending primary stores reach
         # complete_store(), since complete_store() can still submit cascades.
         self._req_state: dict[str, RequestState] = {}
+        # A request ID may be reused after its scheduler-visible lifetime ends
+        # while an earlier GPU->primary store callback is still outstanding.
+        # Keep those finished generations addressable by their ReqContext
+        # identity so late callbacks cannot mutate the new generation.
+        self._retired_req_state: dict[int, RequestState] = {}
         self._lifecycle = SessionLifecycleManager(lifecycle_config or LifecycleConfig())
         self._policy_config = policy_config or TieringPolicyConfig()
         self._device_usage = 0.0
@@ -355,6 +361,19 @@ class TieringOffloadingManager(OffloadingManager):
     @property
     def _track_residency(self) -> bool:
         return self._lifecycle.enabled
+
+    def _request_state_for(self, req_context: ReqContext) -> RequestState:
+        state = self._req_state.get(req_context.req_id)
+        if state is not None and state.req_context is req_context:
+            return state
+        state = self._retired_req_state.get(id(req_context))
+        if state is not None and state.req_context is req_context:
+            return state
+        raise KeyError(f"No request generation for req_id={req_context.req_id!r}")
+
+    def _all_request_states(self) -> Iterable[RequestState]:
+        yield from self._req_state.values()
+        yield from self._retired_req_state.values()
 
     @override
     def update_device_pressure(
@@ -480,14 +499,15 @@ class TieringOffloadingManager(OffloadingManager):
                     )
                     return 0
 
-        state = self._req_state.get(req_context.req_id)
-        if state is None:
+        try:
+            state = self._request_state_for(req_context)
+        except KeyError:
             return 0
 
         inflight_limit = self._policy_config.max_inflight_device_store_jobs
         inflight_jobs = sum(
             request_state.pending_primary_stores
-            for request_state in self._req_state.values()
+            for request_state in self._all_request_states()
         )
         if inflight_limit and inflight_jobs >= inflight_limit:
             self._increase_counter(
@@ -545,7 +565,7 @@ class TieringOffloadingManager(OffloadingManager):
     ) -> None:
         if submitted_blocks <= 0:
             return
-        state = self._req_state[req_context.req_id]
+        state = self._request_state_for(req_context)
         state.submitted_store_blocks += submitted_blocks
         self._step_submitted_store_blocks += submitted_blocks
         self._episode_submitted_store_blocks += submitted_blocks
@@ -971,11 +991,13 @@ class TieringOffloadingManager(OffloadingManager):
             )
 
         if primary_result.keys_to_store:
-            state = self._req_state[req_context.req_id]
+            state = self._request_state_for(req_context)
             state.pending_primary_stores += 1
 
         # Step 3: For request-level tiers, cascade blocks already in primary
-        request_level_tiers = self._req_state[req_context.req_id].request_level_tiers
+        request_level_tiers = self._request_state_for(
+            req_context
+        ).request_level_tiers
         if request_level_tiers:
             keys_to_store_set = set(primary_result.keys_to_store)
             keys_already_in_primary = tuple(
@@ -1072,6 +1094,12 @@ class TieringOffloadingManager(OffloadingManager):
             success: Whether the GPU→primary transfer succeeded.
             req_context: Per-request context forwarded to primary.prepare_read().
         """
+        state = self._request_state_for(req_context)
+        if state.pending_primary_stores <= 0:
+            raise RuntimeError(
+                "Store completion has no pending request generation for "
+                f"req_id={req_context.req_id!r}"
+            )
         # Step 1: Complete store in primary tier (makes blocks loadable)
         self.primary_tier.complete_store(keys, req_context, success)
         if self._track_residency:
@@ -1081,7 +1109,6 @@ class TieringOffloadingManager(OffloadingManager):
             self._record_migration(keys, "device", "cpu")
 
         if success:
-            state = self._req_state[req_context.req_id]
             cascade_tiers: Iterable[SecondaryTierManager]
             if self._policy_config.secondary_pressure_aware and self.secondary_tiers:
                 cascade_tiers = state.request_level_tiers or ()
@@ -1091,11 +1118,8 @@ class TieringOffloadingManager(OffloadingManager):
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
-        req_id = req_context.req_id
-        state = self._req_state[req_id]
-        assert state.pending_primary_stores > 0
         state.pending_primary_stores -= 1
-        self._maybe_finalize_request(req_id)
+        self._maybe_finalize_request(state)
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -1105,11 +1129,22 @@ class TieringOffloadingManager(OffloadingManager):
         Returns REQUEST_LEVEL if ANY secondary tier wants request-level.
         Only stores REQUEST_LEVEL tier decisions for use in prepare_store.
         """
-        self._lifecycle.on_new_request(
+        previous = self._req_state.get(req_context.req_id)
+        if previous is not None:
+            if not previous.is_finished:
+                raise ValueError(
+                    f"Duplicate active req_id={req_context.req_id!r}"
+                )
+            self._retired_req_state[id(previous.req_context)] = previous
+
+        lifecycle_session_id = self._lifecycle.on_new_request(
             req_context,
             track_heat=self._policy_config.reuse_aware,
         )
-        state = RequestState(req_context=req_context)
+        state = RequestState(
+            req_context=req_context,
+            lifecycle_session_id=lifecycle_session_id,
+        )
         for tier in self.secondary_tiers:
             tier_ctx = tier.on_new_request(req_context)
             if tier_ctx.policy == OffloadPolicy.REQUEST_LEVEL:
@@ -1127,23 +1162,24 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
+        state = self._request_state_for(req_context)
+        if state.is_finished:
+            return
         self.primary_tier.on_request_finished(req_context)
         self._lifecycle.on_request_finished(
             req_context,
             track_heat=self._policy_config.reuse_aware,
         )
-        state = self._req_state[req_context.req_id]
         state.is_finished = True
-        self._maybe_finalize_request(req_context.req_id)
+        self._maybe_finalize_request(state)
 
-    def _maybe_finalize_request(self, req_id: str) -> None:
+    def _maybe_finalize_request(self, state: RequestState) -> None:
         """Finalize secondary tiers once no more store cascades can be submitted.
 
         Finalization means forwarding on_request_finished() to secondary tiers.
         It is delayed until pending GPU->primary stores finish, since their
         complete_store() callbacks may still submit primary->secondary stores.
         """
-        state = self._req_state[req_id]
         if not state.is_finished:
             return
         if state.pending_primary_stores != 0:
@@ -1151,8 +1187,16 @@ class TieringOffloadingManager(OffloadingManager):
 
         for tier in self.secondary_tiers:
             tier.on_request_finished(state.req_context)
-        self._lifecycle.on_request_finalized(state.req_context)
-        del self._req_state[req_id]
+        self._lifecycle.on_request_finalized(
+            state.req_context,
+            session_id=state.lifecycle_session_id,
+        )
+        current = self._req_state.get(state.req_context.req_id)
+        if current is state:
+            del self._req_state[state.req_context.req_id]
+        else:
+            removed = self._retired_req_state.pop(id(state.req_context), None)
+            assert removed is state
 
     def _reclaim_primary_keys(
         self,
@@ -1311,6 +1355,11 @@ class TieringOffloadingManager(OffloadingManager):
             for req_id, state in self._req_state.items()
             if state.pending_primary_stores > 0
         }
+        protected_req_ids.update(
+            state.req_context.req_id
+            for state in self._retired_req_state.values()
+            if state.pending_primary_stores > 0
+        )
         expiration = self._lifecycle.expire_idle_sessions(
             protected_keys=protected_keys,
             protected_req_ids=protected_req_ids,
@@ -1449,8 +1498,20 @@ class TieringOffloadingManager(OffloadingManager):
                 continue
             for tier in self.secondary_tiers:
                 tier.on_request_finished(state.req_context)
-            self._lifecycle.on_request_finalized(state.req_context)
+            self._lifecycle.on_request_finalized(
+                state.req_context,
+                session_id=state.lifecycle_session_id,
+            )
             finished_req_ids.append(req_id)
+
+        for state in self._retired_req_state.values():
+            state.pending_primary_stores = 0
+            for tier in self.secondary_tiers:
+                tier.on_request_finished(state.req_context)
+            self._lifecycle.on_request_finalized(
+                state.req_context,
+                session_id=state.lifecycle_session_id,
+            )
 
         self.primary_tier.reset_cache()
         if self._track_residency:
@@ -1458,6 +1519,7 @@ class TieringOffloadingManager(OffloadingManager):
 
         for req_id in finished_req_ids:
             del self._req_state[req_id]
+        self._retired_req_state.clear()
         self._processed_jobs_this_step = False
         self._cpu_pressure_requested = False
         self._device_preempted = False
@@ -1533,7 +1595,10 @@ class TieringOffloadingManager(OffloadingManager):
         )
         stats.set_gauge(
             TieringMetrics.MIGRATION_BUDGET,
-            sum(state.pending_primary_stores for state in self._req_state.values()),
+            sum(
+                state.pending_primary_stores
+                for state in self._all_request_states()
+            ),
             ("inflight_jobs",),
         )
         stats.set_gauge(

@@ -257,10 +257,20 @@ class SessionLifecycleManager:
             if self.enabled:
                 self.residency.on_session_idle(state.session_id)
 
-    def on_request_finalized(self, req_context: ReqContext) -> None:
+    def on_request_finalized(
+        self,
+        req_context: ReqContext,
+        *,
+        session_id: str | None = None,
+    ) -> None:
         """Release per-request metadata after all asynchronous stores finish."""
-        state = self._get_by_req(req_context)
-        self._req_to_session.pop(req_context.req_id, None)
+        if session_id is None:
+            session_id = self._req_to_session.get(req_context.req_id)
+        if session_id is None:
+            session_id = get_session_id(req_context)
+        state = self._sessions.get(session_id)
+        if self._req_to_session.get(req_context.req_id) == session_id:
+            self._req_to_session.pop(req_context.req_id, None)
         if state is None:
             return
         state.retained_req_ids.discard(req_context.req_id)

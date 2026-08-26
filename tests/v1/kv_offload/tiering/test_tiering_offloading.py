@@ -1014,6 +1014,78 @@ class TestTieringOffloadingManager:
             ("secondary_finish_2", ctx.req_id),
         ]
 
+    def test_finished_request_id_can_be_reused_before_old_store_completes(
+        self, manager_setup
+    ):
+        """A late store callback must retire only its own request generation."""
+        blocks = to_keys(range(2))
+        old_ctx = ReqContext(req_id="reused-request")
+        new_ctx = ReqContext(req_id="reused-request")
+
+        self._start_request(old_ctx)
+        self.manager.prepare_store(blocks, old_ctx)
+        self.manager.on_request_finished(old_ctx)
+
+        self.manager.on_new_request(new_ctx)
+        self.manager.complete_store(blocks, old_ctx, success=True)
+
+        assert self.manager._req_state[old_ctx.req_id].req_context is new_ctx
+        assert not self.manager._req_state[old_ctx.req_id].is_finished
+        self.manager.on_request_finished(new_ctx)
+        assert old_ctx.req_id not in self.manager._req_state
+
+    def test_reused_request_id_keeps_stable_session_generations_isolated(
+        self, manager_setup
+    ):
+        """An old finalizer must not detach a newer stable session mapping."""
+        blocks = to_keys(range(2))
+        old_ctx = ReqContext(
+            req_id="reused-stable-request",
+            kv_transfer_params={"session_id": "old-session"},
+        )
+        new_ctx = ReqContext(
+            req_id="reused-stable-request",
+            kv_transfer_params={"session_id": "new-session"},
+        )
+
+        self._start_request(old_ctx)
+        self.manager.prepare_store(blocks, old_ctx)
+        self.manager.on_request_finished(old_ctx)
+        self.manager.on_new_request(new_ctx)
+
+        self.manager.complete_store(blocks, old_ctx, success=True)
+
+        assert self.manager._lifecycle._req_to_session[new_ctx.req_id] == (
+            "new-session"
+        )
+        assert self.manager._lifecycle._sessions["new-session"].active_req_ids == {
+            new_ctx.req_id
+        }
+
+    def test_duplicate_active_request_id_fails_closed(self, manager_setup):
+        ctx = ReqContext(req_id="duplicate-active")
+        self.manager.on_new_request(ctx)
+
+        with pytest.raises(ValueError, match="Duplicate active req_id"):
+            self.manager.on_new_request(ReqContext(req_id=ctx.req_id))
+
+    def test_stale_duplicate_finish_does_not_touch_reused_request_id(
+        self, manager_setup
+    ):
+        blocks = to_keys(range(2))
+        old_ctx = ReqContext(req_id="duplicate-finish")
+        new_ctx = ReqContext(req_id="duplicate-finish")
+
+        self._start_request(old_ctx)
+        self.manager.prepare_store(blocks, old_ctx)
+        self.manager.on_request_finished(old_ctx)
+        self.manager.on_new_request(new_ctx)
+
+        self.manager.on_request_finished(old_ctx)
+
+        assert self.manager._req_state[new_ctx.req_id].req_context is new_ctx
+        assert not self.manager._req_state[new_ctx.req_id].is_finished
+
     def test_failed_store_finalizes_finished_request(self, manager_setup):
         """Failed primary stores still unblock secondary finalization."""
         blocks = to_keys(range(2))
