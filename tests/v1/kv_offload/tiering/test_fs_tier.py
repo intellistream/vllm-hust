@@ -30,6 +30,10 @@ from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+from vllm.v1.kv_offload.tiering.manager import (
+    CPUPrimaryTierOffloadingManager,
+    TieringOffloadingManager,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -223,6 +227,86 @@ def test_store_then_load_roundtrip(fs_tier):
         LookupResult.HIT,
     ]
 
+
+def test_request_id_reuse_survives_real_fs_store_callback(tmp_path, monkeypatch):
+    """The generation fence must hold through the real FS worker path."""
+    tensor = _page_aligned_rand_tensor(4, _BLOCK_ELEMENTS)
+    primary_view = memoryview(tensor.numpy())
+    region = MagicMock()
+    region.create_kv_memoryview.return_value = primary_view
+    primary = CPUPrimaryTierOffloadingManager(num_blocks=4, mmap_region=region)
+
+    store_started = threading.Event()
+    release_store = threading.Event()
+    events: list[dict] = []
+    from vllm.v1.kv_offload.tiering.fs import manager as fs_manager_module
+
+    real_store_block = fs_manager_module.store_block
+
+    def gated_store_block(*args, **kwargs):
+        store_started.set()
+        assert release_store.wait(timeout=5)
+        return real_store_block(*args, **kwargs)
+
+    monkeypatch.setattr(fs_manager_module, "store_block", gated_store_block)
+    fs_tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=primary_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        instrumentation_callback=events.append,
+    )
+    manager = TieringOffloadingManager(
+        primary_tier=primary,
+        secondary_tiers=[fs_tier],
+    )
+    old_ctx = ReqContext(req_id="fs-reused-request")
+    new_ctx = ReqContext(req_id="fs-reused-request")
+    block_key = key(41)
+
+    try:
+        manager.on_new_request(old_ctx)
+        prepared = manager.prepare_store([block_key], old_ctx)
+        assert prepared is not None
+        assert prepared.keys_to_store == [block_key]
+        manager.on_request_finished(old_ctx)
+        manager.on_new_request(new_ctx)
+
+        manager.complete_store([block_key], old_ctx, success=True)
+        assert store_started.wait(timeout=5)
+        assert manager._req_state[new_ctx.req_id].req_context is new_ctx
+        assert not manager._req_state[new_ctx.req_id].is_finished
+        assert id(old_ctx) not in manager._retired_req_state
+        assert manager._transfer_jobs
+
+        release_store.set()
+        deadline = time.monotonic() + 5
+        schedule_end = ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+        while manager._transfer_jobs and time.monotonic() < deadline:
+            manager.on_schedule_end(schedule_end)
+            time.sleep(0.01)
+        assert not manager._transfer_jobs
+
+        stored_path = fs_tier.file_mapper.get_file_name(block_key)
+        assert os.path.exists(stored_path)
+        with open(stored_path, "rb") as stored:
+            assert stored.read() == tensor[0].numpy().tobytes()
+        assert primary.lookup(block_key, new_ctx) is LookupResult.HIT
+        assert any(
+            event["event"] == "io_call_finish"
+            and event["direction"] == "store"
+            and event["success"] is True
+            for event in events
+        )
+
+        manager.on_request_finished(new_ctx)
+        assert new_ctx.req_id not in manager._req_state
+        assert not manager.has_pending_work()
+    finally:
+        release_store.set()
+        manager.shutdown()
 
 def test_invalid_path_raises_at_construction():
     """Construction must fail immediately when the config file cannot be written."""
