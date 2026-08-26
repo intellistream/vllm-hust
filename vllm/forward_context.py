@@ -28,6 +28,45 @@ batchsize_forward_time: defaultdict = defaultdict(list)
 
 
 @dataclass(frozen=True)
+class CUDAGraphRuntimeMetadata:
+    """Opaque metadata that distinguishes runtime-registered graph keys.
+
+    Split-batch (dual-stream) replay registers graph keys at runtime for
+    offset/variant views into the original buffer. Core treats the metadata as
+    opaque: it validates the generic schema (via :meth:`is_valid`) and uses the
+    value only for key hashing/lookup, it does not interpret platform-specific
+    ``variant`` / ``backend_tag`` semantics.
+    """
+
+    token_offset: int
+    variant: str
+    backend_tag: str
+    metadata_mode: str = ""
+
+    def is_valid(self) -> bool:
+        """Return whether the metadata satisfies the core schema."""
+
+        def valid_tag(value: object, *, required: bool) -> bool:
+            if not isinstance(value, str) or len(value) > 128:
+                return False
+            if required and not value:
+                return False
+            return not any(char.isspace() for char in value)
+
+        if (
+            not isinstance(self.token_offset, int)
+            or isinstance(self.token_offset, bool)
+            or self.token_offset <= 0
+        ):
+            return False
+        if not valid_tag(self.variant, required=True) or not valid_tag(
+            self.backend_tag, required=True
+        ):
+            return False
+        return valid_tag(self.metadata_mode, required=False)
+
+
+@dataclass(frozen=True)
 class BatchDescriptor:
     """
     Batch descriptor for cudagraph dispatching. We should keep the num of
@@ -57,28 +96,12 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
-    start_num_tokens: int = 0
+    runtime_metadata: CUDAGraphRuntimeMetadata | None = None
     """
-    Extended graph key metadata: the starting token offset for an offset view
-    (e.g. the second split of an inplace split-batch replay) into the original
-    buffer. 0 (default) means a normal (non-offset) key. This metadata is
-    produced by the pluggable cudagraph key strategy and participates in the
-    versioned key lookup (hash/eq); core does not interpret its value.
-    """
-    graph_variant: str = ""
-    """
-    Extended graph key metadata: split mode variant tag (e.g. "inplace_serial"
-    or "inplace_parallel"). Empty string for standard keys.
-    """
-    attention_backend: str = ""
-    """
-    Extended graph key metadata: attention backend tag (e.g. "fia", "pa")
-    used during graph capture. Empty string for standard keys.
-    """
-    capture_metadata_mode: str = ""
-    """
-    Extended graph key metadata: the metadata mode used during graph capture.
-    Empty string for standard keys.
+    Opaque, validated runtime graph key metadata (split-batch / dual-stream).
+    None for statically captured and eager batches. When present, this is the
+    canonical extended-key representation; core does not interpret the
+    platform-specific ``variant`` / ``backend_tag`` values.
     """
 
 
