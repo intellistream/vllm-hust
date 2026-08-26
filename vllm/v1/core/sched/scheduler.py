@@ -28,6 +28,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+
+# Optional tracing seam (feature-gated). If ADAPTER_TRACE_HOOKS_ENABLED=1,
+# trace_emit will be available and emit structured JSON events.
+try:
+    from adapter_serving_plugin.src.trace_hooks import trace_emit
+except Exception:
+    def trace_emit(event, payload):
+        return
+
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
@@ -1164,6 +1173,15 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             kv_cache_usage=self.kv_cache_manager.usage,
         )
+
+        # Emit scheduler batch summary trace (best-effort)
+        try:
+            trace_emit("schedule_batch", {
+                "scheduled_req_ids": list(num_scheduled_tokens.keys()),
+                "total_num_scheduled_tokens": total_num_scheduled_tokens,
+            })
+        except Exception:
+            pass
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store

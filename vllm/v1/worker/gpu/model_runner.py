@@ -99,6 +99,13 @@ from vllm.v1.worker.gpu.lora_utils import (
     get_lora_capture_cases,
     get_num_active_loras_for_dispatch,
 )
+# Optional tracing seam (feature-gated). If ADAPTER_TRACE_HOOKS_ENABLED=1,
+# trace_emit will be available and emit structured JSON events.
+try:
+    from adapter_serving_plugin.src.trace_hooks import trace_emit
+except Exception:
+    def trace_emit(event, payload):
+        return
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
@@ -813,6 +820,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 req_index, new_req_data.block_ids, overwrite=True
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
+
+            # Emit trace for request->lora association
+            try:
+                trace_emit("request_assigned_lora", {
+                    "req_id": req_id,
+                    "req_index": req_index,
+                    "lora_name": getattr(new_req_data.lora_request, "lora_name", None),
+                    "lora_int_id": getattr(new_req_data.lora_request, "lora_int_id", None),
+                })
+            except Exception:
+                pass
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None

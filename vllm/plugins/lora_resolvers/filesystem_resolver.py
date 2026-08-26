@@ -7,6 +7,14 @@ import vllm.envs as envs
 from vllm.lora.request import LoRARequest
 from vllm.lora.resolver import LoRAResolver, LoRAResolverRegistry
 
+# Optional tracing seam (feature-gated). If ADAPTER_TRACE_HOOKS_ENABLED=1,
+# trace_emit will be available and emit structured JSON events.
+try:
+    from adapter_serving_plugin.src.trace_hooks import trace_emit
+except Exception:
+    def trace_emit(event, payload):
+        return
+
 
 class FilesystemResolver(LoRAResolver):
     def __init__(self, lora_cache_dir: str):
@@ -42,6 +50,16 @@ class FilesystemResolver(LoRAResolver):
                         lora_int_id=abs(hash(lora_name)),
                         lora_path=lora_path,
                     )
+                    # Emit trace for resolver discovery (no-op if tracing disabled)
+                    try:
+                        trace_emit("lora_resolved", {
+                            "lora_name": lora_name,
+                            "lora_int_id": lora_request.lora_int_id,
+                            "lora_path": lora_path,
+                            "resolver": "filesystem",
+                        })
+                    except Exception:
+                        pass
                     return lora_request
         return None
 

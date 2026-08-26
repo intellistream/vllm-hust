@@ -30,6 +30,14 @@ from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
+
+# Optional tracing seam (feature-gated). If ADAPTER_TRACE_HOOKS_ENABLED=1,
+# trace_emit will be available and emit structured JSON events.
+try:
+    from adapter_serving_plugin.src.trace_hooks import trace_emit
+except Exception:
+    def trace_emit(event, payload):
+        return
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
@@ -492,7 +500,19 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        # Emit schedule start trace
+        try:
+            trace_emit("schedule_start", {"scheduler_step": getattr(self, "_step_counter", None)})
+        except Exception:
+            pass
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        # Emit schedule end trace with a summary (best-effort)
+        try:
+            trace_emit("schedule_end", {
+                "scheduled_num_reqs": len(getattr(scheduler_output, "scheduled_requests", [])) if scheduler_output is not None else None,
+            })
+        except Exception:
+            pass
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (

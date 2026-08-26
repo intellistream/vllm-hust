@@ -20,6 +20,14 @@ from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 
+# Optional tracing seam (feature-gated). If ADAPTER_TRACE_HOOKS_ENABLED=1,
+# trace_emit will be available and emit structured JSON events.
+try:
+    from adapter_serving_plugin.src.trace_hooks import trace_emit
+except Exception:
+    def trace_emit(event, payload):
+        return
+
 logger = init_logger(__name__)
 
 
@@ -103,6 +111,15 @@ class WorkerLoRAManager:
         return lora_manager.model
 
     def _load_adapter(self, lora_request: LoRARequest) -> LoRAModel:
+        # Emit start trace for adapter loading (no-op if tracing disabled)
+        try:
+            trace_emit("lora_load_start", {
+                "lora_name": lora_request.lora_name,
+                "lora_int_id": lora_request.lora_int_id,
+                "lora_path": lora_request.lora_path,
+            })
+        except Exception:
+            pass
         try:
             supported_lora_modules = self._adapter_manager.supported_lora_modules
             packed_modules_mapping = self._adapter_manager.packed_modules_mapping
@@ -167,7 +184,29 @@ class WorkerLoRAManager:
                 lora_request.lora_name, lora_request.lora_path
             ) from e
         except Exception as e:
+            # Emit failure trace
+            try:
+                trace_emit("lora_load_end", {
+                    "lora_name": getattr(lora_request, "lora_name", None),
+                    "lora_int_id": getattr(lora_request, "lora_int_id", None),
+                    "lora_path": getattr(lora_request, "lora_path", None),
+                    "outcome": "error",
+                    "error": str(e),
+                })
+            except Exception:
+                pass
             raise e
+
+        # Emit end trace for adapter loading (success)
+        try:
+            trace_emit("lora_load_end", {
+                "lora_name": lora_request.lora_name,
+                "lora_int_id": lora_request.lora_int_id,
+                "lora_path": lora_request.lora_path,
+                "outcome": "ok",
+            })
+        except Exception:
+            pass
 
         return lora
 

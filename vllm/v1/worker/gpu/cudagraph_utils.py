@@ -22,6 +22,13 @@ from vllm.distributed.parallel_state import (
     graph_capture,
     is_global_first_rank,
 )
+# Optional tracing seam (feature-gated). If ADAPTER_TRACE_HOOKS_ENABLED=1,
+# trace_emit will be available and emit structured JSON events.
+try:
+    from adapter_serving_plugin.src.trace_hooks import trace_emit
+except Exception:
+    def trace_emit(event, payload):
+        return
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
@@ -313,6 +320,18 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
+                        # Emit capture start trace for this graph descriptor
+                        try:
+                            trace_emit("cudagraph_capture_start", {
+                                "cg_mode": desc.cg_mode.name,
+                                "num_tokens": desc.num_tokens,
+                                "num_reqs": desc.num_reqs,
+                                "num_active_loras": desc.num_active_loras,
+                                "graph_desc": str(desc),
+                            })
+                        except Exception:
+                            pass
+
                         graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
@@ -326,6 +345,18 @@ class CudaGraphManager:
                             get_offloader().join_after_forward()
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
+
+                        # Emit capture end trace
+                        try:
+                            trace_emit("cudagraph_capture_end", {
+                                "cg_mode": desc.cg_mode.name,
+                                "num_tokens": desc.num_tokens,
+                                "num_reqs": desc.num_reqs,
+                                "num_active_loras": desc.num_active_loras,
+                                "graph_desc": str(desc),
+                            })
+                        except Exception:
+                            pass
         self._graphs_captured = True
         return attn_states
 
@@ -369,8 +400,27 @@ class CudaGraphManager:
         # H2D copies on copy_stream that the graph's captured events
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
+        # Emit cudagraph replay start
+        try:
+            trace_emit("cudagraph_replay_start", {
+                "graph_desc": str(desc),
+                "cg_mode": desc.cg_mode.name,
+                "num_tokens": desc.num_tokens,
+                "num_reqs": desc.num_reqs,
+                "num_active_loras": desc.num_active_loras,
+            })
+        except Exception:
+            pass
         get_offloader().sync_prev_onload()
         self.graphs[desc].replay()
+        # Emit cudagraph replay end
+        try:
+            trace_emit("cudagraph_replay_end", {
+                "graph_desc": str(desc),
+                "cg_mode": desc.cg_mode.name,
+            })
+        except Exception:
+            pass
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:

@@ -10,6 +10,14 @@ import torch
 
 from vllm.config.reasoning import ReasoningConfig
 from vllm.lora.request import LoRARequest
+
+# Optional tracing seam (feature-gated). If ADAPTER_TRACE_HOOKS_ENABLED=1,
+# trace_emit will be available and emit structured JSON events.
+try:
+    from adapter_serving_plugin.src.trace_hooks import trace_emit
+except Exception:
+    def trace_emit(event, payload):
+        return
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
@@ -377,6 +385,17 @@ class InputBatch:
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.block_table.add_row(request.block_ids, req_index)
+
+        # Emit trace that this request was added to the physical input batch
+        try:
+            trace_emit("batch_add_request", {
+                "req_id": req_id,
+                "req_index": req_index,
+                "num_prompt_tokens": num_prompt_tokens,
+                "num_tokens_no_spec": self.num_tokens_no_spec[req_index],
+            })
+        except Exception:
+            pass
 
         if sampling_params := request.sampling_params:
             if sampling_params.sampling_type == SamplingType.GREEDY:
