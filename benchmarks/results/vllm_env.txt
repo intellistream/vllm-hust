@@ -1,0 +1,118 @@
+Collecting environment information...
+==============================
+        System Info
+==============================
+OS                           : Ubuntu 22.04.5 LTS (aarch64)
+GCC version                  : (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0
+Clang version                : Could not collect
+CMake version                : version 4.3.1
+Libc version                 : glibc-2.35
+
+==============================
+       PyTorch Info
+==============================
+PyTorch version              : 2.9.0+cpu
+Is debug build               : False
+CUDA used to build PyTorch   : None
+ROCM used to build PyTorch   : N/A
+
+==============================
+      Python Environment
+==============================
+Python version               : 3.10.20 (main, Mar 11 2026, 17:41:27) [GCC 14.3.0] (64-bit runtime)
+Python platform              : Linux-5.10.0-60.18.0.50.oe2203.aarch64-aarch64-with-glibc2.35
+
+==============================
+       CUDA / GPU Info
+==============================
+Is CUDA available            : False
+CUDA runtime version         : No CUDA
+CUDA_MODULE_LOADING set to   : N/A
+GPU models and configuration : No CUDA
+Nvidia driver version        : No CUDA
+cuDNN version                : No CUDA
+HIP runtime version          : N/A
+MIOpen runtime version       : N/A
+Is XNNPACK available         : True
+
+==============================
+          CPU Info
+==============================
+Architecture:                    aarch64
+CPU op-mode(s):                  64-bit
+Byte Order:                      Little Endian
+CPU(s):                          192
+On-line CPU(s) list:             0-191
+Vendor ID:                       HiSilicon
+Model name:                      Kunpeng-920
+Model:                           0
+Thread(s) per core:              1
+Core(s) per socket:              48
+Socket(s):                       4
+Stepping:                        0x1
+BogoMIPS:                        200.00
+Flags:                           fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma dcpop asimddp asimdfhm ssbs
+L1d cache:                       12 MiB (192 instances)
+L1i cache:                       12 MiB (192 instances)
+L2 cache:                        96 MiB (192 instances)
+L3 cache:                        192 MiB (8 instances)
+NUMA node(s):                    8
+NUMA node0 CPU(s):               0-23
+NUMA node1 CPU(s):               24-47
+NUMA node2 CPU(s):               48-71
+NUMA node3 CPU(s):               72-95
+NUMA node4 CPU(s):               96-119
+NUMA node5 CPU(s):               120-143
+NUMA node6 CPU(s):               144-167
+NUMA node7 CPU(s):               168-191
+Vulnerability Itlb multihit:     Not affected
+Vulnerability L1tf:              Not affected
+Vulnerability Mds:               Not affected
+Vulnerability Meltdown:          Not affected
+Vulnerability Spec store bypass: Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:        Mitigation; __user pointer sanitization
+Vulnerability Spectre v2:        Not affected
+Vulnerability Srbds:             Not affected
+Vulnerability Tsx async abort:   Not affected
+
+==============================
+Versions of relevant libraries
+==============================
+[pip3] numpy==1.26.4
+[pip3] onnxruntime==1.23.2
+[pip3] pyzmq==26.4.0
+[pip3] torch==2.9.0
+[pip3] torch_npu==2.9.0
+[pip3] torchaudio==2.11.0
+[pip3] torchvision==0.24.0
+[pip3] transformers==4.57.6
+[conda] numpy                                       1.26.4                                 pypi_0           pypi
+[conda] pyzmq                                       26.4.0                                 pypi_0           pypi
+[conda] torch                                       2.9.0                                  pypi_0           pypi
+[conda] torch-npu                                   2.9.0                                  pypi_0           pypi
+[conda] torchaudio                                  2.11.0                                 pypi_0           pypi
+[conda] torchvision                                 0.24.0                                 pypi_0           pypi
+[conda] transformers                                4.57.6                                 pypi_0           pypi
+
+==============================
+         vLLM Info
+==============================
+ROCM Version                 : Could not collect
+vLLM Version                 : 0.17.2rc1.dev446+gcd97918a9.d20260402 (git sha: cd97918a9, date: 20260402)
+vLLM Build Flags:
+  CUDA Archs: Not Set; ROCm: Disabled
+GPU Topology:
+  Could not collect
+
+==============================
+     Environment Variables
+==============================
+TORCH_DEVICE_BACKEND_AUTOLOAD=0
+LD_LIBRARY_PATH=/workspace/miniconda3/envs/vllm-hust-dev/lib/python3.10/site-packages/cv2/../../lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64:/usr/local/Ascend/ascend-toolkit/latest/compiler/lib64:/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64:/usr/local/Ascend/ascend-toolkit/latest/hccl/lib64:/usr/local/Ascend/ascend-toolkit/latest/fwkacllib/lib64:/usr/local/Ascend/ascend-toolkit/latest/atc/lib64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64/device/lib64:/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/devlib:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/ascend-toolkit/8.2.RC1/aarch64-linux/lib64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib
+VLLM_LOGGING_LEVEL=WARNING
+VLLM_HOST_IP=172.16.0.43
+PYTORCH_NVML_BASED_CUDA_CHECK=1
+TORCHINDUCTOR_COMPILE_THREADS=1
+VLLM_DISABLE_SHARED_EXPERTS_STREAM=1
+TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_shuhao
+VLLM_WORKER_MULTIPROC_METHOD=spawn
