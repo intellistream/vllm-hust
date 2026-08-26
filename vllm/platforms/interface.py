@@ -598,6 +598,17 @@ class Platform:
         pass
 
     @classmethod
+    def get_cudagraph_key_strategy(cls, vllm_config: "VllmConfig") -> Any | None:
+        """Return a pluggable cudagraph key strategy, or None.
+
+        The cudagraph dispatcher consults this hook for extended
+        (split-batch / dual-stream) capture and replay key policy. Returning
+        None lets core fall back to its default strategy. Platforms that own
+        the policy out of tree implement this hook and return their strategy.
+        """
+        return None
+
+    @classmethod
     def _find_non_ssm_backend(
         cls, vllm_config: "VllmConfig"
     ) -> "type[AttentionBackend] | None":
