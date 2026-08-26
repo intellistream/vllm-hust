@@ -320,17 +320,33 @@ class EngineCore:
         return {
             "boot_id": self._runtime_control_boot_id,
             "config_epoch": limits["config_epoch"],
-            "unfinished_requests": self.scheduler.get_num_old_epoch_unfinished_requests(),
+            "unfinished_requests": (
+                self.scheduler.get_num_old_epoch_unfinished_requests()
+            ),
             "pending_epoch_requests": limits["pending_epoch_request_count"],
             "transition_staged": bool(limits["transition_staged"]),
             "scheduler_limits": limits,
+        }
+
+    def get_native_recapture_scope_state(
+        self, after_sequence: int = 0
+    ) -> dict[str, Any]:
+        """Join scheduler scope receipts to the live EngineCore identity."""
+
+        state = self.scheduler.get_native_recapture_scope_state(after_sequence)
+        return {
+            **state,
+            "engine_boot_id": self._runtime_control_boot_id,
+            "scheduler_limits": self.scheduler.get_runtime_scheduler_limits(),
         }
 
     def prepare_runtime_transition(
         self, mechanism_name: str, config: dict[str, Any]
     ) -> dict[str, Any]:
         if mechanism_name != "scheduler_batching":
-            raise ValueError(f"runtime transition is not implemented for {mechanism_name}")
+            raise ValueError(
+                f"runtime transition is not implemented for {mechanism_name}"
+            )
         expected = {"max_num_scheduled_tokens", "max_num_running_reqs"}
         if set(config) != expected:
             raise ValueError(
@@ -345,10 +361,15 @@ class EngineCore:
         self, mechanism_name: str, config: dict[str, Any]
     ) -> dict[str, Any]:
         if mechanism_name != "scheduler_batching":
-            raise ValueError(f"staged runtime transition is not implemented for {mechanism_name}")
+            raise ValueError(
+                "staged runtime transition is not implemented for "
+                f"{mechanism_name}"
+            )
         expected = {"max_num_scheduled_tokens", "max_num_running_reqs"}
         if set(config) != expected:
-            raise ValueError("scheduler transition requires exactly the registered fields")
+            raise ValueError(
+                "scheduler transition requires exactly the registered fields"
+            )
         return self.scheduler.stage_runtime_scheduler_limits(
             int(config["max_num_scheduled_tokens"]),
             int(config["max_num_running_reqs"]),
@@ -358,26 +379,38 @@ class EngineCore:
         self, mechanism_name: str, next_epoch: int
     ) -> dict[str, Any]:
         if mechanism_name != "scheduler_batching":
-            raise ValueError(f"staged runtime transition is not implemented for {mechanism_name}")
+            raise ValueError(
+                "staged runtime transition is not implemented for "
+                f"{mechanism_name}"
+            )
         return self.scheduler.commit_staged_runtime_scheduler_limits(next_epoch)
 
-    def abort_staged_runtime_transition(self, mechanism_name: str) -> dict[str, Any]:
+    def abort_staged_runtime_transition(
+        self, mechanism_name: str
+    ) -> dict[str, Any]:
         if mechanism_name != "scheduler_batching":
-            raise ValueError(f"staged runtime transition is not implemented for {mechanism_name}")
+            raise ValueError(
+                "staged runtime transition is not implemented for "
+                f"{mechanism_name}"
+            )
         return self.scheduler.abort_staged_runtime_scheduler_limits()
 
     def commit_runtime_transition(
         self, mechanism_name: str, prepared: dict[str, Any], next_epoch: int
     ) -> dict[str, Any]:
         if mechanism_name != "scheduler_batching":
-            raise ValueError(f"runtime transition is not implemented for {mechanism_name}")
+            raise ValueError(
+                f"runtime transition is not implemented for {mechanism_name}"
+            )
         return self.scheduler.commit_runtime_scheduler_limits(prepared, next_epoch)
 
     def verify_runtime_transition(
         self, mechanism_name: str, config: dict[str, Any], epoch: int
     ) -> dict[str, Any]:
         if mechanism_name != "scheduler_batching":
-            raise ValueError(f"runtime transition is not implemented for {mechanism_name}")
+            raise ValueError(
+                f"runtime transition is not implemented for {mechanism_name}"
+            )
         state = self.get_runtime_transition_state()
         limits = state["scheduler_limits"]
         if state["config_epoch"] != epoch or any(
@@ -404,7 +437,9 @@ class EngineCore:
         previous_epoch: int,
     ) -> dict[str, Any]:
         if mechanism_name != "scheduler_batching":
-            raise ValueError(f"runtime transition is not implemented for {mechanism_name}")
+            raise ValueError(
+                f"runtime transition is not implemented for {mechanism_name}"
+            )
         proof = self.scheduler.rollback_runtime_scheduler_limits(prepared)
         return {
             **proof,
