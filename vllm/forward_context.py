@@ -59,24 +59,26 @@ class BatchDescriptor:
     """
     start_num_tokens: int = 0
     """
-    For DUAL_INPLACE split-batch mode: the starting token offset for the
-    second split's offset view into the original buffer. When 0 (default),
-    the descriptor refers to a normal (non-offset) graph.
+    Extended graph key metadata: the starting token offset for an offset view
+    (e.g. the second split of an inplace split-batch replay) into the original
+    buffer. 0 (default) means a normal (non-offset) key. This metadata is
+    produced by the pluggable cudagraph key strategy and participates in the
+    versioned key lookup (hash/eq); core does not interpret its value.
     """
     graph_variant: str = ""
     """
-    For DUAL_INPLACE: identifies the split mode variant, e.g.
-    "inplace_serial" or "inplace_parallel". Empty string for normal graphs.
+    Extended graph key metadata: split mode variant tag (e.g. "inplace_serial"
+    or "inplace_parallel"). Empty string for standard keys.
     """
     attention_backend: str = ""
     """
-    For DUAL_INPLACE: the attention backend tag (e.g. "fia", "pa") used
-    during graph capture. Empty string for normal graphs.
+    Extended graph key metadata: attention backend tag (e.g. "fia", "pa")
+    used during graph capture. Empty string for standard keys.
     """
     capture_metadata_mode: str = ""
     """
-    For DUAL_INPLACE: the metadata mode used during graph capture.
-    Empty string for normal graphs.
+    Extended graph key metadata: the metadata mode used during graph capture.
+    Empty string for standard keys.
     """
 
 
@@ -208,18 +210,20 @@ class ForwardContext:
 
     split_inplace_mode: str | None = None
     """
-    For DUAL_INPLACE: the current split mode, e.g. "inplace_serial" or
-    "inplace_parallel". None when not in a split-batch execution path.
+    Split-batch (dual-stream) per-forward flag: the current split mode, e.g.
+    "inplace_serial" or "inplace_parallel". None when not in a split-batch
+    execution path. Written by the replay strategy; read by graph wrappers and
+    attention backends.
     """
     in_parallel_streams: bool = False
     """
-    For DUAL_INPLACE: whether the current forward pass is executing on
-    the secondary (parallel) stream.
+    Split-batch (dual-stream) per-forward flag: whether the current forward
+    pass executes on the secondary (parallel) stream.
     """
     allow_inplace_lazy_capture: bool = False
     """
-    For DUAL_INPLACE: whether lazy capture of an offset graph is allowed
-    during this forward pass.
+    Split-batch (dual-stream) per-forward flag: whether lazy capture of an
+    offset graph is allowed during this forward pass.
     """
 
     def __post_init__(self):
