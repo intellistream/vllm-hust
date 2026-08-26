@@ -74,6 +74,49 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_runtime_scheduler_limits(self) -> dict[str, int]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_runtime_scheduler_limits(
+        self,
+        max_num_scheduled_tokens: int,
+        max_num_running_reqs: int,
+    ) -> dict[str, int | dict[str, int]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def stage_runtime_scheduler_limits(
+        self,
+        max_num_scheduled_tokens: int,
+        max_num_running_reqs: int,
+    ) -> dict[str, int | dict[str, int]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def commit_staged_runtime_scheduler_limits(self, next_epoch: int) -> dict[str, int]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def abort_staged_runtime_scheduler_limits(self) -> dict[str, int]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def commit_runtime_scheduler_limits(
+        self,
+        prepared: dict[str, int | dict[str, int]],
+        next_epoch: int,
+    ) -> dict[str, int]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def rollback_runtime_scheduler_limits(
+        self,
+        prepared: dict[str, int | dict[str, int]],
+    ) -> dict[str, int]:
+        raise NotImplementedError
+
+    @abstractmethod
     def get_grammar_bitmask(
         self, scheduler_output: "SchedulerOutput"
     ) -> "GrammarOutput | None":

@@ -108,6 +108,15 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_scheduled_tokens
             else self.scheduler_config.max_num_batched_tokens
         )
+        # Runtime control may tighten, but never enlarge, startup-sized
+        # ceilings. Enlarging them could invalidate buffers or compiled paths.
+        self._startup_max_num_running_reqs = self.max_num_running_reqs
+        self._startup_max_num_scheduled_tokens = self.max_num_scheduled_tokens
+        self._runtime_config_epoch = 0
+        self._staged_runtime_scheduler_limits: (
+            dict[str, int | dict[str, int]] | None
+        ) = None
+        self._pending_epoch_requests: list[Request] = []
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -1751,7 +1760,11 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
-            self._enqueue_waiting_request(request)
+            if self._staged_runtime_scheduler_limits is None:
+                self._enqueue_waiting_request(request)
+            else:
+                # Keep next-epoch requests outside the old epoch's batch queues.
+                self._pending_epoch_requests.append(request)
             self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
@@ -1803,6 +1816,12 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+            pending_ids = {request.request_id for request in waiting_requests_to_remove}
+            self._pending_epoch_requests = [
+                request
+                for request in self._pending_epoch_requests
+                if request.request_id not in pending_ids
+            ]
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -1850,6 +1869,11 @@ class Scheduler(SchedulerInterface):
         self._pause_state = pause_state
 
     def get_num_unfinished_requests(self) -> int:
+        return self.get_num_old_epoch_unfinished_requests() + len(
+            self._pending_epoch_requests
+        )
+
+    def get_num_old_epoch_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
             return 0
         if self._pause_state == PauseState.PAUSED_NEW:
@@ -1860,6 +1884,150 @@ class Scheduler(SchedulerInterface):
             - self.num_waiting_for_streaming_input
         )
         return num_waiting + len(self.running)
+
+    def get_runtime_scheduler_limits(self) -> dict[str, int]:
+        return {
+            "config_epoch": self._runtime_config_epoch,
+            "max_num_running_reqs": self.max_num_running_reqs,
+            "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
+            "startup_max_num_running_reqs": self._startup_max_num_running_reqs,
+            "startup_max_num_scheduled_tokens": (
+                self._startup_max_num_scheduled_tokens
+            ),
+            "pending_epoch_request_count": len(self._pending_epoch_requests),
+            "transition_staged": int(self._staged_runtime_scheduler_limits is not None),
+        }
+
+    def _validate_runtime_scheduler_limits(
+        self, max_num_scheduled_tokens: int, max_num_running_reqs: int
+    ) -> None:
+        if not 0 < max_num_scheduled_tokens <= self._startup_max_num_scheduled_tokens:
+            raise ValueError("scheduled-token limit exceeds its startup ceiling")
+        if not 0 < max_num_running_reqs <= self._startup_max_num_running_reqs:
+            raise ValueError("running-request limit exceeds its startup ceiling")
+
+    def _has_runtime_transition_requests(self) -> bool:
+        # Pause-state reporting intentionally hides some queued requests. A
+        # configuration transaction must instead observe the physical queues.
+        return bool(self.running or self.waiting or self.skipped_waiting)
+
+    def prepare_runtime_scheduler_limits(
+        self,
+        max_num_scheduled_tokens: int,
+        max_num_running_reqs: int,
+    ) -> dict[str, int | dict[str, int]]:
+        if self._has_runtime_transition_requests():
+            raise RuntimeError("scheduler limits may change only at an idle epoch")
+        self._validate_runtime_scheduler_limits(
+            max_num_scheduled_tokens, max_num_running_reqs
+        )
+        return {
+            "previous": {
+                "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
+                "max_num_running_reqs": self.max_num_running_reqs,
+            },
+            "requested": {
+                "max_num_scheduled_tokens": max_num_scheduled_tokens,
+                "max_num_running_reqs": max_num_running_reqs,
+            },
+            "previous_epoch": self._runtime_config_epoch,
+        }
+
+    def stage_runtime_scheduler_limits(
+        self,
+        max_num_scheduled_tokens: int,
+        max_num_running_reqs: int,
+    ) -> dict[str, int | dict[str, int]]:
+        if self._staged_runtime_scheduler_limits is not None:
+            raise RuntimeError("a scheduler-limit epoch transition is already staged")
+        self._validate_runtime_scheduler_limits(
+            max_num_scheduled_tokens, max_num_running_reqs
+        )
+        prepared: dict[str, int | dict[str, int]] = {
+            "previous": {
+                "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
+                "max_num_running_reqs": self.max_num_running_reqs,
+            },
+            "requested": {
+                "max_num_scheduled_tokens": max_num_scheduled_tokens,
+                "max_num_running_reqs": max_num_running_reqs,
+            },
+            "previous_epoch": self._runtime_config_epoch,
+        }
+        self._staged_runtime_scheduler_limits = prepared
+        return prepared
+
+    def _release_pending_epoch_requests(self) -> int:
+        pending = self._pending_epoch_requests
+        self._pending_epoch_requests = []
+        for request in pending:
+            self._enqueue_waiting_request(request)
+        return len(pending)
+
+    def commit_staged_runtime_scheduler_limits(self, next_epoch: int) -> dict[str, int]:
+        prepared = self._staged_runtime_scheduler_limits
+        if prepared is None:
+            raise RuntimeError("no scheduler-limit epoch transition is staged")
+        if self._has_runtime_transition_requests():
+            raise RuntimeError("old scheduler epoch has not drained")
+        committed = self.commit_runtime_scheduler_limits(prepared, next_epoch)
+        self._staged_runtime_scheduler_limits = None
+        committed["released_pending_requests"] = self._release_pending_epoch_requests()
+        return committed
+
+    def abort_staged_runtime_scheduler_limits(self) -> dict[str, int]:
+        if self._staged_runtime_scheduler_limits is None:
+            raise RuntimeError("no scheduler-limit epoch transition is staged")
+        self._staged_runtime_scheduler_limits = None
+        return {
+            "config_epoch": self._runtime_config_epoch,
+            "released_pending_requests": self._release_pending_epoch_requests(),
+        }
+
+    def commit_runtime_scheduler_limits(
+        self,
+        prepared: dict[str, int | dict[str, int]],
+        next_epoch: int,
+    ) -> dict[str, int]:
+        if self._has_runtime_transition_requests():
+            raise RuntimeError("idle epoch was lost before scheduler-limit commit")
+        if next_epoch != self._runtime_config_epoch + 1:
+            raise RuntimeError("scheduler-limit epoch is stale or non-monotonic")
+        requested = prepared.get("requested")
+        if not isinstance(requested, dict):
+            raise ValueError("prepared scheduler limits are missing")
+        max_tokens = int(requested["max_num_scheduled_tokens"])
+        max_reqs = int(requested["max_num_running_reqs"])
+        self.prepare_runtime_scheduler_limits(max_tokens, max_reqs)
+        self.max_num_scheduled_tokens = max_tokens
+        self.max_num_running_reqs = max_reqs
+        self._runtime_config_epoch = next_epoch
+        return {
+            "config_epoch": self._runtime_config_epoch,
+            "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
+            "max_num_running_reqs": self.max_num_running_reqs,
+        }
+
+    def rollback_runtime_scheduler_limits(
+        self,
+        prepared: dict[str, int | dict[str, int]],
+    ) -> dict[str, int]:
+        if self._has_runtime_transition_requests():
+            raise RuntimeError("scheduler-limit rollback requires an idle epoch")
+        previous = prepared.get("previous")
+        if not isinstance(previous, dict):
+            raise ValueError("rollback scheduler limits are missing")
+        max_tokens = int(previous["max_num_scheduled_tokens"])
+        max_reqs = int(previous["max_num_running_reqs"])
+        self.prepare_runtime_scheduler_limits(max_tokens, max_reqs)
+        self.max_num_scheduled_tokens = max_tokens
+        self.max_num_running_reqs = max_reqs
+        self._runtime_config_epoch += 1
+        return {
+            "rollback_epoch": self._runtime_config_epoch,
+            "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
+            "max_num_running_reqs": self.max_num_running_reqs,
+        }
 
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0

@@ -138,6 +138,9 @@ class EngineCoreClient(ABC):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         raise NotImplementedError
 
+    def call_utility(self, method: str, *args: Any) -> Any:
+        raise NotImplementedError
+
     def add_request(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
@@ -211,6 +214,9 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
+        raise NotImplementedError
+
+    async def call_utility_async(self, method: str, *args: Any) -> Any:
         raise NotImplementedError
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
@@ -291,6 +297,10 @@ class InprocClient(EngineCoreClient):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.engine_core.get_supported_tasks()
+
+    def call_utility(self, method: str, *args: Any) -> Any:
+        target = getattr(self.engine_core, method)
+        return target(*args)
 
     def add_request(self, request: EngineCoreRequest) -> None:
         req, request_wave = self.engine_core.preprocess_add_request(request)
