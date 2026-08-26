@@ -58,6 +58,9 @@ from vllm.entrypoints.openai.prefix_routing import (
     ROUTE_SELECTED_NODE_HEADER,
     ROUTE_VALIDATION_MODE_GENERATION_SCOPED,
     ROUTE_VALIDATION_MODE_NATIVE_CONTROL,
+    WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER,
+    WORKER_OBSERVED_GENERATION_HEADER,
+    WORKER_OBSERVED_INCARNATION_HEADER,
     NodeLoad,
     PrefixRoutingConfig,
     PrefixRoutingMiddleware,
@@ -2372,6 +2375,87 @@ def test_prefix_routing_accepts_current_generation_scoped_bypass():
             EXPECTED_WORKER_INCARNATION_HEADER.encode(),
         )
         for key, _ in app_scopes[0]["headers"]
+    )
+
+
+def test_prefix_routing_bypass_emits_worker_fence_observation_headers():
+    app_scopes = []
+    sent = []
+
+    class EngineClient:
+        def get_prefix_cache_route_fence_state(self):
+            return {
+                "cache_generation": 9,
+                "worker_incarnation": "epoch-a",
+                "data_parallel_rank": 4,
+            }
+
+    class Proxy:
+        config = SimpleNamespace(
+            routing_token="shared-secret",
+            emit_response_headers=True,
+        )
+        nodes = {
+            "node-a": PrefixRoutingNode(
+                node_id="node-a",
+                url=None,
+                data_parallel_rank=4,
+                local=True,
+            )
+        }
+
+    async def app(scope, receive, send):
+        app_scopes.append(scope)
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/completions",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"x-vllm-prefix-routing", b"shared-secret"),
+            (b"x-data-parallel-rank", b"4"),
+            (
+                PREFIX_ROUTING_VALIDATION_MODE_HEADER.encode(),
+                ROUTE_VALIDATION_MODE_GENERATION_SCOPED.encode(),
+            ),
+            (EXPECTED_NODE_ID_HEADER.encode(), b"node-a"),
+            (EXPECTED_GENERATION_HEADER.encode(), b"9"),
+            (EXPECTED_WORKER_INCARNATION_HEADER.encode(), b"epoch-a"),
+            (WORKER_OBSERVED_GENERATION_HEADER.encode(), b"forged"),
+        ],
+        "server": ("router", 8000),
+        "app": SimpleNamespace(
+            state=SimpleNamespace(
+                engine_client=EngineClient(),
+                prefix_routing_proxy=Proxy(),
+            )
+        ),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"{}"}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(PrefixRoutingMiddleware(app)(scope, receive, send))
+
+    assert all(
+        key.lower() != WORKER_OBSERVED_GENERATION_HEADER.encode()
+        for key, _ in app_scopes[0]["headers"]
+    )
+    response_headers = dict(sent[0]["headers"])
+    assert response_headers[WORKER_OBSERVED_GENERATION_HEADER.encode()] == b"9"
+    assert response_headers[WORKER_OBSERVED_INCARNATION_HEADER.encode()] == b"epoch-a"
+    assert (
+        response_headers[WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER.encode()]
+        == b"4"
     )
 
 

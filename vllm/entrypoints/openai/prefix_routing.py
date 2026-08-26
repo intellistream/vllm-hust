@@ -72,6 +72,15 @@ ROUTE_SELECTED_NODE_HEADER = "x-vllm-prefix-routing-selected-node"
 ROUTE_MATCHED_TOKENS_HEADER = "x-vllm-prefix-routing-matched-tokens"
 ROUTE_GENERATION_HEADER = "x-vllm-prefix-routing-generation"
 ROUTE_WORKER_INCARNATION_HEADER = "x-vllm-prefix-routing-worker-incarnation-result"
+WORKER_OBSERVED_GENERATION_HEADER = (
+    "x-vllm-prefix-routing-worker-observed-generation"
+)
+WORKER_OBSERVED_INCARNATION_HEADER = (
+    "x-vllm-prefix-routing-worker-observed-incarnation"
+)
+WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER = (
+    "x-vllm-prefix-routing-worker-observed-data-parallel-rank"
+)
 ROUTE_RESULT_LOCAL_NO_ROUTE = "local-no-route"
 ROUTE_RESULT_LOCAL_NODE = "local-node"
 ROUTE_RESULT_REMOTE = "remote"
@@ -783,7 +792,16 @@ class PrefixRoutingMiddleware:
                 )
                 await response(scope, receive, send)
                 return
-            await self.app(_without_bypass_header(scope), receive, send)
+            response_headers = (
+                await _worker_observed_route_fence_headers(scope)
+                if emit_response_headers
+                else []
+            )
+            await self.app(
+                _without_bypass_header(scope),
+                receive,
+                _with_response_headers(send, response_headers),
+            )
             return
 
         scope = _without_external_routing_headers(scope)
@@ -1310,6 +1328,9 @@ def _without_external_routing_headers(scope: Scope) -> Scope:
         ROUTE_MATCHED_TOKENS_HEADER.encode(),
         ROUTE_GENERATION_HEADER.encode(),
         ROUTE_WORKER_INCARNATION_HEADER.encode(),
+        WORKER_OBSERVED_GENERATION_HEADER.encode(),
+        WORKER_OBSERVED_INCARNATION_HEADER.encode(),
+        WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER.encode(),
     }
     routed_scope["headers"] = [
         (key, value)
@@ -1333,6 +1354,9 @@ def _without_bypass_header(scope: Scope) -> Scope:
         ROUTE_MATCHED_TOKENS_HEADER.encode(),
         ROUTE_GENERATION_HEADER.encode(),
         ROUTE_WORKER_INCARNATION_HEADER.encode(),
+        WORKER_OBSERVED_GENERATION_HEADER.encode(),
+        WORKER_OBSERVED_INCARNATION_HEADER.encode(),
+        WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER.encode(),
     }
     routed_scope["headers"] = [
         (key, value)
@@ -1435,6 +1459,48 @@ async def _get_engine_route_fence_state(scope: Scope) -> Mapping[str, Any] | Non
     if not isinstance(state, Mapping):
         return None
     return state
+
+
+async def _worker_observed_route_fence_headers(
+    scope: Scope,
+) -> list[tuple[bytes, bytes]]:
+    try:
+        state = await _get_engine_route_fence_state(scope)
+    except Exception:
+        logger.warning(
+            "Prefix routing worker fence observation lookup failed",
+            exc_info=True,
+        )
+        return []
+    if state is None:
+        return []
+
+    headers: list[tuple[bytes, bytes]] = []
+    generation = state.get("cache_generation")
+    if generation is not None:
+        headers.append(
+            (
+                WORKER_OBSERVED_GENERATION_HEADER.encode(),
+                str(generation).encode("ascii", errors="ignore"),
+            )
+        )
+    incarnation = state.get("worker_incarnation")
+    if isinstance(incarnation, str) and incarnation:
+        headers.append(
+            (
+                WORKER_OBSERVED_INCARNATION_HEADER.encode(),
+                incarnation.encode("utf-8"),
+            )
+        )
+    data_parallel_rank = state.get("data_parallel_rank")
+    if data_parallel_rank is not None:
+        headers.append(
+            (
+                WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER.encode(),
+                str(data_parallel_rank).encode("ascii", errors="ignore"),
+            )
+        )
+    return headers
 
 
 def _matches_configured_local_node(
@@ -1556,6 +1622,9 @@ async def _forward_request(
         ROUTE_MATCHED_TOKENS_HEADER,
         ROUTE_GENERATION_HEADER,
         ROUTE_WORKER_INCARNATION_HEADER,
+        WORKER_OBSERVED_GENERATION_HEADER,
+        WORKER_OBSERVED_INCARNATION_HEADER,
+        WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER,
     }
     headers = [
         (key, value) for key, value in headers if key.lower() not in stripped_headers
