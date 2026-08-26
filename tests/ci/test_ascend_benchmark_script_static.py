@@ -6,15 +6,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = REPO_ROOT / ".github/workflows/scripts"
-WORKFLOW = REPO_ROOT / ".github/workflows/ascend-benchmark-leaderboard.yml"
 
 
 def script_text(name: str) -> str:
     return (SCRIPT_DIR / name).read_text(encoding="utf-8")
-
-
-def workflow_text() -> str:
-    return WORKFLOW.read_text(encoding="utf-8")
 
 
 def test_run_ascend_benchmark_propagates_benchmark_repo_publish_env():
