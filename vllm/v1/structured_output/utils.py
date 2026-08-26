@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import json
 import os
 import tempfile
+import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -39,6 +42,43 @@ else:
 logger = init_logger(__name__)
 
 CACHE = None
+_QBI_SCHEMA_MASK_APPLIED_REQUEST_IDS: set[str] = set()
+_QBI_SCHEMA_MASK_APPLIED_REQUEST_ORDER: deque[str] = deque()
+_QBI_SCHEMA_RECEIPT_WINDOW = max(int(os.getenv("QBI_SCHEMA_RECEIPT_WINDOW", "8192")), 1)
+
+
+def _remember_qbi_mask_request(request_id: str) -> bool:
+    if request_id in _QBI_SCHEMA_MASK_APPLIED_REQUEST_IDS:
+        return False
+    _QBI_SCHEMA_MASK_APPLIED_REQUEST_IDS.add(request_id)
+    _QBI_SCHEMA_MASK_APPLIED_REQUEST_ORDER.append(request_id)
+    if len(_QBI_SCHEMA_MASK_APPLIED_REQUEST_ORDER) > _QBI_SCHEMA_RECEIPT_WINDOW:
+        expired = _QBI_SCHEMA_MASK_APPLIED_REQUEST_ORDER.popleft()
+        _QBI_SCHEMA_MASK_APPLIED_REQUEST_IDS.remove(expired)
+    return True
+
+
+def _emit_qbi_schema_mask_applied(
+    request_id: str, *, logit_rows: int, constrained_rows: int
+) -> None:
+    receipt_path = os.getenv("QBI_SCHEMA_EFFECTIVE_EVENT_LOG")
+    if not receipt_path:
+        return
+    event = {
+        "schema": "qbi.schema-effective-event.v1",
+        "phase": "mask_applied",
+        "request_id": request_id,
+        "pid": os.getpid(),
+        "time_ns": time.time_ns(),
+        "logit_rows": logit_rows,
+        "constrained_rows": constrained_rows,
+    }
+    payload = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    fd = os.open(receipt_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
 
 
 def apply_grammar_bitmask(
@@ -119,6 +159,20 @@ def apply_grammar_bitmask(
             index_tensor = index_tensor.to(logits.device, non_blocking=True)
 
         xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=index_tensor)
+        for req_id in grammar_output.structured_output_request_ids:
+            if _remember_qbi_mask_request(req_id):
+                logger.info(
+                    "QBI_SCHEMA_EVENT phase=mask_applied request_id=%s "
+                    "logit_rows=%s constrained_rows=%s",
+                    req_id,
+                    logits.shape[0],
+                    len(out_indices),
+                )
+                _emit_qbi_schema_mask_applied(
+                    req_id,
+                    logit_rows=logits.shape[0],
+                    constrained_rows=len(out_indices),
+                )
         return
 
     # CPU case, use list for indices.
@@ -133,6 +187,20 @@ def apply_grammar_bitmask(
         logits.copy_(logits_fp32.to(logits.dtype))
     else:
         xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=indices)
+    for req_id in grammar_output.structured_output_request_ids:
+        if _remember_qbi_mask_request(req_id):
+            logger.info(
+                "QBI_SCHEMA_EVENT phase=mask_applied request_id=%s "
+                "logit_rows=%s constrained_rows=%s",
+                req_id,
+                logits.shape[0],
+                len(out_indices),
+            )
+            _emit_qbi_schema_mask_applied(
+                req_id,
+                logit_rows=logits.shape[0],
+                constrained_rows=len(out_indices),
+            )
 
 
 class OutlinesVocabulary:
