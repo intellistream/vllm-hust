@@ -150,11 +150,18 @@ def _load_scheduler_module():
     add("vllm.v1.core.kv_cache_utils", KVCacheBlock=MagicMock)
     add(
         "vllm.v1.engine",
-        EngineCoreEventType=MagicMock,
+        EngineCoreEventType=MagicMock(
+            SCHEDULED="SCHEDULED", PREEMPTED="PREEMPTED"
+        ),
         EngineCoreOutput=MagicMock,
         EngineCoreOutputs=MagicMock,
     )
     add("vllm.v1.kv_cache_interface", KVCacheConfig=MagicMock)
+    add(
+        "vllm.v1.kv_cache_compression",
+        KVCacheCompressionError=MagicMock,
+        KVCacheCompressionRuntimeSpec=MagicMock,
+    )
     add("vllm.v1.metrics")
     add("vllm.v1.metrics.perf", ModelMetrics=MagicMock, PerfStats=MagicMock)
     add("vllm.v1.metrics.stats", PrefixCacheStats=MagicMock, SchedulerStats=MagicMock)
@@ -251,7 +258,7 @@ def _make_request(scheduler_mod, request_id: str = "request-1"):
 def _make_scheduler(scheduler_mod, request):
     """Controllable stand-in for Scheduler with the real schedule() bound."""
     sched = MagicMock()
-    sched.log_stats = False
+    sched.log_stats = True  # scheduled event fires inside the log_stats branch
     sched.current_step = 0
     sched._pause_state = scheduler_mod.PauseState.UNPAUSED
     sched.max_num_scheduled_tokens = 4096
@@ -372,6 +379,7 @@ def _scheduler_touched_keys() -> set[str]:
         "vllm.v1.core.kv_cache_utils",
         "vllm.v1.engine",
         "vllm.v1.kv_cache_interface",
+        "vllm.v1.kv_cache_compression",
         "vllm.v1.metrics",
         "vllm.v1.metrics.perf",
         "vllm.v1.metrics.stats",

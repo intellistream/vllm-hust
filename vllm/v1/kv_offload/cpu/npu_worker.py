@@ -219,7 +219,7 @@ class AscendSingleDirectionOffloadingHandler:
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
-        transfer_started_at = time.monotonic() if EVENTS_ENABLED else 0.0
+        transfer_started_at = time.monotonic() if EventBus.enabled else 0.0
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
 
         src_blocks = src_spec.block_ids
@@ -330,7 +330,7 @@ class AscendSingleDirectionOffloadingHandler:
                 "d2h" if self.npu_to_cpu else "h2d",
                 layout_descriptors,
             )
-        descriptors_done_at = time.monotonic() if EVENTS_ENABLED else 0.0
+        descriptors_done_at = time.monotonic() if EventBus.enabled else 0.0
 
         npu = _get_torch_npu()
         start_event = self._new_event()
@@ -344,7 +344,7 @@ class AscendSingleDirectionOffloadingHandler:
             self._stream.wait_stream(npu.current_stream())
         if self._transfers:
             self._stream.wait_event(self._transfers[-1].end_event)
-        dependencies_done_at = time.monotonic() if EVENTS_ENABLED else 0.0
+        dependencies_done_at = time.monotonic() if EventBus.enabled else 0.0
 
         if num_copy_ops and not self.npu_to_cpu:
             max_page_bytes = int(all_sizes.max())

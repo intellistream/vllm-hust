@@ -181,7 +181,7 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
-        started_at = time.monotonic() if EVENTS_ENABLED else 0.0
+        started_at = time.monotonic() if EventBus.enabled else 0.0
         if self.counts is not None:
             num_keys = len(keys)
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
@@ -292,7 +292,7 @@ class CPUOffloadingManager(OffloadingManager):
 
     def evict_keys(self, keys: Collection[OffloadKey]) -> list[OffloadKey]:
         """Explicitly evict ready, unreferenced blocks from the CPU tier."""
-        started_at = time.monotonic() if EVENTS_ENABLED else 0.0
+        started_at = time.monotonic() if EventBus.enabled else 0.0
         evicted: list[OffloadKey] = []
         for key in keys:
             block = self._policy.get(key)
