@@ -39,6 +39,9 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.native_recapture_observer import (
+    NativeRecaptureScopeObserver,
+)
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -117,6 +120,9 @@ class Scheduler(SchedulerInterface):
             dict[str, int | dict[str, int]] | None
         ) = None
         self._pending_epoch_requests: list[Request] = []
+        self._native_recapture_scope_observer = (
+            NativeRecaptureScopeObserver.from_environment()
+        )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -960,7 +966,26 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._record_native_recapture_scope(scheduler_output)
         return scheduler_output
+
+    def _record_native_recapture_scope(self, scheduler_output: SchedulerOutput) -> None:
+        """Record a bounded, prompt-free scheduler receipt for formal recapture."""
+
+        self._native_recapture_scope_observer.record(
+            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+            config_epoch=self._runtime_config_epoch,
+            max_num_running_reqs=self.max_num_running_reqs,
+            max_num_scheduled_tokens=self.max_num_scheduled_tokens,
+        )
+
+    def get_native_recapture_scope_state(
+        self, after_sequence: int = 0
+    ) -> dict[str, Any]:
+        """Return immutable copies of observed scheduler steps after a cursor."""
+
+        return self._native_recapture_scope_observer.state(after_sequence)
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
