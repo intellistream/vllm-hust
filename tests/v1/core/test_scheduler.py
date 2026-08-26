@@ -3019,6 +3019,9 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     assert request.request_id not in scheduler.requests
     assert not scheduler.running
     scheduler._free_request.assert_called_once_with(request)
+    scheduler.kv_cache_manager.commit_kvplane_cache_blocks.assert_called_once_with(
+        request, request.num_computed_tokens
+    )
     assert len(engine_core_outputs[0].outputs) == 1
     engine_core_output = engine_core_outputs[0].outputs[0]
     assert engine_core_output.request_id == request.request_id

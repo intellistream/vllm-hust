@@ -1672,6 +1672,17 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            # KVPlane commit-handshake requests deliberately skip the optimistic
+            # schedule-time cache publication.  Revalidate and publish only now,
+            # after this model-runner step has completed and speculative-token
+            # rejection has corrected the computed-token boundary.  Subtracting
+            # async placeholders also preserves AsyncScheduler's existing cache
+            # boundary.
+            self.kv_cache_manager.commit_kvplane_cache_blocks(
+                request,
+                request.num_computed_tokens - request.num_output_placeholders,
+            )
+
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None

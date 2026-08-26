@@ -363,3 +363,6 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     assert request.status == RequestStatus.FINISHED_ERROR
     assert request.request_id not in scheduler.requests
     assert not scheduler.running
+    scheduler.kv_cache_manager.commit_kvplane_cache_blocks.assert_called_once_with(
+        request, request.num_computed_tokens - request.num_output_placeholders
+    )

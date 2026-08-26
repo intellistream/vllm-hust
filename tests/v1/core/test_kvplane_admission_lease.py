@@ -26,6 +26,7 @@ def _request(
     return SimpleNamespace(
         request_id=request_id,
         external_req_id=external_req_id,
+        num_tokens=32,
         sampling_params=SimpleNamespace(extra_args=extra_args),
     )
 
@@ -193,6 +194,62 @@ def test_native_failure_does_not_consume_publication_sequence(
     assert kv_cache_manager._kvplane_allows_prefix_cache_write(
         request, publication_sequence=16
     )
+
+
+def test_commit_handshake_defers_until_post_execute(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    epoch_file = tmp_path / "pressure-epoch.json"
+    _write_epoch(epoch_file, 7)
+    monkeypatch.setenv("VLLM_KVPLANE_PRESSURE_EPOCH_FILE", str(epoch_file))
+    request = _request(kvplane_admission_commit_handshake=True)
+
+    class Coordinator:
+        def __init__(self) -> None:
+            self.publications: list[int] = []
+
+        def cache_blocks(self, request, num_computed_tokens):
+            self.publications.append(num_computed_tokens)
+            return 1
+
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager.enable_caching = True
+    manager.coordinator = Coordinator()
+    manager.log_stats = False
+
+    manager.cache_blocks(request, 16)
+    assert manager.coordinator.publications == []
+
+    manager.commit_kvplane_cache_blocks(request, 16)
+    assert manager.coordinator.publications == [16]
+
+
+def test_commit_handshake_revalidates_epoch_after_execution(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    epoch_file = tmp_path / "pressure-epoch.json"
+    _write_epoch(epoch_file, 7)
+    monkeypatch.setenv("VLLM_KVPLANE_PRESSURE_EPOCH_FILE", str(epoch_file))
+    request = _request(kvplane_admission_commit_handshake="enabled")
+
+    class Coordinator:
+        def __init__(self) -> None:
+            self.publications: list[int] = []
+
+        def cache_blocks(self, request, num_computed_tokens):
+            self.publications.append(num_computed_tokens)
+            return 1
+
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager.enable_caching = True
+    manager.coordinator = Coordinator()
+    manager.log_stats = False
+
+    manager.cache_blocks(request, 16)
+    _write_epoch(epoch_file, 8)
+    manager.commit_kvplane_cache_blocks(request, 16)
+
+    assert manager.coordinator.publications == []
 
 
 def test_publication_sequence_is_scoped_by_request_and_epoch(

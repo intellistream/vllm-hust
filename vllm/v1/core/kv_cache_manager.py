@@ -79,6 +79,16 @@ def _kvplane_request_identity(request: Request) -> str:
     return getattr(request, "external_req_id", None) or request.request_id
 
 
+def _kvplane_uses_commit_handshake(request: Request) -> bool:
+    """Return whether cache publication must wait for completed execution."""
+    sampling_params = getattr(request, "sampling_params", None)
+    extra_args = getattr(sampling_params, "extra_args", None) or {}
+    value = extra_args.get("kvplane_admission_commit_handshake")
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "enable", "enabled"}
+    return bool(value)
+
+
 def _kvplane_allows_prefix_cache_write(
     request: Request,
     *,
@@ -836,39 +846,68 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
-            if _kvplane_denies_prefix_cache_write(
-                request,
-                publication_sequence=num_computed_tokens,
-            ):
-                logger.info(
-                    "KVPlane prefix cache write denied request_id=%s "
-                    "num_tokens=%d num_computed_tokens=%d",
-                    request.request_id,
-                    request.num_tokens,
-                    num_computed_tokens,
-                )
-                return
-            num_cached_blocks = self.coordinator.cache_blocks(
-                request, num_computed_tokens
+        if not self.enable_caching:
+            return
+        if _kvplane_uses_commit_handshake(request):
+            logger.info(
+                "KVPlane prefix cache publication deferred request_id=%s "
+                "num_tokens=%d num_computed_tokens=%d",
+                request.request_id,
+                request.num_tokens,
+                num_computed_tokens,
             )
-            _kvplane_record_prefix_cache_publication(request, num_computed_tokens)
-            if _prefix_cache_trace_enabled():
-                logger.info(
-                    "Prefix cache trace commit request_id=%s num_tokens=%d "
-                    "num_computed_tokens=%d block_hashes=%d cached_blocks=%d "
-                    "cache_salt=%s hash_sample=%s",
-                    request.request_id,
-                    request.num_tokens,
-                    num_computed_tokens,
-                    len(request.block_hashes),
-                    num_cached_blocks,
-                    request.cache_salt,
-                    _summarize_block_hashes(request.block_hashes),
-                )
-            if self.log_stats and num_cached_blocks > 0:
-                assert self.prefix_cache_stats is not None
-                self.prefix_cache_stats.record_blocks_cached(num_cached_blocks)
+            return
+        self._cache_blocks_now(request, num_computed_tokens, phase="schedule")
+
+    def commit_kvplane_cache_blocks(
+        self, request: Request, num_computed_tokens: int
+    ) -> None:
+        """Publish handshake-controlled blocks after their NPU step completes."""
+        if not self.enable_caching or not _kvplane_uses_commit_handshake(request):
+            return
+        self._cache_blocks_now(request, num_computed_tokens, phase="post_execute")
+
+    def _cache_blocks_now(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        *,
+        phase: str,
+    ) -> None:
+        if _kvplane_denies_prefix_cache_write(
+            request,
+            publication_sequence=num_computed_tokens,
+        ):
+            logger.info(
+                "KVPlane prefix cache write denied request_id=%s "
+                "num_tokens=%d num_computed_tokens=%d phase=%s",
+                request.request_id,
+                request.num_tokens,
+                num_computed_tokens,
+                phase,
+            )
+            return
+        num_cached_blocks = self.coordinator.cache_blocks(
+            request, num_computed_tokens
+        )
+        _kvplane_record_prefix_cache_publication(request, num_computed_tokens)
+        if _prefix_cache_trace_enabled():
+            logger.info(
+                "Prefix cache trace commit request_id=%s num_tokens=%d "
+                "num_computed_tokens=%d block_hashes=%d cached_blocks=%d "
+                "cache_salt=%s hash_sample=%s phase=%s",
+                request.request_id,
+                request.num_tokens,
+                num_computed_tokens,
+                len(request.block_hashes),
+                num_cached_blocks,
+                request.cache_salt,
+                _summarize_block_hashes(request.block_hashes),
+                phase,
+            )
+        if self.log_stats and num_cached_blocks > 0:
+            assert self.prefix_cache_stats is not None
+            self.prefix_cache_stats.record_blocks_cached(num_cached_blocks)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
