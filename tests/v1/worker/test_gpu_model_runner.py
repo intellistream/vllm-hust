@@ -57,6 +57,40 @@ NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
 
 
+def test_should_check_ep_fault_without_all2all_manager(monkeypatch):
+    communicator = SimpleNamespace(all2all_manager=None)
+    ep_group = SimpleNamespace(device_communicator=communicator)
+    monkeypatch.setattr(gpu_model_runner_module, "get_ep_group", lambda: ep_group)
+
+    assert not gpu_model_runner_module._should_check_ep_fault(2, True)
+
+
+@pytest.mark.parametrize("support_fault_tolerance", [False, True])
+def test_should_check_ep_fault_preserves_manager_capability(
+    monkeypatch, support_fault_tolerance
+):
+    manager = SimpleNamespace(support_fault_tolerance=support_fault_tolerance)
+    communicator = SimpleNamespace(all2all_manager=manager)
+    ep_group = SimpleNamespace(device_communicator=communicator)
+    monkeypatch.setattr(gpu_model_runner_module, "get_ep_group", lambda: ep_group)
+
+    assert (
+        gpu_model_runner_module._should_check_ep_fault(2, True)
+        is support_fault_tolerance
+    )
+
+
+@pytest.mark.parametrize(("dp_size", "is_moe"), [(1, True), (2, False)])
+def test_should_check_ep_fault_skips_irrelevant_topologies(
+    monkeypatch, dp_size, is_moe
+):
+    get_ep_group = Mock(side_effect=AssertionError("EP group must not be read"))
+    monkeypatch.setattr(gpu_model_runner_module, "get_ep_group", get_ep_group)
+
+    assert not gpu_model_runner_module._should_check_ep_fault(dp_size, is_moe)
+    get_ep_group.assert_not_called()
+
+
 def initialize_kv_cache(runner: GPUModelRunner):
     """
     Only perform necessary steps in GPUModelRunner.initialize_kv_cache()
