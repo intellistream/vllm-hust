@@ -54,5 +54,30 @@ async def collective_rpc(raw_request: Request):
     return JSONResponse(content={"results": response})
 
 
+@router.get("/qbi/native-recapture/scope")
+async def native_recapture_scope(raw_request: Request, after_sequence: int = 0):
+    """Read prompt-free scheduler receipts from the isolated control surface."""
+
+    utility = getattr(engine_client(raw_request), "call_utility_async", None)
+    if not callable(utility):
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="Engine client does not expose utility calls",
+        )
+    try:
+        result = await utility("get_native_recapture_scope_state", after_sequence)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=str(error),
+        ) from error
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="Engine returned a non-object native recapture state",
+        )
+    return JSONResponse(content=result)
+
+
 def attach_router(app: FastAPI):
     app.include_router(router)

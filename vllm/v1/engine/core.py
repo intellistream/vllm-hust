@@ -470,6 +470,18 @@ class EngineCore:
             "scheduler_limits": limits,
         }
 
+    def get_native_recapture_scope_state(
+        self, after_sequence: int = 0
+    ) -> dict[str, Any]:
+        """Join scheduler scope receipts to the live EngineCore identity."""
+
+        state = self.scheduler.get_native_recapture_scope_state(after_sequence)
+        return {
+            **state,
+            "engine_boot_id": self._runtime_control_boot_id,
+            "scheduler_limits": self.scheduler.get_runtime_scheduler_limits(),
+        }
+
     def prepare_runtime_transition(
         self, mechanism_name: str, config: dict[str, Any]
     ) -> dict[str, Any]:

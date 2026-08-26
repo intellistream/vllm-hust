@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from collections import deque
+from types import SimpleNamespace
 
 import pytest
 
 from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.native_recapture_observer import (
+    NativeRecaptureScopeObserver,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 
 
@@ -24,7 +28,52 @@ def _scheduler() -> Scheduler:
     scheduler.num_waiting_for_streaming_input = 0
     scheduler.requests = {}
     scheduler.log_stats = False
+    scheduler._native_recapture_scope_observer = NativeRecaptureScopeObserver(
+        enabled=True,
+        capacity=128,
+        request_prefix="chatcmpl-anise-native-recapture-",
+    )
     return scheduler
+
+
+def test_native_recapture_observer_records_exact_formed_batch_membership() -> None:
+    scheduler = _scheduler()
+    output = SimpleNamespace(
+        num_scheduled_tokens={
+            "chatcmpl-anise-native-recapture-a": 32,
+            "chatcmpl-anise-native-recapture-b": 48,
+            "chatcmpl-unrelated": 16,
+        },
+        total_num_scheduled_tokens=96,
+    )
+
+    scheduler._record_native_recapture_scope(output)
+    state = scheduler.get_native_recapture_scope_state()
+
+    assert state["latest_sequence"] == 1
+    assert len(state["receipts"]) == 1
+    receipt = state["receipts"][0]
+    assert receipt["formed_batch"] is True
+    assert receipt["matched_request_count"] == 2
+    assert receipt["request_count"] == 3
+    assert receipt["request_ids"] == [
+        "chatcmpl-anise-native-recapture-a",
+        "chatcmpl-anise-native-recapture-b",
+        "chatcmpl-unrelated",
+    ]
+    assert scheduler.get_native_recapture_scope_state(1)["receipts"] == []
+
+
+def test_native_recapture_observer_ignores_unbound_requests() -> None:
+    scheduler = _scheduler()
+    output = SimpleNamespace(
+        num_scheduled_tokens={"chatcmpl-unrelated": 16},
+        total_num_scheduled_tokens=16,
+    )
+
+    scheduler._record_native_recapture_scope(output)
+
+    assert scheduler.get_native_recapture_scope_state()["receipts"] == []
 
 
 def test_runtime_scheduler_limits_commit_and_rollback_without_restart() -> None:
