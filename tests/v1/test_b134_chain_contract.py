@@ -18,19 +18,45 @@ CPU_MANAGER = REPO_ROOT / "vllm" / "v1" / "kv_offload" / "cpu" / "manager.py"
 TIERING_MANAGER = REPO_ROOT / "vllm" / "v1" / "kv_offload" / "tiering" / "manager.py"
 
 
+_EVENT_CLASS_TO_NAME = {
+    "RequestAdmitted": "admission",
+    "RequestScheduled": "scheduled",
+    "RequestPreempted": "preempt",
+    "RequestResumed": "wakeup",
+    "KVOffloadStore": "cpu_store",
+    "KVOffloadEvict": "cpu_evict",
+    "KVOffloadRestoreStart": "restore_start",
+    "KVOffloadRestoreDone": "restore_done",
+    "KVOffloadTierEvict": "evict",
+    "KVOffloadSchedStep": "sched_step",
+    "KVTransferSwapD2H": "swap_d2h_submit",
+    "KVTransferGatherH2D": "gather_h2d",
+    "KVTransferSubmit": "transfer_submit",
+    "KVTransferCopyDone": "copy_observed_complete",
+}
+
+
 def _emit_calls(tree: ast.AST) -> list[tuple[str, int]]:
-    """Return (event_name, lineno) for every ``emit("event", ...)`` call."""
+    """Return (event_name, lineno) for every ``EventBus.emit(TypedEvent(...))``.
+
+    The pluginized core no longer calls ``emit("name", ...)``; events are
+    typed classes dispatched through the event bus. Map the typed class name
+    back to the historical B134 event name so the ordering contract tests
+    keep working.
+    """
     calls: list[tuple[str, int]] = []
     for node in ast.walk(tree):
-        if (
+        if not (
             isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "emit"
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "emit"
             and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name)
+            and node.args[0].func.id in _EVENT_CLASS_TO_NAME
         ):
-            calls.append((node.args[0].value, node.lineno))
+            continue
+        calls.append((_EVENT_CLASS_TO_NAME[node.args[0].func.id], node.lineno))
     return calls
 
 

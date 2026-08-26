@@ -1145,12 +1145,11 @@ class Scheduler(SchedulerInterface):
                         EventBus.emit(RequestResumed(request.request_id))
                 if EventBus.enabled:
                     EventBus.emit(RequestAdmitted(request.request_id))
+                    EventBus.emit(RequestScheduled(request.request_id))
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
-                    if EventBus.enabled:
-                        EventBus.emit(RequestScheduled(request.request_id))
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
