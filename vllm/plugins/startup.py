@@ -6,13 +6,11 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-from packaging.specifiers import InvalidSpecifier, SpecifierSet
-from packaging.version import InvalidVersion, Version
 
 from vllm.plugins.contracts import (
     EXTENSION_HOST_API_VERSION,
@@ -28,6 +26,46 @@ if TYPE_CHECKING:
 
 class ExtensionBundleAdmissionError(ValueError):
     """Reject an explicitly configured bundle before implementation import."""
+
+
+_API_VERSION = re.compile(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
+_API_CLAUSE = re.compile(r"^(>=|<=|==|!=|>|<)(\d+(?:\.\d+){0,2})$")
+
+
+def _parse_api_version(value: str) -> tuple[int, int, int]:
+    match = _API_VERSION.fullmatch(value)
+    if match is None:
+        raise ExtensionBundleAdmissionError(
+            f"extension API version must be one to three numeric parts: {value!r}"
+        )
+    major, minor, patch = match.groups()
+    return int(major), int(minor or 0), int(patch or 0)
+
+
+def _matches_api_range(version: tuple[int, int, int], api_range: str) -> bool:
+    clauses = api_range.split(",")
+    if not clauses or any(not clause for clause in clauses):
+        raise ExtensionBundleAdmissionError(
+            f"invalid host_api_range: {api_range!r}"
+        )
+    operations = {
+        ">=": lambda left, right: left >= right,
+        "<=": lambda left, right: left <= right,
+        "==": lambda left, right: left == right,
+        "!=": lambda left, right: left != right,
+        ">": lambda left, right: left > right,
+        "<": lambda left, right: left < right,
+    }
+    for clause in clauses:
+        match = _API_CLAUSE.fullmatch(clause)
+        if match is None:
+            raise ExtensionBundleAdmissionError(
+                f"invalid host_api_range clause: {clause!r}"
+            )
+        operation, required = match.groups()
+        if not operations[operation](version, _parse_api_version(required)):
+            return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,20 +89,15 @@ def _validate_host_api_range(
     bundle: ExtensionBundleDescriptor,
     host_api_version: str,
 ) -> None:
+    host_version = _parse_api_version(host_api_version)
     try:
-        host_version = Version(host_api_version)
-    except InvalidVersion as error:
-        raise ExtensionBundleAdmissionError(
-            f"host extension API version is invalid: {host_api_version!r}"
-        ) from error
-    try:
-        supported = SpecifierSet(bundle.host_api_range)
-    except InvalidSpecifier as error:
+        compatible = _matches_api_range(host_version, bundle.host_api_range)
+    except ExtensionBundleAdmissionError as error:
         raise ExtensionBundleAdmissionError(
             f"bundle {bundle.bundle_id!r} has an invalid host_api_range: "
             f"{bundle.host_api_range!r}"
         ) from error
-    if host_version not in supported:
+    if not compatible:
         raise ExtensionBundleAdmissionError(
             f"bundle {bundle.bundle_id!r} requires host API "
             f"{bundle.host_api_range!r}, but this host provides "
