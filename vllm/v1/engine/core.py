@@ -482,85 +482,140 @@ class EngineCore:
             "scheduler_limits": self.scheduler.get_runtime_scheduler_limits(),
         }
 
+    def get_priority_scheduling_state(self, after_sequence: int = 0) -> dict[str, Any]:
+        """Join request-priority receipts to the live EngineCore identity."""
+
+        state = self.scheduler.get_priority_scheduling_state(after_sequence)
+        return {
+            **state,
+            "engine_boot_id": self._runtime_control_boot_id,
+            "queue_policy": self.scheduler.policy.value,
+            "scheduler_limits": self.scheduler.get_runtime_scheduler_limits(),
+        }
+
     def prepare_runtime_transition(
         self, mechanism_name: str, config: dict[str, Any]
     ) -> dict[str, Any]:
-        if mechanism_name != "scheduler_batching":
-            raise ValueError(
-                f"runtime transition is not implemented for {mechanism_name}"
+        if mechanism_name == "scheduler_batching":
+            expected = {"max_num_scheduled_tokens", "max_num_running_reqs"}
+            if set(config) != expected:
+                raise ValueError(
+                    "scheduler transition requires exactly the registered fields"
+                )
+            return self.scheduler.prepare_runtime_scheduler_limits(
+                int(config["max_num_scheduled_tokens"]),
+                int(config["max_num_running_reqs"]),
             )
-        expected = {"max_num_scheduled_tokens", "max_num_running_reqs"}
-        if set(config) != expected:
-            raise ValueError(
-                "scheduler transition requires exactly the registered fields"
+        if mechanism_name == "prefill_admission_guard":
+            if set(config) != {"scheduler_reserve_full_isl"} or not isinstance(
+                config["scheduler_reserve_full_isl"], bool
+            ):
+                raise ValueError(
+                    "prefill admission transition requires one boolean registered field"
+                )
+            return self.scheduler.prepare_runtime_prefill_admission_guard(
+                config["scheduler_reserve_full_isl"]
             )
-        return self.scheduler.prepare_runtime_scheduler_limits(
-            int(config["max_num_scheduled_tokens"]),
-            int(config["max_num_running_reqs"]),
-        )
+        raise ValueError(f"runtime transition is not implemented for {mechanism_name}")
 
     def stage_runtime_transition(
         self, mechanism_name: str, config: dict[str, Any]
     ) -> dict[str, Any]:
-        if mechanism_name != "scheduler_batching":
-            raise ValueError(
-                f"staged runtime transition is not implemented for {mechanism_name}"
+        if mechanism_name == "scheduler_batching":
+            expected = {"max_num_scheduled_tokens", "max_num_running_reqs"}
+            if set(config) != expected:
+                raise ValueError(
+                    "scheduler transition requires exactly the registered fields"
+                )
+            return self.scheduler.stage_runtime_scheduler_limits(
+                int(config["max_num_scheduled_tokens"]),
+                int(config["max_num_running_reqs"]),
             )
-        expected = {"max_num_scheduled_tokens", "max_num_running_reqs"}
-        if set(config) != expected:
-            raise ValueError(
-                "scheduler transition requires exactly the registered fields"
+        if mechanism_name == "prefill_admission_guard":
+            if set(config) != {"scheduler_reserve_full_isl"} or not isinstance(
+                config["scheduler_reserve_full_isl"], bool
+            ):
+                raise ValueError(
+                    "prefill admission transition requires one boolean registered field"
+                )
+            return self.scheduler.stage_runtime_prefill_admission_guard(
+                config["scheduler_reserve_full_isl"]
             )
-        return self.scheduler.stage_runtime_scheduler_limits(
-            int(config["max_num_scheduled_tokens"]),
-            int(config["max_num_running_reqs"]),
+        raise ValueError(
+            f"staged runtime transition is not implemented for {mechanism_name}"
         )
 
     def commit_staged_runtime_transition(
         self, mechanism_name: str, next_epoch: int
     ) -> dict[str, Any]:
-        if mechanism_name != "scheduler_batching":
-            raise ValueError(
-                f"staged runtime transition is not implemented for {mechanism_name}"
+        if mechanism_name == "scheduler_batching":
+            return self.scheduler.commit_staged_runtime_scheduler_limits(next_epoch)
+        if mechanism_name == "prefill_admission_guard":
+            return self.scheduler.commit_staged_runtime_prefill_admission_guard(
+                next_epoch
             )
-        return self.scheduler.commit_staged_runtime_scheduler_limits(next_epoch)
+        raise ValueError(
+            f"staged runtime transition is not implemented for {mechanism_name}"
+        )
 
     def abort_staged_runtime_transition(self, mechanism_name: str) -> dict[str, Any]:
-        if mechanism_name != "scheduler_batching":
-            raise ValueError(
-                f"staged runtime transition is not implemented for {mechanism_name}"
-            )
-        return self.scheduler.abort_staged_runtime_scheduler_limits()
+        if mechanism_name == "scheduler_batching":
+            return self.scheduler.abort_staged_runtime_scheduler_limits()
+        if mechanism_name == "prefill_admission_guard":
+            return self.scheduler.abort_staged_runtime_prefill_admission_guard()
+        raise ValueError(
+            f"staged runtime transition is not implemented for {mechanism_name}"
+        )
 
     def commit_runtime_transition(
         self, mechanism_name: str, prepared: dict[str, Any], next_epoch: int
     ) -> dict[str, Any]:
-        if mechanism_name != "scheduler_batching":
-            raise ValueError(
-                f"runtime transition is not implemented for {mechanism_name}"
+        if mechanism_name == "scheduler_batching":
+            return self.scheduler.commit_runtime_scheduler_limits(prepared, next_epoch)
+        if mechanism_name == "prefill_admission_guard":
+            return self.scheduler.commit_runtime_prefill_admission_guard(
+                prepared, next_epoch
             )
-        return self.scheduler.commit_runtime_scheduler_limits(prepared, next_epoch)
+        raise ValueError(f"runtime transition is not implemented for {mechanism_name}")
 
     def verify_runtime_transition(
         self, mechanism_name: str, config: dict[str, Any], epoch: int
     ) -> dict[str, Any]:
-        if mechanism_name != "scheduler_batching":
+        state = self.get_runtime_transition_state()
+        limits = state["scheduler_limits"]
+        if mechanism_name == "scheduler_batching":
+            if state["config_epoch"] != epoch or any(
+                int(limits[field]) != int(value) for field, value in config.items()
+            ):
+                raise RuntimeError("scheduler transition did not become effective")
+            receipt_field = "scheduler_profile_receipt"
+            profile = "scheduler_batching"
+        elif mechanism_name == "prefill_admission_guard":
+            if set(config) != {"scheduler_reserve_full_isl"} or not isinstance(
+                config["scheduler_reserve_full_isl"], bool
+            ):
+                raise ValueError("prefill admission verification config is invalid")
+            if (
+                state["config_epoch"] != epoch
+                or bool(limits["scheduler_reserve_full_isl"])
+                is not config["scheduler_reserve_full_isl"]
+            ):
+                raise RuntimeError(
+                    "prefill admission transition did not become effective"
+                )
+            receipt_field = "prefill_admission_guard_receipt"
+            profile = "prefill_admission_guard"
+        else:
             raise ValueError(
                 f"runtime transition is not implemented for {mechanism_name}"
             )
-        state = self.get_runtime_transition_state()
-        limits = state["scheduler_limits"]
-        if state["config_epoch"] != epoch or any(
-            int(limits[field]) != int(value) for field, value in config.items()
-        ):
-            raise RuntimeError("scheduler transition did not become effective")
         config_hash = hashlib.sha256(
             json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         return {
-            "effective_runtime_profile": "scheduler_batching",
+            "effective_runtime_profile": profile,
             "engine_config_hash": config_hash,
-            "scheduler_profile_receipt": {
+            receipt_field: {
                 "boot_id": self._runtime_control_boot_id,
                 "config_epoch": epoch,
                 "limits": limits,
@@ -573,11 +628,14 @@ class EngineCore:
         prepared: dict[str, Any],
         previous_epoch: int,
     ) -> dict[str, Any]:
-        if mechanism_name != "scheduler_batching":
+        if mechanism_name == "scheduler_batching":
+            proof = self.scheduler.rollback_runtime_scheduler_limits(prepared)
+        elif mechanism_name == "prefill_admission_guard":
+            proof = self.scheduler.rollback_runtime_prefill_admission_guard(prepared)
+        else:
             raise ValueError(
                 f"runtime transition is not implemented for {mechanism_name}"
             )
-        proof = self.scheduler.rollback_runtime_scheduler_limits(prepared)
         return {
             **proof,
             "last_known_good_epoch": previous_epoch,
