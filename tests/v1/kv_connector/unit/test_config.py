@@ -4,11 +4,71 @@
 """Tests for KV cache offloading configuration."""
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.config import CacheConfig, KVTransferConfig, ParallelConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _typed_selection() -> dict:
+    return {
+        "schema_version": "1.0",
+        "composition": "single",
+        "connectors": [
+            {
+                "connector_id": "primary",
+                "scheduler_component": "org.example.kv/connector",
+                "worker_component": "org.example.kv/connector",
+                "scheduler_capabilities": {"supports_hma": True},
+                "worker_capabilities": {
+                    "supports_hma": True,
+                    "requires_piecewise_for_cudagraph": False,
+                },
+            }
+        ],
+    }
+
+
+def test_typed_connector_selection_is_normalized_and_sets_role_flags():
+    config = KVTransferConfig(
+        kv_connector_selection=_typed_selection(),
+        kv_role="kv_both",
+    )
+
+    assert config.kv_connector_selection is not None
+    assert config.kv_connector_selection.schema_version == "1.0"
+    assert config.kv_connector is None
+    assert config.has_kv_connector
+    assert config.is_kv_transfer_instance
+    assert config.is_kv_producer
+    assert config.is_kv_consumer
+
+
+@pytest.mark.parametrize(
+    "legacy_fields",
+    [
+        {"kv_connector": "LMCacheConnectorV1"},
+        {"kv_connector_module_path": "example.connector"},
+    ],
+)
+def test_typed_connector_selection_rejects_legacy_implementation_fields(
+    legacy_fields,
+):
+    with pytest.raises(
+        (ValueError, ValidationError), match="cannot be combined|mutually exclusive"
+    ):
+        KVTransferConfig(
+            kv_connector_selection=_typed_selection(),
+            kv_role="kv_both",
+            **legacy_fields,
+        )
+
+
+def test_typed_connector_selection_requires_kv_role():
+    with pytest.raises((ValueError, ValidationError), match="kv_role"):
+        KVTransferConfig(kv_connector_selection=_typed_selection())
 
 
 class _StubLMCacheMPConnector:

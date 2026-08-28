@@ -6,6 +6,7 @@ from dataclasses import field
 from typing import Any, Literal, get_args
 
 from vllm.config.utils import config
+from vllm.plugins.kv_connector_selection import KVConnectorSelectionProfile
 from vllm.utils.hashing import safe_hash
 
 KVProducer = Literal["kv_producer", "kv_both"]
@@ -26,6 +27,11 @@ class KVTransferConfig:
     kv_connector: str | None = None
     """The KV connector for vLLM to transmit KV caches between vLLM instances.
     """
+
+    kv_connector_selection: KVConnectorSelectionProfile | None = None
+    """Admitted typed connector topology. This is mutually exclusive with
+    ``kv_connector`` and ``kv_connector_module_path``. Runtime construction
+    remains owned by ``KVConnectorFactory``."""
 
     engine_id: str | None = None
     """The engine id for KV transfers."""
@@ -99,23 +105,38 @@ class KVTransferConfig:
                 f"Supported roles are {get_args(KVRole)}"
             )
 
-        if self.kv_connector is not None and self.kv_role is None:
+        has_legacy_connector = self.kv_connector is not None
+        has_typed_connector = self.kv_connector_selection is not None
+        if has_legacy_connector and has_typed_connector:
             raise ValueError(
-                "Please specify kv_role when kv_connector "
-                f"is set, supported roles are {get_args(KVRole)}"
+                "kv_connector and kv_connector_selection are mutually exclusive"
+            )
+        if has_typed_connector and self.kv_connector_module_path is not None:
+            raise ValueError(
+                "kv_connector_module_path cannot be combined with "
+                "kv_connector_selection"
+            )
+        if (has_legacy_connector or has_typed_connector) and self.kv_role is None:
+            raise ValueError(
+                "Please specify kv_role when a KV connector is set, "
+                f"supported roles are {get_args(KVRole)}"
             )
 
     @property
+    def has_kv_connector(self) -> bool:
+        return self.kv_connector is not None or self.kv_connector_selection is not None
+
+    @property
     def is_kv_transfer_instance(self) -> bool:
-        return self.kv_connector is not None and self.kv_role in get_args(KVRole)
+        return self.has_kv_connector and self.kv_role in get_args(KVRole)
 
     @property
     def is_kv_producer(self) -> bool:
-        return self.kv_connector is not None and self.kv_role in get_args(KVProducer)
+        return self.has_kv_connector and self.kv_role in get_args(KVProducer)
 
     @property
     def is_kv_consumer(self) -> bool:
-        return self.kv_connector is not None and self.kv_role in get_args(KVConsumer)
+        return self.has_kv_connector and self.kv_role in get_args(KVConsumer)
 
     def get_from_extra_config(self, key, default) -> Any:
         return self.kv_connector_extra_config.get(key, default)
