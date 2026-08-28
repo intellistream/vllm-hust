@@ -242,6 +242,10 @@ class FrontendArgs(BaseFrontendArgs):
     probe is declared failed in multi-port external LB mode."""
     uds: str | None = None
     """Unix domain socket path. If set, host and port arguments are ignored."""
+    control_bridge_config: str | None = None
+    """Absolute path to a closed local control-bridge host configuration.
+    Omit this option to keep the bridge disabled. This enables only the
+    same-host Unix-socket bridge; it is not a remote control-plane endpoint."""
     uvicorn_log_level: Literal[
         "critical", "error", "warning", "info", "debug", "trace"
     ] = "info"

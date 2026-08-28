@@ -345,6 +345,22 @@ async def init_app_state(
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
     state.args = args
+    control_bridge_config = getattr(args, "control_bridge_config", None)
+    if control_bridge_config is not None:
+        api_process_count = vllm_config.parallel_config._api_process_count
+        if api_process_count != 1:
+            raise ValueError(
+                "the local control bridge requires exactly one API process"
+            )
+        from vllm.control_bridge.bootstrap import (
+            ManagedControlBridgeRuntime,
+            load_control_bridge_host_config,
+        )
+
+        state.control_bridge_runtime = ManagedControlBridgeRuntime(
+            load_control_bridge_host_config(control_bridge_config),
+            engine_client,
+        )
     resolved_chat_template = load_chat_template(args.chat_template)
 
     # Merge default_mm_loras into the static lora_modules

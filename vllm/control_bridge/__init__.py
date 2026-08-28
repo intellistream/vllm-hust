@@ -3,6 +3,13 @@
 
 """Runtime-owned contracts for an external control-plane bridge."""
 
+from vllm.control_bridge.bootstrap import (
+    ControlBridgeBootstrapError,
+    ControlBridgeHostConfig,
+    ControlBridgeHostLimits,
+    ManagedControlBridgeRuntime,
+    load_control_bridge_host_config,
+)
 from vllm.control_bridge.contracts import (
     ControlAction,
     ControlActionAdmissionContext,
@@ -54,6 +61,9 @@ from vllm.control_bridge.transport import (
 )
 
 __all__ = [
+    "ControlBridgeBootstrapError",
+    "ControlBridgeHostConfig",
+    "ControlBridgeHostLimits",
     "ControlAction",
     "ControlActionAdmissionContext",
     "ControlActionAdmissionDecision",
@@ -71,6 +81,7 @@ __all__ = [
     "ControlTransportState",
     "ControlReceipt",
     "LocalControlBridgeService",
+    "ManagedControlBridgeRuntime",
     "PersistentReplayLedger",
     "ProcessIsolatedControlBridgeExecutor",
     "ReplayDisposition",
@@ -87,6 +98,7 @@ __all__ = [
     "encode_control_request",
     "evaluate_control_action_admission",
     "materialize_process_isolated_control_bridge",
+    "load_control_bridge_host_config",
     "observe_engine_client_health",
     "parse_control_action",
     "parse_control_receipt",

@@ -534,6 +534,9 @@ _running_tasks: set[asyncio.Task] = set()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        control_bridge_runtime = getattr(app.state, "control_bridge_runtime", None)
+        if control_bridge_runtime is not None:
+            await control_bridge_runtime.start()
         if app.state.log_stats:
             engine_client: EngineClient = app.state.engine_client
 
@@ -559,6 +562,8 @@ async def lifespan(app: FastAPI):
                 await prefix_routing_proxy.shutdown()
             if task is not None:
                 task.cancel()
+            if control_bridge_runtime is not None:
+                await control_bridge_runtime.stop()
             for attr_name in (
                 "openai_serving_transcription",
                 "openai_serving_translation",
