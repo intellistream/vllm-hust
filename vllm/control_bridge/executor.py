@@ -358,16 +358,16 @@ def core_health_probe_worker(
                 )
             if action.action_type is not ControlActionType.RUNTIME_HEALTH_PROBE:
                 raise ControlBridgeExecutorError("worker action is not read-only")
-            diagnostic = "healthy"
+            diagnostic = "bridge worker responsive; runtime health source unavailable"
             if action.payload.include_diagnostics:
-                diagnostic = f"healthy; worker_pid={os.getpid()}"
+                diagnostic += f"; worker_pid={os.getpid()}"
             receipt = ControlReceipt(
                 schema_version="1.0",
                 action_id=action.action_id,
                 runtime_id=runtime_id,
                 observed_epoch=epoch,
-                status=ControlActionStatus.APPLIED,
-                reason_code="HEALTH_PROBE_COMPLETED",
+                status=ControlActionStatus.FAILED,
+                reason_code="RUNTIME_HEALTH_UNAVAILABLE",
                 diagnostic=diagnostic,
                 mutation_occurred=False,
                 resulting_state_version=state_version,

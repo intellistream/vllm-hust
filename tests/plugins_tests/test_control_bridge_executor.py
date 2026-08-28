@@ -83,7 +83,8 @@ def test_fixed_worker_executes_read_only_probe_in_another_process() -> None:
 
         assert executor.state is ControlBridgeExecutorState.READY
         assert executor.worker_pid != parent_pid
-        assert receipt.status is ControlActionStatus.APPLIED
+        assert receipt.status is ControlActionStatus.FAILED
+        assert receipt.reason_code == "RUNTIME_HEALTH_UNAVAILABLE"
         assert receipt.mutation_occurred is False
         assert receipt.resulting_state_version == 11
         assert f"worker_pid={executor.worker_pid}" in receipt.diagnostic
