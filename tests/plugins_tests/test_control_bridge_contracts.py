@@ -13,8 +13,11 @@ from vllm.control_bridge.contracts import (
     ControlActionContractError,
     ControlActionStatus,
     ControlAuthorizationScope,
+    control_action_to_dict,
+    control_receipt_to_dict,
     evaluate_control_action_admission,
     parse_control_action,
+    parse_control_receipt,
 )
 
 
@@ -32,6 +35,23 @@ def valid_action() -> dict:
         "authorization_scope": "runtime.read",
         "payload": {"include_diagnostics": False},
         "expected_state_version": 11,
+        "trace_id": "trace-1",
+        "causation_id": None,
+    }
+
+
+def valid_receipt() -> dict:
+    return {
+        "schema_version": "1.0",
+        "action_id": "123e4567-e89b-12d3-a456-426614174000",
+        "runtime_id": "runtime-a",
+        "observed_epoch": 7,
+        "status": "accepted",
+        "reason_code": "ADMISSION_ACCEPTED",
+        "diagnostic": "side-effect-free admission passed",
+        "mutation_occurred": False,
+        "resulting_state_version": 11,
+        "completed_at": "2026-08-29T00:01:00+00:00",
         "trace_id": "trace-1",
         "causation_id": None,
     }
@@ -64,6 +84,12 @@ def test_valid_read_only_action_is_admitted_without_mutation() -> None:
     assert decision.mutation_occurred is False
 
 
+def test_action_serializer_round_trips_the_semantic_contract() -> None:
+    payload = valid_action()
+
+    assert control_action_to_dict(parse_control_action(payload)) == payload
+
+
 def test_packaged_action_and_receipt_schemas_validate_wire_examples() -> None:
     packaged = resources.files("vllm.plugins")
     action_schema = json.loads(
@@ -76,21 +102,34 @@ def test_packaged_action_and_receipt_schemas_validate_wire_examples() -> None:
         valid_action()
     )
     Draft202012Validator(receipt_schema, format_checker=FormatChecker()).validate(
-        {
-            "schema_version": "1.0",
-            "action_id": "123e4567-e89b-12d3-a456-426614174000",
-            "runtime_id": "runtime-a",
-            "observed_epoch": 7,
-            "status": "accepted",
-            "reason_code": "ADMISSION_ACCEPTED",
-            "diagnostic": "side-effect-free admission passed",
-            "mutation_occurred": False,
-            "resulting_state_version": 11,
-            "completed_at": "2026-08-29T00:01:00+00:00",
-            "trace_id": "trace-1",
-            "causation_id": None,
-        }
+        valid_receipt()
     )
+
+
+def test_receipt_parser_round_trips_a_valid_terminal_record() -> None:
+    receipt = parse_control_receipt(valid_receipt())
+
+    assert control_receipt_to_dict(receipt) == valid_receipt()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda payload: payload.update(extra=True), "unknown fields"),
+        (lambda payload: payload.pop("status"), "missing required"),
+        (lambda payload: payload.update(action_id="NOT-A-UUID"), "UUID"),
+        (lambda payload: payload.update(reason_code="not-stable"), "uppercase"),
+        (lambda payload: payload.update(mutation_occurred=1), "boolean"),
+        (lambda payload: payload.update(observed_epoch=-1), "non-negative"),
+        (lambda payload: payload.update(completed_at="no-timezone"), "timestamp"),
+    ],
+)
+def test_receipt_parser_rejects_malformed_records(mutation, message) -> None:
+    payload = valid_receipt()
+    mutation(payload)
+
+    with pytest.raises(ControlActionContractError, match=message):
+        parse_control_receipt(payload)
 
 
 @pytest.mark.parametrize(
@@ -100,6 +139,7 @@ def test_packaged_action_and_receipt_schemas_validate_wire_examples() -> None:
         (lambda payload: payload.pop("issuer"), "missing required"),
         (lambda payload: payload.update(schema_version="2.0"), "unsupported"),
         (lambda payload: payload.update(action_id="not-a-uuid"), "UUID"),
+        (lambda payload: payload.update(idempotency_key="x" * 257), "256"),
         (lambda payload: payload.update(target_epoch=True), "non-negative integer"),
         (
             lambda payload: payload["payload"].update(command="mutate"),
