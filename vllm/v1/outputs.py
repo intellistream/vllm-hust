@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, TypeVar
 
 import numpy as np
 import torch
@@ -200,6 +200,12 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Prompt-free QBI activation receipts. These fields are populated only by
+    # source-backed candidate paths and are joined to EngineCore identity
+    # before they leave the isolated developer control surface.
+    qbi_dynamic_mtp_receipt: dict[str, Any] | None = None
+    qbi_reasoning_budget_receipts: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ModelRunnerOutput wrapper for async scheduling.

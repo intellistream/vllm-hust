@@ -16,8 +16,10 @@ logger = init_logger(__name__)
 
 router = APIRouter()
 
-_QBI_SCHEDULER_MECHANISM = "scheduler_batching"
-_QBI_SCHEDULER_FIELDS = {"max_num_scheduled_tokens", "max_num_running_reqs"}
+_QBI_TRANSITION_FIELDS = {
+    "scheduler_batching": {"max_num_scheduled_tokens", "max_num_running_reqs"},
+    "prefill_admission_guard": {"scheduler_reserve_full_isl"},
+}
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -50,20 +52,44 @@ async def _qbi_json_body(request: Request) -> dict[str, Any]:
     return body
 
 
-def _qbi_scheduler_config(body: dict[str, Any]) -> dict[str, int]:
-    if body.get("mechanism_name") != _QBI_SCHEDULER_MECHANISM:
+def _qbi_transition_mechanism(body: dict[str, Any]) -> str:
+    mechanism_name = body.get("mechanism_name")
+    if mechanism_name not in _QBI_TRANSITION_FIELDS:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Only scheduler_batching is supported",
+            detail=(
+                "Supported runtime transitions are scheduler_batching and "
+                "prefill_admission_guard"
+            ),
         )
+    return mechanism_name
+
+
+def _qbi_transition_config(body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    mechanism_name = _qbi_transition_mechanism(body)
+    expected_fields = _QBI_TRANSITION_FIELDS[mechanism_name]
     config = body.get("config")
-    if not isinstance(config, dict) or set(config) != _QBI_SCHEDULER_FIELDS:
+    if not isinstance(config, dict) or set(config) != expected_fields:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Scheduler config has unexpected or missing fields",
+            detail="Runtime transition config has unexpected or missing fields",
         )
+    if mechanism_name == "prefill_admission_guard":
+        value = config["scheduler_reserve_full_isl"]
+        if not isinstance(value, bool):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="scheduler_reserve_full_isl must be a boolean",
+            )
+        return mechanism_name, {"scheduler_reserve_full_isl": value}
     try:
-        return {field: int(config[field]) for field in sorted(_QBI_SCHEDULER_FIELDS)}
+        normalized: dict[str, Any] = {}
+        for field in sorted(expected_fields):
+            value = config[field]
+            if isinstance(value, bool):
+                raise TypeError
+            normalized[field] = int(value)
+        return mechanism_name, normalized
     except (TypeError, ValueError) as error:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -153,16 +179,48 @@ async def qbi_runtime_transition_state(raw_request: Request):
     return await _qbi_call(raw_request, "get_runtime_transition_state")
 
 
+@router.get("/qbi/priority-scheduling/state")
+async def qbi_priority_scheduling_state(raw_request: Request, after_sequence: int = 0):
+    """Read bounded prompt-free receipts from the native priority queue."""
+
+    return await _qbi_call(
+        raw_request, "get_priority_scheduling_state", int(after_sequence)
+    )
+
+
+@router.get("/qbi/prefix-cache/policy-receipts")
+async def qbi_prefix_cache_policy_receipts(raw_request: Request):
+    """Drain bounded prompt-free session APC policy receipts."""
+
+    return await _qbi_call(raw_request, "get_prefix_cache_policy_receipts")
+
+
+@router.get("/qbi/dynamic-mtp/state")
+async def qbi_dynamic_mtp_state(raw_request: Request, after_sequence: int = 0):
+    """Read scheduler/model-runner joined dynamic-MTP receipts."""
+
+    return await _qbi_call(raw_request, "get_dynamic_mtp_state", int(after_sequence))
+
+
+@router.get("/qbi/reasoning-budget/state")
+async def qbi_reasoning_budget_state(raw_request: Request, after_sequence: int = 0):
+    """Read live sampler receipts for bounded reasoning requests."""
+
+    return await _qbi_call(
+        raw_request, "get_reasoning_budget_state", int(after_sequence)
+    )
+
+
 @router.post("/qbi/runtime-transition/stage")
 async def qbi_runtime_transition_stage(raw_request: Request):
     """Stage one bounded scheduler-limit change without accepting mixed epochs."""
 
     body = await _qbi_json_body(raw_request)
-    config = _qbi_scheduler_config(body)
+    mechanism_name, config = _qbi_transition_config(body)
     return await _qbi_call(
         raw_request,
         "stage_runtime_transition",
-        _QBI_SCHEDULER_MECHANISM,
+        mechanism_name,
         config,
     )
 
@@ -172,11 +230,7 @@ async def qbi_runtime_transition_commit(raw_request: Request):
     """Commit a staged change after the previous scheduler epoch drains."""
 
     body = await _qbi_json_body(raw_request)
-    if body.get("mechanism_name") != _QBI_SCHEDULER_MECHANISM:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Only scheduler_batching is supported",
-        )
+    mechanism_name = _qbi_transition_mechanism(body)
     try:
         next_epoch = int(body["next_epoch"])
     except (KeyError, TypeError, ValueError) as error:
@@ -187,7 +241,7 @@ async def qbi_runtime_transition_commit(raw_request: Request):
     return await _qbi_call(
         raw_request,
         "commit_staged_runtime_transition",
-        _QBI_SCHEDULER_MECHANISM,
+        mechanism_name,
         next_epoch,
     )
 
@@ -197,15 +251,11 @@ async def qbi_runtime_transition_abort(raw_request: Request):
     """Abort an uncommitted scheduler transition and release pending requests."""
 
     body = await _qbi_json_body(raw_request)
-    if body.get("mechanism_name") != _QBI_SCHEDULER_MECHANISM:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Only scheduler_batching is supported",
-        )
+    mechanism_name = _qbi_transition_mechanism(body)
     return await _qbi_call(
         raw_request,
         "abort_staged_runtime_transition",
-        _QBI_SCHEDULER_MECHANISM,
+        mechanism_name,
     )
 
 
@@ -214,7 +264,7 @@ async def qbi_runtime_transition_verify(raw_request: Request):
     """Return the EngineCore effectiveness receipt for a committed epoch."""
 
     body = await _qbi_json_body(raw_request)
-    config = _qbi_scheduler_config(body)
+    mechanism_name, config = _qbi_transition_config(body)
     try:
         epoch = int(body["epoch"])
     except (KeyError, TypeError, ValueError) as error:
@@ -225,7 +275,7 @@ async def qbi_runtime_transition_verify(raw_request: Request):
     return await _qbi_call(
         raw_request,
         "verify_runtime_transition",
-        _QBI_SCHEDULER_MECHANISM,
+        mechanism_name,
         config,
         epoch,
     )
@@ -236,11 +286,7 @@ async def qbi_runtime_transition_rollback(raw_request: Request):
     """Restore the staged transition's previous limits at an idle boundary."""
 
     body = await _qbi_json_body(raw_request)
-    if body.get("mechanism_name") != _QBI_SCHEDULER_MECHANISM:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Only scheduler_batching is supported",
-        )
+    mechanism_name = _qbi_transition_mechanism(body)
     prepared = body.get("prepared")
     if not isinstance(prepared, dict):
         raise HTTPException(
@@ -257,7 +303,7 @@ async def qbi_runtime_transition_rollback(raw_request: Request):
     return await _qbi_call(
         raw_request,
         "rollback_runtime_transition",
-        _QBI_SCHEDULER_MECHANISM,
+        mechanism_name,
         prepared,
         previous_epoch,
     )

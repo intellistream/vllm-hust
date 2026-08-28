@@ -91,6 +91,40 @@ class ThinkingBudgetStateHolder:
         """
         return bool(self._state)
 
+    def qbi_runtime_receipts(self, req_ids: list[str | None]) -> list[dict[str, Any]]:
+        """Return prompt-free sampler state for currently budgeted requests."""
+
+        receipts: list[dict[str, Any]] = []
+        for seq_idx, state in sorted(self._state.items()):
+            if seq_idx >= len(req_ids) or not req_ids[seq_idx]:
+                continue
+            self._record_qbi_reasoning_progress(state)
+            end_kind = state.get("qbi_reasoning_end_kind")
+            if end_kind is None:
+                end_kind = "in_progress" if state.get("in_think") else "not_started"
+            receipts.append(
+                {
+                    "schema": "qbi.reasoning-token-budget-sampler-state.v1",
+                    "request_id": req_ids[seq_idx],
+                    "requested_thinking_token_budget": state[
+                        "qbi_requested_thinking_token_budget"
+                    ],
+                    "effective_thinking_token_budget": state["thinking_token_budget"],
+                    "initialized_start_token_ids": list(self.think_start_token_ids),
+                    "initialized_end_token_ids": list(self.think_end_token_ids),
+                    "prompt_reasoning_tokens": state["qbi_prompt_reasoning_tokens"],
+                    "generated_reasoning_tokens": state[
+                        "qbi_generated_reasoning_tokens_peak"
+                    ],
+                    "reasoning_end_kind": end_kind,
+                    "forced_end_token_applied": bool(
+                        state.get("qbi_forced_end_token_applied", False)
+                    ),
+                    "sampler_state_tracked": True,
+                }
+            )
+        return receipts
+
     def sync_batch(self, batch_update: BatchUpdate | None) -> None:
         """Add/remove/move per-request state only (no _update_think_state)."""
         if not self.is_enabled or not batch_update:
@@ -236,7 +270,21 @@ class ThinkingBudgetStateHolder:
             "bonus_token_forced": False,
             "continue_thinking": continue_thinking,
             "scan_offset": 0,
+            "qbi_requested_thinking_token_budget": thinking_token_budget,
+            "qbi_prompt_reasoning_tokens": think_count,
+            "qbi_generated_reasoning_tokens_peak": 0,
+            "qbi_reasoning_end_kind": "forced_budget" if in_end else None,
+            "qbi_forced_end_token_applied": False,
         }
+
+    @staticmethod
+    def _record_qbi_reasoning_progress(state: dict[str, Any]) -> None:
+        prompt_tokens = int(state.get("qbi_prompt_reasoning_tokens", 0))
+        generated_tokens = max(0, int(state.get("think_count", 0)) - prompt_tokens)
+        state["qbi_generated_reasoning_tokens_peak"] = max(
+            int(state.get("qbi_generated_reasoning_tokens_peak", 0)),
+            generated_tokens,
+        )
 
     def _update_think_state(self, state: dict[str, Any]) -> None:
         if state.get("thinking_token_budget", -1) == -1:
@@ -273,6 +321,8 @@ class ThinkingBudgetStateHolder:
             and state["end_thinking"] > state["start_thinking"]
             and not state.get("continue_thinking", False)
         ):
+            self._record_qbi_reasoning_progress(state)
+            state["qbi_reasoning_end_kind"] = "natural_end"
             state["in_think"] = False
             state["think_count"] = 0
             state["continue_thinking"] = False
@@ -355,6 +405,7 @@ class ThinkingBudgetStateHolder:
         absolute_start_pos = state["start_thinking"]
 
         if state["continue_thinking"] and state["end_thinking"] > -1:
+            state["qbi_reasoning_end_kind"] = "natural_end"
             absolute_end_pos = state["end_thinking"] + len(
                 state.get("prompt_tok_ids") or []
             )
@@ -400,6 +451,8 @@ class ThinkingBudgetStateHolder:
 
             elif absolute_end_pos >= 0:
                 # Found think end - exiting think mode
+                self._record_qbi_reasoning_progress(state)
+                state["qbi_reasoning_end_kind"] = "natural_end"
                 state["in_think"] = False
                 state["think_count"] = 0
                 state["continue_thinking"] = False
@@ -434,6 +487,8 @@ class ThinkingBudgetStateHolder:
                 state["in_think"]
                 and total_thinking_tokens > state["thinking_token_budget"]
             ):
+                self._record_qbi_reasoning_progress(state)
+                state["qbi_reasoning_end_kind"] = "forced_budget"
                 # Calculate force_index: position within spec_token_ids where
                 # forcing starts. If we're already over budget without spec
                 # tokens, force from position 0. Force from the position
@@ -547,6 +602,7 @@ class ThinkingBudgetStateHolder:
                                 self.force_token_ids[mask_idx] = (
                                     self.think_end_token_ids[end_count]
                                 )
+                                state["qbi_forced_end_token_applied"] = True
                             if predict_bonus_token:
                                 if state["end_count"] > 0:
                                     state["bonus_token_forced"] = False

@@ -85,6 +85,7 @@ from vllm.version import __version__ as VLLM_VERSION
 logger = init_logger(__name__)
 
 HANDSHAKE_TIMEOUT_MINS = 5
+_QBI_MECHANISM_RECEIPT_LIMIT = 4096
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -217,6 +218,17 @@ class EngineCore:
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
         self._runtime_control_boot_id = uuid.uuid4().hex
+        self._qbi_dynamic_mtp_receipts: deque[dict[str, Any]] = deque(
+            maxlen=_QBI_MECHANISM_RECEIPT_LIMIT
+        )
+        self._qbi_reasoning_budget_receipts: deque[dict[str, Any]] = deque(
+            maxlen=_QBI_MECHANISM_RECEIPT_LIMIT
+        )
+        self._qbi_dynamic_mtp_sequence = 0
+        self._qbi_reasoning_budget_sequence = 0
+        self._qbi_dynamic_mtp_dropped_receipts = 0
+        self._qbi_reasoning_budget_dropped_receipts = 0
+        self._qbi_pending_dynamic_mtp_receipt: dict[str, Any] | None = None
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -350,6 +362,193 @@ class EngineCore:
             "queue_policy": self.scheduler.policy.value,
             "scheduler_limits": self.scheduler.get_runtime_scheduler_limits(),
         }
+
+    def get_prefix_cache_policy_receipts(self) -> dict[str, Any]:
+        """Join session APC receipts to the live EngineCore/cache identity."""
+
+        state = self.scheduler.kv_cache_manager.take_qbi_prefix_cache_policy_receipts()
+        return {
+            **state,
+            "engine_boot_id": self._runtime_control_boot_id,
+            "prefix_caching_enabled": bool(
+                self.vllm_config.cache_config.enable_prefix_caching
+            ),
+            "prefix_caching_hash_algo": (
+                self.vllm_config.cache_config.prefix_caching_hash_algo
+            ),
+            "scheduler_limits": self.scheduler.get_runtime_scheduler_limits(),
+        }
+
+    @staticmethod
+    def _qbi_receipts_after(
+        receipts: deque[dict[str, Any]], after_sequence: int
+    ) -> list[dict[str, Any]]:
+        if (
+            isinstance(after_sequence, bool)
+            or not isinstance(after_sequence, int)
+            or after_sequence < 0
+        ):
+            raise ValueError("after_sequence must be a non-negative integer")
+        return [row for row in receipts if int(row["sequence"]) > after_sequence]
+
+    def get_dynamic_mtp_state(self, after_sequence: int = 0) -> dict[str, Any]:
+        """Read prompt-free scheduler/model-runner dynamic-MTP receipts."""
+
+        return {
+            "schema": "qbi.dynamic-qwen35-mtp-engine-state.v1",
+            "engine_boot_id": self._runtime_control_boot_id,
+            "capacity": _QBI_MECHANISM_RECEIPT_LIMIT,
+            "latest_sequence": self._qbi_dynamic_mtp_sequence,
+            "dropped_receipts": self._qbi_dynamic_mtp_dropped_receipts,
+            "receipts": self._qbi_receipts_after(
+                self._qbi_dynamic_mtp_receipts, after_sequence
+            ),
+        }
+
+    def get_reasoning_budget_state(self, after_sequence: int = 0) -> dict[str, Any]:
+        """Read prompt-free live sampler receipts for reasoning budgets."""
+
+        return {
+            "schema": "qbi.reasoning-token-budget-engine-state.v1",
+            "engine_boot_id": self._runtime_control_boot_id,
+            "capacity": _QBI_MECHANISM_RECEIPT_LIMIT,
+            "latest_sequence": self._qbi_reasoning_budget_sequence,
+            "dropped_receipts": self._qbi_reasoning_budget_dropped_receipts,
+            "receipts": self._qbi_receipts_after(
+                self._qbi_reasoning_budget_receipts, after_sequence
+            ),
+        }
+
+    def _record_qbi_model_runner_telemetry(
+        self, scheduler_output: SchedulerOutput, model_output: ModelRunnerOutput
+    ) -> None:
+        mtp_state = getattr(model_output, "qbi_dynamic_mtp_receipt", None)
+        if isinstance(mtp_state, dict):
+            if len(self._qbi_dynamic_mtp_receipts) == _QBI_MECHANISM_RECEIPT_LIMIT:
+                self._qbi_dynamic_mtp_dropped_receipts += 1
+            self._qbi_dynamic_mtp_sequence += 1
+            sequence = self._qbi_dynamic_mtp_sequence
+            scheduler_members = list(scheduler_output.num_scheduled_tokens.keys())
+            configured_schedule = (
+                self.vllm_config.speculative_config.num_speculative_tokens_per_batch_size
+                if self.vllm_config.speculative_config is not None
+                else None
+            )
+            schedule_payload = {
+                "runtime_max_speculative_tokens": (
+                    self.vllm_config.speculative_config.num_speculative_tokens
+                    if self.vllm_config.speculative_config is not None
+                    else 0
+                ),
+                "num_speculative_tokens_per_batch_size": configured_schedule,
+            }
+            schedule_sha256 = hashlib.sha256(
+                json.dumps(
+                    schedule_payload, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            batch_identity = {
+                "engine_boot_id": self._runtime_control_boot_id,
+                "sequence": sequence,
+                "member_request_ids": scheduler_members,
+                "total_num_scheduled_tokens": (
+                    scheduler_output.total_num_scheduled_tokens
+                ),
+            }
+            batch_proposal_id = hashlib.sha256(
+                json.dumps(
+                    batch_identity, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            receipt = {
+                **mtp_state,
+                "schema": "qbi.dynamic-qwen35-mtp-engine-receipt.v1",
+                "sequence": sequence,
+                "batch_proposal_id": batch_proposal_id,
+                "engine_boot_id": self._runtime_control_boot_id,
+                "member_request_ids": scheduler_members,
+                "schedule_sha256": schedule_sha256,
+                "scheduler_effective_k_proven": (
+                    mtp_state.get("scheduler_selected_num_spec_tokens")
+                    == scheduler_output.num_spec_tokens_to_schedule
+                ),
+                "model_runner_effective_k_proven": (
+                    mtp_state.get("model_runner_consumed_num_spec_tokens")
+                    == scheduler_output.num_spec_tokens_to_schedule
+                    and mtp_state.get("member_request_ids") == scheduler_members
+                ),
+                "proposed_token_count": None,
+                "draft_receipt_complete": False,
+                "draft_receipt_collision": False,
+            }
+            if self._qbi_pending_dynamic_mtp_receipt is not None:
+                self._qbi_pending_dynamic_mtp_receipt["draft_receipt_collision"] = True
+                receipt["draft_receipt_collision"] = True
+            self._qbi_dynamic_mtp_receipts.append(receipt)
+            self._qbi_pending_dynamic_mtp_receipt = receipt
+
+        raw_reasoning = getattr(model_output, "qbi_reasoning_budget_receipts", [])
+        if not isinstance(raw_reasoning, list):
+            return
+        for sampler_state in raw_reasoning:
+            if not isinstance(sampler_state, dict):
+                continue
+            if len(self._qbi_reasoning_budget_receipts) == _QBI_MECHANISM_RECEIPT_LIMIT:
+                self._qbi_reasoning_budget_dropped_receipts += 1
+            self._qbi_reasoning_budget_sequence += 1
+            budget_binding_proven = bool(
+                sampler_state.get("sampler_state_tracked")
+                and sampler_state.get("initialized_start_token_ids")
+                and sampler_state.get("initialized_end_token_ids")
+                and sampler_state.get("requested_thinking_token_budget")
+                == sampler_state.get("effective_thinking_token_budget")
+            )
+            budget_enforced_proven = bool(
+                budget_binding_proven
+                and sampler_state.get("reasoning_end_kind") == "forced_budget"
+                and sampler_state.get("forced_end_token_applied")
+            )
+            receipt = {
+                **sampler_state,
+                "schema": "qbi.reasoning-token-budget-engine-receipt.v1",
+                "sequence": self._qbi_reasoning_budget_sequence,
+                "engine_boot_id": self._runtime_control_boot_id,
+                "transport_parameter_applied_proven": bool(
+                    sampler_state.get("sampler_state_tracked")
+                ),
+                "runtime_budget_binding_proven": budget_binding_proven,
+                "runtime_budget_effective_proven": budget_enforced_proven,
+                "runtime_budget_enforced_proven": budget_enforced_proven,
+                "natural_end_before_budget": bool(
+                    budget_binding_proven
+                    and sampler_state.get("reasoning_end_kind") == "natural_end"
+                    and not sampler_state.get("forced_end_token_applied")
+                ),
+            }
+            self._qbi_reasoning_budget_receipts.append(receipt)
+
+    def _finalize_qbi_dynamic_mtp_draft_receipt(self, draft_token_ids: Any) -> None:
+        receipt = self._qbi_pending_dynamic_mtp_receipt
+        if receipt is None:
+            return
+        rows = getattr(draft_token_ids, "draft_token_ids", None)
+        req_ids = getattr(draft_token_ids, "req_ids", None)
+        if rows is None:
+            proposed_token_count = 0
+            member_identity_match = (
+                receipt["model_runner_consumed_num_spec_tokens"] == 0
+            )
+        else:
+            proposed_token_count = sum(len(row) for row in rows)
+            member_identity_match = list(req_ids or []) == receipt["member_request_ids"]
+        receipt["proposed_token_count"] = proposed_token_count
+        receipt["draft_member_identity_match"] = member_identity_match
+        receipt["proposal_count_within_bound_proven"] = proposed_token_count <= (
+            int(receipt["model_runner_consumed_num_spec_tokens"])
+            * len(receipt["member_request_ids"])
+        )
+        receipt["draft_receipt_complete"] = True
+        self._qbi_pending_dynamic_mtp_receipt = None
 
     def prepare_runtime_transition(
         self, mechanism_name: str, config: dict[str, Any]
@@ -613,6 +812,7 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        self._record_qbi_model_runner_telemetry(scheduler_output, model_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
@@ -626,6 +826,7 @@ class EngineCore:
         if not self.async_scheduling and self.use_spec_decode and model_executed:
             # Take the draft token ids.
             draft_token_ids = self.model_executor.take_draft_token_ids()
+            self._finalize_qbi_dynamic_mtp_draft_receipt(draft_token_ids)
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
@@ -717,6 +918,7 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        self._record_qbi_model_runner_telemetry(scheduler_output, model_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )

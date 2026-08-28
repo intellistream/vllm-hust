@@ -916,6 +916,47 @@ def test_thinking_budget_holder_has_tracked_after_sync_add():
     assert h._state[0]["thinking_token_budget"] == 3
 
 
+def test_thinking_budget_holder_exports_prompt_free_runtime_receipt():
+    vc = VllmConfig()
+    vc.reasoning_config = MockReasoningConfig()
+    h = ThinkingBudgetStateHolder(
+        vc.reasoning_config,
+        vc.scheduler_config.max_num_seqs,
+        0,
+        torch.device("cpu"),
+        False,
+    )
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(thinking_token_budget=2),
+                    None,
+                    [THINK_START_TOKEN_ID],
+                )
+            ],
+            moved=(),
+        )
+    )
+    h.update_state([[THINK_START_TOKEN_ID, 42, 43]], None)
+
+    receipts = h.qbi_runtime_receipts(["r1"])
+
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["request_id"] == "r1"
+    assert receipt["requested_thinking_token_budget"] == 2
+    assert receipt["effective_thinking_token_budget"] == 2
+    assert receipt["initialized_start_token_ids"] == [THINK_START_TOKEN_ID]
+    assert receipt["initialized_end_token_ids"] == [THINK_END_TOKEN_ID]
+    assert receipt["sampler_state_tracked"] is True
+    assert "prompt_tok_ids" not in receipt
+    assert "output_tok_ids" not in receipt
+
+
 def test_thinking_budget_holder_sync_remove_clears_state():
     vc = VllmConfig()
     vc.reasoning_config = MockReasoningConfig()

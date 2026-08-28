@@ -4188,9 +4188,27 @@ class GPUModelRunner(
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
+        spec_config = self.speculative_config
+        is_dynamic_qwen35_mtp = bool(
+            spec_config is not None
+            and spec_config.method in {"mtp", "qwen3_5_mtp"}
+            and spec_config.num_speculative_tokens_per_batch_size is not None
+        )
+        qbi_dynamic_mtp_proposal_path_executed = False
+
         def propose_draft_token_ids(sampled_token_ids):
+            nonlocal qbi_dynamic_mtp_proposal_path_executed
+            if (
+                is_dynamic_qwen35_mtp
+                and scheduler_output.num_spec_tokens_to_schedule == 0
+            ):
+                # K=0 is an actual skip, not a zero-width drafter invocation.
+                self._draft_token_ids = []
+                return
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
+                if is_dynamic_qwen35_mtp:
+                    qbi_dynamic_mtp_proposal_path_executed = True
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -4204,7 +4222,6 @@ class GPUModelRunner(
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
-        spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
@@ -4323,6 +4340,38 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            qbi_dynamic_mtp_receipt = None
+            if is_dynamic_qwen35_mtp:
+                assert spec_config is not None
+                effective_k = scheduler_output.num_spec_tokens_to_schedule
+                consumed_k = (
+                    effective_k if qbi_dynamic_mtp_proposal_path_executed else 0
+                )
+                qbi_dynamic_mtp_receipt = {
+                    "schema": "qbi.dynamic-qwen35-mtp-model-runner-state.v1",
+                    "speculative_method": spec_config.method,
+                    "member_request_ids": list(
+                        scheduler_output.num_scheduled_tokens.keys()
+                    ),
+                    "scheduler_selected_num_spec_tokens": effective_k,
+                    "model_runner_consumed_num_spec_tokens": consumed_k,
+                    "proposal_path_executed": (qbi_dynamic_mtp_proposal_path_executed),
+                    "proposal_work_skipped_proven": (
+                        effective_k == 0 and not qbi_dynamic_mtp_proposal_path_executed
+                    ),
+                    "max_draft_steps": (
+                        effective_k if qbi_dynamic_mtp_proposal_path_executed else 0
+                    ),
+                }
+
+            reasoning_holder = (
+                self.input_batch.sampling_metadata.thinking_budget_state_holder
+            )
+            qbi_reasoning_budget_receipts = (
+                reasoning_holder.qbi_runtime_receipts(list(self.input_batch.req_ids))
+                if reasoning_holder is not None
+                else []
+            )
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4335,6 +4384,8 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                qbi_dynamic_mtp_receipt=qbi_dynamic_mtp_receipt,
+                qbi_reasoning_budget_receipts=qbi_reasoning_budget_receipts,
             )
 
         if not self.use_async_scheduling:
