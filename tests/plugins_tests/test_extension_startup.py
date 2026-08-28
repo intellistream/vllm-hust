@@ -9,7 +9,7 @@ import pytest
 
 import vllm.plugins as plugins
 import vllm.plugins.startup as startup
-from vllm.plugins.contracts import ComponentPermission
+from vllm.plugins.contracts import ComponentIsolation, ComponentPermission
 from vllm.plugins.startup import (
     ExtensionBundleAdmissionError,
     resolve_extension_startup,
@@ -107,6 +107,22 @@ def test_resolver_applies_explicit_permission_policy(tmp_path: Path) -> None:
     resolution = resolve_extension_startup(
         (path,),
         allowed_permissions=(ComponentPermission.NETWORK_EGRESS,),
+    )
+    assert len(resolution.snapshot.components) == 1
+
+
+def test_resolver_rejects_isolation_without_a_materializer(tmp_path: Path) -> None:
+    path = write_manifest(tmp_path, "org.example.isolated")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["components"][0]["isolation"] = "process_isolated"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ExtensionBundleAdmissionError, match="unsupported isolation"):
+        resolve_extension_startup((path,))
+
+    resolution = resolve_extension_startup(
+        (path,),
+        supported_isolations=(ComponentIsolation.PROCESS_ISOLATED,),
     )
     assert len(resolution.snapshot.components) == 1
 

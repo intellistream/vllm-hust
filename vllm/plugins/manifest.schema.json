@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vllm-hust.sage.org.ai/schemas/extension-bundle-v1.schema.json",
+  "title": "vLLM-HUST extension bundle manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "bundle_id",
+    "bundle_version",
+    "host_api_range",
+    "components"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "bundle_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]*$"
+    },
+    "bundle_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "host_api_range": {
+      "type": "string",
+      "pattern": "^(>=|<=|==|!=|>|<)[0-9]+(\\.[0-9]+){0,2}(,(>=|<=|==|!=|>|<)[0-9]+(\\.[0-9]+){0,2})*$"
+    },
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/component"}
+    }
+  },
+  "$defs": {
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component_id",
+        "contracts",
+        "execution_planes",
+        "isolation",
+        "implementation_ref"
+      ],
+      "properties": {
+        "component_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+        },
+        "contracts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "vllm.kv_connector.scheduler.v1",
+              "vllm.kv_connector.worker.v1",
+              "vllm.scheduler.policy.v1",
+              "vllm.platform.v1",
+              "vllm.operator.v1",
+              "vllm.model_runner.v1",
+              "vllm.io_processor.v1",
+              "vllm.stat_logger.v1",
+              "vllm.telemetry.exporter.v1",
+              "vllm.control.action.v1",
+              "vllm.control.receipt.v1"
+            ]
+          }
+        },
+        "execution_planes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["api", "scheduler", "worker", "native", "device", "bridge"]
+          }
+        },
+        "isolation": {
+          "enum": [
+            "trusted_in_process",
+            "process_isolated",
+            "sandboxed_process"
+          ]
+        },
+        "implementation_ref": {"type": "string", "minLength": 1},
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "default": [],
+          "items": {
+            "enum": [
+              "device_access",
+              "filesystem_read",
+              "filesystem_write",
+              "ipc",
+              "network_egress",
+              "shared_memory",
+              "subprocess"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

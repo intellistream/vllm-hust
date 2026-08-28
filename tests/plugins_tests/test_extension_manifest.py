@@ -3,11 +3,17 @@
 
 import json
 import sys
+from importlib import resources
 from pathlib import Path
 
 import pytest
 
-from vllm.plugins.contracts import DomainContract, ExecutionPlane
+from vllm.plugins.contracts import (
+    ComponentIsolation,
+    ComponentPermission,
+    DomainContract,
+    ExecutionPlane,
+)
 from vllm.plugins.manifest import (
     load_extension_bundle_manifest,
     parse_extension_bundle_manifest,
@@ -52,10 +58,36 @@ def test_manifest_is_validated_before_implementation_import(tmp_path: Path) -> N
     assert "module_that_must_not_load" not in sys.modules
 
 
+def test_packaged_schema_matches_runtime_vocabulary() -> None:
+    schema = json.loads(
+        resources.files("vllm.plugins")
+        .joinpath("manifest.schema.json")
+        .read_text(encoding="utf-8")
+    )
+    component = schema["$defs"]["component"]["properties"]
+
+    assert set(component["contracts"]["items"]["enum"]) == {
+        contract.value for contract in DomainContract
+    }
+    assert set(component["execution_planes"]["items"]["enum"]) == {
+        plane.value for plane in ExecutionPlane
+    }
+    assert set(component["isolation"]["enum"]) == {
+        isolation.value for isolation in ComponentIsolation
+    }
+    assert set(component["permissions"]["items"]["enum"]) == {
+        permission.value for permission in ComponentPermission
+    }
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
         (lambda manifest: manifest.update(extra=True), "unknown fields"),
+        (
+            lambda manifest: manifest.update(bundle_version="latest"),
+            "semantic version",
+        ),
         (
             lambda manifest: manifest["components"][0].update(extra=True),
             "unknown fields",

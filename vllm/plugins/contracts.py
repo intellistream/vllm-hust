@@ -18,6 +18,9 @@ from enum import Enum
 
 
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
+_BUNDLE_VERSION = re.compile(
+    r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
 EXTENSION_HOST_API_VERSION = "1.0"
 
 
@@ -125,8 +128,8 @@ class ExtensionBundleDescriptor:
             raise ValueError(
                 "bundle_id must use lowercase letters, digits, dots, or hyphens"
             )
-        if not self.bundle_version.strip():
-            raise ValueError("bundle_version must not be empty")
+        if not _BUNDLE_VERSION.fullmatch(self.bundle_version):
+            raise ValueError("bundle_version must be a semantic version")
         if not self.host_api_range.strip():
             raise ValueError("host_api_range must not be empty")
         if not self.components:

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from vllm.plugins.contracts import (
     EXTENSION_HOST_API_VERSION,
+    ComponentIsolation,
     ComponentPermission,
     ExtensionBundleDescriptor,
 )
@@ -107,10 +108,8 @@ def _validate_host_api_range(
 
 def _validate_permission_policy(
     bundle: ExtensionBundleDescriptor,
-    allowed_permissions: "Iterable[ComponentPermission] | None",
+    allowed_permissions: "Iterable[ComponentPermission]",
 ) -> None:
-    if allowed_permissions is None:
-        return
     allowed = frozenset(allowed_permissions)
     for component in bundle.components:
         denied = set(component.permissions) - allowed
@@ -122,11 +121,27 @@ def _validate_permission_policy(
             )
 
 
+def _validate_isolation_support(
+    bundle: ExtensionBundleDescriptor,
+    supported_isolations: "Iterable[ComponentIsolation]",
+) -> None:
+    supported = frozenset(supported_isolations)
+    for component in bundle.components:
+        if component.isolation not in supported:
+            raise ExtensionBundleAdmissionError(
+                f"component {bundle.bundle_id}/{component.component_id} "
+                f"requests unsupported isolation {component.isolation.value!r}"
+            )
+
+
 def resolve_extension_startup(
     manifest_paths: "Sequence[str | Path]",
     *,
     enabled_bundle_ids: "Iterable[str] | None" = None,
-    allowed_permissions: "Iterable[ComponentPermission] | None" = None,
+    allowed_permissions: "Iterable[ComponentPermission]" = (),
+    supported_isolations: "Iterable[ComponentIsolation]" = (
+        ComponentIsolation.TRUSTED_IN_PROCESS,
+    ),
     host_api_version: str = EXTENSION_HOST_API_VERSION,
 ) -> ExtensionStartupResolution:
     """Validate configured manifests and build a deterministic startup view.
@@ -153,6 +168,7 @@ def resolve_extension_startup(
         seen_bundle_ids.add(bundle.bundle_id)
         _validate_host_api_range(bundle, host_api_version)
         _validate_permission_policy(bundle, allowed_permissions)
+        _validate_isolation_support(bundle, supported_isolations)
         if enabled is not None and bundle.bundle_id not in enabled:
             disabled.append(bundle.bundle_id)
             continue
