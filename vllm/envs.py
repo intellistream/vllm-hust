@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     VLLM_PLUGINS: list[str] | None = None
     VLLM_EXTENSION_MANIFESTS: list[str] = []
     VLLM_EXTENSION_BUNDLES: list[str] | None = None
+    VLLM_EXTENSION_ALLOWED_PERMISSIONS: list[str] = []
     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
     VLLM_LORA_RESOLVER_HF_REPO_LIST: str | None = None
     VLLM_USE_AOT_COMPILE: bool = False
@@ -1086,6 +1087,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if "VLLM_EXTENSION_BUNDLES" not in os.environ
         else os.environ["VLLM_EXTENSION_BUNDLES"].split(",")
+    ),
+    # Explicit comma-separated audit allowlist for permissions declared by
+    # configured Extension Bundle components. Empty by default. Declarations
+    # do not create an OS sandbox or grant authority the process does not have.
+    "VLLM_EXTENSION_ALLOWED_PERMISSIONS": lambda: (
+        []
+        if not os.environ.get("VLLM_EXTENSION_ALLOWED_PERMISSIONS")
+        else os.environ["VLLM_EXTENSION_ALLOWED_PERMISSIONS"].split(",")
     ),
     # Retain local sliding-window KV checkpoints for prefix caching.
     # Unset (default) preserves the dense local checkpointing behavior. `0`

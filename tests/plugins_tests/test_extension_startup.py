@@ -7,11 +7,14 @@ from pathlib import Path
 
 import pytest
 
+import vllm.envs as envs
 import vllm.plugins as plugins
 import vllm.plugins.startup as startup
 from vllm.plugins.contracts import ComponentIsolation, ComponentPermission
 from vllm.plugins.startup import (
     ExtensionBundleAdmissionError,
+    get_configured_extension_startup,
+    parse_component_permission_allowlist,
     resolve_extension_startup,
 )
 
@@ -77,15 +80,11 @@ def test_resolver_reports_bundles_disabled_by_allowlist(tmp_path: Path) -> None:
         "org.example.second"
     ]
     assert resolution.disabled_bundle_ids == ("org.example.first",)
-    assert resolution.diagnostics().admitted_bundle_ids == (
-        "org.example.second",
-    )
+    assert resolution.diagnostics().admitted_bundle_ids == ("org.example.second",)
     assert resolution.diagnostics().admitted_component_ids == (
         "org.example.second/scheduler",
     )
-    assert resolution.diagnostics().disabled_bundle_ids == (
-        "org.example.first",
-    )
+    assert resolution.diagnostics().disabled_bundle_ids == ("org.example.first",)
 
 
 @pytest.mark.parametrize("host_api_range", [">=2", "not-a-specifier"])
@@ -118,6 +117,68 @@ def test_resolver_applies_explicit_permission_policy(tmp_path: Path) -> None:
         allowed_permissions=(ComponentPermission.NETWORK_EGRESS,),
     )
     assert len(resolution.snapshot.components) == 1
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ("network",),
+        ("",),
+        ("ipc", "ipc"),
+    ],
+)
+def test_permission_allowlist_rejects_unknown_blank_or_duplicate_values(
+    values: tuple[str, ...],
+) -> None:
+    with pytest.raises(ExtensionBundleAdmissionError, match="allowlist"):
+        parse_component_permission_allowlist(values)
+
+
+def test_configured_startup_uses_explicit_permission_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = write_manifest(
+        tmp_path,
+        "org.example.networked",
+        permissions=["network_egress"],
+    )
+    monkeypatch.setattr(envs, "VLLM_EXTENSION_MANIFESTS", [str(path)])
+    monkeypatch.setattr(envs, "VLLM_EXTENSION_BUNDLES", None)
+    monkeypatch.setattr(
+        envs,
+        "VLLM_EXTENSION_ALLOWED_PERMISSIONS",
+        ["network_egress"],
+    )
+    get_configured_extension_startup.cache_clear()
+    try:
+        resolution = get_configured_extension_startup()
+    finally:
+        get_configured_extension_startup.cache_clear()
+
+    assert resolution.snapshot.components[0].component.permissions == (
+        ComponentPermission.NETWORK_EGRESS,
+    )
+
+
+def test_configured_startup_denies_permissions_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = write_manifest(
+        tmp_path,
+        "org.example.networked",
+        permissions=["network_egress"],
+    )
+    monkeypatch.setattr(envs, "VLLM_EXTENSION_MANIFESTS", [str(path)])
+    monkeypatch.setattr(envs, "VLLM_EXTENSION_BUNDLES", None)
+    monkeypatch.setattr(envs, "VLLM_EXTENSION_ALLOWED_PERMISSIONS", [])
+    get_configured_extension_startup.cache_clear()
+    try:
+        with pytest.raises(ExtensionBundleAdmissionError, match="denied"):
+            get_configured_extension_startup()
+    finally:
+        get_configured_extension_startup.cache_clear()
 
 
 def test_resolver_rejects_isolation_without_a_materializer(tmp_path: Path) -> None:

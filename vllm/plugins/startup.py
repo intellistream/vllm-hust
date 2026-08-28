@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import regex as re
 
 from vllm.plugins.contracts import (
     EXTENSION_HOST_API_VERSION,
@@ -49,9 +50,7 @@ def _parse_api_version(value: str) -> tuple[int, int, int]:
 def _matches_api_range(version: tuple[int, int, int], api_range: str) -> bool:
     clauses = api_range.split(",")
     if not clauses or any(not clause for clause in clauses):
-        raise ExtensionBundleAdmissionError(
-            f"invalid host_api_range: {api_range!r}"
-        )
+        raise ExtensionBundleAdmissionError(f"invalid host_api_range: {api_range!r}")
     operations = {
         ">=": lambda left, right: left >= right,
         "<=": lambda left, right: left <= right,
@@ -79,7 +78,7 @@ class ExtensionStartupResolution:
     snapshot: ExtensionStartupSnapshot
     disabled_bundle_ids: tuple[str, ...]
 
-    def diagnostics(self) -> "ExtensionStartupDiagnostics":
+    def diagnostics(self) -> ExtensionStartupDiagnostics:
         """Return immutable, implementation-free startup identities."""
         return ExtensionStartupDiagnostics(
             admitted_bundle_ids=tuple(
@@ -101,12 +100,10 @@ class ExtensionStartupDiagnostics:
     admitted_component_ids: tuple[str, ...]
 
 
-def _normalize_manifest_paths(paths: "Sequence[str | Path]") -> tuple[Path, ...]:
+def _normalize_manifest_paths(paths: Sequence[str | Path]) -> tuple[Path, ...]:
     normalized = tuple(Path(os.path.abspath(path)) for path in paths)
     if len(normalized) != len(set(normalized)):
-        raise ExtensionBundleAdmissionError(
-            "extension manifest paths must be unique"
-        )
+        raise ExtensionBundleAdmissionError("extension manifest paths must be unique")
     return normalized
 
 
@@ -132,7 +129,7 @@ def _validate_host_api_range(
 
 def _validate_permission_policy(
     bundle: ExtensionBundleDescriptor,
-    allowed_permissions: "Iterable[ComponentPermission]",
+    allowed_permissions: Iterable[ComponentPermission],
 ) -> None:
     allowed = frozenset(allowed_permissions)
     for component in bundle.components:
@@ -147,7 +144,7 @@ def _validate_permission_policy(
 
 def _validate_isolation_support(
     bundle: ExtensionBundleDescriptor,
-    supported_isolations: "Iterable[ComponentIsolation]",
+    supported_isolations: Iterable[ComponentIsolation],
 ) -> None:
     supported = frozenset(supported_isolations)
     for component in bundle.components:
@@ -159,11 +156,11 @@ def _validate_isolation_support(
 
 
 def resolve_extension_startup(
-    manifest_paths: "Sequence[str | Path]",
+    manifest_paths: Sequence[str | Path],
     *,
-    enabled_bundle_ids: "Iterable[str] | None" = None,
-    allowed_permissions: "Iterable[ComponentPermission]" = (),
-    supported_isolations: "Iterable[ComponentIsolation]" = (
+    enabled_bundle_ids: Iterable[str] | None = None,
+    allowed_permissions: Iterable[ComponentPermission] = (),
+    supported_isolations: Iterable[ComponentIsolation] = (
         ComponentIsolation.TRUSTED_IN_PROCESS,
     ),
     host_api_version: str = EXTENSION_HOST_API_VERSION,
@@ -212,6 +209,27 @@ def resolve_extension_startup(
     )
 
 
+def parse_component_permission_allowlist(
+    values: Iterable[str],
+) -> tuple[ComponentPermission, ...]:
+    """Parse an explicit host allowlist without accepting aliases or blanks."""
+    raw = tuple(values)
+    if any(not isinstance(value, str) or not value for value in raw):
+        raise ExtensionBundleAdmissionError(
+            "extension permission allowlist contains an empty value"
+        )
+    if len(raw) != len(set(raw)):
+        raise ExtensionBundleAdmissionError(
+            "extension permission allowlist contains duplicate values"
+        )
+    try:
+        return tuple(ComponentPermission(value) for value in raw)
+    except ValueError as error:
+        raise ExtensionBundleAdmissionError(
+            "extension permission allowlist contains an unknown value"
+        ) from error
+
+
 @cache
 def get_configured_extension_startup() -> ExtensionStartupResolution:
     """Resolve process startup configuration once into an immutable snapshot."""
@@ -220,14 +238,18 @@ def get_configured_extension_startup() -> ExtensionStartupResolution:
     resolution = resolve_extension_startup(
         envs.VLLM_EXTENSION_MANIFESTS,
         enabled_bundle_ids=envs.VLLM_EXTENSION_BUNDLES,
+        allowed_permissions=parse_component_permission_allowlist(
+            envs.VLLM_EXTENSION_ALLOWED_PERMISSIONS
+        ),
     )
     if envs.VLLM_EXTENSION_MANIFESTS:
         diagnostics = resolution.diagnostics()
         logger.info(
             "Extension startup snapshot: admitted_bundles=%s "
-            "disabled_bundles=%s admitted_components=%s",
+            "disabled_bundles=%s admitted_components=%s allowed_permissions=%s",
             diagnostics.admitted_bundle_ids,
             diagnostics.disabled_bundle_ids,
             diagnostics.admitted_component_ids,
+            sorted(envs.VLLM_EXTENSION_ALLOWED_PERMISSIONS),
         )
     return resolution
