@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 import itertools
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 from vllm import envs
 from vllm.config.kv_cache_compression import KVCacheCompressionConfig
@@ -29,6 +31,50 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+_QBI_PREFIX_CACHE_ADMIT_KEY = "kvplane_admit_prefix_cache"
+_QBI_PREFIX_CACHE_POLICY_VERSION_KEY = "qbi_prefix_cache_policy_version"
+_QBI_PREFIX_CACHE_RECEIPT_LIMIT = 4096
+
+
+def _qbi_prefix_cache_policy(request: Request) -> tuple[bool, str] | None:
+    """Return the source-backed per-request APC write policy, if controlled."""
+
+    sampling_params = getattr(request, "sampling_params", None)
+    extra_args = getattr(sampling_params, "extra_args", None) or {}
+    policy_version = extra_args.get(_QBI_PREFIX_CACHE_POLICY_VERSION_KEY)
+    if policy_version is None:
+        return None
+    normalized_version = str(policy_version).strip()
+    if not normalized_version:
+        raise ValueError("QBI prefix-cache policy version must not be empty")
+    value = extra_args.get(_QBI_PREFIX_CACHE_ADMIT_KEY)
+    if value is None:
+        raise ValueError("QBI prefix-cache write admission is required")
+    if isinstance(value, str):
+        normalized_value = value.strip().lower()
+        if normalized_value in {"1", "true", "yes", "allow", "admit"}:
+            admit_write = True
+        elif normalized_value in {"0", "false", "no", "deny", "skip"}:
+            admit_write = False
+        else:
+            raise ValueError("QBI prefix-cache write admission is malformed")
+    elif isinstance(value, bool):
+        admit_write = value
+    else:
+        raise ValueError("QBI prefix-cache write admission must be boolean-like")
+    if not request.cache_salt:
+        raise ValueError("QBI prefix-cache policy requires a session namespace")
+    if admit_write == request.skip_reading_prefix_cache:
+        raise ValueError(
+            "QBI prefix-cache policy must allow both lookup/write or bypass both"
+        )
+    return admit_write, normalized_version
+
+
+def _qbi_prefix_cache_namespace_sha256(request: Request) -> str:
+    cache_salt = str(request.cache_salt or "")
+    return hashlib.sha256(cache_salt.encode("utf-8")).hexdigest()
 
 
 def _prefix_cache_trace_enabled() -> bool:
@@ -263,6 +309,11 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        self._qbi_prefix_cache_receipts: deque[dict[str, Any]] = deque(
+            maxlen=_QBI_PREFIX_CACHE_RECEIPT_LIMIT
+        )
+        self._qbi_prefix_cache_receipt_sequence = 0
+        self._qbi_prefix_cache_dropped_receipts = 0
 
     @property
     def usage(self) -> float:
@@ -541,6 +592,60 @@ class KVCacheManager:
         """Return the committed physical length for a compressed request."""
         return self._compressed_request_physical_tokens.get(request_id)
 
+    def _record_qbi_prefix_cache_policy(
+        self,
+        request: Request,
+        *,
+        operation: str,
+        decision: str,
+        hit_tokens: int = 0,
+        reused_blocks: int = 0,
+        newly_cached_blocks: int = 0,
+    ) -> None:
+        policy = _qbi_prefix_cache_policy(request)
+        if policy is None:
+            return
+        admit_write, policy_version = policy
+        if len(self._qbi_prefix_cache_receipts) == _QBI_PREFIX_CACHE_RECEIPT_LIMIT:
+            self._qbi_prefix_cache_dropped_receipts += 1
+        self._qbi_prefix_cache_receipt_sequence += 1
+        self._qbi_prefix_cache_receipts.append(
+            {
+                "schema": "qbi.session-prefix-cache-runtime-event.v1",
+                "sequence": self._qbi_prefix_cache_receipt_sequence,
+                "request_id": request.request_id,
+                "namespace_sha256": _qbi_prefix_cache_namespace_sha256(request),
+                "policy_version": policy_version,
+                "operation": operation,
+                "decision": decision,
+                "read_allowed": not request.skip_reading_prefix_cache,
+                "write_allowed": admit_write,
+                "hit_tokens": hit_tokens,
+                "reused_blocks": reused_blocks,
+                "newly_cached_blocks": newly_cached_blocks,
+                "block_hash_count": len(request.block_hashes),
+            }
+        )
+
+    def take_qbi_prefix_cache_policy_receipts(self) -> dict[str, Any]:
+        """Drain bounded prompt-free APC policy receipts for one audit window."""
+
+        receipt = {
+            "schema": "qbi.session-prefix-cache-runtime-receipts.v1",
+            "capacity": _QBI_PREFIX_CACHE_RECEIPT_LIMIT,
+            "dropped_receipts": self._qbi_prefix_cache_dropped_receipts,
+            "receipts": list(self._qbi_prefix_cache_receipts),
+        }
+        self._qbi_prefix_cache_receipts.clear()
+        self._qbi_prefix_cache_dropped_receipts = 0
+        return receipt
+
+    def _qbi_cached_block_count(self, request_id: str) -> int:
+        return sum(
+            getattr(manager, "num_cached_block", {}).get(request_id, 0)
+            for manager in self.coordinator.single_type_managers
+        )
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -557,7 +662,19 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
+        if not self.enable_caching:
+            self._record_qbi_prefix_cache_policy(
+                request,
+                operation="lookup",
+                decision="carrier_disabled",
+            )
+            return self.empty_kv_cache_blocks, 0
+        if request.skip_reading_prefix_cache:
+            self._record_qbi_prefix_cache_policy(
+                request,
+                operation="lookup",
+                decision="bypass",
+            )
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -611,6 +728,14 @@ class KVCacheManager:
                 num_hits=num_new_computed_tokens // self.hash_block_size,
             )
 
+        reused_blocks = sum(len(group) for group in computed_blocks)
+        self._record_qbi_prefix_cache_policy(
+            request,
+            operation="lookup",
+            decision="allow",
+            hit_tokens=num_new_computed_tokens,
+            reused_blocks=reused_blocks,
+        )
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
     def can_fit_full_sequence(
@@ -1072,6 +1197,19 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
+            policy = _qbi_prefix_cache_policy(request)
+            if policy is not None and not policy[0]:
+                self._record_qbi_prefix_cache_policy(
+                    request,
+                    operation="admit",
+                    decision="bypass",
+                )
+                return
+            cached_blocks_before = (
+                self._qbi_cached_block_count(request.request_id)
+                if policy is not None
+                else 0
+            )
             num_cached_blocks = self.coordinator.cache_blocks(
                 request, num_computed_tokens
             )
@@ -1091,6 +1229,18 @@ class KVCacheManager:
             if self.log_stats and num_cached_blocks > 0:
                 assert self.prefix_cache_stats is not None
                 self.prefix_cache_stats.record_blocks_cached(num_cached_blocks)
+            if policy is not None:
+                cached_blocks_after = self._qbi_cached_block_count(
+                    request.request_id
+                )
+                self._record_qbi_prefix_cache_policy(
+                    request,
+                    operation="admit",
+                    decision="allow",
+                    newly_cached_blocks=max(
+                        0, cached_blocks_after - cached_blocks_before
+                    ),
+                )
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
