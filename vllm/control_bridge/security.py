@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 import stat
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -171,9 +172,13 @@ class PersistentReplayLedger:
 
     def __init__(self, database_path: str | os.PathLike[str]) -> None:
         self._path = Path(database_path)
+        self._lock = threading.RLock()
         self._prepare_database_path()
         self._connection = sqlite3.connect(
-            self._path, isolation_level=None, timeout=5.0
+            self._path,
+            isolation_level=None,
+            timeout=5.0,
+            check_same_thread=False,
         )
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA synchronous=FULL")
@@ -202,10 +207,15 @@ class PersistentReplayLedger:
         self.close()
 
     def close(self) -> None:
-        self._connection.close()
+        with self._lock:
+            self._connection.close()
 
     def reserve(self, action: ControlAction) -> ReplayReservation:
         """Atomically bind the action's key, or describe the prior binding."""
+        with self._lock:
+            return self._reserve_locked(action)
+
+    def _reserve_locked(self, action: ControlAction) -> ReplayReservation:
         serialized_action = _serialize_action(action)
         fingerprint = hashlib.sha256(serialized_action.encode("utf-8")).hexdigest()
         connection = self._connection
@@ -258,6 +268,10 @@ class PersistentReplayLedger:
 
     def lookup(self, action: ControlAction) -> ReplayReservation | None:
         """Read an existing durable binding without reserving a new action."""
+        with self._lock:
+            return self._lookup_locked(action)
+
+    def _lookup_locked(self, action: ControlAction) -> ReplayReservation | None:
         serialized_action = _serialize_action(action)
         fingerprint = hashlib.sha256(serialized_action.encode("utf-8")).hexdigest()
         row = self._connection.execute(
@@ -281,6 +295,12 @@ class PersistentReplayLedger:
 
     def complete(self, idempotency_key: str, receipt: ControlReceipt) -> ControlReceipt:
         """Persist one immutable terminal receipt for a prior reservation."""
+        with self._lock:
+            return self._complete_locked(idempotency_key, receipt)
+
+    def _complete_locked(
+        self, idempotency_key: str, receipt: ControlReceipt
+    ) -> ControlReceipt:
         if not idempotency_key:
             raise ReplayLedgerError("idempotency key must be non-empty")
         normalized = parse_control_receipt(control_receipt_to_dict(receipt))

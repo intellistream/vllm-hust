@@ -44,6 +44,14 @@ from vllm.control_bridge.security import (
     authenticate_control_action,
 )
 from vllm.control_bridge.service import LocalControlBridgeService
+from vllm.control_bridge.transport import (
+    ControlTransportError,
+    ControlTransportProtocolError,
+    ControlTransportState,
+    UnixControlBridgeHost,
+    encode_control_request,
+    read_control_response,
+)
 
 __all__ = [
     "ControlAction",
@@ -58,6 +66,9 @@ __all__ = [
     "ControlHmacKey",
     "ControlKeyConfigurationError",
     "ControlKeySet",
+    "ControlTransportError",
+    "ControlTransportProtocolError",
+    "ControlTransportState",
     "ControlReceipt",
     "LocalControlBridgeService",
     "PersistentReplayLedger",
@@ -68,13 +79,16 @@ __all__ = [
     "ReloadableControlKeyStore",
     "RuntimeHealthObservation",
     "RuntimeHealthState",
+    "UnixControlBridgeHost",
     "authenticate_control_action",
     "build_control_action_signature",
     "control_action_to_dict",
     "control_receipt_to_dict",
+    "encode_control_request",
     "evaluate_control_action_admission",
     "materialize_process_isolated_control_bridge",
     "observe_engine_client_health",
     "parse_control_action",
     "parse_control_receipt",
+    "read_control_response",
 ]
