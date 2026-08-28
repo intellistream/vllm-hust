@@ -1305,6 +1305,7 @@ package_data = {
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
         "plugins/*.schema.json",
+        "plugins/builtin_kv_bundles/*.json",
         "control_bridge/*.schema.json",
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",

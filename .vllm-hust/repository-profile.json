@@ -13,15 +13,41 @@
       "delivery_model": "core_release",
       "execution_planes": ["api", "scheduler", "worker", "native", "device"],
       "integration_contracts": []
+    },
+    {
+      "id": "mooncake-vllm-connectors",
+      "artifact_type": "bridge",
+      "system_role": "kv_integration",
+      "delivery_model": "core_release",
+      "execution_planes": ["api", "scheduler", "worker", "native", "device"],
+      "integration_contracts": [
+        "vllm.kv_connector.scheduler.v1",
+        "vllm.kv_connector.worker.v1",
+        "vllm.kv_connector.telemetry.v1"
+      ]
+    },
+    {
+      "id": "lmcache-vllm-connectors",
+      "artifact_type": "bridge",
+      "system_role": "kv_integration",
+      "delivery_model": "core_release",
+      "execution_planes": ["api", "scheduler", "worker"],
+      "integration_contracts": [
+        "vllm.kv_connector.scheduler.v1",
+        "vllm.kv_connector.worker.v1",
+        "vllm.kv_connector.telemetry.v1"
+      ]
     }
   ],
   "system_boundaries": {
     "is": [
       "the inference runtime core and owner of stable domain contracts",
-      "the default implementation and compatibility authority for typed runtime extension surfaces"
+      "the default implementation and compatibility authority for typed runtime extension surfaces",
+      "the delivery owner of its built-in Mooncake and LMCache vLLM bridge implementations"
     ],
     "is_not": [
       "the implementation owner of every platform profile or external subsystem",
+      "the owner of the external Mooncake or LMCache systems",
       "an external control plane",
       "the public ecosystem catalog or benchmark evidence store"
     ]

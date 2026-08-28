@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0",
+  "bundle_id": "vllm-core.mooncake-bridges",
+  "bundle_version": "1.0.0",
+  "host_api_range": ">=1,<2",
+  "components": [
+    {
+      "component_id": "direct-scheduler",
+      "contracts": ["vllm.kv_connector.scheduler.v1"],
+      "execution_planes": ["scheduler"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector:MooncakeConnector",
+      "permissions": ["filesystem_read", "ipc", "network_egress"]
+    },
+    {
+      "component_id": "direct-worker",
+      "contracts": ["vllm.kv_connector.worker.v1"],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector:MooncakeConnector",
+      "permissions": ["device_access", "filesystem_read", "ipc", "network_egress", "shared_memory"]
+    },
+    {
+      "component_id": "direct-telemetry",
+      "contracts": ["vllm.kv_connector.telemetry.v1"],
+      "execution_planes": ["api"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm.plugins.builtin_kv_bundles.mooncake_telemetry:MooncakeDirectTelemetryProvider",
+      "permissions": []
+    },
+    {
+      "component_id": "store-scheduler",
+      "contracts": ["vllm.kv_connector.scheduler.v1"],
+      "execution_planes": ["scheduler"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector:MooncakeStoreConnector",
+      "permissions": ["filesystem_read", "ipc", "network_egress"]
+    },
+    {
+      "component_id": "store-worker",
+      "contracts": ["vllm.kv_connector.worker.v1"],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector:MooncakeStoreConnector",
+      "permissions": ["device_access", "filesystem_read", "ipc", "network_egress", "shared_memory"]
+    },
+    {
+      "component_id": "store-telemetry",
+      "contracts": ["vllm.kv_connector.telemetry.v1"],
+      "execution_planes": ["api"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm.plugins.builtin_kv_bundles.mooncake_telemetry:MooncakeStoreTelemetryProvider",
+      "permissions": []
+    }
+  ]
+}
