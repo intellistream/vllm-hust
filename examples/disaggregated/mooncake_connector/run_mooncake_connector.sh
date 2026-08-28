@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # =============================================================================
 # vLLM Disaggregated Serving Script for Mooncake Connector
@@ -39,6 +41,14 @@ echo "  Timeout: ${TIMEOUT_SECONDS}s"
 echo ""
 
 PIDS=()
+
+start_child() {
+    local log_file=$1
+    shift
+    # Each retained PID is also the process-group ID for exactly one service.
+    setsid "$@" > "$log_file" 2>&1 &
+    PIDS+=("$!")
+}
 
 # Switch to the directory of the current script
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -88,12 +98,39 @@ ensure_python_library_installed() {
 }
 
 cleanup() {
+    local status=${1:-0}
     echo "Stopping everything…"
-    trap - INT TERM        # prevent re-entrancy
-    pkill -9 -f "mooncake_connector_proxy.py"
-    kill -- -$$            # negative PID  ==  "this whole process-group"
-    wait                   # reap children so we don't leave zombies
-    exit 0
+    trap - INT TERM USR1
+
+    # Stop only the process groups created and retained by this invocation.
+    for process_group in "${PIDS[@]}"; do
+        kill -TERM -- "-${process_group}" 2>/dev/null || true
+    done
+
+    # Give services a bounded graceful-shutdown window before escalation.
+    for _ in {1..20}; do
+        local running=false
+        for process_group in "${PIDS[@]}"; do
+            if kill -0 -- "-${process_group}" 2>/dev/null; then
+                running=true
+                break
+            fi
+        done
+        if [[ "$running" == false ]]; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    for process_group in "${PIDS[@]}"; do
+        if kill -0 -- "-${process_group}" 2>/dev/null; then
+            kill -KILL -- "-${process_group}" 2>/dev/null || true
+        fi
+    done
+    for pid in "${PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    exit "$status"
 }
 
 wait_for_server() {
@@ -126,9 +163,9 @@ main() {
     ensure_python_library_installed vllm
     ensure_python_library_installed mooncake.engine
 
-    trap cleanup INT
-    trap cleanup USR1
-    trap cleanup TERM
+    trap 'cleanup 130' INT
+    trap 'cleanup 138' USR1
+    trap 'cleanup 143' TERM
 
     echo "Launching disaggregated serving components..."
     echo "Please check the log files for detailed output:"
@@ -156,11 +193,13 @@ main() {
         local bootstrap_port=${BOOTSTRAP_PORT_ARRAY[$i]}
 
         echo "  Prefill server $((i+1)): GPU $gpu_id, Port $port, Bootstrap Port $bootstrap_port"
-        VLLM_MOONCAKE_BOOTSTRAP_PORT=$bootstrap_port CUDA_VISIBLE_DEVICES=$gpu_id vllm serve "$MODEL" \
+        start_child "prefill$((i+1)).log" env \
+            VLLM_MOONCAKE_BOOTSTRAP_PORT="$bootstrap_port" \
+            CUDA_VISIBLE_DEVICES="$gpu_id" \
+            vllm serve "$MODEL" \
         --port "$port" \
         --kv-transfer-config \
-        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\"}" > prefill$((i+1)).log 2>&1 &
-        PIDS+=($!)
+        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\"}"
         proxy_args+=(--prefill "http://0.0.0.0:${port}" "$bootstrap_port")
     done
 
@@ -174,11 +213,12 @@ main() {
         local port=${DECODE_PORT_ARRAY[$i]}
 
         echo "  Decode server $((i+1)): GPU $gpu_id, Port $port"
-        CUDA_VISIBLE_DEVICES=$gpu_id vllm serve "$MODEL" \
+        start_child "decode$((i+1)).log" env \
+            CUDA_VISIBLE_DEVICES="$gpu_id" \
+            vllm serve "$MODEL" \
         --port "$port" \
         --kv-transfer-config \
-        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\"}" > decode$((i+1)).log 2>&1 &
-        PIDS+=($!)
+        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\"}"
         proxy_args+=(--decode "http://0.0.0.0:${port}")
     done
 
@@ -187,8 +227,8 @@ main() {
     # =============================================================================
     echo ""
     echo "Starting proxy server on port $PROXY_PORT..."
-    python3 mooncake_connector_proxy.py "${proxy_args[@]}" --port "$PROXY_PORT" > proxy.log 2>&1 &
-    PIDS+=($!)
+    start_child "proxy.log" python3 mooncake_connector_proxy.py \
+        "${proxy_args[@]}" --port "$PROXY_PORT"
 
     # =============================================================================
     # Wait for All Servers to Start
@@ -198,9 +238,7 @@ main() {
     for port in "${PREFILL_PORT_ARRAY[@]}" "${DECODE_PORT_ARRAY[@]}"; do
         if ! wait_for_server "$port"; then
             echo "Failed to start server on port $port"
-            cleanup
-            # shellcheck disable=SC2317
-            exit 1
+            cleanup 1
         fi
     done
 
@@ -217,7 +255,7 @@ main() {
 
     echo "Benchmarking done. Cleaning up..."
 
-    cleanup
+    cleanup 0
 }
 
 main
