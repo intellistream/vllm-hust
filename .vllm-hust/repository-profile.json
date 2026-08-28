@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "canonical_registry": "https://github.com/vLLM-HUST/vllm-hust-docs/tree/codex/ecosystem-architecture-reorganization/registry",
+  "repository": "https://github.com/vLLM-HUST/vllm-hust",
+  "repository_role": "runtime_core",
+  "relation_to_runtime": "owns_core_contracts",
+  "lifecycle": "core",
+  "artifacts": [
+    {
+      "id": "vllm-hust-runtime-core",
+      "artifact_type": "runtime_core",
+      "system_role": "inference_runtime",
+      "delivery_model": "core_release",
+      "execution_planes": ["api", "scheduler", "worker", "native", "device"],
+      "integration_contracts": []
+    }
+  ],
+  "system_boundaries": {
+    "is": [
+      "the inference runtime core and owner of stable domain contracts",
+      "the default implementation and compatibility authority for typed runtime extension surfaces"
+    ],
+    "is_not": [
+      "the implementation owner of every platform profile or external subsystem",
+      "an external control plane",
+      "the public ecosystem catalog or benchmark evidence store"
+    ]
+  },
+  "validation": [
+    ".venv/bin/python -m pytest -q tests/plugins_tests/",
+    ".venv/bin/python -m ruff check vllm/plugins tests/plugins_tests",
+    ".venv/bin/python -m ruff format --check vllm/plugins tests/plugins_tests"
+  ],
+  "compatibility_document": null
+}
