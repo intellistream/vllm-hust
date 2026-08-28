@@ -21,10 +21,12 @@ def _typed_selection() -> dict:
                 "connector_id": "primary",
                 "scheduler_component": "org.example.kv/connector",
                 "worker_component": "org.example.kv/connector",
+                "telemetry_component": "org.example.kv/connector",
                 "scheduler_capabilities": {"supports_hma": True},
                 "worker_capabilities": {
                     "supports_hma": True,
                     "requires_piecewise_for_cudagraph": False,
+                    "required_kv_cache_layout": None,
                 },
             }
         ],

@@ -44,6 +44,14 @@ def valid_manifest() -> dict:
                 "implementation_ref": "module_that_must_not_load:Worker",
                 "permissions": [],
             },
+            {
+                "component_id": "telemetry-codec",
+                "contracts": ["vllm.kv_connector.telemetry.v1"],
+                "execution_planes": ["api"],
+                "isolation": "trusted_in_process",
+                "implementation_ref": "module_that_must_not_load:Telemetry",
+                "permissions": [],
+            },
         ],
     }
 
@@ -99,9 +107,7 @@ def test_packaged_schema_matches_runtime_vocabulary() -> None:
             "unsupported value",
         ),
         (
-            lambda manifest: manifest["components"][0].update(
-                isolation="subprocess"
-            ),
+            lambda manifest: manifest["components"][0].update(isolation="subprocess"),
             "isolation is unsupported",
         ),
         (
@@ -135,12 +141,19 @@ def test_startup_snapshot_preserves_scheduler_worker_separation() -> None:
         DomainContract.KV_CONNECTOR_WORKER_V1,
         ExecutionPlane.WORKER,
     )
+    telemetry = snapshot.components_for(
+        DomainContract.KV_CONNECTOR_TELEMETRY_V1,
+        ExecutionPlane.API,
+    )
 
     assert [item.qualified_id for item in scheduler] == [
         "org.example.kv-adapter/scheduler-connector"
     ]
     assert [item.qualified_id for item in worker] == [
         "org.example.kv-adapter/worker-connector"
+    ]
+    assert [item.qualified_id for item in telemetry] == [
+        "org.example.kv-adapter/telemetry-codec"
     ]
 
 

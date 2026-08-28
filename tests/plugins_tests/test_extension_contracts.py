@@ -28,15 +28,22 @@ def test_bundle_can_place_kv_components_in_distinct_processes() -> None:
         isolation=ComponentIsolation.TRUSTED_IN_PROCESS,
         implementation_ref="example.connector:WorkerConnector",
     )
+    telemetry = ExtensionComponentDescriptor(
+        component_id="telemetry-codec",
+        contracts=(DomainContract.KV_CONNECTOR_TELEMETRY_V1,),
+        execution_planes=(ExecutionPlane.API,),
+        isolation=ComponentIsolation.TRUSTED_IN_PROCESS,
+        implementation_ref="example.connector:TelemetryCodec",
+    )
 
     bundle = ExtensionBundleDescriptor(
         bundle_id="org.example.kv-system-adapter",
         bundle_version="1.0.0",
         host_api_range=">=1,<2",
-        components=(scheduler, worker),
+        components=(scheduler, worker, telemetry),
     )
 
-    assert bundle.components == (scheduler, worker)
+    assert bundle.components == (scheduler, worker, telemetry)
 
 
 def test_control_plane_is_represented_by_a_local_bridge() -> None:

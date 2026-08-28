@@ -38,6 +38,13 @@ class KVConnectorComposition(str, Enum):
     ORDERED_MULTI = "ordered_multi"
 
 
+class KVConnectorCacheLayout(str, Enum):
+    """KV cache layout required by a worker implementation."""
+
+    NHD = "NHD"
+    HND = "HND"
+
+
 @dataclass(frozen=True, slots=True)
 class KVConnectorSchedulerCapabilities:
     """Configuration-time scheduler capability declarations."""
@@ -51,6 +58,7 @@ class KVConnectorWorkerCapabilities:
 
     supports_hma: bool
     requires_piecewise_for_cudagraph: bool
+    required_kv_cache_layout: KVConnectorCacheLayout | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +68,7 @@ class KVConnectorPairSelection:
     connector_id: str
     scheduler_component: str
     worker_component: str
+    telemetry_component: str
     scheduler_capabilities: KVConnectorSchedulerCapabilities
     worker_capabilities: KVConnectorWorkerCapabilities
 
@@ -72,6 +81,9 @@ class KVConnectorPairSelection:
             self.scheduler_component, "scheduler_component"
         )
         _validate_qualified_component_id(self.worker_component, "worker_component")
+        _validate_qualified_component_id(
+            self.telemetry_component, "telemetry_component"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +128,16 @@ class KVConnectorSelectionProfile:
             raise KVConnectorSelectionError(
                 "ordered_multi composition requires at least two connectors"
             )
+        required_layouts = {
+            connector.worker_capabilities.required_kv_cache_layout
+            for connector in self.connectors
+            if connector.worker_capabilities.required_kv_cache_layout is not None
+        }
+        if len(required_layouts) > 1:
+            raise KVConnectorSelectionError(
+                "ordered connectors declare conflicting required_kv_cache_layout "
+                f"values: {sorted(layout.value for layout in required_layouts)}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +147,7 @@ class ResolvedKVConnectorPair:
     connector_id: str
     scheduler_component: ResolvedExtensionComponent
     worker_component: ResolvedExtensionComponent
+    telemetry_component: ResolvedExtensionComponent
     scheduler_capabilities: KVConnectorSchedulerCapabilities
     worker_capabilities: KVConnectorWorkerCapabilities
 
@@ -151,6 +174,18 @@ class ResolvedKVConnectorSelection:
         return any(
             connector.worker_capabilities.requires_piecewise_for_cudagraph
             for connector in self.connectors
+        )
+
+    @property
+    def required_kv_cache_layout(self) -> KVConnectorCacheLayout | None:
+        """Return the single compatible worker layout declared by the profile."""
+        return next(
+            (
+                connector.worker_capabilities.required_kv_cache_layout
+                for connector in self.connectors
+                if connector.worker_capabilities.required_kv_cache_layout is not None
+            ),
+            None,
         )
 
 
@@ -189,6 +224,7 @@ def parse_kv_connector_selection(
                 "connector_id",
                 "scheduler_component",
                 "worker_component",
+                "telemetry_component",
                 "scheduler_capabilities",
                 "worker_capabilities",
             },
@@ -207,6 +243,9 @@ def parse_kv_connector_selection(
                     raw_connector, "scheduler_component"
                 ),
                 worker_component=_required_string(raw_connector, "worker_component"),
+                telemetry_component=_required_string(
+                    raw_connector, "telemetry_component"
+                ),
                 scheduler_capabilities=scheduler_capabilities,
                 worker_capabilities=worker_capabilities,
             )
@@ -238,6 +277,12 @@ def resolve_kv_connector_selection(
                 connector.worker_component,
                 DomainContract.KV_CONNECTOR_WORKER_V1,
                 ExecutionPlane.WORKER,
+            ),
+            telemetry_component=_resolve_component(
+                snapshot,
+                connector.telemetry_component,
+                DomainContract.KV_CONNECTOR_TELEMETRY_V1,
+                ExecutionPlane.API,
             ),
             scheduler_capabilities=connector.scheduler_capabilities,
             worker_capabilities=connector.worker_capabilities,
@@ -305,7 +350,11 @@ def _parse_worker_capabilities(
         raise KVConnectorSelectionError(f"{location} must be an object")
     _reject_unknown_fields(
         value,
-        {"supports_hma", "requires_piecewise_for_cudagraph"},
+        {
+            "supports_hma",
+            "requires_piecewise_for_cudagraph",
+            "required_kv_cache_layout",
+        },
         location,
     )
     return KVConnectorWorkerCapabilities(
@@ -313,7 +362,29 @@ def _parse_worker_capabilities(
         requires_piecewise_for_cudagraph=_required_bool(
             value, "requires_piecewise_for_cudagraph", location
         ),
+        required_kv_cache_layout=_optional_cache_layout(
+            value, "required_kv_cache_layout", location
+        ),
     )
+
+
+def _optional_cache_layout(
+    payload: Mapping[str, Any], field: str, location: str
+) -> KVConnectorCacheLayout | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise KVConnectorSelectionError(
+            f"{location}.{field} must be null or a cache layout string"
+        )
+    try:
+        return KVConnectorCacheLayout(value)
+    except ValueError as error:
+        allowed = [item.value for item in KVConnectorCacheLayout]
+        raise KVConnectorSelectionError(
+            f"{location}.{field} must be null or one of {allowed}, got {value!r}"
+        ) from error
 
 
 def _required_bool(payload: Mapping[str, Any], field: str, location: str) -> bool:

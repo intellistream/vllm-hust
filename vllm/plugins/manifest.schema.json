@@ -55,6 +55,7 @@
             "enum": [
               "vllm.kv_connector.scheduler.v1",
               "vllm.kv_connector.worker.v1",
+              "vllm.kv_connector.telemetry.v1",
               "vllm.scheduler.policy.v1",
               "vllm.platform.v1",
               "vllm.operator.v1",

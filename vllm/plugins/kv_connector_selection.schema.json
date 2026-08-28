@@ -18,6 +18,7 @@
           "connector_id",
           "scheduler_component",
           "worker_component",
+          "telemetry_component",
           "scheduler_capabilities",
           "worker_capabilities"
         ],
@@ -34,6 +35,10 @@
             "type": "string",
             "pattern": "^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9.-]*$"
           },
+          "telemetry_component": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9.-]*$"
+          },
           "scheduler_capabilities": {
             "type": "object",
             "additionalProperties": false,
@@ -47,11 +52,16 @@
             "additionalProperties": false,
             "required": [
               "supports_hma",
-              "requires_piecewise_for_cudagraph"
+              "requires_piecewise_for_cudagraph",
+              "required_kv_cache_layout"
             ],
             "properties": {
               "supports_hma": {"type": "boolean"},
-              "requires_piecewise_for_cudagraph": {"type": "boolean"}
+              "requires_piecewise_for_cudagraph": {"type": "boolean"},
+              "required_kv_cache_layout": {
+                "type": ["string", "null"],
+                "enum": ["NHD", "HND", null]
+              }
             }
           }
         }

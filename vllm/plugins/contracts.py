@@ -12,10 +12,10 @@ bridge component.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from enum import Enum
 
+import regex as re
 
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 _BUNDLE_VERSION = re.compile(
@@ -29,6 +29,7 @@ class DomainContract(str, Enum):
 
     KV_CONNECTOR_SCHEDULER_V1 = "vllm.kv_connector.scheduler.v1"
     KV_CONNECTOR_WORKER_V1 = "vllm.kv_connector.worker.v1"
+    KV_CONNECTOR_TELEMETRY_V1 = "vllm.kv_connector.telemetry.v1"
     SCHEDULER_POLICY_V1 = "vllm.scheduler.policy.v1"
     PLATFORM_V1 = "vllm.platform.v1"
     OPERATOR_V1 = "vllm.operator.v1"
