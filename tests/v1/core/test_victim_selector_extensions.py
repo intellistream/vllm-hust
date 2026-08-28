@@ -22,6 +22,11 @@ from vllm.v1.core.sched.victim_selector import (
 
 
 def make_resolution(*component_ids: str) -> ExtensionStartupResolution:
+    if not component_ids:
+        return ExtensionStartupResolution(
+            snapshot=ExtensionStartupSnapshot.build(()),
+            disabled_bundle_ids=(),
+        )
     bundle = ExtensionBundleDescriptor(
         bundle_id="org.example.policies",
         bundle_version="1.0.0",
@@ -124,4 +129,79 @@ def test_typed_import_failure_does_not_fall_back_to_legacy(
     monkeypatch.setattr(victim_selector, "import_module", fail_import)
 
     with pytest.raises(VictimSelectorMaterializationError, match="failed to import"):
+        get_victim_selector(SimpleNamespace(additional_config={}))
+
+
+def test_zero_typed_providers_preserve_legacy_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.plugins.startup.get_configured_extension_startup",
+        lambda: make_resolution(),
+    )
+    entry_point = SimpleNamespace(load=lambda: ExampleSelector)
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: [entry_point],
+    )
+
+    assert isinstance(
+        get_victim_selector(SimpleNamespace(additional_config={})),
+        ExampleSelector,
+    )
+
+
+def test_disable_flag_bypasses_typed_and_legacy_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.plugins.startup.get_configured_extension_startup",
+        lambda: pytest.fail("typed snapshot must not be consulted"),
+    )
+
+    selector = get_victim_selector(
+        SimpleNamespace(
+            additional_config={"victim_selector_plugin_disabled": True}
+        )
+    )
+
+    assert isinstance(selector, victim_selector.NoOpVictimSelector)
+
+
+def test_unknown_qualified_selection_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.plugins.startup.get_configured_extension_startup",
+        lambda: make_resolution("primary"),
+    )
+    config = SimpleNamespace(
+        additional_config={
+            "victim_selector_component": "org.example.policies/missing"
+        }
+    )
+
+    with pytest.raises(VictimSelectorMaterializationError, match="selects no admitted"):
+        get_victim_selector(config)
+
+
+def test_protocol_mismatch_does_not_fall_back_to_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InvalidSelectorFactory:
+        @classmethod
+        def from_vllm_config(cls, vllm_config):
+            return object()
+
+    monkeypatch.setattr(
+        "vllm.plugins.startup.get_configured_extension_startup",
+        lambda: make_resolution("primary"),
+    )
+    monkeypatch.setattr(
+        victim_selector,
+        "import_module",
+        lambda name: SimpleNamespace(primary=InvalidSelectorFactory),
+    )
+
+    with pytest.raises(VictimSelectorMaterializationError, match="does not implement"):
         get_victim_selector(SimpleNamespace(additional_config={}))
