@@ -38,11 +38,11 @@ def _controlled_request(
     )
     assert request.sampling_params is not None
     request.sampling_params.extra_args = {
-        "kvplane_admit_prefix_cache": allow,
+        "kvplane_admit_prefix_cache": "allow" if allow else "deny",
+        "kvplane_bypass_prefix_cache": "false" if allow else "true",
         "qbi_prefix_cache_policy_version": "session-apc-v2",
     }
-    request.sampling_params.skip_reading_prefix_cache = not allow
-    request.skip_reading_prefix_cache = not allow
+    request.skip_reading_prefix_cache = request.get_skip_reading_prefix_cache()
     return request
 
 
@@ -252,21 +252,21 @@ def test_session_apc_hybrid_mamba_allow_and_bypass_do_not_corrupt_manager() -> N
     [
         (
             {"qbi_prefix_cache_policy_version": "session-apc-v2"},
-            False,
+            "false",
             "write admission is required",
         ),
         (
             {
                 "qbi_prefix_cache_policy_version": "session-apc-v2",
-                "kvplane_admit_prefix_cache": True,
+                "kvplane_admit_prefix_cache": "allow",
             },
-            True,
+            "true",
             "allow both lookup/write or bypass both",
         ),
     ],
 )
 def test_session_apc_malformed_or_split_policy_fails_closed(
-    extra_args: dict, skip_reading: bool, message: str
+    extra_args: dict, skip_reading: str, message: str
 ) -> None:
     manager = _manager()
     request = make_request(
@@ -277,8 +277,11 @@ def test_session_apc_malformed_or_split_policy_fails_closed(
         cache_salt="session-a",
     )
     assert request.sampling_params is not None
-    request.sampling_params.extra_args = extra_args
-    request.skip_reading_prefix_cache = skip_reading
+    request.sampling_params.extra_args = {
+        **extra_args,
+        "kvplane_bypass_prefix_cache": skip_reading,
+    }
+    request.skip_reading_prefix_cache = request.get_skip_reading_prefix_cache()
 
     with pytest.raises(ValueError, match=message):
         manager.get_computed_blocks(request)

@@ -264,6 +264,24 @@ class Request:
         return self.num_encoder_inputs > 0
 
     def get_skip_reading_prefix_cache(self) -> bool:
+        if self.sampling_params is not None:
+            extra_args = self.sampling_params.extra_args or {}
+            controlled_bypass = extra_args.get("kvplane_bypass_prefix_cache")
+            if controlled_bypass is not None:
+                if isinstance(controlled_bypass, str):
+                    normalized = controlled_bypass.strip().lower()
+                    if normalized in {"1", "true", "yes", "bypass", "skip"}:
+                        return True
+                    if normalized in {"0", "false", "no", "allow", "read"}:
+                        return False
+                    raise ValueError(
+                        "KVPlane prefix-cache lookup bypass is malformed"
+                    )
+                if isinstance(controlled_bypass, bool):
+                    return controlled_bypass
+                raise ValueError(
+                    "KVPlane prefix-cache lookup bypass must be boolean-like"
+                )
         if (
             self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None
