@@ -63,3 +63,9 @@ def test_wait_loop_fails_when_a_retained_service_exits() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
     assert 'if ! kill -0 "$pid"' in source
     assert "A retained service process exited before port" in source
+
+
+def test_proxy_readiness_uses_an_endpoint_the_proxy_exposes() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "local readiness_path=${2:-/health}" in source
+    assert 'wait_for_server "$PROXY_PORT" "/openapi.json"' in source

@@ -76,9 +76,11 @@ cleanup() {
 
 wait_for_server() {
     local port=$1
+    local readiness_path=${2:-/health}
     local started
     started=$(date +%s)
-    while ! curl --fail --silent --show-error "http://127.0.0.1:${port}/health" \
+    while ! curl --fail --silent --show-error \
+        "http://127.0.0.1:${port}${readiness_path}" \
         > /dev/null 2>&1; do
         for pid in "${PIDS[@]}"; do
             if ! kill -0 "$pid" 2>/dev/null; then
@@ -319,7 +321,9 @@ main() {
     for port in "${PREFILL_PORT_ARRAY[@]}" "${DECODE_PORT_ARRAY[@]}"; do
         wait_for_server "$port"
     done
-    wait_for_server "$PROXY_PORT"
+    # The example proxy exposes OpenAPI routes but intentionally has no
+    # service-owned /health endpoint.
+    wait_for_server "$PROXY_PORT" "/openapi.json"
 
     set +e
     "$PYTHON_BIN" -m vllm.entrypoints.cli.main bench serve \
