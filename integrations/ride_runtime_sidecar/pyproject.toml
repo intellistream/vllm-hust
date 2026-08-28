@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-hust-ride-runtime-sidecar"
+version = "0.1.0"
+description = "mTLS-to-UDS forwarding boundary for the vLLM-HUST control bridge"
+requires-python = ">=3.10"
+
+[project.scripts]
+vllm-hust-ride-sidecar = "ride_runtime_sidecar.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ride_runtime_sidecar = ["sidecar-config.schema.json"]

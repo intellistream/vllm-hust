@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vLLM-HUST RIDE remote runtime sidecar configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "listen_host",
+    "listen_port",
+    "local_socket_path",
+    "server_certificate",
+    "server_private_key",
+    "client_ca_bundle",
+    "allowed_peer_sha256",
+    "max_in_flight",
+    "read_timeout_seconds",
+    "connect_timeout_seconds",
+    "response_timeout_seconds"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "listen_host": {"type": "string", "minLength": 1},
+    "listen_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "local_socket_path": {"type": "string", "minLength": 1},
+    "server_certificate": {"type": "string", "minLength": 1},
+    "server_private_key": {"type": "string", "minLength": 1},
+    "client_ca_bundle": {"type": "string", "minLength": 1},
+    "allowed_peer_sha256": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^([0-9a-fA-F]{2}:?){32}$"}
+    },
+    "max_in_flight": {"type": "integer", "minimum": 1, "maximum": 256},
+    "read_timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 60},
+    "connect_timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 60},
+    "response_timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 60}
+  }
+}

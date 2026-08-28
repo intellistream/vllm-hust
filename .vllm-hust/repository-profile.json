@@ -37,13 +37,25 @@
         "vllm.kv_connector.worker.v1",
         "vllm.kv_connector.telemetry.v1"
       ]
+    },
+    {
+      "id": "ride-runtime-bridge",
+      "artifact_type": "bridge",
+      "system_role": "control_plane_bridge",
+      "delivery_model": "python_distribution",
+      "execution_planes": ["bridge"],
+      "integration_contracts": [
+        "vllm.control.action.v1",
+        "vllm.control.receipt.v1"
+      ]
     }
   ],
   "system_boundaries": {
     "is": [
       "the inference runtime core and owner of stable domain contracts",
       "the default implementation and compatibility authority for typed runtime extension surfaces",
-      "the delivery owner of its built-in Mooncake and LMCache vLLM bridge implementations"
+      "the delivery owner of its built-in Mooncake and LMCache vLLM bridge implementations",
+      "the source host for a separately built remote RIDE mTLS-to-UDS sidecar"
     ],
     "is_not": [
       "the implementation owner of every platform profile or external subsystem",
@@ -54,6 +66,7 @@
   },
   "validation": [
     ".venv/bin/python -m pytest -q tests/plugins_tests/",
+    "PYTHONPATH=integrations/ride_runtime_sidecar/src .venv/bin/python -m pytest -q integrations/ride_runtime_sidecar/tests",
     ".venv/bin/python -m ruff check vllm/plugins tests/plugins_tests",
     ".venv/bin/python -m ruff format --check vllm/plugins tests/plugins_tests"
   ],
