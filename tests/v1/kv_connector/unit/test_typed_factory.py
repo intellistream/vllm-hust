@@ -354,6 +354,69 @@ def test_typed_runtime_config_schema_is_closed_at_the_host_boundary() -> None:
     assert errors
 
 
+def test_legacy_module_path_remains_available_without_typed_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    imported = []
+
+    def import_module(name: str):
+        imported.append(name)
+        return SimpleNamespace(SchedulerConnector=SchedulerConnector)
+
+    monkeypatch.setattr(factory.importlib, "import_module", import_module)
+    legacy_config = KVTransferConfig(
+        kv_connector="SchedulerConnector",
+        kv_connector_module_path="external_connector_module",
+        kv_role="kv_both",
+    )
+
+    assert KVConnectorFactory.get_connector_class(legacy_config) is SchedulerConnector
+    assert imported == ["external_connector_module"]
+
+
+def test_typed_import_failure_does_not_fall_back_and_legacy_rollback_still_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    imported = []
+
+    def fail_typed_import(name: str):
+        imported.append(name)
+        raise ImportError(name)
+
+    monkeypatch.setattr(factory.importlib, "import_module", fail_typed_import)
+    typed = typed_config()
+    typed_vllm_config = SimpleNamespace(
+        kv_transfer_config=typed,
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+    )
+
+    with pytest.raises(
+        factory.KVConnectorMaterializationError, match="failed to import"
+    ):
+        KVConnectorFactory.create_connector(
+            typed_vllm_config,
+            KVConnectorRole.SCHEDULER,
+            SimpleNamespace(),
+        )
+    assert imported == ["scheduler_module"]
+
+    imported.clear()
+
+    def import_legacy(name: str):
+        imported.append(name)
+        return SimpleNamespace(SchedulerConnector=SchedulerConnector)
+
+    monkeypatch.setattr(factory.importlib, "import_module", import_legacy)
+    legacy_config = KVTransferConfig(
+        kv_connector="SchedulerConnector",
+        kv_connector_module_path="external_connector_module",
+        kv_role="kv_both",
+    )
+
+    assert KVConnectorFactory.get_connector_class(legacy_config) is SchedulerConnector
+    assert imported == ["external_connector_module"]
+
+
 @pytest.mark.parametrize(
     ("role", "expected_type", "expected_module"),
     [
