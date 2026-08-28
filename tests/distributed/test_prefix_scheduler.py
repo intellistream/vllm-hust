@@ -232,7 +232,7 @@ def test_sync_mp_client_get_load_metrics_async():
     client.core_engines = [b"rank-2"]
     client.core_engine = client.core_engines[0]
     client.utility_results = {}
-    result = Future()
+    result: Future[dict[str, int]] = Future()
     result.set_result({"num_running_reqs": 2, "num_waiting_reqs": 1})
     client._start_utility = Mock(return_value=(1, result))
     client.utility_results[1] = result

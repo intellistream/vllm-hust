@@ -4,6 +4,7 @@
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,7 +29,7 @@ def test_default_off_has_no_listener() -> None:
 
 
 def test_listener_receives_immutable_event() -> None:
-    events = []
+    events: list[Any] = []
     worker_events.register_worker_lifecycle_listener("test", events.append)
 
     worker_events.emit_worker_lifecycle_event("created", value=1)
@@ -53,7 +54,7 @@ def test_registration_is_idempotent_only_for_same_listener() -> None:
 
 
 def test_failing_listener_is_disabled_without_escaping() -> None:
-    calls = []
+    calls: list[Any] = []
 
     def failing(event):
         raise RuntimeError("observer failure")
@@ -68,7 +69,7 @@ def test_failing_listener_is_disabled_without_escaping() -> None:
 
 
 def test_unregister_removes_listener() -> None:
-    events = []
+    events: list[Any] = []
     worker_events.register_worker_lifecycle_listener("test", events.append)
     worker_events.unregister_worker_lifecycle_listener("test")
 
