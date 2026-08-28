@@ -196,7 +196,5 @@ def test_resolution_error_names_available_provider() -> None:
         }
     )
 
-    with pytest.raises(
-        KVConnectorSelectionError, match="org.example.split/scheduler"
-    ):
+    with pytest.raises(KVConnectorSelectionError, match="org.example.split/scheduler"):
         resolve_kv_connector_selection(profile, make_snapshot())

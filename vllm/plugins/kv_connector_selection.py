@@ -11,11 +11,12 @@ materialization.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+import regex as re
 
 from vllm.plugins.contracts import DomainContract, ExecutionPlane
 from vllm.plugins.snapshot import (
@@ -145,9 +146,7 @@ def parse_kv_connector_selection(
     connectors: list[KVConnectorPairSelection] = []
     for index, raw_connector in enumerate(raw_connectors):
         if not isinstance(raw_connector, Mapping):
-            raise KVConnectorSelectionError(
-                f"connectors[{index}] must be an object"
-            )
+            raise KVConnectorSelectionError(f"connectors[{index}] must be an object")
         _reject_unknown_fields(
             raw_connector,
             {"connector_id", "scheduler_component", "worker_component"},
@@ -159,9 +158,7 @@ def parse_kv_connector_selection(
                 scheduler_component=_required_string(
                     raw_connector, "scheduler_component"
                 ),
-                worker_component=_required_string(
-                    raw_connector, "worker_component"
-                ),
+                worker_component=_required_string(raw_connector, "worker_component"),
             )
         )
 
@@ -207,9 +204,7 @@ def _resolve_component(
     contract: DomainContract,
     plane: ExecutionPlane,
 ) -> ResolvedExtensionComponent:
-    by_id = {
-        component.qualified_id: component for component in snapshot.components
-    }
+    by_id = {component.qualified_id: component for component in snapshot.components}
     component = by_id.get(qualified_id)
     if component is None:
         available = sorted(
