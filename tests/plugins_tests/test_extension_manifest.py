@@ -88,6 +88,17 @@ def test_packaged_schema_matches_runtime_vocabulary() -> None:
     }
 
 
+def test_all_extension_domain_schemas_are_available_as_package_resources() -> None:
+    packaged = resources.files("vllm.plugins")
+    for schema_name in (
+        "manifest.schema.json",
+        "kv_connector_selection.schema.json",
+        "kv_connector_runtime_config.schema.json",
+    ):
+        schema = json.loads(packaged.joinpath(schema_name).read_text(encoding="utf-8"))
+        assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vllm-hust.sage.org.ai/schemas/kv-connector-runtime-config-v1.schema.json",
+  "title": "vLLM typed KV connector runtime configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["typed_connectors"],
+  "properties": {
+    "typed_connectors": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z0-9][a-z0-9.-]*$": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

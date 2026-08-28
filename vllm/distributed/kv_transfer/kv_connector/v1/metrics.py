@@ -74,12 +74,15 @@ class KVConnectorLogging:
             transfer_stats_data
         )
         if transfer_stats is None:
+            provider_name = getattr(
+                self.connector_cls, "__name__", type(self.connector_cls).__name__
+            )
             logger.warning_once(
                 "The connector %s is collecting stats but "
                 "does not implement the "
                 "`build_kv_connector_stats` method. "
                 "Stats will not be logged.",
-                self.connector_cls.__name__,
+                provider_name,
             )
             return
 

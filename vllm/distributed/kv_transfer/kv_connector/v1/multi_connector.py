@@ -179,15 +179,44 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
 
         self._connectors: list[KVConnectorBase_V1] = []
         self._ktc_kv_transfer_config = []
-        for connector_cls, temp_config in self._get_connector_classes_and_configs(
-            vllm_config
-        ):
+        self._connector_ids: list[str] = []
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        materializations: list[
+            tuple[type[KVConnectorBaseType], VllmConfig, str, Any]
+        ] = []
+        if kv_transfer_config.kv_connector_selection is None:
+            legacy_materializations = self._get_connector_classes_and_configs(
+                vllm_config
+            )
+            materializations.extend(
+                (connector_cls, temp_config, connector_cls.__name__, None)
+                for connector_cls, temp_config in legacy_materializations
+            )
+        else:
+            resolved = KVConnectorFactory.resolve_typed_selection(kv_transfer_config)
+            materializations.extend(
+                (
+                    KVConnectorFactory.get_typed_connector_class(pair, role),
+                    KVConnectorFactory.typed_child_vllm_config(
+                        vllm_config, pair.connector_id
+                    ),
+                    pair.connector_id,
+                    pair,
+                )
+                for pair in resolved.connectors
+            )
+        for connector_cls, temp_config, connector_id, pair in materializations:
+            if pair is not None:
+                KVConnectorFactory.verify_typed_connector_declarations(
+                    connector_cls, pair, role, temp_config
+                )
             self._connectors.append(connector_cls(temp_config, role, kv_cache_config))
             self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
+            self._connector_ids.append(connector_id)
 
-        assert vllm_config.kv_transfer_config is not None
-        self._all_support_hma = MultiConnector.all_children_support_hma(
-            vllm_config.kv_transfer_config
+        self._all_support_hma = KVConnectorFactory.supports_hma_config(
+            kv_transfer_config
         )
         assert (
             vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
@@ -640,14 +669,13 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def get_kv_connector_stats(self) -> MultiKVConnectorStats | None:
         # Group connector stats by connector type.
         stats_by_connector: MultiKVConnectorStats | None = None
-        for c in self._connectors:
+        for connector_id, c in zip(self._connector_ids, self._connectors):
             stats = c.get_kv_connector_stats()
             if stats is None:
                 continue
             if stats_by_connector is None:
                 # Lazy init to allow optional return value.
                 stats_by_connector = MultiKVConnectorStats()
-            connector_id = c.__class__.__name__
             if connector_id in stats_by_connector.data:
                 stats_by_connector[connector_id] = stats_by_connector[
                     connector_id
