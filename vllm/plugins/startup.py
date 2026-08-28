@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from vllm.plugins.snapshot import ExtensionStartupSnapshot
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 class ExtensionBundleAdmissionError(ValueError):
@@ -75,6 +78,27 @@ class ExtensionStartupResolution:
 
     snapshot: ExtensionStartupSnapshot
     disabled_bundle_ids: tuple[str, ...]
+
+    def diagnostics(self) -> "ExtensionStartupDiagnostics":
+        """Return immutable, implementation-free startup identities."""
+        return ExtensionStartupDiagnostics(
+            admitted_bundle_ids=tuple(
+                bundle.bundle_id for bundle in self.snapshot.bundles
+            ),
+            disabled_bundle_ids=self.disabled_bundle_ids,
+            admitted_component_ids=tuple(
+                component.qualified_id for component in self.snapshot.components
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionStartupDiagnostics:
+    """Safe read-only diagnostics; never expose imported implementation state."""
+
+    admitted_bundle_ids: tuple[str, ...]
+    disabled_bundle_ids: tuple[str, ...]
+    admitted_component_ids: tuple[str, ...]
 
 
 def _normalize_manifest_paths(paths: "Sequence[str | Path]") -> tuple[Path, ...]:
@@ -193,7 +217,17 @@ def get_configured_extension_startup() -> ExtensionStartupResolution:
     """Resolve process startup configuration once into an immutable snapshot."""
     import vllm.envs as envs
 
-    return resolve_extension_startup(
+    resolution = resolve_extension_startup(
         envs.VLLM_EXTENSION_MANIFESTS,
         enabled_bundle_ids=envs.VLLM_EXTENSION_BUNDLES,
     )
+    if envs.VLLM_EXTENSION_MANIFESTS:
+        diagnostics = resolution.diagnostics()
+        logger.info(
+            "Extension startup snapshot: admitted_bundles=%s "
+            "disabled_bundles=%s admitted_components=%s",
+            diagnostics.admitted_bundle_ids,
+            diagnostics.disabled_bundle_ids,
+            diagnostics.admitted_component_ids,
+        )
+    return resolution

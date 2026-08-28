@@ -77,6 +77,15 @@ def test_resolver_reports_bundles_disabled_by_allowlist(tmp_path: Path) -> None:
         "org.example.second"
     ]
     assert resolution.disabled_bundle_ids == ("org.example.first",)
+    assert resolution.diagnostics().admitted_bundle_ids == (
+        "org.example.second",
+    )
+    assert resolution.diagnostics().admitted_component_ids == (
+        "org.example.second/scheduler",
+    )
+    assert resolution.diagnostics().disabled_bundle_ids == (
+        "org.example.first",
+    )
 
 
 @pytest.mark.parametrize("host_api_range", [">=2", "not-a-specifier"])
