@@ -62,6 +62,7 @@ def _manager(*, block_size: int = 16) -> KVCacheManager:
     return KVCacheManager(
         make_kv_cache_config(block_size, 32),
         max_model_len=8192,
+        scheduler_block_size=block_size,
         enable_caching=True,
         hash_block_size=block_size,
         log_stats=True,
@@ -202,6 +203,7 @@ def test_session_apc_hybrid_mamba_allow_and_bypass_do_not_corrupt_manager() -> N
             ["full", "mamba_align"],
         ),
         max_model_len=8192,
+        scheduler_block_size=block_size,
         enable_caching=True,
         hash_block_size=block_size,
         log_stats=True,

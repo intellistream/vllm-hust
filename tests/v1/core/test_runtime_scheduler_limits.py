@@ -34,6 +34,7 @@ def _scheduler() -> Scheduler:
     scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.PRIORITY)
     scheduler.num_waiting_for_streaming_input = 0
     scheduler.requests = {}
+    scheduler.connector = None
     scheduler.log_stats = False
     scheduler._native_recapture_scope_observer = NativeRecaptureScopeObserver(
         enabled=True,
