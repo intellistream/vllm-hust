@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""Legacy Python entry-point compatibility profile.
+
+Entry points are a delivery and discovery mechanism. They do not define the
+domain contracts implemented by scheduler policies, KV connectors, platform
+profiles, operators, or control-plane bridges. New extension work should use a
+typed domain contract and treat this loader as a migration surface.
+"""
+
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -26,7 +34,7 @@ plugins_loaded = False
 
 
 def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
-    """Load plugins registered under the given entry point group."""
+    """Load legacy plugins registered under the given entry-point group."""
     from importlib.metadata import entry_points
 
     allowed_plugins = envs.VLLM_PLUGINS

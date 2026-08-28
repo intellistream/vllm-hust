@@ -25,6 +25,13 @@ logger = init_logger(__name__)
 
 
 class KVConnectorFactory:
+    """Materialize scheduler and worker implementations of the KV contract.
+
+    A connector is a domain-specific adapter between vLLM and a KV state
+    system. Registration or packaging may be provided by an extension bundle,
+    but the external state system itself is not a vLLM plugin component.
+    """
+
     _registry: dict[str, Callable[[], type[KVConnectorBase]]] = {}
 
     @classmethod
@@ -145,7 +152,7 @@ class KVConnectorFactory:
         return MultiConnector.all_children_support_hma(kv_transfer_config)
 
 
-# Register various connectors here.
+# Register built-in connector adapters here.
 # The registration should not be done in each individual file, as we want to
 # only load the files corresponding to the current connector.
 
