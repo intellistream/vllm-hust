@@ -16,8 +16,11 @@ Plugins (e.g. BidKV) are installed separately and auto-registered via::
 from __future__ import annotations
 
 from collections.abc import Sequence
+from importlib import import_module
 from typing import Any, Protocol, runtime_checkable
 
+from vllm.plugins.contracts import DomainContract, ExecutionPlane
+from vllm.plugins.snapshot import ResolvedExtensionComponent
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.request import Request
 
@@ -106,16 +109,112 @@ class NoOpVictimSelector:
 # ---------------------------------------------------------------------------
 
 
+class VictimSelectorMaterializationError(RuntimeError):
+    """Fail closed after a typed scheduler-policy component was admitted."""
+
+
+def _select_typed_component(
+    vllm_config,
+) -> ResolvedExtensionComponent | None:
+    """Select one admitted scheduler-policy provider for this process.
+
+    Selection is deliberately domain-specific: scheduler policies are
+    exclusive, while other contracts may eventually define composition or
+    fan-out rules.  A qualified component id is required to resolve ambiguity.
+    """
+    from vllm.plugins.startup import get_configured_extension_startup
+
+    resolution = get_configured_extension_startup()
+    providers = resolution.snapshot.components_for(
+        DomainContract.SCHEDULER_POLICY_V1,
+        ExecutionPlane.SCHEDULER,
+    )
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    selected_id = additional_config.get("victim_selector_component")
+
+    if selected_id is not None:
+        matches = tuple(
+            provider for provider in providers if provider.qualified_id == selected_id
+        )
+        if not matches:
+            available = sorted(provider.qualified_id for provider in providers)
+            raise VictimSelectorMaterializationError(
+                "victim_selector_component selects no admitted scheduler-policy "
+                f"provider: {selected_id!r}; available providers: {available}"
+            )
+        return matches[0]
+
+    if len(providers) > 1:
+        available = sorted(provider.qualified_id for provider in providers)
+        raise VictimSelectorMaterializationError(
+            "multiple admitted scheduler-policy providers require an explicit "
+            f"victim_selector_component: {available}"
+        )
+    return providers[0] if providers else None
+
+
+def _load_implementation(implementation_ref: str) -> Any:
+    """Import a ``module:attribute`` reference only after typed admission."""
+    module_name, separator, attribute_path = implementation_ref.partition(":")
+    if not separator or not module_name or not attribute_path:
+        raise VictimSelectorMaterializationError(
+            "scheduler-policy implementation_ref must use module:attribute syntax: "
+            f"{implementation_ref!r}"
+        )
+    try:
+        implementation = import_module(module_name)
+        for attribute in attribute_path.split("."):
+            if not attribute:
+                raise AttributeError("empty attribute segment")
+            implementation = getattr(implementation, attribute)
+        return implementation
+    except Exception as error:
+        raise VictimSelectorMaterializationError(
+            f"failed to import scheduler-policy implementation {implementation_ref!r}"
+        ) from error
+
+
+def _materialize_typed_victim_selector(
+    component: ResolvedExtensionComponent,
+    vllm_config,
+) -> VictimSelector:
+    implementation = _load_implementation(component.component.implementation_ref)
+    factory = getattr(implementation, "from_vllm_config", None)
+    if not callable(factory):
+        raise VictimSelectorMaterializationError(
+            f"scheduler-policy component {component.qualified_id!r} does not expose "
+            "a callable from_vllm_config factory"
+        )
+    try:
+        selector = factory(vllm_config)
+    except Exception as error:
+        raise VictimSelectorMaterializationError(
+            "scheduler-policy component "
+            f"{component.qualified_id!r} failed to initialize"
+        ) from error
+    if not isinstance(selector, VictimSelector):
+        raise VictimSelectorMaterializationError(
+            f"scheduler-policy component {component.qualified_id!r} returned an "
+            "object that does not implement VictimSelector"
+        )
+    return selector
+
+
 def get_victim_selector(vllm_config) -> VictimSelector:
     """Discover and instantiate a victim selector.
 
-    Tries to load a plugin registered under the
-    ``vllm.victim_selector`` entry-point group.  Falls back to
-    ``NoOpVictimSelector`` if no plugin is installed or loading fails.
+    An admitted typed scheduler-policy component takes precedence and fails
+    closed if selection, import, or protocol validation fails.  When no typed
+    provider is configured, retain the legacy ``vllm.victim_selector`` entry
+    point behavior for compatibility.
     """
     additional_config = getattr(vllm_config, "additional_config", None) or {}
     if additional_config.get("victim_selector_plugin_disabled"):
         return NoOpVictimSelector()
+
+    typed_component = _select_typed_component(vllm_config)
+    if typed_component is not None:
+        return _materialize_typed_victim_selector(typed_component, vllm_config)
 
     try:
         from importlib.metadata import EntryPoints, entry_points
