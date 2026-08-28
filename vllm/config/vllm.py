@@ -1334,18 +1334,15 @@ class VllmConfig:
                     KVConnectorFactory,
                 )
 
-                connector_cls = KVConnectorFactory.get_connector_class(
+                if KVConnectorFactory.requires_piecewise_config(
                     self.kv_transfer_config
-                )
-                if connector_cls.requires_piecewise_for_cudagraph(
-                    self.kv_transfer_config.kv_connector_extra_config
                 ):
                     logger.warning_once(
                         "KV connector %s requires PIECEWISE CUDA graph mode "
                         "due to layerwise async operations that cannot be "
                         "captured in CUDA graphs. "
                         "Overriding cudagraph_mode from %s to PIECEWISE.",
-                        connector_cls.__name__,
+                        self.kv_transfer_config.kv_connector or "typed selection",
                         self.compilation_config.cudagraph_mode.name,
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE

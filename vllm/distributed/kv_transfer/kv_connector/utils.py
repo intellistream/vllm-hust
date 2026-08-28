@@ -37,8 +37,9 @@ def get_kv_connector_cache_layout():
     vllm_config = get_current_vllm_config()
     kv_config = vllm_config.kv_transfer_config
     if kv_config is not None:
-        connector_cls = KVConnectorFactory.get_connector_class(kv_config)
-        required_kvcache_layout = connector_cls.get_required_kvcache_layout(vllm_config)
+        required_kvcache_layout = KVConnectorFactory.required_kv_cache_layout(
+            vllm_config
+        )
         if required_kvcache_layout is not None:
             return required_kvcache_layout
         logger.info_once(

@@ -53,8 +53,9 @@ class KVConnectorStats:
 class KVConnectorLogging:
     def __init__(self, kv_transfer_config: KVTransferConfig | None):
         # Instantiate the connector's stats class.
-        if kv_transfer_config and kv_transfer_config.kv_connector:
-            self.connector_cls = KVConnectorFactory.get_connector_class(
+        self.connector_cls = None
+        if kv_transfer_config and kv_transfer_config.has_kv_connector:
+            self.connector_cls = KVConnectorFactory.get_telemetry_class(
                 kv_transfer_config
             )
         self.reset()
@@ -78,7 +79,7 @@ class KVConnectorLogging:
                 "does not implement the "
                 "`build_kv_connector_stats` method. "
                 "Stats will not be logged.",
-                self.connector_cls,
+                self.connector_cls.__name__,
             )
             return
 
@@ -155,8 +156,8 @@ class KVConnectorProm:
     ):
         self.prom_metrics: KVConnectorPromMetrics | None = None
         kv_transfer_config = vllm_config.kv_transfer_config
-        if kv_transfer_config and kv_transfer_config.kv_connector:
-            connector_cls = KVConnectorFactory.get_connector_class(kv_transfer_config)
+        if kv_transfer_config and kv_transfer_config.has_kv_connector:
+            connector_cls = KVConnectorFactory.get_telemetry_class(kv_transfer_config)
             metric_types = {
                 Gauge: self._gauge_cls,
                 Counter: self._counter_cls,
