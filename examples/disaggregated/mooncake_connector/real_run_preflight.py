@@ -116,6 +116,16 @@ def _version_at_least(version: str | None, minimum: tuple[int, int, int]) -> boo
     return len(numeric) == 3 and tuple(numeric) >= minimum
 
 
+def _source_is_under(source: str | None, project_root: Path) -> bool:
+    if source is None:
+        return False
+    try:
+        Path(source).resolve().relative_to(project_root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _manifest_probe(project_root: Path, topology: str) -> dict[str, Any]:
     path = (
         project_root
@@ -251,6 +261,14 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
                 modules.get(name, {}).get("ok") for name in ("vllm", "mooncake.engine")
             ),
             python_probe,
+        ),
+        _check(
+            "vllm_source",
+            _source_is_under(modules.get("vllm", {}).get("file"), project_root),
+            {
+                "required_root": str(project_root),
+                "imported_file": modules.get("vllm", {}).get("file"),
+            },
         ),
         _check(
             "mooncake_version",

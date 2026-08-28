@@ -31,6 +31,20 @@ def test_version_gate_handles_release_and_prerelease_versions() -> None:
     assert not module._version_at_least(None, (0, 3, 8))
 
 
+def test_runtime_source_must_be_inside_selected_core(tmp_path: Path) -> None:
+    module = _module()
+    core = tmp_path / "core"
+    source = core / "vllm" / "__init__.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("", encoding="utf-8")
+    outside = tmp_path / "installed" / "vllm" / "__init__.py"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("", encoding="utf-8")
+    assert module._source_is_under(str(source), core)
+    assert not module._source_is_under(str(outside), core)
+    assert not module._source_is_under(None, core)
+
+
 def test_store_config_is_topology_specific(tmp_path: Path) -> None:
     module = _module()
     config = tmp_path / "mooncake.json"
