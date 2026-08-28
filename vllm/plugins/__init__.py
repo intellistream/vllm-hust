@@ -82,6 +82,13 @@ def load_general_plugins():
     global plugins_loaded
     if plugins_loaded:
         return
+
+    # Build the new typed bundle snapshot before importing any legacy entry
+    # point. Domain-specific materializers consume this immutable snapshot;
+    # this compatibility loader does not instantiate their implementations.
+    from vllm.plugins.startup import get_configured_extension_startup
+
+    get_configured_extension_startup()
     plugins_loaded = True
 
     plugins = load_plugins_by_group(group=DEFAULT_PLUGINS_GROUP)

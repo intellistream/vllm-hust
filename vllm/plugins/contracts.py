@@ -18,6 +18,7 @@ from enum import Enum
 
 
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
+EXTENSION_HOST_API_VERSION = "1.0"
 
 
 class DomainContract(str, Enum):
@@ -55,6 +56,22 @@ class ComponentIsolation(str, Enum):
     SANDBOXED_PROCESS = "sandboxed_process"
 
 
+class ComponentPermission(str, Enum):
+    """Auditable capabilities requested by an extension component.
+
+    Declarations are admission inputs, not proof of enforcement. In particular,
+    ``trusted_in_process`` components still run with the host process authority.
+    """
+
+    DEVICE_ACCESS = "device_access"
+    FILESYSTEM_READ = "filesystem_read"
+    FILESYSTEM_WRITE = "filesystem_write"
+    IPC = "ipc"
+    NETWORK_EGRESS = "network_egress"
+    SHARED_MEMORY = "shared_memory"
+    SUBPROCESS = "subprocess"
+
+
 @dataclass(frozen=True, slots=True)
 class ExtensionComponentDescriptor:
     """Describe one implementation of one or more typed domain contracts.
@@ -68,7 +85,7 @@ class ExtensionComponentDescriptor:
     execution_planes: tuple[ExecutionPlane, ...]
     isolation: ComponentIsolation
     implementation_ref: str
-    permissions: tuple[str, ...] = ()
+    permissions: tuple[ComponentPermission, ...] = ()
 
     def __post_init__(self) -> None:
         if not _IDENTIFIER.fullmatch(self.component_id):
@@ -87,6 +104,11 @@ class ExtensionComponentDescriptor:
             raise ValueError("implementation_ref must not be empty")
         if len(self.permissions) != len(set(self.permissions)):
             raise ValueError("component permissions must be unique")
+        if not all(
+            isinstance(permission, ComponentPermission)
+            for permission in self.permissions
+        ):
+            raise ValueError("component permissions must use known identities")
 
 
 @dataclass(frozen=True, slots=True)

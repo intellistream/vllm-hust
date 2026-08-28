@@ -72,6 +72,12 @@ def test_manifest_is_validated_before_implementation_import(tmp_path: Path) -> N
             ),
             "isolation is unsupported",
         ),
+        (
+            lambda manifest: manifest["components"][0].update(
+                permissions=["ambient_root"]
+            ),
+            "unsupported value",
+        ),
     ],
 )
 def test_manifest_rejects_unknown_or_ambiguous_fields(

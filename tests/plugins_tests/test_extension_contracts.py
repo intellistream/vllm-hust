@@ -5,6 +5,7 @@ import pytest
 
 from vllm.plugins.contracts import (
     ComponentIsolation,
+    ComponentPermission,
     DomainContract,
     ExecutionPlane,
     ExtensionBundleDescriptor,
@@ -48,7 +49,7 @@ def test_control_plane_is_represented_by_a_local_bridge() -> None:
         execution_planes=(ExecutionPlane.BRIDGE,),
         isolation=ComponentIsolation.PROCESS_ISOLATED,
         implementation_ref="example.control:Bridge",
-        permissions=("network:control-plane",),
+        permissions=(ComponentPermission.NETWORK_EGRESS,),
     )
 
     assert DomainContract.CONTROL_ACTION_V1 in bridge.contracts

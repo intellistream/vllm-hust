@@ -16,6 +16,7 @@ from typing import Any, TypeVar
 
 from vllm.plugins.contracts import (
     ComponentIsolation,
+    ComponentPermission,
     DomainContract,
     ExecutionPlane,
     ExtensionBundleDescriptor,
@@ -38,7 +39,12 @@ _COMPONENT_FIELDS = {
     "implementation_ref",
     "permissions",
 }
-_EnumT = TypeVar("_EnumT", DomainContract, ExecutionPlane)
+_EnumT = TypeVar(
+    "_EnumT",
+    ComponentPermission,
+    DomainContract,
+    ExecutionPlane,
+)
 
 
 def _require_object(value: Any, location: str) -> dict[str, Any]:
@@ -115,8 +121,10 @@ def _parse_component(value: Any, index: int) -> ExtensionComponentDescriptor:
         implementation_ref=_require_string(
             component["implementation_ref"], f"{location}.implementation_ref"
         ),
-        permissions=_require_string_tuple(
-            component.get("permissions", []), f"{location}.permissions"
+        permissions=_parse_enum_tuple(
+            component.get("permissions", []),
+            ComponentPermission,
+            f"{location}.permissions",
         ),
     )
 

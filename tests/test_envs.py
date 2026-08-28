@@ -111,7 +111,6 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
     with patch.dict(os.environ, {"VLLM_USE_PRECOMPILED_RUST": "1"}, clear=True):
         assert environment_variables["VLLM_USE_PRECOMPILED"]() is False
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
-
     # ...and the reverse: requesting precompiled C extensions (here via a
     # wheel location, which enables VLLM_USE_PRECOMPILED) must not flip the
     # Rust frontend flag.
@@ -132,6 +131,28 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
     ):
         assert environment_variables["VLLM_USE_PRECOMPILED"]() is True
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
+
+
+def test_extension_bundle_environment_is_separate_from_legacy_plugins() -> None:
+    manifests = os.pathsep.join(("/opt/first/manifest.json", "/opt/second.json"))
+    with patch.dict(
+        os.environ,
+        {
+            "VLLM_PLUGINS": "legacy-entry-point",
+            "VLLM_EXTENSION_MANIFESTS": manifests,
+            "VLLM_EXTENSION_BUNDLES": "org.example.first,org.example.second",
+        },
+        clear=True,
+    ):
+        assert environment_variables["VLLM_PLUGINS"]() == ["legacy-entry-point"]
+        assert environment_variables["VLLM_EXTENSION_MANIFESTS"]() == [
+            "/opt/first/manifest.json",
+            "/opt/second.json",
+        ]
+        assert environment_variables["VLLM_EXTENSION_BUNDLES"]() == [
+            "org.example.first",
+            "org.example.second",
+        ]
 
 
 class TestEnvWithChoices:

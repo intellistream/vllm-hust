@@ -102,6 +102,8 @@ if TYPE_CHECKING:
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
     VLLM_MAX_N_SEQUENCES: int = 16384
     VLLM_PLUGINS: list[str] | None = None
+    VLLM_EXTENSION_MANIFESTS: list[str] = []
+    VLLM_EXTENSION_BUNDLES: list[str] | None = None
     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
     VLLM_LORA_RESOLVER_HF_REPO_LIST: str | None = None
     VLLM_USE_AOT_COMPILE: bool = False
@@ -1070,6 +1072,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if "VLLM_PLUGINS" not in os.environ
         else os.environ["VLLM_PLUGINS"].split(",")
+    ),
+    # Explicit, path-separator-delimited extension bundle manifests. There is
+    # intentionally no implicit filesystem scan or package import.
+    "VLLM_EXTENSION_MANIFESTS": lambda: (
+        []
+        if not os.environ.get("VLLM_EXTENSION_MANIFESTS")
+        else os.environ["VLLM_EXTENSION_MANIFESTS"].split(os.pathsep)
+    ),
+    # Optional comma-separated bundle-id allowlist. Unset admits all explicitly
+    # configured manifests; an empty string admits none of them.
+    "VLLM_EXTENSION_BUNDLES": lambda: (
+        None
+        if "VLLM_EXTENSION_BUNDLES" not in os.environ
+        else os.environ["VLLM_EXTENSION_BUNDLES"].split(",")
     ),
     # Retain local sliding-window KV checkpoints for prefix caching.
     # Unset (default) preserves the dense local checkpointing behavior. `0`
