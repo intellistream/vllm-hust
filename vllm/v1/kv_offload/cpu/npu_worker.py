@@ -396,7 +396,9 @@ class AscendSingleDirectionOffloadingHandler:
                     ):
                         chunk_src = all_src[chunk_start:chunk_end]
                         chunk_sizes = all_sizes[chunk_start:chunk_end]
-                        gather_started_at = time.monotonic() if EventBus.enabled else 0.0
+                        gather_started_at = (
+                            time.monotonic() if EventBus.enabled else 0.0
+                        )
                         chunk_dma_ops = _coalesce_host_pages(
                             chunk_src,
                             chunk_sizes,

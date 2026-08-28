@@ -10,8 +10,6 @@ setup(
     packages=["vllm_b134_events"],
     python_requires=">=3.10",
     entry_points={
-        "vllm.general_plugins": [
-            "register_b134_events = vllm_b134_events:register"
-        ]
+        "vllm.general_plugins": ["register_b134_events = vllm_b134_events:register"]
     },
 )

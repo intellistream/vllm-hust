@@ -150,9 +150,7 @@ def _load_scheduler_module():
     add("vllm.v1.core.kv_cache_utils", KVCacheBlock=MagicMock)
     add(
         "vllm.v1.engine",
-        EngineCoreEventType=MagicMock(
-            SCHEDULED="SCHEDULED", PREEMPTED="PREEMPTED"
-        ),
+        EngineCoreEventType=MagicMock(SCHEDULED="SCHEDULED", PREEMPTED="PREEMPTED"),
         EngineCoreOutput=MagicMock,
         EngineCoreOutputs=MagicMock,
     )

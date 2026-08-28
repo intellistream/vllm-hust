@@ -63,7 +63,7 @@ class B134JsonlSink:
         queue_max: int = _DEFAULT_QUEUE_MAX,
     ) -> None:
         self._path = path or os.environ.get("B134_EVENTS_FILE", "")
-        self._queue: "queue.Queue[str | object]" = queue.Queue(maxsize=queue_max)
+        self._queue: queue.Queue[str | object] = queue.Queue(maxsize=queue_max)
         self._thread: threading.Thread | None = None
         self._file = None
         self._closed = False
@@ -124,59 +124,99 @@ class B134JsonlSink:
         elif isinstance(event, RequestResumed):
             name, request_id, fields = "wakeup", event.request_id, {}
         elif isinstance(event, KVOffloadStore):
-            name, request_id, fields = "cpu_store", event.request_id, {
-                "duration_us": event.duration_us,
-                "evicted_keys": event.evicted_keys,
-                "stored_keys": event.stored_keys,
-            }
+            name, request_id, fields = (
+                "cpu_store",
+                event.request_id,
+                {
+                    "duration_us": event.duration_us,
+                    "evicted_keys": event.evicted_keys,
+                    "stored_keys": event.stored_keys,
+                },
+            )
         elif isinstance(event, KVOffloadEvict):
-            name, request_id, fields = "cpu_evict", event.request_id, {
-                "duration_us": event.duration_us,
-                "evicted_keys": event.evicted_keys,
-            }
+            name, request_id, fields = (
+                "cpu_evict",
+                event.request_id,
+                {
+                    "duration_us": event.duration_us,
+                    "evicted_keys": event.evicted_keys,
+                },
+            )
         elif isinstance(event, KVOffloadRestoreStart):
-            name, request_id, fields = "restore_start", event.request_id, {
-                "keys": event.keys,
-            }
+            name, request_id, fields = (
+                "restore_start",
+                event.request_id,
+                {
+                    "keys": event.keys,
+                },
+            )
         elif isinstance(event, KVOffloadRestoreDone):
-            name, request_id, fields = "restore_done", event.request_id, {
-                "keys": event.keys,
-            }
+            name, request_id, fields = (
+                "restore_done",
+                event.request_id,
+                {
+                    "keys": event.keys,
+                },
+            )
         elif isinstance(event, KVOffloadTierEvict):
-            name, request_id, fields = "evict", event.request_id, {
-                "duration_us": event.duration_us,
-                "keys": event.keys,
-            }
+            name, request_id, fields = (
+                "evict",
+                event.request_id,
+                {
+                    "duration_us": event.duration_us,
+                    "keys": event.keys,
+                },
+            )
         elif isinstance(event, KVOffloadSchedStep):
-            name, request_id, fields = "sched_step", "step", {
-                "duration_us": event.duration_us,
-            }
+            name, request_id, fields = (
+                "sched_step",
+                "step",
+                {
+                    "duration_us": event.duration_us,
+                },
+            )
         elif isinstance(event, KVTransferSwapD2H):
-            name, request_id, fields = "swap_d2h_submit", event.job_id, {
-                "descriptors": event.descriptors,
-                "duration_us": event.duration_us,
-            }
+            name, request_id, fields = (
+                "swap_d2h_submit",
+                event.job_id,
+                {
+                    "descriptors": event.descriptors,
+                    "duration_us": event.duration_us,
+                },
+            )
         elif isinstance(event, KVTransferGatherH2D):
-            name, request_id, fields = "gather_h2d", event.job_id, {
-                "dma_runs": event.dma_runs,
-                "duration_us": event.duration_us,
-            }
+            name, request_id, fields = (
+                "gather_h2d",
+                event.job_id,
+                {
+                    "dma_runs": event.dma_runs,
+                    "duration_us": event.duration_us,
+                },
+            )
         elif isinstance(event, KVTransferSubmit):
-            name, request_id, fields = "transfer_submit", event.job_id, {
-                "bytes": event.bytes,
-                "dependency_us": event.dependency_us,
-                "descriptor_us": event.descriptor_us,
-                "descriptors": event.descriptors,
-                "direction": event.direction,
-                "submit_us": event.submit_us,
-            }
+            name, request_id, fields = (
+                "transfer_submit",
+                event.job_id,
+                {
+                    "bytes": event.bytes,
+                    "dependency_us": event.dependency_us,
+                    "descriptor_us": event.descriptor_us,
+                    "descriptors": event.descriptors,
+                    "direction": event.direction,
+                    "submit_us": event.submit_us,
+                },
+            )
         elif isinstance(event, KVTransferCopyDone):
-            name, request_id, fields = "copy_observed_complete", event.job_id, {
-                "bytes": event.bytes,
-                "completion_observed_ms": event.completion_observed_ms,
-                "device_event_ms": event.device_event_ms,
-                "direction": event.direction,
-            }
+            name, request_id, fields = (
+                "copy_observed_complete",
+                event.job_id,
+                {
+                    "bytes": event.bytes,
+                    "completion_observed_ms": event.completion_observed_ms,
+                    "device_event_ms": event.device_event_ms,
+                    "direction": event.direction,
+                },
+            )
         else:
             return None
 
@@ -213,7 +253,11 @@ class B134JsonlSink:
             if not path:
                 return None
             try:
-                self._file = open(path, "a", buffering=1, encoding="utf-8")
+                # The sink intentionally owns this file across writes and closes it
+                # in ``close``; a per-call context manager would defeat buffering.
+                self._file = open(  # noqa: SIM115
+                    path, "a", buffering=1, encoding="utf-8"
+                )
             except OSError:
                 with self._lock:
                     self._error_count += 1

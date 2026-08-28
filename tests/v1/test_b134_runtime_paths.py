@@ -190,9 +190,7 @@ def test_prepare_store_emits_cpu_store(kv_offload_env, monkeypatch) -> None:
         assert out is not None
         assert [k for k in out.keys_to_store] == keys
 
-        cpu_store_events = [
-            e for e in emitted if type(e).__name__ == "KVOffloadStore"
-        ]
+        cpu_store_events = [e for e in emitted if type(e).__name__ == "KVOffloadStore"]
         assert len(cpu_store_events) == 1, (
             f"expected one cpu_store event, got {emitted}"
         )

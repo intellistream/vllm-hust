@@ -21,11 +21,11 @@ instrumentation can never affect serving correctness or latency.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-
 
 # ---------------------------------------------------------------------------
 # Typed events (generic semantics)
@@ -36,9 +36,7 @@ from typing import Any, Protocol
 class EngineCoreEvent:
     """Base class for all engine-core events."""
 
-    ts_monotonic_ns: int = field(
-        init=False, default_factory=time.monotonic_ns
-    )
+    ts_monotonic_ns: int = field(init=False, default_factory=time.monotonic_ns)
     """Monotonic timestamp (ns) taken at construction time."""
 
 
@@ -217,10 +215,8 @@ class EventBus:
         if not sinks:
             return
         for sink in sinks:
-            try:
+            with contextlib.suppress(Exception):
                 sink.emit(event)
-            except Exception:  # noqa: BLE001 - degrade, never propagate
-                pass
 
 
 # Re-export for plugin authors that introspect event payloads.

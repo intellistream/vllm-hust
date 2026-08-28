@@ -974,9 +974,7 @@ class TieringOffloadingManager(OffloadingManager):
             EventBus.emit(
                 KVOffloadTierEvict(
                     req_context.req_id,
-                    duration_us=round(
-                        (time.monotonic() - eviction_started_at) * 1e6
-                    ),
+                    duration_us=round((time.monotonic() - eviction_started_at) * 1e6),
                     keys=len(primary_result.evicted_keys),
                 )
             )
