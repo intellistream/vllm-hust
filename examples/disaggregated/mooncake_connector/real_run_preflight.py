@@ -20,6 +20,11 @@ from pathlib import Path
 from typing import Any
 
 MINIMUM_MOONCAKE_VERSION = (0, 3, 8)
+REQUIRED_RUNTIME_IMPORTS = (
+    "vllm",
+    "vllm.engine.arg_utils",
+    "mooncake.engine",
+)
 TOPOLOGY_COMPONENTS = {
     "direct": ("direct-scheduler", "direct-worker", "direct-telemetry"),
     "store-embedded": ("store-scheduler", "store-worker", "store-telemetry"),
@@ -81,7 +86,7 @@ import importlib.metadata
 import json
 
 modules = {}
-for name in ("vllm", "mooncake.engine"):
+for name in ("vllm", "vllm.engine.arg_utils", "mooncake.engine"):
     try:
         module = importlib.import_module(name)
         modules[name] = {"ok": True, "file": getattr(module, "__file__", None)}
@@ -134,6 +139,10 @@ def _source_is_under(source: str | None, project_root: Path) -> bool:
     except (OSError, ValueError):
         return False
     return True
+
+
+def _runtime_imports_ready(modules: dict[str, Any]) -> bool:
+    return all(modules.get(name, {}).get("ok") for name in REQUIRED_RUNTIME_IMPORTS)
 
 
 def _manifest_probe(project_root: Path, topology: str) -> dict[str, Any]:
@@ -266,10 +275,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         _check("python", python.is_file(), str(python)),
         _check(
             "required_imports",
-            python_probe.get("probe_ok", False)
-            and all(
-                modules.get(name, {}).get("ok") for name in ("vllm", "mooncake.engine")
-            ),
+            python_probe.get("probe_ok", False) and _runtime_imports_ready(modules),
             python_probe,
         ),
         _check(

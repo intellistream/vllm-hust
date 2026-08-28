@@ -53,6 +53,18 @@ def test_runtime_source_must_be_inside_selected_core(tmp_path: Path) -> None:
     assert not module._source_is_under(None, core)
 
 
+def test_runtime_probe_requires_engine_import_not_only_top_level() -> None:
+    module = _module()
+    modules = {
+        "vllm": {"ok": True},
+        "vllm.engine.arg_utils": {"ok": False, "error_type": "ImportError"},
+        "mooncake.engine": {"ok": True},
+    }
+    assert not module._runtime_imports_ready(modules)
+    modules["vllm.engine.arg_utils"] = {"ok": True}
+    assert module._runtime_imports_ready(modules)
+
+
 def test_store_config_is_topology_specific(tmp_path: Path) -> None:
     module = _module()
     config = tmp_path / "mooncake.json"
