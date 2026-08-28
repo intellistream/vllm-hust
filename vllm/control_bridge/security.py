@@ -18,6 +18,7 @@ import sqlite3
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -34,8 +35,15 @@ from vllm.control_bridge.contracts import (
     parse_control_action,
     parse_control_receipt,
 )
+from vllm.control_bridge.keys import (
+    ControlKeyResolutionError,
+    ControlKeySet,
+)
 
-_SIGNATURE = re.compile(r"^sha256=([0-9a-f]{64})$")
+_LEGACY_SIGNATURE = re.compile(r"^sha256=([0-9a-f]{64})$")
+_VERSIONED_SIGNATURE = re.compile(
+    r"^v1;kid=([a-z0-9][a-z0-9._-]{0,63});sha256=([0-9a-f]{64})$"
+)
 _MINIMUM_HMAC_KEY_BYTES = 32
 _DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024
 _TERMINAL_STATUSES = frozenset(
@@ -79,8 +87,9 @@ class ReplayReservation:
 def authenticate_control_action(
     wire_payload: bytes,
     signature: str,
-    issuer_keys: Mapping[str, bytes],
+    issuer_keys: Mapping[str, bytes] | ControlKeySet,
     *,
+    now: datetime | None = None,
     max_payload_bytes: int = _DEFAULT_MAX_PAYLOAD_BYTES,
 ) -> ControlAction:
     """Verify an HMAC over exact wire bytes, then parse the strict action.
@@ -97,10 +106,6 @@ def authenticate_control_action(
         raise ControlActionAuthenticationError("wire payload size is invalid")
     if not isinstance(signature, str):
         raise ControlActionAuthenticationError("signature format is invalid")
-    signature_match = _SIGNATURE.fullmatch(signature)
-    if signature_match is None:
-        raise ControlActionAuthenticationError("signature format is invalid")
-
     try:
         decoded = wire_payload.decode("utf-8")
         payload = json.loads(decoded, object_pairs_hook=_reject_duplicate_fields)
@@ -113,14 +118,38 @@ def authenticate_control_action(
     issuer = payload.get("issuer")
     if not isinstance(issuer, str) or not issuer:
         raise ControlActionAuthenticationError("wire payload has no usable issuer")
-    key = issuer_keys.get(issuer)
-    if key is None:
-        raise ControlActionAuthenticationError("issuer has no authentication key")
-    if not isinstance(key, bytes) or len(key) < _MINIMUM_HMAC_KEY_BYTES:
-        raise ControlActionAuthenticationError("issuer authentication key is invalid")
+    if isinstance(issuer_keys, ControlKeySet):
+        if now is None or now.tzinfo is None:
+            raise ValueError("now must be timezone-aware for versioned keys")
+        signature_match = _VERSIONED_SIGNATURE.fullmatch(signature)
+        if signature_match is None:
+            raise ControlActionAuthenticationError("signature format is invalid")
+        key_id, transmitted_digest = signature_match.groups()
+        try:
+            selected_key = issuer_keys.resolve(issuer, key_id, now=now)
+        except ControlKeyResolutionError as error:
+            raise ControlActionAuthenticationError(
+                "control action authentication failed"
+            ) from error
+    else:
+        signature_match = _LEGACY_SIGNATURE.fullmatch(signature)
+        if signature_match is None:
+            raise ControlActionAuthenticationError("signature format is invalid")
+        transmitted_digest = signature_match.group(1)
+        legacy_key = issuer_keys.get(issuer)
+        if legacy_key is None:
+            raise ControlActionAuthenticationError("issuer has no authentication key")
+        if (
+            not isinstance(legacy_key, bytes)
+            or len(legacy_key) < _MINIMUM_HMAC_KEY_BYTES
+        ):
+            raise ControlActionAuthenticationError(
+                "issuer authentication key is invalid"
+            )
+        selected_key = legacy_key
 
-    expected = hmac.new(key, wire_payload, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, signature_match.group(1)):
+    expected = hmac.new(selected_key, wire_payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, transmitted_digest):
         raise ControlActionAuthenticationError("control action signature is invalid")
     try:
         return parse_control_action(payload)

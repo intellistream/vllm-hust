@@ -23,6 +23,13 @@ from vllm.control_bridge.executor import (
     ProcessIsolatedControlBridgeExecutor,
     materialize_process_isolated_control_bridge,
 )
+from vllm.control_bridge.keys import (
+    ControlHmacKey,
+    ControlKeyConfigurationError,
+    ControlKeySet,
+    ReloadableControlKeyStore,
+    build_control_action_signature,
+)
 from vllm.control_bridge.runtime_health import (
     RuntimeHealthObservation,
     RuntimeHealthState,
@@ -48,6 +55,9 @@ __all__ = [
     "ControlBridgeBackpressureError",
     "ControlBridgeExecutorError",
     "ControlBridgeExecutorState",
+    "ControlHmacKey",
+    "ControlKeyConfigurationError",
+    "ControlKeySet",
     "ControlReceipt",
     "LocalControlBridgeService",
     "PersistentReplayLedger",
@@ -55,9 +65,11 @@ __all__ = [
     "ReplayDisposition",
     "ReplayLedgerError",
     "ReplayReservation",
+    "ReloadableControlKeyStore",
     "RuntimeHealthObservation",
     "RuntimeHealthState",
     "authenticate_control_action",
+    "build_control_action_signature",
     "control_action_to_dict",
     "control_receipt_to_dict",
     "evaluate_control_action_admission",

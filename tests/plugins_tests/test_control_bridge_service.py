@@ -15,6 +15,12 @@ from vllm.control_bridge.contracts import (
     ControlReceipt,
 )
 from vllm.control_bridge.executor import ControlBridgeExecutorError
+from vllm.control_bridge.keys import (
+    ControlHmacKey,
+    ControlKeySet,
+    ReloadableControlKeyStore,
+    build_control_action_signature,
+)
 from vllm.control_bridge.runtime_health import (
     RuntimeHealthObservation,
     RuntimeHealthState,
@@ -230,3 +236,63 @@ def test_unauthenticated_payload_has_no_receipt_or_side_effect(tmp_path) -> None
         ledger.close()
 
     assert executor.calls == 0
+
+
+def test_key_rotation_preserves_terminal_replay_without_old_key(tmp_path) -> None:
+    old_secret = b"old-control-key-material-at-least-32-bytes"
+    new_secret = b"new-control-key-material-at-least-32-bytes"
+    old_set = ControlKeySet(
+        generation=1,
+        keys=(
+            ControlHmacKey(
+                issuer="ride.example",
+                key_id="old-1",
+                secret=old_secret,
+                not_before=datetime(2026, 8, 29, tzinfo=timezone.utc),
+            ),
+        ),
+    )
+    store = ReloadableControlKeyStore(old_set)
+    executor = RecordingExecutor()
+    ledger = PersistentReplayLedger(tmp_path / "replay.sqlite3")
+    bridge = LocalControlBridgeService(
+        runtime_id="runtime-a",
+        epoch=7,
+        state_version=11,
+        issuer_keys=store,
+        granted_scopes=frozenset({ControlAuthorizationScope.RUNTIME_READ}),
+        ledger=ledger,
+        executor=executor,
+    )
+    action_wire, _ = signed(payload())
+    old_signature = build_control_action_signature(
+        action_wire, key_id="old-1", secret=old_secret
+    )
+    try:
+        first = bridge.handle(action_wire, old_signature, now=_NOW)
+        store.replace(
+            ControlKeySet(
+                generation=2,
+                keys=(
+                    ControlHmacKey(
+                        issuer="ride.example",
+                        key_id="new-2",
+                        secret=new_secret,
+                        not_before=datetime(2026, 8, 29, 0, 2, tzinfo=timezone.utc),
+                    ),
+                ),
+            )
+        )
+        new_signature = build_control_action_signature(
+            action_wire, key_id="new-2", secret=new_secret
+        )
+        recovered = bridge.handle(
+            action_wire,
+            new_signature,
+            now=datetime(2026, 8, 29, 0, 6, tzinfo=timezone.utc),
+        )
+    finally:
+        ledger.close()
+
+    assert recovered == first
+    assert executor.calls == 1

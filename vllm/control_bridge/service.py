@@ -18,6 +18,10 @@ from vllm.control_bridge.contracts import (
     evaluate_control_action_admission,
 )
 from vllm.control_bridge.executor import ControlBridgeExecutorError
+from vllm.control_bridge.keys import (
+    ControlKeySet,
+    ReloadableControlKeyStore,
+)
 from vllm.control_bridge.runtime_health import RuntimeHealthObservation
 from vllm.control_bridge.security import (
     PersistentReplayLedger,
@@ -52,7 +56,7 @@ class LocalControlBridgeService:
         runtime_id: str,
         epoch: int,
         state_version: int,
-        issuer_keys: Mapping[str, bytes],
+        issuer_keys: (Mapping[str, bytes] | ControlKeySet | ReloadableControlKeyStore),
         granted_scopes: frozenset[ControlAuthorizationScope],
         ledger: PersistentReplayLedger,
         executor: ControlActionExecutor,
@@ -64,7 +68,9 @@ class LocalControlBridgeService:
         self._runtime_id = runtime_id
         self._epoch = epoch
         self._state_version = state_version
-        self._issuer_keys = dict(issuer_keys)
+        self._issuer_keys = (
+            dict(issuer_keys) if isinstance(issuer_keys, Mapping) else issuer_keys
+        )
         self._granted_scopes = granted_scopes
         self._ledger = ledger
         self._executor = executor
@@ -80,7 +86,17 @@ class LocalControlBridgeService:
         """Authenticate and deterministically resolve one read-only action."""
         if now.tzinfo is None:
             raise ValueError("now must be timezone-aware")
-        action = authenticate_control_action(wire_payload, signature, self._issuer_keys)
+        key_source = (
+            self._issuer_keys.snapshot()
+            if isinstance(self._issuer_keys, ReloadableControlKeyStore)
+            else self._issuer_keys
+        )
+        action = authenticate_control_action(
+            wire_payload,
+            signature,
+            key_source,
+            now=now,
+        )
         existing = self._ledger.lookup(action)
         if existing is not None:
             return self._resolve_replay(action, existing, completed_at=now)
@@ -90,7 +106,11 @@ class LocalControlBridgeService:
                 runtime_id=self._runtime_id,
                 epoch=self._epoch,
                 state_version=self._state_version,
-                trusted_issuers=frozenset(self._issuer_keys),
+                trusted_issuers=(
+                    key_source.issuers
+                    if isinstance(key_source, ControlKeySet)
+                    else frozenset(key_source)
+                ),
                 granted_scopes=self._granted_scopes,
                 idempotency_ledger={},
             ),
