@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -34,10 +36,10 @@ TWO_CONSUMERS = frozenset({ArenaConsumer.OUTPUT, ArenaConsumer.INPUT_BATCH})
 
 
 def acquire(
-    arena: PinnedOutputArena,
+    arena: Any,
     fingerprint: str,
-    consumers: frozenset[ArenaConsumer] = OUTPUT_ONLY,
-) -> ArenaLease:
+    consumers: frozenset[Any] = OUTPUT_ONLY,
+) -> Any:
     lease = arena.acquire(
         shape=(4, 1),
         dtype="int64",
@@ -48,7 +50,7 @@ def acquire(
     return lease
 
 
-def counters(arena: PinnedOutputArena) -> dict[str, int]:
+def counters(arena: Any) -> dict[str, int]:
     value = arena.snapshot()["counters"]
     assert isinstance(value, dict)
     return value
@@ -106,7 +108,7 @@ def test_two_slots_are_not_reacquired_while_live() -> None:
     "first_consumer",
     [ArenaConsumer.OUTPUT, ArenaConsumer.INPUT_BATCH],
 )
-def test_slot_waits_for_both_consumers(first_consumer: ArenaConsumer) -> None:
+def test_slot_waits_for_both_consumers(first_consumer: Any) -> None:
     arena = PinnedOutputArena(arena_id="test", capacity=1, enabled=True)
     lease = acquire(arena, "req-0", TWO_CONSUMERS)
     arena.mark_ready(lease)

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Host-testable lifecycle controller for a pinned output arena.
 
 This module deliberately has no torch dependency. Device-specific storage and
