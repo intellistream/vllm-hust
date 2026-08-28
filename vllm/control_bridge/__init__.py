@@ -16,6 +16,13 @@ from vllm.control_bridge.contracts import (
     parse_control_action,
     parse_control_receipt,
 )
+from vllm.control_bridge.executor import (
+    ControlBridgeBackpressureError,
+    ControlBridgeExecutorError,
+    ControlBridgeExecutorState,
+    ProcessIsolatedControlBridgeExecutor,
+    materialize_process_isolated_control_bridge,
+)
 from vllm.control_bridge.security import (
     ControlActionAuthenticationError,
     PersistentReplayLedger,
@@ -32,8 +39,12 @@ __all__ = [
     "ControlActionAuthenticationError",
     "ControlActionContractError",
     "ControlActionStatus",
+    "ControlBridgeBackpressureError",
+    "ControlBridgeExecutorError",
+    "ControlBridgeExecutorState",
     "ControlReceipt",
     "PersistentReplayLedger",
+    "ProcessIsolatedControlBridgeExecutor",
     "ReplayDisposition",
     "ReplayLedgerError",
     "ReplayReservation",
@@ -41,6 +52,7 @@ __all__ = [
     "control_action_to_dict",
     "control_receipt_to_dict",
     "evaluate_control_action_admission",
+    "materialize_process_isolated_control_bridge",
     "parse_control_action",
     "parse_control_receipt",
 ]
