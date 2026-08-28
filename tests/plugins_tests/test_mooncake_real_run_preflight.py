@@ -31,6 +31,14 @@ def test_version_gate_handles_release_and_prerelease_versions() -> None:
     assert not module._version_at_least(None, (0, 3, 8))
 
 
+def test_probe_parser_ignores_runtime_logs_before_final_json() -> None:
+    module = _module()
+    assert module._last_json_object('INFO runtime initialized\n{"ok": true}\n') == {
+        "ok": True
+    }
+    assert module._last_json_object("INFO only\n") is None
+
+
 def test_runtime_source_must_be_inside_selected_core(tmp_path: Path) -> None:
     module = _module()
     core = tmp_path / "core"

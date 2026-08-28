@@ -63,6 +63,17 @@ def _git_revision(path: Path) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _last_json_object(output: str) -> dict[str, Any] | None:
+    for line in reversed(output.splitlines()):
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
 def _python_probe(python: Path) -> dict[str, Any]:
     probe = """
 import importlib
@@ -92,9 +103,8 @@ print(json.dumps({"modules": modules, "mooncake_version": version}, sort_keys=Tr
             "probe_ok": False,
             "error": result.stderr.strip() or result.stdout.strip(),
         }
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError:
+    payload = _last_json_object(result.stdout)
+    if payload is None:
         return {"probe_ok": False, "error": "probe returned non-JSON output"}
     payload["probe_ok"] = True
     return payload
