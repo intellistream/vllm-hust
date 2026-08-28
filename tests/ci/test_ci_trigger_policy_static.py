@@ -7,44 +7,23 @@ from pathlib import Path
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-NPU_WORKFLOWS = (
-    REPO_ROOT / ".github/workflows/linux-ascend-inference-smoke.yml",
-    REPO_ROOT / ".github/workflows/linux-ascend-inference-regression.yml",
-    REPO_ROOT / ".github/workflows/ascend-benchmark-leaderboard.yml",
-)
 
 
 def load_workflow(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-def test_npu_pr_workflows_run_when_labeled_and_after_new_commits():
-    for workflow_path in NPU_WORKFLOWS:
-        workflow = load_workflow(workflow_path)
-        pull_request = workflow[True]["pull_request"]
+def test_ordinary_pr_ci_is_hosted_and_does_not_run_ascend_performance() -> None:
+    workflow_path = REPO_ROOT / ".github/workflows/pre-commit.yml"
+    workflow = load_workflow(workflow_path)
+    text = workflow_path.read_text(encoding="utf-8")
 
-        assert set(pull_request["types"]) == {
-            "labeled",
-            "synchronize",
-            "reopened",
-        }
-
-
-def test_npu_pr_workflows_gate_on_current_labels_not_label_event():
-    for workflow_path in NPU_WORKFLOWS:
-        text = workflow_path.read_text(encoding="utf-8")
-
-        assert "contains(github.event.pull_request.labels.*.name, 'ready')" in text
-        assert "contains(github.event.pull_request.labels.*.name, 'verified')" in text
-        assert "github.event.label.name" not in text
-
-
-def test_npu_pr_workflows_submit_to_the_central_evaluation_queue():
-    for workflow_path in NPU_WORKFLOWS:
-        text = workflow_path.read_text(encoding="utf-8")
-
-        assert "evaluation-request.yml@main" in text
-        assert "self-hosted" not in text
+    assert workflow[True].get("pull_request") is not None
+    assert workflow[True].get("push") is not None
+    assert workflow["jobs"]["pre-commit"]["runs-on"] == "ubuntu-latest"
+    assert "self-hosted" not in text
+    assert "npu" not in text.lower()
+    assert "evaluation-request.yml@main" not in text
 
 
 def test_pre_commit_uses_available_github_hosted_runner():
@@ -62,15 +41,6 @@ def test_pre_commit_uses_available_github_hosted_runner():
     assert "--hook-stage manual" not in text
     assert "PRE_COMMIT_FROM_REF:" in text
     assert "PRE_COMMIT_TO_REF:" in text
-
-
-def test_benchmark_workflow_does_not_manage_devices_in_actions():
-    workflow_path = REPO_ROOT / ".github/workflows/ascend-benchmark-leaderboard.yml"
-    text = workflow_path.read_text(encoding="utf-8")
-
-    assert "ASCEND_VISIBLE_DEVICES" not in text
-    assert "npu-smi" not in text
-    assert "evaluation-request.yml@main" in text
 
 
 def test_actionlint_knows_ascend_runner_labels():
