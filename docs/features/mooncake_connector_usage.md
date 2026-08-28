@@ -67,3 +67,10 @@ Refer to these example scripts in the vLLM repository:
 
 - [run_mooncake_connector.sh](../../examples/disaggregated/mooncake_connector/run_mooncake_connector.sh)
 - [mooncake_connector_proxy.py](../../examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py)
+
+Before a legacy/typed comparison, run the
+[Mooncake real-run readiness gate](mooncake_real_run_readiness.md). Its
+topology-aware preflight checks the controlled Python environment, exact bundle
+roles, model, accelerator inventory, ports, output uniqueness, and revision
+without launching or terminating any service. A blocked preflight is
+environment-readiness evidence, not a Mooncake behavior or performance result.

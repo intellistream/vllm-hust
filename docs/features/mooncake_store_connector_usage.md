@@ -137,6 +137,12 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
 
 A disaggregation proxy is required to route requests between prefiller and decoder nodes. The proxy assigns `do_remote_prefill=True` / `do_remote_decode=True` to coordinate P2P transfer via `MooncakeConnector`. Refer to the [MooncakeConnector usage guide](mooncake_connector_usage.md) for proxy setup details.
 
+Run the [Mooncake real-run readiness gate](mooncake_real_run_readiness.md)
+before starting a matched legacy/typed/rollback experiment. The selected
+`store-embedded`, `store-standalone`, or combined topology determines which
+bundle roles, config invariants, service executables, devices, and ports must
+pass. The preflight starts no Mooncake or vLLM process.
+
 ### Disk Offloading
 
 Disk offloading is most commonly run in `standalone-store` mode: an external
