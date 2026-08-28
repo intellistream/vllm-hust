@@ -284,9 +284,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         with torch.cuda.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
             copy_start_ns = (
-                time.perf_counter_ns()
-                if self._worker_lifecycle_events_enabled
-                else 0
+                time.perf_counter_ns() if self._worker_lifecycle_events_enabled else 0
             )
             try:
                 self.sampled_token_ids_cpu = self._sampled_token_ids.to(
@@ -333,9 +331,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
     def synchronize(self) -> None:
         wait_start_ns = (
-            time.perf_counter_ns()
-            if self._worker_lifecycle_events_enabled
-            else 0
+            time.perf_counter_ns() if self._worker_lifecycle_events_enabled else 0
         )
         self.async_copy_ready_event.synchronize()
         if self._worker_lifecycle_events_enabled:
@@ -355,9 +351,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
     def get_output_without_sync(self) -> ModelRunnerOutput:
         materialization_start_ns = (
-            time.perf_counter_ns()
-            if self._worker_lifecycle_events_enabled
-            else 0
+            time.perf_counter_ns() if self._worker_lifecycle_events_enabled else 0
         )
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
 
@@ -399,9 +393,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             worker_events.emit_worker_lifecycle_event(
                 worker_events.ASYNC_OUTPUT_MATERIALIZED,
                 lifecycle_id=self._worker_lifecycle_id,
-                materialization_ns=(
-                    time.perf_counter_ns() - materialization_start_ns
-                ),
+                materialization_ns=(time.perf_counter_ns() - materialization_start_ns),
             )
         return output
 
@@ -1001,6 +993,19 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self._knorm_scores: dict | None = None
         self._knorm_wrapper_installed: bool = False
+        # Knorm is active only when should_activate() returns True — the
+        # same single source of truth used by register_all_kvcache_specs.
+        # This avoids the half-enabled state where the wrapper is installed
+        # but the manager is not registered (or vice versa). See issue #163.
+        try:
+            from vllm.knorm.config import (
+                should_activate as _knorm_should_activate,
+            )
+        except ImportError:
+            _knorm_should_activate = lambda _: False  # type: ignore[assignment]  # noqa: E731
+        self._knorm_active: bool = bool(
+            _knorm_should_activate(self.cache_config.enable_prefix_caching)
+        )
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
@@ -4183,8 +4188,11 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
-        # Knorm: install Ascend attention wrapper on first forward.
-        if not getattr(self, "_knorm_wrapper_installed", False):
+        # Knorm: install Ascend attention wrapper on first forward, but
+        # only when knorm is active (enabled AND prefix caching disabled).
+        # When prefix caching is on, the wrapper would add per-forward
+        # overhead with no consumer (KnormFullAttentionManager not registered).
+        if self._knorm_active and not self._knorm_wrapper_installed:
             from vllm.knorm.attention_backend import install_ascend_wrapper
 
             install_ascend_wrapper()
@@ -4437,6 +4445,10 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        self._spec_decode_proposer_latency_seconds = 0.0
+        self._spec_decode_verification_started_at = (
+            time.perf_counter() if self.speculative_config is not None else None
+        )
         # Update the EPLB meta.
         if self.eplb_state is not None:
             self.eplb_state.prepare_forward(
@@ -4462,6 +4474,7 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            self.observe_kv_recovery_first_compute(scheduler_output)
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4547,8 +4560,9 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        # Knorm: collect key L2 norms from attention backend after forward.
-        if get_pp_group().is_last_rank:
+        # Knorm: collect key L2 norms from attention backend after forward,
+        # but only when the wrapper was actually installed.
+        if self._knorm_wrapper_installed and get_pp_group().is_last_rank:
             from vllm.knorm.hooks import collect_knorm_scores
 
             collect_knorm_scores(self, self.input_batch)
@@ -4631,6 +4645,7 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            started_at = time.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4644,6 +4659,9 @@ class GPUModelRunner(
                     slot_mappings,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+            self._spec_decode_proposer_latency_seconds += (
+                time.perf_counter() - started_at
+            )
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
@@ -4739,6 +4757,12 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        verification_latency_seconds = 0.0
+        if self._spec_decode_verification_started_at is not None:
+            verification_latency_seconds = (
+                time.perf_counter() - self._spec_decode_verification_started_at
+            )
+
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -4770,13 +4794,19 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                spec_decode_proposer_latency_seconds=(
+                    self._spec_decode_proposer_latency_seconds
+                ),
+                spec_decode_verification_latency_seconds=(verification_latency_seconds),
+                spec_decode_num_forwards=int(spec_config is not None),
                 routed_experts=None,
             )
 
         if not self.use_async_scheduling:
-            from vllm.knorm.hooks import attach_knorm_scores
+            if self._knorm_wrapper_installed:
+                from vllm.knorm.hooks import attach_knorm_scores
 
-            attach_knorm_scores(self, output)
+                attach_knorm_scores(self, output)
             if self.routed_experts_initialized:
                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
                 # synchronized by ``_to_list``'s event.synchronize(), so
@@ -4836,9 +4866,12 @@ class GPUModelRunner(
 
         # Knorm: attach scores directly (not via attach_knorm_scores,
         # which calls get_output() — a destructive one-shot method).
-        knorm_scores = getattr(self, "_knorm_scores", None)
-        if knorm_scores:
-            async_output.knorm_block_scores = knorm_scores  # type: ignore[attr-defined]
+        # Guarded by _knorm_wrapper_installed so the getattr is skipped
+        # entirely when knorm is inactive.
+        if self._knorm_wrapper_installed:
+            knorm_scores = getattr(self, "_knorm_scores", None)
+            if knorm_scores:
+                async_output.knorm_block_scores = knorm_scores  # type: ignore[attr-defined]
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(

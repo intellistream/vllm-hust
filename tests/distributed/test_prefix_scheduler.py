@@ -8,7 +8,9 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from concurrent.futures import Future
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import msgspec
@@ -38,6 +40,7 @@ from vllm.distributed.prefix_scheduler import (
     PrefixCacheSnapshot,
 )
 from vllm.entrypoints.openai.prefix_routing import (
+    NodeLoad,
     PrefixRoutingConfig,
     PrefixRoutingMiddleware,
     PrefixRoutingNode,
@@ -58,10 +61,505 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     maybe_convert_block_hash,
 )
-from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine import EngineCoreRequest, UtilityOutput
+from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.core_client import (
+    AsyncMPClient,
+    InprocClient,
+    SyncMPClient,
+    _process_utility_output,
+)
 from vllm.v1.request import Request as VllmRequest
 
 pytestmark = pytest.mark.skip_global_cleanup
+
+
+def test_engine_core_get_load_metrics_uses_scheduler_counts():
+    engine_core = object.__new__(EngineCore)
+    engine_core.scheduler = Mock()
+    engine_core.scheduler.get_request_counts.return_value = (4, 3)
+
+    result = engine_core.get_load_metrics()
+
+    assert result == {
+        "num_running_reqs": 4,
+        "num_waiting_reqs": 3,
+    }
+    engine_core.scheduler.get_request_counts.assert_called_once_with()
+
+
+def test_load_metrics_queries_requested_dp_rank():
+    client = object.__new__(AsyncMPClient)
+    client.engine_ranks_managed = [2, 3]
+    client.core_engines = [b"rank-2", b"rank-3"]
+    client.core_engine = client.core_engines[0]
+    client._call_utility_async = AsyncMock(
+        return_value={
+            "num_running_reqs": 4,
+            "num_waiting_reqs": 3,
+        }
+    )
+
+    result = asyncio.run(client.get_load_metrics_async(3))
+
+    assert result == {
+        "num_running_reqs": 4,
+        "num_waiting_reqs": 3,
+    }
+    client._call_utility_async.assert_awaited_once_with(
+        "get_load_metrics",
+        engine=b"rank-3",
+    )
+
+
+def test_load_metrics_uses_only_engine_when_dp_rank_is_omitted():
+    client = object.__new__(AsyncMPClient)
+    client.engine_ranks_managed = [2]
+    client.core_engines = [b"rank-2"]
+    client.core_engine = client.core_engines[0]
+    client._call_utility_async = AsyncMock(
+        return_value={
+            "num_running_reqs": 1,
+            "num_waiting_reqs": 0,
+        }
+    )
+
+    result = asyncio.run(client.get_load_metrics_async())
+
+    assert result == {
+        "num_running_reqs": 1,
+        "num_waiting_reqs": 0,
+    }
+    client._call_utility_async.assert_awaited_once_with(
+        "get_load_metrics",
+        engine=b"rank-2",
+    )
+
+
+def test_load_metrics_aggregates_managed_engines_when_rank_is_omitted():
+    client = object.__new__(AsyncMPClient)
+    client.engine_ranks_managed = [2, 3]
+    client.core_engines = [b"rank-2", b"rank-3"]
+    client.core_engine = client.core_engines[0]
+
+    async def get_load_metrics(_method, *, engine):
+        return {
+            "num_running_reqs": 1 if engine == b"rank-2" else 3,
+            "num_waiting_reqs": 2 if engine == b"rank-2" else 4,
+        }
+
+    client._call_utility_async = AsyncMock(side_effect=get_load_metrics)
+
+    assert asyncio.run(client.get_load_metrics_async()) == {
+        "num_running_reqs": 4,
+        "num_waiting_reqs": 6,
+    }
+
+
+def test_load_metrics_cancels_sibling_when_one_engine_fails():
+    async def exercise():
+        client = object.__new__(AsyncMPClient)
+        client.engine_ranks_managed = [2, 3]
+        client.core_engines = [b"rank-2", b"rank-3"]
+        client.core_engine = client.core_engines[0]
+        sibling_cancelled = asyncio.Event()
+
+        async def get_load_metrics(_method, *, engine):
+            if engine == b"rank-2":
+                await asyncio.sleep(0)
+                raise RuntimeError("engine failed")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                sibling_cancelled.set()
+
+        client._call_utility_async = AsyncMock(side_effect=get_load_metrics)
+
+        with pytest.raises(RuntimeError, match="engine failed"):
+            await client.get_load_metrics_async()
+        assert sibling_cancelled.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_async_utility_call_is_removed_before_late_output():
+    async def exercise():
+        client = object.__new__(AsyncMPClient)
+        client.client_index = 0
+        client.utility_results = {}
+        client.encoder = Mock()
+        client.encoder.encode.return_value = (b"payload",)
+        client._send_input_message = AsyncMock()
+        client._ensure_output_queue_task = Mock()
+
+        task = asyncio.create_task(
+            client._call_utility_async("get_load_metrics", engine=b"rank-2")
+        )
+        await asyncio.sleep(0)
+        call_id = next(iter(client.utility_results))
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert client.utility_results == {}
+        _process_utility_output(UtilityOutput(call_id), client.utility_results)
+
+    asyncio.run(exercise())
+
+
+def test_inproc_client_get_load_metrics_async():
+    client = object.__new__(InprocClient)
+    client.engine_core = Mock(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_index=2)
+        )
+    )
+    client.engine_core.get_load_metrics.return_value = {
+        "num_running_reqs": 2,
+        "num_waiting_reqs": 1,
+    }
+
+    assert asyncio.run(client.get_load_metrics_async(2)) == {
+        "num_running_reqs": 2,
+        "num_waiting_reqs": 1,
+    }
+
+
+def test_sync_mp_client_get_load_metrics_async():
+    client = object.__new__(SyncMPClient)
+    client.engine_ranks_managed = [2]
+    client.core_engines = [b"rank-2"]
+    client.core_engine = client.core_engines[0]
+    client.utility_results = {}
+    result = Future()
+    result.set_result({"num_running_reqs": 2, "num_waiting_reqs": 1})
+    client._start_utility = Mock(return_value=(1, result))
+    client.utility_results[1] = result
+
+    assert asyncio.run(client.get_load_metrics_async(2)) == {
+        "num_running_reqs": 2,
+        "num_waiting_reqs": 1,
+    }
+    assert client.utility_results == {}
+
+
+def test_cancelled_sync_load_metrics_call_is_removed():
+    async def exercise():
+        client = object.__new__(SyncMPClient)
+        client.engine_ranks_managed = [2]
+        client.core_engines = [b"rank-2"]
+        client.core_engine = client.core_engines[0]
+        client.utility_results = {}
+        result: Future[dict[str, int]] = Future()
+
+        def start_utility(*_args, **_kwargs):
+            client.utility_results[1] = result
+            return 1, result
+
+        client._start_utility = Mock(side_effect=start_utility)
+        task = asyncio.create_task(client.get_load_metrics_async(2))
+        await asyncio.sleep(0)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert client.utility_results == {}
+        _process_utility_output(UtilityOutput(1), client.utility_results)
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_sync_utility_future_does_not_break_output_processing():
+    future: Future[object] = Future()
+    future.cancel()
+    utility_results = {1: future}
+
+    _process_utility_output(
+        UtilityOutput(1, failure_message="cancelled call completed late"),
+        utility_results,
+    )
+
+    assert utility_results == {}
+
+
+@pytest.mark.parametrize(
+    ("data_parallel_rank", "error"),
+    [(4, "data parallel rank 4 is not managed")],
+)
+def test_load_metrics_rejects_missing_or_unmanaged_dp_rank(
+    data_parallel_rank,
+    error,
+):
+    client = object.__new__(AsyncMPClient)
+    client.engine_ranks_managed = [2, 3]
+    client.core_engines = [b"rank-2", b"rank-3"]
+    client.core_engine = client.core_engines[0]
+    client._call_utility_async = AsyncMock()
+
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(client.get_load_metrics_async(data_parallel_rank))
+
+    client._call_utility_async.assert_not_awaited()
+
+
+def test_prefix_routing_fetches_local_load_for_dp_rank():
+    proxy = object.__new__(PrefixRoutingProxy)
+    proxy.config = SimpleNamespace(load_request_timeout=1.0)
+
+    engine_client = SimpleNamespace(
+        get_load_metrics=AsyncMock(
+            return_value={
+                "num_running_reqs": 2,
+                "num_waiting_reqs": 1,
+            }
+        )
+    )
+    proxy.app_state = SimpleNamespace(engine_client=engine_client)
+    node = PrefixRoutingNode(
+        node_id="node-rank-3",
+        url=None,
+        data_parallel_rank=3,
+        local=True,
+    )
+
+    load = asyncio.run(proxy._fetch_node_load(node))
+
+    assert load.num_running_reqs == 2
+    assert load.num_waiting_reqs == 1
+    engine_client.get_load_metrics.assert_awaited_once_with(3)
+
+
+def test_prefix_routing_load_fetch_keeps_successful_nodes():
+    proxy = object.__new__(PrefixRoutingProxy)
+    good_node = PrefixRoutingNode(
+        node_id="good",
+        url=None,
+        local=True,
+    )
+    bad_node = PrefixRoutingNode(
+        node_id="bad",
+        url=None,
+        local=True,
+    )
+    proxy.nodes = {
+        good_node.node_id: good_node,
+        bad_node.node_id: bad_node,
+    }
+
+    async def fetch(node):
+        if node.node_id == "bad":
+            raise TimeoutError
+        return NodeLoad(
+            num_running_reqs=2,
+            num_waiting_reqs=1,
+            updated_at=1.0,
+        )
+
+    proxy._fetch_node_load = fetch
+
+    loads = asyncio.run(proxy._fetch_all_node_loads())
+
+    assert loads == {
+        "good": NodeLoad(
+            num_running_reqs=2,
+            num_waiting_reqs=1,
+            updated_at=1.0,
+        )
+    }
+
+
+def test_prefix_routing_fetches_remote_load_for_dp_rank():
+    proxy = object.__new__(PrefixRoutingProxy)
+    proxy.config = SimpleNamespace(load_request_timeout=1.0)
+
+    response = AsyncMock()
+    response.__aenter__.return_value = response
+    response.raise_for_status = Mock()
+    response.json.return_value = {
+        "server_load": 7,
+        "num_running_reqs": 4,
+        "num_waiting_reqs": 3,
+    }
+
+    session = SimpleNamespace(get=Mock(return_value=response))
+    proxy._session = session
+    node = PrefixRoutingNode(
+        node_id="remote-rank-3",
+        url="http://node-a:8000/",
+        data_parallel_rank=3,
+        local=False,
+    )
+
+    load = asyncio.run(proxy._fetch_node_load(node))
+
+    assert load.num_running_reqs == 4
+    assert load.num_waiting_reqs == 3
+
+    args, kwargs = session.get.call_args
+    assert args == ("http://node-a:8000/load",)
+    assert kwargs["headers"] == {"x-data-parallel-rank": "3"}
+    assert kwargs["timeout"].total == 1.0
+
+
+def test_prefix_routing_poll_retains_fresh_and_evicts_stale(monkeypatch):
+    proxy = object.__new__(PrefixRoutingProxy)
+    proxy.config = SimpleNamespace(
+        load_ttl=3.0,
+        load_poll_interval=0,
+    )
+    proxy.nodes = {
+        "fresh": object(),
+        "stale": object(),
+        "new": object(),
+        "stale_fetched": object(),
+    }
+
+    fresh = NodeLoad(
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+        updated_at=97.0,
+    )
+    stale = NodeLoad(
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+        updated_at=96.0,
+    )
+    new = NodeLoad(
+        num_running_reqs=3,
+        num_waiting_reqs=1,
+        updated_at=100.0,
+    )
+    stale_fetched = NodeLoad(
+        num_running_reqs=4,
+        num_waiting_reqs=2,
+        updated_at=96.0,
+    )
+    proxy._node_loads = {
+        "fresh": fresh,
+        "stale": stale,
+    }
+    proxy._fetch_all_node_loads = AsyncMock(
+        side_effect=[
+            {
+                "new": new,
+                "stale_fetched": stale_fetched,
+            },
+            asyncio.CancelledError(),
+        ]
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.openai.prefix_routing.time.monotonic",
+        lambda: 100.0,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(proxy._poll_node_loads())
+
+    assert proxy._node_loads == {
+        "fresh": fresh,
+        "new": new,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {
+            "num_running_reqs": True,
+            "num_waiting_reqs": 0,
+        },
+        {
+            "num_running_reqs": 0,
+            "num_waiting_reqs": -1,
+        },
+        {
+            "num_running_reqs": 0,
+        },
+    ],
+)
+def test_prefix_routing_rejects_invalid_node_load(payload):
+    with pytest.raises(ValueError):
+        PrefixRoutingProxy._parse_node_load(payload)
+
+
+def test_prefix_routing_accepts_legacy_server_load():
+    load = PrefixRoutingProxy._parse_node_load({"server_load": 3})
+
+    assert load.num_running_reqs == 3
+    assert load.num_waiting_reqs == 0
+
+
+def test_prefix_routing_start_skips_disabled_load_polling():
+    proxy = object.__new__(PrefixRoutingProxy)
+    proxy.config = SimpleNamespace(load_poll_interval=0, request_timeout=1.0)
+    proxy.nodes = {}
+    proxy._tasks = []
+    proxy._session = None
+
+    proxy.start()
+
+    assert proxy._tasks == []
+
+
+def test_prefix_routing_passes_fresh_loads_to_scheduler(monkeypatch):
+    proxy = object.__new__(PrefixRoutingProxy)
+    proxy.config = SimpleNamespace(load_ttl=3.0)
+    proxy._node_loads = {
+        "fresh": NodeLoad(2, 1, 99.0),
+        "stale": NodeLoad(5, 0, 96.0),
+    }
+    proxy._render_request = AsyncMock(return_value=([object()], None))
+    proxy._make_cache_key_request = Mock(
+        return_value=SimpleNamespace(block_hashes=[], num_prompt_tokens=1)
+    )
+    proxy.app_state = SimpleNamespace(
+        engine_client=SimpleNamespace(get_supported_tasks=AsyncMock(return_value=()))
+    )
+    proxy.scheduler = SimpleNamespace(choose_node=Mock(return_value=None))
+    monkeypatch.setattr(
+        "vllm.entrypoints.openai.prefix_routing.time.monotonic",
+        lambda: 100.0,
+    )
+
+    asyncio.run(proxy.choose_node_for_request("/v1/completions", {}))
+
+    proxy.scheduler.choose_node.assert_called_once_with(
+        block_hashes=[],
+        prompt_num_tokens=1,
+        node_loads={"fresh": 3},
+    )
+
+
+def test_prefix_routing_shutdown_cancels_load_polling():
+    async def exercise():
+        task_cancelled = asyncio.Event()
+
+        async def poll_forever():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                task_cancelled.set()
+
+        task = asyncio.create_task(poll_forever())
+        await asyncio.sleep(0)
+
+        session = SimpleNamespace(close=AsyncMock())
+        proxy = object.__new__(PrefixRoutingProxy)
+        proxy._tasks = [task]
+        proxy._session = session
+
+        await proxy.shutdown()
+
+        assert task.cancelled()
+        assert task_cancelled.is_set()
+        session.close.assert_awaited_once_with()
+        assert proxy._session is None
+
+    asyncio.run(exercise())
 
 
 def _hash(value: int) -> BlockHash:
@@ -164,6 +662,30 @@ def test_global_prefix_scheduler_round_robins_ties():
     ]
 
     assert decisions == ["node-a", "node-b", "node-a", "node-b"]
+
+
+def test_global_prefix_scheduler_prefers_least_loaded_tie():
+    scheduler = GlobalPrefixScheduler()
+    block_hashes = [_hash(1)]
+    for node_id in ("node-a", "node-b"):
+        scheduler.update_snapshot(
+            PrefixCacheSnapshot(
+                node_id=node_id,
+                data_parallel_rank=None,
+                hash_block_size=16,
+                group_block_sizes={0: 16},
+                group_hashes={0: {_external_hash(block_hashes[0])}},
+            )
+        )
+
+    decision = scheduler.choose_node(
+        block_hashes,
+        prompt_num_tokens=32,
+        node_loads={"node-a": 2, "node-b": 1},
+    )
+
+    assert decision is not None
+    assert decision.node_id == "node-b"
 
 
 def test_global_prefix_scheduler_applies_event_batch_rank():
@@ -1108,7 +1630,7 @@ def test_prefix_routing_proxy_reuses_and_closes_http_session(monkeypatch):
             self.closed = True
 
     proxy = object.__new__(PrefixRoutingProxy)
-    proxy.config = SimpleNamespace(request_timeout=1.0)
+    proxy.config = SimpleNamespace(request_timeout=1.0, load_poll_interval=0)
     proxy.nodes = {
         "node-a": PrefixRoutingNode(
             node_id="node-a",
@@ -1722,6 +2244,27 @@ def test_prefix_cache_config_rejects_invalid_upload_limits(kwargs, error):
             },
             "event_sync_interval must be positive",
         ),
+        (
+            {
+                "nodes": [{"id": "node-a", "url": "local"}],
+                "load_request_timeout": 0,
+            },
+            "load_request_timeout must be positive",
+        ),
+        (
+            {
+                "nodes": [{"id": "node-a", "url": "local"}],
+                "load_poll_interval": True,
+            },
+            "load_poll_interval must be a finite number",
+        ),
+        (
+            {
+                "nodes": [{"id": "node-a", "url": "local"}],
+                "load_ttl": -1,
+            },
+            "load_ttl must be positive",
+        ),
     ],
 )
 def test_prefix_routing_config_rejects_invalid_values(config, error):
@@ -1731,6 +2274,94 @@ def test_prefix_routing_config_rejects_invalid_values(config, error):
 
     with pytest.raises(ValueError, match=error):
         _parse_prefix_routing_config(config, vllm_config)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "load_request_timeout",
+        "load_poll_interval",
+        "load_ttl",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        float("nan"),
+        float("inf"),
+    ],
+)
+def test_prefix_routing_config_rejects_non_finite_load_values(field, value):
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(hash_block_size=16, block_size=16)
+    )
+    raw_config = {
+        "nodes": [{"id": "node-a", "url": "local"}],
+        field: value,
+    }
+
+    expected = (
+        "load_poll_interval must be a finite number"
+        if field == "load_poll_interval"
+        else rf"{field} must be positive"
+    )
+    with pytest.raises(ValueError, match=expected):
+        _parse_prefix_routing_config(raw_config, vllm_config)
+
+
+def test_prefix_routing_config_parses_load_polling_values():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(hash_block_size=16, block_size=16)
+    )
+    raw_config = {
+        "nodes": [{"id": "node-a", "url": "local"}],
+        "load_request_timeout": 0.25,
+        "load_poll_interval": 0.5,
+        "load_ttl": 1.5,
+    }
+
+    config = _parse_prefix_routing_config(raw_config, vllm_config)
+
+    assert config.load_request_timeout == 0.25
+    assert config.load_poll_interval == 0.5
+    assert config.load_ttl == 1.5
+
+
+@pytest.mark.parametrize("load_poll_interval", [0, -1])
+def test_prefix_routing_config_disables_load_polling(load_poll_interval):
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(hash_block_size=16, block_size=16)
+    )
+
+    config = _parse_prefix_routing_config(
+        {
+            "nodes": [{"id": "node-a", "url": "local"}],
+            "load_poll_interval": load_poll_interval,
+        },
+        vllm_config,
+    )
+
+    assert config.load_poll_interval == load_poll_interval
+
+
+def test_prefix_routing_config_rejects_load_refresh_slower_than_ttl():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(hash_block_size=16, block_size=16)
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"load_request_timeout \+ load_poll_interval must be less than load_ttl",
+    ):
+        _parse_prefix_routing_config(
+            {
+                "nodes": [{"id": "node-a", "url": "local"}],
+                "load_request_timeout": 1.0,
+                "load_poll_interval": 1.0,
+                "load_ttl": 2.0,
+            },
+            vllm_config,
+        )
 
 
 def test_api_app_wires_prefix_routing_middleware_route_and_shutdown(monkeypatch):

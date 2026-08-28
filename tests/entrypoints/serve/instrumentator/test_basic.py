@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
 from http import HTTPStatus
 from unittest.mock import AsyncMock, Mock
 
@@ -9,9 +10,12 @@ import openai
 import pytest
 import pytest_asyncio
 import requests
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from tests.utils import RemoteOpenAIServer
+from vllm.entrypoints.serve.instrumentator.basic import (
+    get_server_load_metrics,
+)
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -199,6 +203,108 @@ async def test_server_load(server: RemoteOpenAIServer):
     response = requests.get(server.url_for("load"))
     assert response.status_code == HTTPStatus.OK
     assert response.json().get("server_load") == 0
+
+
+@pytest.mark.asyncio
+async def test_server_load_returns_engine_metrics_for_dp_rank():
+    mock_request = Mock(spec=Request)
+    mock_request.headers = {"x-data-parallel-rank": "2"}
+
+    mock_engine_client = AsyncMock()
+    mock_engine_client.get_load_metrics.return_value = {
+        "num_running_reqs": 4,
+        "num_waiting_reqs": 3,
+    }
+    mock_request.app.state = Mock(
+        engine_client=mock_engine_client,
+        server_load_metrics=7,
+    )
+
+    response = await get_server_load_metrics(mock_request)
+
+    assert json.loads(response.body) == {
+        "server_load": 7,
+        "num_running_reqs": 4,
+        "num_waiting_reqs": 3,
+    }
+    mock_engine_client.get_load_metrics.assert_awaited_once_with(2)
+
+
+@pytest.mark.parametrize("rank_header", ["invalid", "-1"])
+@pytest.mark.asyncio
+async def test_server_load_rejects_invalid_dp_rank(rank_header):
+    mock_request = Mock(spec=Request)
+    mock_request.headers = {"x-data-parallel-rank": rank_header}
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_server_load_metrics(mock_request)
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_server_load_rejects_unmanaged_dp_rank():
+    mock_request = Mock(spec=Request)
+    mock_request.headers = {"x-data-parallel-rank": "4"}
+
+    mock_engine_client = AsyncMock()
+    mock_engine_client.get_load_metrics.side_effect = ValueError(
+        "data parallel rank 4 is not managed by this client"
+    )
+    mock_request.app.state = Mock(
+        engine_client=mock_engine_client,
+        server_load_metrics=7,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_server_load_metrics(mock_request)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == (
+        "data parallel rank 4 is not managed by this client"
+    )
+    mock_engine_client.get_load_metrics.assert_awaited_once_with(4)
+
+
+@pytest.mark.asyncio
+async def test_server_load_without_engine_client_returns_server_load():
+    mock_request = Mock(spec=Request)
+    mock_request.app.state = Mock(
+        engine_client=None,
+        server_load_metrics=7,
+    )
+
+    response = await get_server_load_metrics(mock_request)
+
+    assert json.loads(response.body) == {
+        "server_load": 7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_server_load_times_out_when_engine_metrics_stall(monkeypatch):
+    mock_request = Mock(spec=Request)
+    mock_request.headers = {}
+
+    async def never_returns(_data_parallel_rank):
+        await asyncio.Event().wait()
+
+    mock_engine_client = AsyncMock()
+    mock_engine_client.get_load_metrics.side_effect = never_returns
+    mock_request.app.state = Mock(
+        engine_client=mock_engine_client,
+        server_load_metrics=7,
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.serve.instrumentator.basic.LOAD_METRICS_TIMEOUT_S",
+        0.01,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_server_load_metrics(mock_request)
+
+    assert exc_info.value.status_code == 504
+    mock_engine_client.get_load_metrics.assert_awaited_once_with(None)
 
 
 @pytest.mark.asyncio
