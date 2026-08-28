@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_recovery_profile import KVRecoveryRequeueReason
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -341,6 +342,13 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             agg_block_ids |= c.get_block_ids_with_load_errors()
         return agg_block_ids
 
+    def observe_kv_recovery_first_compute(
+        self,
+        scheduled_request_ids: Iterable[str],
+    ) -> None:
+        for c in self._connectors:
+            c.observe_kv_recovery_first_compute(scheduled_request_ids)
+
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Set xPU-specific copy ops for all sub-connectors."""
         for c in self._connectors:
@@ -416,6 +424,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.on_new_request(request)
 
+    def observe_kv_recovery_requeue(
+        self,
+        request: "Request",
+        reason: "KVRecoveryRequeueReason",
+    ) -> None:
+        for c in self._connectors:
+            c.observe_kv_recovery_requeue(request, reason)
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> MultiKVConnectorMetadata:
@@ -449,6 +465,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         finally:
             # restore kv_connector_worker_meta
             connector_output.kv_connector_worker_meta = multi_connector_worker_meta
+
+    def take_reclaimable_block_ids(self) -> set[int]:
+        reclaimable_block_ids: set[int] = set()
+        for c in self._connectors:
+            reclaimable_block_ids.update(c.take_reclaimable_block_ids())
+        return reclaimable_block_ids
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """

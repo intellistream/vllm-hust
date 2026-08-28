@@ -851,6 +851,28 @@ Options:
 """)
 
 
+def test_multi_connector_forwards_kv_recovery_observations(mc):
+    request = MagicMock()
+    reason = "block_capacity"
+    scheduled_request_ids = frozenset({"request-0", "request-1"})
+
+    mc.observe_kv_recovery_requeue(request, reason)
+    mc.observe_kv_recovery_first_compute(scheduled_request_ids)
+
+    for connector in mc._connectors:
+        connector.observe_kv_recovery_requeue.assert_called_once_with(request, reason)
+        connector.observe_kv_recovery_first_compute.assert_called_once_with(
+            scheduled_request_ids
+        )
+
+
+def test_multi_connector_unions_reclaimable_block_ids(mc):
+    mc._connectors[0].take_reclaimable_block_ids.return_value = {1, 2}
+    mc._connectors[1].take_reclaimable_block_ids.return_value = {2, 3}
+
+    assert mc.take_reclaimable_block_ids() == {1, 2, 3}
+
+
 def test_multi_connector_prefer_cross_layer_blocks(mc):
     mc._connectors[0].prefer_cross_layer_blocks = False
     mc._connectors[1].prefer_cross_layer_blocks = True
