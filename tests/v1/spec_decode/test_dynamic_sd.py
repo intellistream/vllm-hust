@@ -189,8 +189,8 @@ def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():
     assert output.num_spec_tokens_to_schedule == 3
 
 
-def test_dynamic_sd_is_disabled_with_data_parallel(caplog_vllm):
-    with caplog_vllm.at_level(logging.WARNING, logger="vllm"):
+def test_dynamic_sd_is_disabled_with_data_parallel(caplog):
+    with caplog.at_level(logging.WARNING, logger="vllm"):
         scheduler = create_scheduler(
             max_num_seqs=256,
             max_num_batched_tokens=2560,
@@ -208,7 +208,7 @@ def test_dynamic_sd_is_disabled_with_data_parallel(caplog_vllm):
     assert speculative_config.num_speculative_tokens_per_batch_size is None
     assert scheduler.dynamic_sd_lookup is None
     assert "Dynamic speculative decoding is not supported with data parallelism" in (
-        caplog_vllm.text
+        caplog.text
     )
 
     output = _add_requests_and_schedule(scheduler, 256)
