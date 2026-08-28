@@ -25,6 +25,8 @@ BENCHMARK_INPUT_LEN=${BENCHMARK_INPUT_LEN:-128}
 BENCHMARK_OUTPUT_LEN=${BENCHMARK_OUTPUT_LEN:-32}
 BENCHMARK_NUM_PROMPTS=${BENCHMARK_NUM_PROMPTS:-8}
 BENCHMARK_REQUEST_RATE=${BENCHMARK_REQUEST_RATE:-2}
+MIN_FREE_GPU_MEMORY_MIB=${MIN_FREE_GPU_MEMORY_MIB:-20000}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.8}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
@@ -78,6 +80,12 @@ wait_for_server() {
     started=$(date +%s)
     while ! curl --fail --silent --show-error "http://127.0.0.1:${port}/health" \
         > /dev/null 2>&1; do
+        for pid in "${PIDS[@]}"; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "A retained service process exited before port $port became ready" >&2
+                return 1
+            fi
+        done
         if (( $(date +%s) - started >= TIMEOUT_SECONDS )); then
             echo "Timed out waiting for server on port $port" >&2
             return 1
@@ -117,17 +125,34 @@ validate_configuration() {
     local revision
     revision=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
     "$PYTHON_BIN" - "$PREFLIGHT_RECORD" "$PROJECT_ROOT" "$MODEL" "$revision" \
-        "$PROXY_PORT" "$PREFILL_PORTS" "$BOOTSTRAP_PORTS" "$DECODE_PORTS" <<'PY'
+        "$PROXY_PORT" "$PREFILL_PORTS" "$BOOTSTRAP_PORTS" "$DECODE_PORTS" \
+        "$PREFILL_GPUS" "$DECODE_GPUS" "$MIN_FREE_GPU_MEMORY_MIB" <<'PY'
 import json
 import pathlib
+import socket
+import subprocess
 import sys
 
-record_path, root, model, revision, proxy, prefill, bootstrap, decode = sys.argv[1:]
+(
+    record_path,
+    root,
+    model,
+    revision,
+    proxy,
+    prefill,
+    bootstrap,
+    decode,
+    prefill_gpus,
+    decode_gpus,
+    minimum_free_memory_mib,
+) = sys.argv[1:]
 record = json.loads(pathlib.Path(record_path).read_text(encoding="utf-8"))
 checks = {item["name"]: item for item in record.get("checks", [])}
+minimum_free_memory_mib = int(minimum_free_memory_mib)
 required_ports = {int(proxy)}
 for values in (prefill, bootstrap, decode):
     required_ports.update(int(value) for value in values.split(","))
+required_gpus = set(prefill_gpus.split(",")) | set(decode_gpus.split(","))
 
 errors = []
 if record.get("provenance_label") != "preflight-only":
@@ -147,6 +172,36 @@ if pathlib.Path(checks.get("model", {}).get("evidence", "")).resolve() != pathli
 recorded_ports = set(checks.get("ports", {}).get("evidence", {}).get("ports", []))
 if not required_ports.issubset(recorded_ports):
     errors.append("runner ports were not all admitted by preflight")
+accelerator = checks.get("accelerator_inventory", {}).get("evidence", {})
+eligible_gpus = set(accelerator.get("eligible_device_ids", []))
+if accelerator.get("minimum_free_memory_mib", 0) < minimum_free_memory_mib:
+    errors.append("preflight free-memory threshold is lower than runner threshold")
+if not required_gpus.issubset(eligible_gpus):
+    errors.append("runner GPUs were not all admitted by preflight")
+
+# Repeat volatile resource checks immediately before creating evidence or services.
+live = subprocess.check_output(
+    [
+        "nvidia-smi",
+        "--query-gpu=index,memory.free",
+        "--format=csv,noheader,nounits",
+    ],
+    text=True,
+)
+live_free = {
+    fields[0]: int(fields[1])
+    for line in live.splitlines()
+    if len(fields := [field.strip() for field in line.split(",")]) == 2
+}
+if any(live_free.get(gpu, -1) < minimum_free_memory_mib for gpu in required_gpus):
+    errors.append("runner GPUs no longer satisfy the free-memory threshold")
+for port in required_ports:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
+        candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            candidate.bind(("127.0.0.1", port))
+        except OSError:
+            errors.append(f"runner port {port} is no longer available")
 if errors:
     raise SystemExit("; ".join(errors))
 PY
@@ -208,6 +263,10 @@ payload = {
         "num_prompts": int(${BENCHMARK_NUM_PROMPTS@Q}),
         "request_rate": float(${BENCHMARK_REQUEST_RATE@Q}),
     },
+    "resource_admission": {
+        "minimum_free_gpu_memory_mib": int(${MIN_FREE_GPU_MEMORY_MIB@Q}),
+        "gpu_memory_utilization": float(${GPU_MEMORY_UTILIZATION@Q}),
+    },
     "typed_manifest": ${MANIFEST@Q} if ${MODE@Q} == "typed" else None,
     "rollback_invariant": (
         "fresh process and output directory; built-in connector names; "
@@ -239,7 +298,8 @@ main() {
             VLLM_MOONCAKE_BOOTSTRAP_PORT="$bootstrap_port" \
             CUDA_VISIBLE_DEVICES="$gpu_id" \
             "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL" \
-            --port "$port" --kv-transfer-config "$PRODUCER_CONFIG"
+            --port "$port" --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+            --kv-transfer-config "$PRODUCER_CONFIG"
         proxy_args+=(--prefill "http://127.0.0.1:${port}" "$bootstrap_port")
     done
 
@@ -248,7 +308,8 @@ main() {
         local port=${DECODE_PORT_ARRAY[$i]}
         start_child "decode$((i+1)).log" env CUDA_VISIBLE_DEVICES="$gpu_id" \
             "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL" \
-            --port "$port" --kv-transfer-config "$CONSUMER_CONFIG"
+            --port "$port" --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+            --kv-transfer-config "$CONSUMER_CONFIG"
         proxy_args+=(--decode "http://127.0.0.1:${port}")
     done
 

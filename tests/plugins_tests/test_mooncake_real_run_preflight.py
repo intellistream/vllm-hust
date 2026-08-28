@@ -108,6 +108,26 @@ def test_cli_probe_requires_successful_service_cli(monkeypatch, tmp_path: Path) 
     assert blocked["error"] == "runtime ABI mismatch"
 
 
+def test_nvidia_probe_requires_enough_free_memory(monkeypatch) -> None:
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda command, cwd=None: module.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="0, 8192, 81920\n1, 70000, 81920\n",
+            stderr="",
+        ),
+    )
+    blocked = module._accelerator_probe("nvidia", 2, 20000)
+    assert not blocked["ok"]
+    assert blocked["eligible_device_ids"] == ["1"]
+    assert blocked["devices"][0]["eligible"] is False
+    ready = module._accelerator_probe("nvidia", 1, 20000)
+    assert ready["ok"]
+
+
 def test_store_config_is_topology_specific(tmp_path: Path) -> None:
     module = _module()
     config = tmp_path / "mooncake.json"
@@ -170,7 +190,9 @@ def test_blocked_preflight_writes_record_and_launches_nothing(
         },
     )
     monkeypatch.setattr(module, "_manifest_probe", lambda root, topology: {"ok": True})
-    monkeypatch.setattr(module, "_accelerator_probe", lambda kind, count: {"ok": True})
+    monkeypatch.setattr(
+        module, "_accelerator_probe", lambda kind, count, minimum: {"ok": True}
+    )
     monkeypatch.setattr(module, "_ports_probe", lambda ports: {"ok": True})
     monkeypatch.setattr(module, "_service_probe", lambda topology: {"ok": True})
     monkeypatch.setattr(module, "_cli_probe", lambda python, project_root: {"ok": True})
@@ -185,6 +207,7 @@ def test_blocked_preflight_writes_record_and_launches_nothing(
         store_config=None,
         accelerator="ascend",
         expected_devices=2,
+        minimum_free_memory_mib=0,
         ports=[8000],
     )
     record = module.build_record(args)
@@ -204,7 +227,9 @@ def test_existing_output_is_never_overwritten(monkeypatch, tmp_path: Path) -> No
         module, "_python_probe", lambda python, project_root: {"probe_ok": False}
     )
     monkeypatch.setattr(module, "_manifest_probe", lambda root, topology: {"ok": False})
-    monkeypatch.setattr(module, "_accelerator_probe", lambda kind, count: {"ok": False})
+    monkeypatch.setattr(
+        module, "_accelerator_probe", lambda kind, count, minimum: {"ok": False}
+    )
     monkeypatch.setattr(module, "_ports_probe", lambda ports: {"ok": False})
     monkeypatch.setattr(module, "_service_probe", lambda topology: {"ok": False})
     monkeypatch.setattr(
@@ -220,6 +245,7 @@ def test_existing_output_is_never_overwritten(monkeypatch, tmp_path: Path) -> No
         store_config=None,
         accelerator="ascend",
         expected_devices=2,
+        minimum_free_memory_mib=0,
         ports=[8000],
     )
     record = module.build_record(args)
@@ -248,7 +274,9 @@ def test_virtual_environment_interpreter_path_is_preserved(
 
     monkeypatch.setattr(module, "_python_probe", observe_python)
     monkeypatch.setattr(module, "_manifest_probe", lambda root, topology: {"ok": False})
-    monkeypatch.setattr(module, "_accelerator_probe", lambda kind, count: {"ok": False})
+    monkeypatch.setattr(
+        module, "_accelerator_probe", lambda kind, count, minimum: {"ok": False}
+    )
     monkeypatch.setattr(module, "_ports_probe", lambda ports: {"ok": False})
     monkeypatch.setattr(module, "_service_probe", lambda topology: {"ok": False})
     monkeypatch.setattr(
@@ -264,6 +292,7 @@ def test_virtual_environment_interpreter_path_is_preserved(
         store_config=None,
         accelerator="ascend",
         expected_devices=2,
+        minimum_free_memory_mib=0,
         ports=[8000],
     )
     module.build_record(args)

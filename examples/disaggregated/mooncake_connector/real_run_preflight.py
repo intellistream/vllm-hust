@@ -222,11 +222,34 @@ def _store_config_probe(path: Path | None, topology: str) -> dict[str, Any]:
     }
 
 
-def _accelerator_probe(kind: str, expected_devices: int) -> dict[str, Any]:
+def _accelerator_probe(
+    kind: str, expected_devices: int, minimum_free_memory_mib: int
+) -> dict[str, Any]:
     if kind == "nvidia":
-        command = ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"]
+        command = [
+            "nvidia-smi",
+            "--query-gpu=index,memory.free,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
         result = _run(command)
-        ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        devices = []
+        for line in result.stdout.splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 3:
+                continue
+            try:
+                free_mib, total_mib = int(fields[1]), int(fields[2])
+            except ValueError:
+                continue
+            devices.append(
+                {
+                    "id": fields[0],
+                    "free_memory_mib": free_mib,
+                    "total_memory_mib": total_mib,
+                    "eligible": free_mib >= minimum_free_memory_mib,
+                }
+            )
+        ids = [device["id"] for device in devices if device["eligible"]]
     else:
         command = ["npu-smi", "info", "-l"]
         result = _run(command)
@@ -237,11 +260,14 @@ def _accelerator_probe(kind: str, expected_devices: int) -> dict[str, Any]:
                 if "NPU ID" in line and line.partition(":")[2].strip().isdigit()
             }
         )
+        devices = [{"id": device_id, "eligible": True} for device_id in ids]
     return {
         "ok": result.returncode == 0 and len(ids) >= expected_devices,
         "kind": kind,
         "expected_devices": expected_devices,
-        "device_ids": ids,
+        "minimum_free_memory_mib": minimum_free_memory_mib,
+        "eligible_device_ids": ids,
+        "devices": devices,
         "error": result.stderr.strip() if result.returncode else None,
     }
 
@@ -288,7 +314,9 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
     modules = python_probe.get("modules", {})
     manifest = _manifest_probe(project_root, args.topology)
     config = _store_config_probe(store_config, args.topology)
-    accelerator = _accelerator_probe(args.accelerator, args.expected_devices)
+    accelerator = _accelerator_probe(
+        args.accelerator, args.expected_devices, args.minimum_free_memory_mib
+    )
     ports = _ports_probe(args.ports)
     services = _service_probe(args.topology)
     revision = _git_revision(project_root)
@@ -366,6 +394,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--store-config", type=Path)
     parser.add_argument("--accelerator", choices=("nvidia", "ascend"), required=True)
     parser.add_argument("--expected-devices", type=int, default=2)
+    parser.add_argument("--minimum-free-memory-mib", type=int, default=0)
     parser.add_argument(
         "--ports", type=int, nargs="+", default=[8000, 8010, 8020, 8998, 50051]
     )

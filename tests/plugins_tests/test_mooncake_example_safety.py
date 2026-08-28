@@ -54,3 +54,12 @@ def test_runner_requires_matching_successful_preflight() -> None:
     assert 'record.get("topology") != "direct"' in source
     assert "preflight revision differs from current checkout" in source
     assert "runner ports were not all admitted by preflight" in source
+    assert "runner GPUs were not all admitted by preflight" in source
+    assert "runner GPUs no longer satisfy the free-memory threshold" in source
+    assert "runner port {port} is no longer available" in source
+
+
+def test_wait_loop_fails_when_a_retained_service_exits() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert 'if ! kill -0 "$pid"' in source
+    assert "A retained service process exited before port" in source
