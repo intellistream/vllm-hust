@@ -27,7 +27,9 @@ def engine_client(request: Request) -> EngineClient:
 
 
 def _qbi_utility(request: Request):
-    utility = getattr(engine_client(request), "call_utility_async", None)
+    client = engine_client(request)
+    core_client = getattr(client, "engine_core", client)
+    utility = getattr(core_client, "call_utility_async", None)
     if not callable(utility):
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
@@ -151,12 +153,7 @@ async def collective_rpc(raw_request: Request):
 async def native_recapture_scope(raw_request: Request, after_sequence: int = 0):
     """Read prompt-free scheduler receipts from the isolated control surface."""
 
-    utility = getattr(engine_client(raw_request), "call_utility_async", None)
-    if not callable(utility):
-        raise HTTPException(
-            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            detail="Engine client does not expose utility calls",
-        )
+    utility = _qbi_utility(raw_request)
     try:
         result = await utility("get_native_recapture_scope_state", after_sequence)
     except (TypeError, ValueError) as error:

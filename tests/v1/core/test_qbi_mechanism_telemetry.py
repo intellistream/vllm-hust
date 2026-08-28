@@ -10,7 +10,7 @@ import pytest
 from vllm.v1.engine.core import _QBI_MECHANISM_RECEIPT_LIMIT, EngineCore
 from vllm.v1.outputs import ModelRunnerOutput
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
 def _core() -> EngineCore:

@@ -15,6 +15,8 @@ from vllm.entrypoints.serve.rpc.api_router import (
     qbi_runtime_transition_verify,
 )
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 class _FakeClient:
     def __init__(self):

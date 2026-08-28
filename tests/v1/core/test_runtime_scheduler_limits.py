@@ -18,6 +18,8 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.request import RequestStatus
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 def _scheduler() -> Scheduler:
     scheduler = object.__new__(Scheduler)
