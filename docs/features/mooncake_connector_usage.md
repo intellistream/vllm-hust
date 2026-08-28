@@ -71,6 +71,9 @@ Refer to these example scripts in the vLLM repository:
 Before a legacy/typed comparison, run the
 [Mooncake real-run readiness gate](mooncake_real_run_readiness.md). Its
 topology-aware preflight checks the controlled Python environment, exact bundle
-roles, model, accelerator inventory, ports, output uniqueness, and revision
-without launching or terminating any service. A blocked preflight is
-environment-readiness evidence, not a Mooncake behavior or performance result.
+roles, runnable CLI, model, eligible accelerator memory, ports, output
+uniqueness, and revision without launching or terminating any service. The
+process-owned runner then executes exactly one of `legacy`, `typed`, or
+`rollback` into a fresh evidence directory and rechecks volatile resources
+before launch. A blocked preflight is environment-readiness evidence, not a
+Mooncake behavior or performance result.
