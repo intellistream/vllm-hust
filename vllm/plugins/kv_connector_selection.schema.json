@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vllm-hust.sage.org.ai/schemas/kv-connector-selection-v1.schema.json",
+  "title": "vLLM KV connector selection topology v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "composition", "connectors"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "composition": {"enum": ["single", "ordered_multi"]},
+    "connectors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "connector_id",
+          "scheduler_component",
+          "worker_component"
+        ],
+        "properties": {
+          "connector_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9.-]*$"
+          },
+          "scheduler_component": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9.-]*$"
+          },
+          "worker_component": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9.-]*$"
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"composition": {"const": "single"}}},
+      "then": {"properties": {"connectors": {"minItems": 1, "maxItems": 1}}}
+    },
+    {
+      "if": {"properties": {"composition": {"const": "ordered_multi"}}},
+      "then": {"properties": {"connectors": {"minItems": 2}}}
+    }
+  ]
+}
