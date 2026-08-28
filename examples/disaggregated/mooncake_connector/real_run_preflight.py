@@ -79,7 +79,7 @@ def _last_json_object(output: str) -> dict[str, Any] | None:
     return None
 
 
-def _python_probe(python: Path) -> dict[str, Any]:
+def _python_probe(python: Path, project_root: Path) -> dict[str, Any]:
     probe = """
 import importlib
 import importlib.metadata
@@ -102,7 +102,7 @@ except importlib.metadata.PackageNotFoundError:
     version = None
 print(json.dumps({"modules": modules, "mooncake_version": version}, sort_keys=True))
 """
-    result = _run([str(python), "-c", probe])
+    result = _run([str(python), "-c", probe], cwd=project_root)
     if result.returncode != 0:
         return {
             "probe_ok": False,
@@ -113,6 +113,25 @@ print(json.dumps({"modules": modules, "mooncake_version": version}, sort_keys=Tr
         return {"probe_ok": False, "error": "probe returned non-JSON output"}
     payload["probe_ok"] = True
     return payload
+
+
+def _cli_probe(python: Path, project_root: Path) -> dict[str, Any]:
+    """Require the actual service CLI to construct under the selected source tree."""
+    result = _run(
+        [str(python), "-m", "vllm.entrypoints.cli.main", "--help"],
+        cwd=project_root,
+    )
+    return {
+        "ok": result.returncode == 0 and "serve" in result.stdout,
+        "command": [
+            str(python),
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "--help",
+        ],
+        "returncode": result.returncode,
+        "error": result.stderr.strip() or None,
+    }
 
 
 def _version_at_least(version: str | None, minimum: tuple[int, int, int]) -> bool:
@@ -257,9 +276,14 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
     store_config = args.store_config.resolve() if args.store_config else None
     output_is_new = not output_dir.exists()
     python_probe = (
-        _python_probe(python)
+        _python_probe(python, project_root)
         if python.is_file()
         else {"probe_ok": False, "error": "python executable does not exist"}
+    )
+    cli = (
+        _cli_probe(python, project_root)
+        if python.is_file() and project_root.is_dir()
+        else {"ok": False, "error": "python executable or project root is missing"}
     )
     modules = python_probe.get("modules", {})
     manifest = _manifest_probe(project_root, args.topology)
@@ -286,6 +310,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
                 "imported_file": modules.get("vllm", {}).get("file"),
             },
         ),
+        _check("vllm_cli", cli["ok"], cli),
         _check(
             "mooncake_version",
             _version_at_least(

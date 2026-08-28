@@ -65,6 +65,49 @@ def test_runtime_probe_requires_engine_import_not_only_top_level() -> None:
     assert module._runtime_imports_ready(modules)
 
 
+def test_python_probe_runs_from_selected_project_root(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = _module()
+    observed: dict[str, Path | None] = {}
+
+    def fake_run(command, *, cwd=None):
+        observed["cwd"] = cwd
+        return module.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='{"modules": {}, "mooncake_version": "0.3.8"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    probe = module._python_probe(Path("/controlled/python"), tmp_path)
+    assert probe["probe_ok"]
+    assert observed["cwd"] == tmp_path
+
+
+def test_cli_probe_requires_successful_service_cli(monkeypatch, tmp_path: Path) -> None:
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda command, cwd=None: module.subprocess.CompletedProcess(
+            command, 0, stdout="commands: serve\n", stderr=""
+        ),
+    )
+    assert module._cli_probe(Path("/controlled/python"), tmp_path)["ok"]
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda command, cwd=None: module.subprocess.CompletedProcess(
+            command, 1, stdout="", stderr="runtime ABI mismatch"
+        ),
+    )
+    blocked = module._cli_probe(Path("/controlled/python"), tmp_path)
+    assert not blocked["ok"]
+    assert blocked["error"] == "runtime ABI mismatch"
+
+
 def test_store_config_is_topology_specific(tmp_path: Path) -> None:
     module = _module()
     config = tmp_path / "mooncake.json"
@@ -117,7 +160,7 @@ def test_blocked_preflight_writes_record_and_launches_nothing(
     monkeypatch.setattr(
         module,
         "_python_probe",
-        lambda python: {
+        lambda python, project_root: {
             "probe_ok": True,
             "modules": {
                 "vllm": {"ok": True},
@@ -130,6 +173,7 @@ def test_blocked_preflight_writes_record_and_launches_nothing(
     monkeypatch.setattr(module, "_accelerator_probe", lambda kind, count: {"ok": True})
     monkeypatch.setattr(module, "_ports_probe", lambda ports: {"ok": True})
     monkeypatch.setattr(module, "_service_probe", lambda topology: {"ok": True})
+    monkeypatch.setattr(module, "_cli_probe", lambda python, project_root: {"ok": True})
     monkeypatch.setattr(module, "_git_revision", lambda path: "a" * 40)
     output = tmp_path / "evidence"
     args = argparse.Namespace(
@@ -156,11 +200,16 @@ def test_existing_output_is_never_overwritten(monkeypatch, tmp_path: Path) -> No
     output.mkdir()
     sentinel = output / "owned"
     sentinel.write_text("keep", encoding="utf-8")
-    monkeypatch.setattr(module, "_python_probe", lambda python: {"probe_ok": False})
+    monkeypatch.setattr(
+        module, "_python_probe", lambda python, project_root: {"probe_ok": False}
+    )
     monkeypatch.setattr(module, "_manifest_probe", lambda root, topology: {"ok": False})
     monkeypatch.setattr(module, "_accelerator_probe", lambda kind, count: {"ok": False})
     monkeypatch.setattr(module, "_ports_probe", lambda ports: {"ok": False})
     monkeypatch.setattr(module, "_service_probe", lambda topology: {"ok": False})
+    monkeypatch.setattr(
+        module, "_cli_probe", lambda python, project_root: {"ok": False}
+    )
     monkeypatch.setattr(module, "_git_revision", lambda path: None)
     args = argparse.Namespace(
         project_root=tmp_path,
@@ -193,7 +242,7 @@ def test_virtual_environment_interpreter_path_is_preserved(
     venv_python.symlink_to(real_python)
     observed: list[Path] = []
 
-    def observe_python(python: Path) -> dict[str, bool]:
+    def observe_python(python: Path, project_root: Path) -> dict[str, bool]:
         observed.append(python)
         return {"probe_ok": False}
 
@@ -202,6 +251,9 @@ def test_virtual_environment_interpreter_path_is_preserved(
     monkeypatch.setattr(module, "_accelerator_probe", lambda kind, count: {"ok": False})
     monkeypatch.setattr(module, "_ports_probe", lambda ports: {"ok": False})
     monkeypatch.setattr(module, "_service_probe", lambda topology: {"ok": False})
+    monkeypatch.setattr(
+        module, "_cli_probe", lambda python, project_root: {"ok": False}
+    )
     monkeypatch.setattr(module, "_git_revision", lambda path: None)
     args = argparse.Namespace(
         project_root=tmp_path,
