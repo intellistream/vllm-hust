@@ -31,6 +31,7 @@ from vllm.control_bridge.security import (
     ReplayReservation,
     authenticate_control_action,
 )
+from vllm.control_bridge.service import LocalControlBridgeService
 
 __all__ = [
     "ControlAction",
@@ -43,6 +44,7 @@ __all__ = [
     "ControlBridgeExecutorError",
     "ControlBridgeExecutorState",
     "ControlReceipt",
+    "LocalControlBridgeService",
     "PersistentReplayLedger",
     "ProcessIsolatedControlBridgeExecutor",
     "ReplayDisposition",

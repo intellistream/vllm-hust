@@ -227,6 +227,29 @@ class PersistentReplayLedger:
                 connection.execute("ROLLBACK")
             raise
 
+    def lookup(self, action: ControlAction) -> ReplayReservation | None:
+        """Read an existing durable binding without reserving a new action."""
+        serialized_action = _serialize_action(action)
+        fingerprint = hashlib.sha256(serialized_action.encode("utf-8")).hexdigest()
+        row = self._connection.execute(
+            """SELECT action_id, state, receipt_json, action_fingerprint,
+                      action_json
+               FROM control_action_replay WHERE idempotency_key = ?""",
+            (action.idempotency_key,),
+        ).fetchone()
+        if row is not None:
+            if row[0] != action.action_id or row[3] != fingerprint:
+                return ReplayReservation(ReplayDisposition.CONFLICT, row[0])
+            return self._reservation_from_row(row)
+        action_row = self._connection.execute(
+            """SELECT idempotency_key FROM control_action_replay
+               WHERE action_id = ?""",
+            (action.action_id,),
+        ).fetchone()
+        if action_row is not None:
+            return ReplayReservation(ReplayDisposition.CONFLICT, action.action_id)
+        return None
+
     def complete(self, idempotency_key: str, receipt: ControlReceipt) -> ControlReceipt:
         """Persist one immutable terminal receipt for a prior reservation."""
         if not idempotency_key:
