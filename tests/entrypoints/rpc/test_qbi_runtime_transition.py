@@ -35,6 +35,12 @@ class _FakeRequest:
         return self._body
 
 
+class _WrappedFakeRequest(_FakeRequest):
+    def __init__(self, body=None):
+        super().__init__(body)
+        self.app.state.engine_client = SimpleNamespace(engine_core=self.client)
+
+
 @pytest.mark.asyncio
 async def test_runtime_transition_routes_use_explicit_engine_utilities():
     state_request = _FakeRequest()

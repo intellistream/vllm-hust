@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import numpy as np
 import torch
