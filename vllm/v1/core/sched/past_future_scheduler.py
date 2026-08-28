@@ -14,7 +14,6 @@ from vllm.v1.core.sched.past_future_policy import (
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
-
 PAST_FUTURE_SEED = 20260816
 
 
@@ -94,7 +93,9 @@ class PastFutureSchedulerPort(Scheduler):
         return {
             "scheduler_type": "past_future",
             "seed": PAST_FUTURE_SEED,
-            "history_output_tokens": list(self._past_future_policy.history_output_tokens),
+            "history_output_tokens": list(
+                self._past_future_policy.history_output_tokens
+            ),
             "last_admission_decisions": [
                 decision.to_dict() for decision in self._past_future_decisions
             ],

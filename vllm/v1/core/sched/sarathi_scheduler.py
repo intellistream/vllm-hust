@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from vllm.v1.core.sched.scheduler import Scheduler
 
-
 SARATHI_FIXED_CHUNK_SIZE = 512
 
 
