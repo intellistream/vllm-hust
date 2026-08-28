@@ -19,6 +19,18 @@ from vllm.plugins.kv_connector_selection import (
 from vllm.plugins.snapshot import ExtensionStartupSnapshot
 
 
+def capabilities(
+    *, supports_hma: bool = False, requires_piecewise: bool = False
+) -> dict:
+    return {
+        "scheduler_capabilities": {"supports_hma": supports_hma},
+        "worker_capabilities": {
+            "supports_hma": supports_hma,
+            "requires_piecewise_for_cudagraph": requires_piecewise,
+        },
+    }
+
+
 def make_snapshot() -> ExtensionStartupSnapshot:
     split = ExtensionBundleDescriptor(
         bundle_id="org.example.split",
@@ -71,6 +83,7 @@ def test_single_selection_resolves_split_role_components() -> None:
                     "connector_id": "primary",
                     "scheduler_component": "org.example.split/scheduler",
                     "worker_component": "org.example.split/worker",
+                    **capabilities(),
                 }
             ],
         }
@@ -85,6 +98,8 @@ def test_single_selection_resolves_split_role_components() -> None:
     assert resolved.connectors[0].worker_component.qualified_id == (
         "org.example.split/worker"
     )
+    assert resolved.supports_hma is False
+    assert resolved.requires_piecewise_for_cudagraph is False
 
 
 def test_ordered_multi_preserves_explicit_order() -> None:
@@ -97,11 +112,13 @@ def test_ordered_multi_preserves_explicit_order() -> None:
                     "connector_id": "first",
                     "scheduler_component": "org.example.combined/connector",
                     "worker_component": "org.example.combined/connector",
+                    **capabilities(supports_hma=True, requires_piecewise=True),
                 },
                 {
                     "connector_id": "second",
                     "scheduler_component": "org.example.split/scheduler",
                     "worker_component": "org.example.split/worker",
+                    **capabilities(supports_hma=True),
                 },
             ],
         }
@@ -113,6 +130,8 @@ def test_ordered_multi_preserves_explicit_order() -> None:
         "first",
         "second",
     ]
+    assert resolved.supports_hma is True
+    assert resolved.requires_piecewise_for_cudagraph is True
 
 
 @pytest.mark.parametrize(
@@ -135,6 +154,7 @@ def test_ordered_multi_preserves_explicit_order() -> None:
                         "connector_id": "only",
                         "scheduler_component": "org.example.split/scheduler",
                         "worker_component": "org.example.split/worker",
+                        **capabilities(),
                     }
                 ],
             },
@@ -149,6 +169,21 @@ def test_ordered_multi_preserves_explicit_order() -> None:
                         "connector_id": "primary",
                         "scheduler_component": "org.example.split/scheduler",
                         "worker_component": "org.example.split/worker",
+                    }
+                ],
+            },
+            "scheduler_capabilities must be an object",
+        ),
+        (
+            {
+                "schema_version": "1.0",
+                "composition": "single",
+                "connectors": [
+                    {
+                        "connector_id": "primary",
+                        "scheduler_component": "org.example.split/scheduler",
+                        "worker_component": "org.example.split/worker",
+                        **capabilities(),
                         "configuration": {},
                     }
                 ],
@@ -172,6 +207,7 @@ def test_resolution_rejects_scheduler_worker_crossing() -> None:
                     "connector_id": "crossed",
                     "scheduler_component": "org.example.split/worker",
                     "worker_component": "org.example.split/scheduler",
+                    **capabilities(),
                 }
             ],
         }
@@ -191,6 +227,7 @@ def test_resolution_error_names_available_provider() -> None:
                     "connector_id": "missing",
                     "scheduler_component": "org.example.missing/scheduler",
                     "worker_component": "org.example.split/worker",
+                    **capabilities(),
                 }
             ],
         }

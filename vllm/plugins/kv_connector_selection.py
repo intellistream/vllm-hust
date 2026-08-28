@@ -39,12 +39,29 @@ class KVConnectorComposition(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class KVConnectorSchedulerCapabilities:
+    """Configuration-time scheduler capability declarations."""
+
+    supports_hma: bool
+
+
+@dataclass(frozen=True, slots=True)
+class KVConnectorWorkerCapabilities:
+    """Configuration-time worker capability declarations."""
+
+    supports_hma: bool
+    requires_piecewise_for_cudagraph: bool
+
+
+@dataclass(frozen=True, slots=True)
 class KVConnectorPairSelection:
     """Pair scheduler and worker components for one logical connector."""
 
     connector_id: str
     scheduler_component: str
     worker_component: str
+    scheduler_capabilities: KVConnectorSchedulerCapabilities
+    worker_capabilities: KVConnectorWorkerCapabilities
 
     def __post_init__(self) -> None:
         if not _IDENTIFIER.fullmatch(self.connector_id):
@@ -108,6 +125,8 @@ class ResolvedKVConnectorPair:
     connector_id: str
     scheduler_component: ResolvedExtensionComponent
     worker_component: ResolvedExtensionComponent
+    scheduler_capabilities: KVConnectorSchedulerCapabilities
+    worker_capabilities: KVConnectorWorkerCapabilities
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +135,23 @@ class ResolvedKVConnectorSelection:
 
     composition: KVConnectorComposition
     connectors: tuple[ResolvedKVConnectorPair, ...]
+
+    @property
+    def supports_hma(self) -> bool:
+        """Return true only when every role of every child declares HMA."""
+        return all(
+            connector.scheduler_capabilities.supports_hma
+            and connector.worker_capabilities.supports_hma
+            for connector in self.connectors
+        )
+
+    @property
+    def requires_piecewise_for_cudagraph(self) -> bool:
+        """Return true when any ordered worker child requires piecewise mode."""
+        return any(
+            connector.worker_capabilities.requires_piecewise_for_cudagraph
+            for connector in self.connectors
+        )
 
 
 def parse_kv_connector_selection(
@@ -149,8 +185,20 @@ def parse_kv_connector_selection(
             raise KVConnectorSelectionError(f"connectors[{index}] must be an object")
         _reject_unknown_fields(
             raw_connector,
-            {"connector_id", "scheduler_component", "worker_component"},
+            {
+                "connector_id",
+                "scheduler_component",
+                "worker_component",
+                "scheduler_capabilities",
+                "worker_capabilities",
+            },
             f"connectors[{index}]",
+        )
+        scheduler_capabilities = _parse_scheduler_capabilities(
+            raw_connector.get("scheduler_capabilities"), index
+        )
+        worker_capabilities = _parse_worker_capabilities(
+            raw_connector.get("worker_capabilities"), index
         )
         connectors.append(
             KVConnectorPairSelection(
@@ -159,6 +207,8 @@ def parse_kv_connector_selection(
                     raw_connector, "scheduler_component"
                 ),
                 worker_component=_required_string(raw_connector, "worker_component"),
+                scheduler_capabilities=scheduler_capabilities,
+                worker_capabilities=worker_capabilities,
             )
         )
 
@@ -189,6 +239,8 @@ def resolve_kv_connector_selection(
                 DomainContract.KV_CONNECTOR_WORKER_V1,
                 ExecutionPlane.WORKER,
             ),
+            scheduler_capabilities=connector.scheduler_capabilities,
+            worker_capabilities=connector.worker_capabilities,
         )
         for connector in profile.connectors
     )
@@ -230,6 +282,44 @@ def _required_string(payload: Mapping[str, Any], field: str) -> str:
     value = payload.get(field)
     if not isinstance(value, str) or not value:
         raise KVConnectorSelectionError(f"{field} must be a non-empty string")
+    return value
+
+
+def _parse_scheduler_capabilities(
+    value: Any, connector_index: int
+) -> KVConnectorSchedulerCapabilities:
+    location = f"connectors[{connector_index}].scheduler_capabilities"
+    if not isinstance(value, Mapping):
+        raise KVConnectorSelectionError(f"{location} must be an object")
+    _reject_unknown_fields(value, {"supports_hma"}, location)
+    return KVConnectorSchedulerCapabilities(
+        supports_hma=_required_bool(value, "supports_hma", location)
+    )
+
+
+def _parse_worker_capabilities(
+    value: Any, connector_index: int
+) -> KVConnectorWorkerCapabilities:
+    location = f"connectors[{connector_index}].worker_capabilities"
+    if not isinstance(value, Mapping):
+        raise KVConnectorSelectionError(f"{location} must be an object")
+    _reject_unknown_fields(
+        value,
+        {"supports_hma", "requires_piecewise_for_cudagraph"},
+        location,
+    )
+    return KVConnectorWorkerCapabilities(
+        supports_hma=_required_bool(value, "supports_hma", location),
+        requires_piecewise_for_cudagraph=_required_bool(
+            value, "requires_piecewise_for_cudagraph", location
+        ),
+    )
+
+
+def _required_bool(payload: Mapping[str, Any], field: str, location: str) -> bool:
+    value = payload.get(field)
+    if not isinstance(value, bool):
+        raise KVConnectorSelectionError(f"{location}.{field} must be a boolean")
     return value
 
 
