@@ -18,6 +18,7 @@ from vllm.control_bridge.contracts import (
     evaluate_control_action_admission,
 )
 from vllm.control_bridge.executor import ControlBridgeExecutorError
+from vllm.control_bridge.runtime_health import RuntimeHealthObservation
 from vllm.control_bridge.security import (
     PersistentReplayLedger,
     ReplayDisposition,
@@ -30,7 +31,11 @@ class ControlActionExecutor(Protocol):
     """Minimum executor surface consumed by the local orchestration service."""
 
     def execute(
-        self, action: ControlAction, *, completed_at: datetime
+        self,
+        action: ControlAction,
+        *,
+        completed_at: datetime,
+        health_observation: RuntimeHealthObservation | None = None,
     ) -> ControlReceipt: ...
 
 
@@ -70,6 +75,7 @@ class LocalControlBridgeService:
         signature: str,
         *,
         now: datetime,
+        health_observation: RuntimeHealthObservation | None = None,
     ) -> ControlReceipt:
         """Authenticate and deterministically resolve one read-only action."""
         if now.tzinfo is None:
@@ -104,7 +110,11 @@ class LocalControlBridgeService:
             return self._resolve_replay(action, reservation, completed_at=now)
 
         try:
-            receipt = self._executor.execute(action, completed_at=now)
+            receipt = self._executor.execute(
+                action,
+                completed_at=now,
+                health_observation=health_observation,
+            )
         except ControlBridgeExecutorError:
             receipt = self._receipt(
                 action,

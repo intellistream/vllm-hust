@@ -29,6 +29,12 @@ from vllm.control_bridge.contracts import (
     parse_control_action,
     parse_control_receipt,
 )
+from vllm.control_bridge.runtime_health import (
+    RuntimeHealthObservation,
+    RuntimeHealthState,
+    health_observation_to_dict,
+    parse_health_observation,
+)
 from vllm.plugins.contracts import (
     ComponentIsolation,
     ComponentPermission,
@@ -40,6 +46,7 @@ from vllm.plugins.snapshot import ResolvedExtensionComponent
 _CORE_HEALTH_PROBE_IMPLEMENTATION = (
     "vllm.control_bridge.executor:core_health_probe_worker"
 )
+_MAX_HEALTH_OBSERVATION_AGE_SECONDS = 5.0
 
 
 class ControlBridgeExecutorError(RuntimeError):
@@ -165,6 +172,7 @@ class ProcessIsolatedControlBridgeExecutor:
         action: ControlAction,
         *,
         completed_at: datetime,
+        health_observation: RuntimeHealthObservation | None = None,
     ) -> ControlReceipt:
         """Execute a previously authenticated, admitted, and reserved action."""
         if self._state is not ControlBridgeExecutorState.READY:
@@ -174,6 +182,7 @@ class ProcessIsolatedControlBridgeExecutor:
         if completed_at.tzinfo is None:
             raise ValueError("completed_at must be timezone-aware")
         self._validate_action_preconditions(action)
+        self._validate_health_observation(health_observation, completed_at)
         if not self._request_slot.acquire(blocking=False):
             raise ControlBridgeBackpressureError("bridge request slot is occupied")
         try:
@@ -183,6 +192,11 @@ class ProcessIsolatedControlBridgeExecutor:
                     "kind": "execute",
                     "action": control_action_to_dict(action),
                     "completed_at": completed_at.isoformat(),
+                    "health_observation": (
+                        None
+                        if health_observation is None
+                        else health_observation_to_dict(health_observation)
+                    ),
                 }
             )
             if not connection.poll(self._request_timeout):
@@ -262,6 +276,19 @@ class ProcessIsolatedControlBridgeExecutor:
             and action.expected_state_version != self._state_version
         ):
             raise ControlBridgeExecutorError("action state precondition is stale")
+
+    def _validate_health_observation(
+        self,
+        observation: RuntimeHealthObservation | None,
+        completed_at: datetime,
+    ) -> None:
+        if observation is None:
+            return
+        age = (completed_at - observation.observed_at).total_seconds()
+        if age < 0:
+            raise ControlBridgeExecutorError("health observation is from the future")
+        if age > _MAX_HEALTH_OBSERVATION_AGE_SECONDS:
+            raise ControlBridgeExecutorError("health observation is stale")
 
     def _fail_worker(self) -> None:
         self._state = ControlBridgeExecutorState.FAILED
@@ -358,16 +385,41 @@ def core_health_probe_worker(
                 )
             if action.action_type is not ControlActionType.RUNTIME_HEALTH_PROBE:
                 raise ControlBridgeExecutorError("worker action is not read-only")
-            diagnostic = "bridge worker responsive; runtime health source unavailable"
+            raw_observation = message.get("health_observation")
+            observation = (
+                None
+                if raw_observation is None
+                else parse_health_observation(raw_observation)
+            )
+            status = ControlActionStatus.FAILED
+            reason_code = "RUNTIME_HEALTH_UNAVAILABLE"
+            diagnostic = "runtime health observation unavailable"
+            if observation is not None:
+                if observation.observed_at > completed_at:
+                    raise ControlBridgeExecutorError(
+                        "health observation is newer than completion"
+                    )
+                if (
+                    completed_at - observation.observed_at
+                ).total_seconds() > _MAX_HEALTH_OBSERVATION_AGE_SECONDS:
+                    raise ControlBridgeExecutorError("health observation is stale")
+                if observation.state is RuntimeHealthState.HEALTHY:
+                    status = ControlActionStatus.APPLIED
+                    reason_code = "RUNTIME_HEALTHY"
+                    diagnostic = "runtime health check passed"
+                elif observation.state is RuntimeHealthState.UNHEALTHY:
+                    reason_code = "RUNTIME_UNHEALTHY"
+                    diagnostic = "runtime health check reported engine dead"
             if action.payload.include_diagnostics:
-                diagnostic += f"; worker_pid={os.getpid()}"
+                source = "none" if observation is None else observation.source
+                diagnostic += f"; source={source}; worker_pid={os.getpid()}"
             receipt = ControlReceipt(
                 schema_version="1.0",
                 action_id=action.action_id,
                 runtime_id=runtime_id,
                 observed_epoch=epoch,
-                status=ControlActionStatus.FAILED,
-                reason_code="RUNTIME_HEALTH_UNAVAILABLE",
+                status=status,
+                reason_code=reason_code,
                 diagnostic=diagnostic,
                 mutation_occurred=False,
                 resulting_state_version=state_version,

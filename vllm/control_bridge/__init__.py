@@ -23,6 +23,11 @@ from vllm.control_bridge.executor import (
     ProcessIsolatedControlBridgeExecutor,
     materialize_process_isolated_control_bridge,
 )
+from vllm.control_bridge.runtime_health import (
+    RuntimeHealthObservation,
+    RuntimeHealthState,
+    observe_engine_client_health,
+)
 from vllm.control_bridge.security import (
     ControlActionAuthenticationError,
     PersistentReplayLedger,
@@ -50,11 +55,14 @@ __all__ = [
     "ReplayDisposition",
     "ReplayLedgerError",
     "ReplayReservation",
+    "RuntimeHealthObservation",
+    "RuntimeHealthState",
     "authenticate_control_action",
     "control_action_to_dict",
     "control_receipt_to_dict",
     "evaluate_control_action_admission",
     "materialize_process_isolated_control_bridge",
+    "observe_engine_client_health",
     "parse_control_action",
     "parse_control_receipt",
 ]

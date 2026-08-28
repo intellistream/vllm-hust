@@ -15,6 +15,10 @@ from vllm.control_bridge.contracts import (
     ControlReceipt,
 )
 from vllm.control_bridge.executor import ControlBridgeExecutorError
+from vllm.control_bridge.runtime_health import (
+    RuntimeHealthObservation,
+    RuntimeHealthState,
+)
 from vllm.control_bridge.security import (
     ControlActionAuthenticationError,
     PersistentReplayLedger,
@@ -56,11 +60,17 @@ class RecordingExecutor:
     def __init__(self, *, fail: bool = False) -> None:
         self.calls = 0
         self.fail = fail
+        self.last_health_observation: RuntimeHealthObservation | None = None
 
     def execute(
-        self, action: ControlAction, *, completed_at: datetime
+        self,
+        action: ControlAction,
+        *,
+        completed_at: datetime,
+        health_observation: RuntimeHealthObservation | None = None,
     ) -> ControlReceipt:
         self.calls += 1
+        self.last_health_observation = health_observation
         if self.fail:
             raise ControlBridgeExecutorError("sensitive implementation detail")
         return ControlReceipt(
@@ -100,7 +110,16 @@ def test_terminal_receipt_is_restored_without_reexecution(tmp_path) -> None:
     bridge, ledger = service(tmp_path, executor)
     wire, signature = signed(payload())
     try:
-        first = bridge.handle(wire, signature, now=_NOW)
+        observation = RuntimeHealthObservation(
+            state=RuntimeHealthState.HEALTHY,
+            observed_at=_NOW,
+        )
+        first = bridge.handle(
+            wire,
+            signature,
+            now=_NOW,
+            health_observation=observation,
+        )
         duplicate = bridge.handle(
             wire,
             signature,
@@ -112,6 +131,7 @@ def test_terminal_receipt_is_restored_without_reexecution(tmp_path) -> None:
     assert first == duplicate
     assert first.status is ControlActionStatus.FAILED
     assert executor.calls == 1
+    assert executor.last_health_observation == observation
 
 
 def test_executor_failure_is_safe_and_durably_recoverable(tmp_path) -> None:
