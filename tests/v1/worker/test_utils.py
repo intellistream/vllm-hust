@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
+from vllm.v1.worker import utils as worker_utils
 from vllm.v1.worker.utils import bind_kv_cache
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def test_bind_kv_cache(default_vllm_config):
@@ -90,3 +94,24 @@ def test_bind_kv_cache_draft_model(default_vllm_config):
     assert runner_kv_caches[1] is kv_cache["draft_model.layers.0.attn"]
     assert runner_kv_caches[2] is kv_cache["model.layers.1.attn"]
     assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
+
+
+def test_bind_kv_cache_accepts_multiple_npu_layers(monkeypatch) -> None:
+    monkeypatch.setattr(worker_utils.current_platform, "is_cuda_alike", lambda: False)
+    monkeypatch.setattr(worker_utils.current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(worker_utils.current_platform, "is_cpu", lambda: False)
+    monkeypatch.setattr(
+        worker_utils.current_platform, "device_type", "npu", raising=False
+    )
+    layer_names = ["model.layers.0.attn", "draft_model.layers.0.attn"]
+    ctx = {
+        layer_name: type("AttentionStub", (), {"kv_cache": None})()
+        for layer_name in layer_names
+    }
+    kv_cache = {layer_name: torch.zeros((1,)) for layer_name in layer_names}
+    runner_kv_caches: list[torch.Tensor] = []
+
+    bind_kv_cache(kv_cache, ctx, runner_kv_caches)
+
+    assert runner_kv_caches == [kv_cache[layer_name] for layer_name in layer_names]
+    assert all(ctx[name].kv_cache is kv_cache[name] for name in layer_names)
