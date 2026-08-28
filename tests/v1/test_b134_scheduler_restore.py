@@ -150,11 +150,16 @@ def _load_scheduler_module():
     add("vllm.v1.core.kv_cache_utils", KVCacheBlock=MagicMock)
     add(
         "vllm.v1.engine",
-        EngineCoreEventType=MagicMock,
+        EngineCoreEventType=MagicMock(SCHEDULED="SCHEDULED", PREEMPTED="PREEMPTED"),
         EngineCoreOutput=MagicMock,
         EngineCoreOutputs=MagicMock,
     )
     add("vllm.v1.kv_cache_interface", KVCacheConfig=MagicMock)
+    add(
+        "vllm.v1.kv_cache_compression",
+        KVCacheCompressionError=MagicMock,
+        KVCacheCompressionRuntimeSpec=MagicMock,
+    )
     add("vllm.v1.metrics")
     add("vllm.v1.metrics.perf", ModelMetrics=MagicMock, PerfStats=MagicMock)
     add("vllm.v1.metrics.stats", PrefixCacheStats=MagicMock, SchedulerStats=MagicMock)
@@ -191,10 +196,10 @@ def _load_scheduler_module():
     add("vllm.v1.structured_output", StructuredOutputManager=MagicMock)
     add("vllm.v1.utils", record_function_or_nullcontext=MagicMock())
 
-    # Real b134_events module (pure stdlib): scheduler imports `emit` from it.
+    # Real events module (pure stdlib): scheduler imports EventBus from it.
     events_spec = importlib.util.spec_from_file_location(
-        "vllm.v1.b134_events",
-        REPO_ROOT / "vllm" / "v1" / "b134_events.py",
+        "vllm.v1.events",
+        REPO_ROOT / "vllm" / "v1" / "events.py",
     )
     assert events_spec is not None and events_spec.loader is not None
     events_mod = importlib.util.module_from_spec(events_spec)
@@ -209,10 +214,10 @@ def _load_scheduler_module():
     # Snapshot EVERY key we are about to touch — stubs plus the two real
     # modules loaded below — BEFORE overwriting anything. Restoring from
     # this snapshot puts sys.modules back to its pre-test identity.
-    touched = set(stubs) | {"vllm.v1.b134_events", "vllm.v1.core.sched.scheduler"}
+    touched = set(stubs) | {"vllm.v1.events", "vllm.v1.core.sched.scheduler"}
     saved = {name: sys.modules.get(name) for name in touched}
     sys.modules.update(stubs)
-    sys.modules["vllm.v1.b134_events"] = events_mod
+    sys.modules["vllm.v1.events"] = events_mod
     events_spec.loader.exec_module(events_mod)
     sys.modules["vllm.v1.core.sched.scheduler"] = scheduler_mod
     try:
@@ -251,7 +256,7 @@ def _make_request(scheduler_mod, request_id: str = "request-1"):
 def _make_scheduler(scheduler_mod, request):
     """Controllable stand-in for Scheduler with the real schedule() bound."""
     sched = MagicMock()
-    sched.log_stats = False
+    sched.log_stats = True  # scheduled event fires inside the log_stats branch
     sched.current_step = 0
     sched._pause_state = scheduler_mod.PauseState.UNPAUSED
     sched.max_num_scheduled_tokens = 4096
@@ -372,6 +377,7 @@ def _scheduler_touched_keys() -> set[str]:
         "vllm.v1.core.kv_cache_utils",
         "vllm.v1.engine",
         "vllm.v1.kv_cache_interface",
+        "vllm.v1.kv_cache_compression",
         "vllm.v1.metrics",
         "vllm.v1.metrics.perf",
         "vllm.v1.metrics.stats",
@@ -384,28 +390,36 @@ def _scheduler_touched_keys() -> set[str]:
         "vllm.v1.structured_output",
         "vllm.v1.utils",
     }
-    return stub_names | {"vllm.v1.b134_events", "vllm.v1.core.sched.scheduler"}
+    return stub_names | {"vllm.v1.events", "vllm.v1.core.sched.scheduler"}
 
 
 def test_restore_request_emits_wakeup_admission_scheduled(monkeypatch) -> None:
     """One PREEMPTED request going through schedule() must emit the exact
-    chain wakeup -> admission -> scheduled."""
+    chain RequestResumed -> RequestAdmitted -> RequestScheduled."""
     scheduler_mod = _load_scheduler_module()
 
-    emitted: list[str] = []
-    monkeypatch.setattr(
-        scheduler_mod, "emit", lambda event, request_id, **kw: emitted.append(event)
-    )
+    emitted: list = []
 
-    request = _make_request(scheduler_mod)
-    sched = _make_scheduler(scheduler_mod, request)
+    class _Sink:
+        def emit(self, event):
+            emitted.append(event)
 
-    result = scheduler_mod.Scheduler.schedule(sched)
-    assert result is not None
+    scheduler_mod.EventBus.register_sink(_Sink())
+    try:
+        request = _make_request(scheduler_mod)
+        sched = _make_scheduler(scheduler_mod, request)
 
-    assert emitted == ["wakeup", "admission", "scheduled"], (
-        f"restore chain order wrong: {emitted}"
-    )
+        result = scheduler_mod.Scheduler.schedule(sched)
+        assert result is not None
+
+        assert [type(e).__name__ for e in emitted] == [
+            "RequestResumed",
+            "RequestAdmitted",
+            "RequestScheduled",
+        ], f"restore chain order wrong: {emitted}"
+    finally:
+        scheduler_mod.EventBus._sinks = []
+        scheduler_mod.EventBus.enabled = False
 
 
 def test_scheduler_loader_restores_sys_modules_identity() -> None:

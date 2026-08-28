@@ -10,7 +10,7 @@ from typing_extensions import override
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
-from vllm.v1.b134_events import EVENTS_ENABLED, emit
+from vllm.v1.events import EventBus, KVOffloadEvict, KVOffloadStore
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
@@ -181,7 +181,7 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
-        started_at = time.monotonic() if EVENTS_ENABLED else 0.0
+        started_at = time.monotonic() if EventBus.enabled else 0.0
         if self.counts is not None:
             num_keys = len(keys)
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
@@ -241,13 +241,14 @@ class CPUOffloadingManager(OffloadingManager):
         # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
 
-        if EVENTS_ENABLED:
-            emit(
-                "cpu_store",
-                req_context.req_id,
-                duration_us=round((time.monotonic() - started_at) * 1e6),
-                evicted_keys=len(to_evict),
-                stored_keys=len(keys_to_store),
+        if EventBus.enabled:
+            EventBus.emit(
+                KVOffloadStore(
+                    req_context.req_id,
+                    duration_us=round((time.monotonic() - started_at) * 1e6),
+                    evicted_keys=len(to_evict),
+                    stored_keys=len(keys_to_store),
+                )
             )
 
         return PrepareStoreOutput(
@@ -291,7 +292,7 @@ class CPUOffloadingManager(OffloadingManager):
 
     def evict_keys(self, keys: Collection[OffloadKey]) -> list[OffloadKey]:
         """Explicitly evict ready, unreferenced blocks from the CPU tier."""
-        started_at = time.monotonic() if EVENTS_ENABLED else 0.0
+        started_at = time.monotonic() if EventBus.enabled else 0.0
         evicted: list[OffloadKey] = []
         for key in keys:
             block = self._policy.get(key)
@@ -311,12 +312,13 @@ class CPUOffloadingManager(OffloadingManager):
                     removed=True,
                 )
             )
-        if EVENTS_ENABLED:
-            emit(
-                "cpu_evict",
-                "cpu",
-                duration_us=round((time.monotonic() - started_at) * 1e6),
-                evicted_keys=len(evicted),
+        if EventBus.enabled:
+            EventBus.emit(
+                KVOffloadEvict(
+                    "cpu",
+                    duration_us=round((time.monotonic() - started_at) * 1e6),
+                    evicted_keys=len(evicted),
+                )
             )
         return evicted
 

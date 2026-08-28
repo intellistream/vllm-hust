@@ -34,7 +34,6 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
-from vllm.v1.b134_events import emit
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
 )
@@ -60,6 +59,13 @@ from vllm.v1.core.sched.victim_selector import (
     infer_kv_utilization_from_scheduler,
 )
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.events import (
+    EventBus,
+    RequestAdmitted,
+    RequestPreempted,
+    RequestResumed,
+    RequestScheduled,
+)
 from vllm.v1.kv_cache_compression import (
     KVCacheCompressionError,
     KVCacheCompressionRuntimeSpec,
@@ -1134,14 +1140,15 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
-                if request.status == RequestStatus.PREEMPTED:
-                    emit("wakeup", request.request_id)
-                emit("admission", request.request_id)
+                if request.status == RequestStatus.PREEMPTED and EventBus.enabled:
+                    EventBus.emit(RequestResumed(request.request_id))
+                if EventBus.enabled:
+                    EventBus.emit(RequestAdmitted(request.request_id))
+                    EventBus.emit(RequestScheduled(request.request_id))
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
-                emit("scheduled", request.request_id)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
@@ -1435,7 +1442,8 @@ class Scheduler(SchedulerInterface):
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
-        emit("preempt", request.request_id)
+        if EventBus.enabled:
+            EventBus.emit(RequestPreempted(request.request_id))
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
