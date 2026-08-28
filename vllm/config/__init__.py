@@ -13,6 +13,7 @@ from vllm.config.device import DeviceConfig
 from vllm.config.diffusion import DiffusionConfig
 from vllm.config.ec_transfer import ECTransferConfig
 from vllm.config.kernel import KernelConfig
+from vllm.config.kv_cache_compression import KVCacheCompressionConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.config.load import LoadConfig
@@ -38,6 +39,10 @@ from vllm.config.profiler import ProfilerConfig
 from vllm.config.reasoning import ReasoningConfig
 from vllm.config.scheduler import SchedulerConfig
 from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative_capability import (
+    SpeculativeCapability,
+    SpeculativeCapabilityError,
+)
 from vllm.config.speech_to_text import SpeechToTextConfig, SpeechToTextParams
 from vllm.config.structured_outputs import StructuredOutputsConfig
 from vllm.config.utils import (
@@ -79,6 +84,8 @@ __all__ = [
     "ECTransferConfig",
     # From vllm.config.kernel
     "KernelConfig",
+    # From vllm.config.kv_cache_compression
+    "KVCacheCompressionConfig",
     # From vllm.config.kv_events
     "KVEventsConfig",
     # From vllm.config.kv_transfer
@@ -114,6 +121,8 @@ __all__ = [
     "SchedulerConfig",
     # From vllm.config.speculative
     "SpeculativeConfig",
+    "SpeculativeCapability",
+    "SpeculativeCapabilityError",
     # From vllm.config.speech_to_text
     "SpeechToTextConfig",
     "SpeechToTextParams",

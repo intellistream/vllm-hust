@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import math
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import field, fields
@@ -1468,19 +1469,12 @@ class CompilationConfig:
     ):
         multiple_of = uniform_decode_query_len
         if tensor_parallel_size > 1 and self.pass_config.enable_sp:
-            multiple_of = max(uniform_decode_query_len, tensor_parallel_size)
-            if (
-                multiple_of % uniform_decode_query_len != 0
-                or multiple_of % tensor_parallel_size != 0
-            ):
-                raise ValueError(
-                    f"Can't determine cudagraph shapes that are both a "
-                    f"multiple of {uniform_decode_query_len} "
-                    f"(num_speculative_tokens + 1) required by spec-decode "
-                    f"and {tensor_parallel_size} (tensor_parallel_size) "
-                    f"required by sequence parallelism please adjust "
-                    f"num_speculative_tokens or disable sequence parallelism"
-                )
+            # Full-decode graphs must satisfy both the speculative decode
+            # query width and the sequence-parallel TP width.  Taking max()
+            # only works when one width divides the other (for example 4 and
+            # 8); LCM also handles valid co-prime/non-divisible combinations
+            # such as DSpark k=5 (width 6) with TP=8 (width 24).
+            multiple_of = math.lcm(uniform_decode_query_len, tensor_parallel_size)
 
         if not self.cudagraph_capture_sizes or multiple_of <= 1:
             return

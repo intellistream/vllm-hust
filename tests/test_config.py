@@ -25,7 +25,7 @@ from vllm.config import (
     VllmConfig,
     update_config,
 )
-from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
 from vllm.config.kernel import IrOpPriorityConfig
 from vllm.config.load import LoadConfig
 from vllm.config.utils import get_field
@@ -1399,6 +1399,30 @@ def test_vllm_config_uses_hardware_aware_cudagraph_ceiling(monkeypatch):
 
     assert config.compilation_config.max_cudagraph_capture_size == 256
     assert config.compilation_config.cudagraph_capture_sizes[-1] == 256
+
+
+@pytest.mark.parametrize(
+    ("uniform_decode_query_len", "tensor_parallel_size", "expected_sizes"),
+    [
+        (6, 8, [24, 48]),
+        (4, 8, [8, 16, 24, 32, 40, 48]),
+        (3, 4, [12, 24, 36, 48]),
+    ],
+)
+def test_spec_decode_sequence_parallel_cudagraph_sizes_use_lcm(
+    uniform_decode_query_len, tensor_parallel_size, expected_sizes
+):
+    config = CompilationConfig(
+        cudagraph_capture_sizes=[8, 16, 24, 32, 40, 48],
+        max_cudagraph_capture_size=48,
+        pass_config=PassConfig(enable_sp=True),
+    )
+
+    config.adjust_cudagraph_sizes_for_spec_decode(
+        uniform_decode_query_len, tensor_parallel_size
+    )
+
+    assert config.cudagraph_capture_sizes == expected_sizes
 
 
 def test_fusion_pass_op_priority():

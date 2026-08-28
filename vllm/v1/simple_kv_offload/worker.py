@@ -57,10 +57,6 @@ class SimpleCPUOffloadWorker:
         # Metadata for the current step
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
 
-        # Compute-done event recorded before each store; reused across steps
-        # (get_finished runs once per step, copy queue is FIFO).
-        self._store_compute_done: torch.Event | None = None
-
         # Pending event index sets, populated in bind_connector_metadata
         self._pending_load_event_indices: set[int] = set()
         self._pending_store_event_indices: set[int] = set()
@@ -233,16 +229,15 @@ class SimpleCPUOffloadWorker:
                     events_list=self._load_events,
                 )
             if metadata.store_gpu_blocks:
-                if self._store_compute_done is None:
-                    self._store_compute_done = torch.Event()
-                self._store_compute_done.record(torch.cuda.current_stream())
+                store_compute_done = torch.Event()
+                store_compute_done.record(torch.cuda.current_stream())
                 self._backend.launch_copy(
                     metadata.store_gpu_blocks,
                     metadata.store_cpu_blocks,
                     is_store=True,
                     event_idx=metadata.store_event,
                     events_list=self._store_events,
-                    wait_event=self._store_compute_done,
+                    wait_event=store_compute_done,
                 )
 
         # (2) Track completed transfer events

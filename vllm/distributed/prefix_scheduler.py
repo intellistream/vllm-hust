@@ -294,10 +294,12 @@ class GlobalPrefixScheduler:
         *,
         candidate_node_ids: Iterable[str] | None = None,
         max_cache_hit_length: int | None = None,
+        node_loads: Mapping[str, int] | None = None,
     ) -> PrefixRouteDecision | None:
         """Choose the node with the longest prefix-cache hit.
 
-        Ties are broken round-robin so equally good nodes still receive traffic.
+        Ties prefer the least-loaded node when all candidates have load data,
+        then use round-robin so equally good nodes still receive traffic.
         """
         node_ids = list(candidate_node_ids) if candidate_node_ids is not None else None
         states = (
@@ -325,6 +327,13 @@ class GlobalPrefixScheduler:
         tied_states = [
             state for matched_tokens, state in scored if matched_tokens == best_match
         ]
+        if node_loads is not None and all(
+            state.node_id in node_loads for state in tied_states
+        ):
+            best_load = min(node_loads[state.node_id] for state in tied_states)
+            tied_states = [
+                state for state in tied_states if node_loads[state.node_id] == best_load
+            ]
         state = tied_states[next(self._tie_breaker) % len(tied_states)]
         return PrefixRouteDecision(
             node_id=state.node_id,

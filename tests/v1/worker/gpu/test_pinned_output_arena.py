@@ -30,9 +30,7 @@ ArenaLifecycleError = ARENA_MODULE.ArenaLifecycleError
 PinnedOutputArena = ARENA_MODULE.PinnedOutputArena
 
 OUTPUT_ONLY = frozenset({ArenaConsumer.OUTPUT})
-TWO_CONSUMERS = frozenset(
-    {ArenaConsumer.OUTPUT, ArenaConsumer.INPUT_BATCH}
-)
+TWO_CONSUMERS = frozenset({ArenaConsumer.OUTPUT, ArenaConsumer.INPUT_BATCH})
 
 
 def acquire(
@@ -194,9 +192,7 @@ def test_duplicate_cancel_is_fail_closed() -> None:
 
 @pytest.mark.parametrize("method_name", ["cancel", "fail"])
 @pytest.mark.parametrize("copy_complete", [True, False])
-def test_cancel_and_exception_cleanup(
-    method_name: str, copy_complete: bool
-) -> None:
+def test_cancel_and_exception_cleanup(method_name: str, copy_complete: bool) -> None:
     arena = PinnedOutputArena(arena_id="test", capacity=1, enabled=True)
     lease = acquire(arena, "req-0")
 
@@ -204,9 +200,7 @@ def test_cancel_and_exception_cleanup(
 
     state = arena.snapshot()["slots"][0]["state"]
     assert state == ("free" if copy_complete else "quarantined")
-    counter = (
-        "cancel_cleanups" if method_name == "cancel" else "exception_cleanups"
-    )
+    counter = "cancel_cleanups" if method_name == "cancel" else "exception_cleanups"
     assert counters(arena)[counter] == 1
 
 

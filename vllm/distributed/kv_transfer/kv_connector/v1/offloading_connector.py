@@ -39,6 +39,12 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+from vllm.v1.kv_recovery_profile import (
+    KVRecoveryRequeueReason,
+    create_kv_recovery_scheduler_observer,
+    create_kv_recovery_worker_observer,
+    kv_recovery_runtime_scope_enabled,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -57,13 +63,28 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
 
         spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
+        kv_recovery_scope_enabled = kv_recovery_runtime_scope_enabled(spec, vllm_config)
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = OffloadingConnectorScheduler(spec)
+            self.connector_scheduler = OffloadingConnectorScheduler(
+                spec,
+                kv_recovery_observer=(
+                    create_kv_recovery_scheduler_observer()
+                    if kv_recovery_scope_enabled
+                    else None
+                ),
+            )
         elif role == KVConnectorRole.WORKER:
-            self.connector_worker = OffloadingConnectorWorker(spec)
+            self.connector_worker = OffloadingConnectorWorker(
+                spec,
+                kv_recovery_observer=(
+                    create_kv_recovery_worker_observer()
+                    if kv_recovery_scope_enabled
+                    else None
+                ),
+            )
 
     def shutdown(self) -> None:
         if self.connector_worker is not None:
@@ -80,6 +101,23 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         assert self.connector_worker is not None
         self.connector_worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
+
+    def observe_kv_recovery_requeue(
+        self, request: Request, reason: KVRecoveryRequeueReason
+    ) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.observe_kv_recovery_requeue(
+                request.request_id, reason
+            )
+
+    def observe_kv_recovery_first_compute(
+        self,
+        scheduled_request_ids: Iterable[str],
+    ) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.observe_kv_recovery_first_compute(
+                scheduled_request_ids,
+            )
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         assert self.connector_worker is not None
