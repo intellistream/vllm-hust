@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vllm-hust.sage.org.ai/schemas/control-action-v1.schema.json",
+  "title": "vLLM runtime control action v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "action_id", "idempotency_key", "action_type",
+    "target_runtime_id", "target_epoch", "issued_at", "expires_at",
+    "issuer", "authorization_scope", "payload", "expected_state_version",
+    "trace_id", "causation_id"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "action_id": {"type": "string", "format": "uuid"},
+    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
+    "action_type": {"const": "runtime.health_probe"},
+    "target_runtime_id": {"type": "string", "minLength": 1},
+    "target_epoch": {"type": "integer", "minimum": 0},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "issuer": {"type": "string", "minLength": 1},
+    "authorization_scope": {"const": "runtime.read"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["include_diagnostics"],
+      "properties": {"include_diagnostics": {"type": "boolean"}}
+    },
+    "expected_state_version": {"type": ["integer", "null"], "minimum": 0},
+    "trace_id": {"type": "string", "minLength": 1},
+    "causation_id": {"type": ["string", "null"]}
+  }
+}

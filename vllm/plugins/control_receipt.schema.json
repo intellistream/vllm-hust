@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vllm-hust.sage.org.ai/schemas/control-receipt-v1.schema.json",
+  "title": "vLLM runtime control receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "action_id", "runtime_id", "observed_epoch", "status",
+    "reason_code", "diagnostic", "mutation_occurred", "resulting_state_version",
+    "completed_at", "trace_id", "causation_id"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "action_id": {"type": "string", "format": "uuid"},
+    "runtime_id": {"type": "string", "minLength": 1},
+    "observed_epoch": {"type": "integer", "minimum": 0},
+    "status": {"enum": ["accepted", "applied", "rejected", "expired", "duplicate", "failed"]},
+    "reason_code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"},
+    "diagnostic": {"type": "string", "maxLength": 1024},
+    "mutation_occurred": {"type": "boolean"},
+    "resulting_state_version": {"type": ["integer", "null"], "minimum": 0},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "trace_id": {"type": "string", "minLength": 1},
+    "causation_id": {"type": ["string", "null"]}
+  }
+}
