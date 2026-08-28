@@ -29,3 +29,28 @@ def test_all_service_launches_use_the_retained_child_helper() -> None:
     assert 'start_child "prefill$((i+1)).log"' in source
     assert 'start_child "decode$((i+1)).log"' in source
     assert 'start_child "proxy.log"' in source
+
+
+def test_runner_requires_one_explicit_migration_mode_and_fresh_evidence() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "legacy|typed|rollback" in source
+    assert '[[ ! -e "$OUTPUT_DIR" ]]' in source
+    assert '"provenance_label": "real-online-run"' in source
+    assert '"seed": int(${BENCHMARK_SEED@Q})' in source
+
+
+def test_typed_and_rollback_configs_are_mutually_exclusive() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert 'if [[ "$MODE" == typed ]]' in source
+    assert 'export VLLM_EXTENSION_MANIFESTS="$MANIFEST"' in source
+    assert "PRODUCER_CONFIG=$TYPED_PRODUCER" in source
+    assert "PRODUCER_CONFIG=$LEGACY_PRODUCER" in source
+    assert "unset VLLM_EXTENSION_MANIFESTS" in source
+
+
+def test_runner_requires_matching_successful_preflight() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert 'if not record.get("ready_for_real_online")' in source
+    assert 'record.get("topology") != "direct"' in source
+    assert "preflight revision differs from current checkout" in source
+    assert "runner ports were not all admitted by preflight" in source
