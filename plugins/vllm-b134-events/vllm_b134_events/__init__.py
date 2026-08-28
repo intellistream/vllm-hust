@@ -5,15 +5,16 @@
 Registers :class:`vllm_b134_events.sink.B134JsonlSink` on the generic
 engine-core event bus when the plugin is enabled.
 
-The sink is only active when ``B134_EVENTS_FILE`` is set (or a path is passed
-explicitly); without it the plugin registers a sink that is a no-op, keeping
-the default-off property of the core event outlet.
+The sink is only registered when ``B134_EVENTS_FILE`` is set.  This preserves
+the default-off property of the core event outlet: hot paths do not construct
+or timestamp events merely because the wheel is installed.
 """
 
 from __future__ import annotations
 
-from vllm.v1.events import EventBus
+import os
 
+from vllm.v1.events import EventBus
 from vllm_b134_events.sink import B134JsonlSink
 
 _sink: B134JsonlSink | None = None
@@ -24,7 +25,10 @@ def register() -> None:
     global _sink
     if _sink is not None:
         return  # re-entrant: called once per vLLM process
-    _sink = B134JsonlSink()
+    path = os.environ.get("B134_EVENTS_FILE")
+    if not path:
+        return
+    _sink = B134JsonlSink(path)
     EventBus.register_sink(_sink)
     _sink.start()
 

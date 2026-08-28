@@ -8,11 +8,13 @@ Pure-Python: no NPU/GPU required. Run from the repo root with
     python -m pytest tests/v1/test_b134_events.py -v
 """
 
+import importlib
 import json
 import os
 import tempfile
 
 import pytest
+from vllm_b134_events.sink import B134JsonlSink
 
 from vllm.v1.events import (
     EventBus,
@@ -22,10 +24,7 @@ from vllm.v1.events import (
     KVTransferSubmit,
     RequestAdmitted,
     RequestPreempted,
-    RequestResumed,
 )
-
-from vllm_b134_events.sink import B134JsonlSink
 
 
 class CollectingSink:
@@ -95,15 +94,30 @@ def test_b134_sink_selects_only_relevant_events(tmp_path):
     sink.start()
     try:
         sink.emit(RequestAdmitted("req-1"))
-        sink.emit(KVOffloadStore("req-1", duration_us=12, evicted_keys=1,
-                                 stored_keys=4))
-        sink.emit(KVTransferSubmit("job3", bytes=1024, dependency_us=2,
-                                   descriptor_us=1, descriptors=2,
-                                   direction="h2d", submit_us=3))
+        sink.emit(
+            KVOffloadStore("req-1", duration_us=12, evicted_keys=1, stored_keys=4)
+        )
+        sink.emit(
+            KVTransferSubmit(
+                "job3",
+                bytes=1024,
+                dependency_us=2,
+                descriptor_us=1,
+                descriptors=2,
+                direction="h2d",
+                submit_us=3,
+            )
+        )
         sink.emit(KVOffloadTierEvict("req-2", duration_us=5, keys=7))
-        sink.emit(KVTransferCopyDone("job3", bytes=1024,
-                                     completion_observed_ms=1.5,
-                                     device_event_ms=1.2, direction="h2d"))
+        sink.emit(
+            KVTransferCopyDone(
+                "job3",
+                bytes=1024,
+                completion_observed_ms=1.5,
+                device_event_ms=1.2,
+                direction="h2d",
+            )
+        )
         sink.close()
     finally:
         sink.close()
@@ -140,6 +154,18 @@ def test_b134_sink_disabled_without_path():
     finally:
         if old is not None:
             os.environ["B134_EVENTS_FILE"] = old
+
+
+def test_b134_plugin_does_not_enable_bus_without_path(monkeypatch):
+    """Installing the plugin must keep event production disabled by default."""
+    monkeypatch.delenv("B134_EVENTS_FILE", raising=False)
+    import vllm_b134_events
+
+    plugin = importlib.reload(vllm_b134_events)
+    plugin.register()
+
+    assert EventBus.enabled is False
+    assert EventBus._sinks == []
 
 
 def test_b134_sink_queue_overflow_degrades():
