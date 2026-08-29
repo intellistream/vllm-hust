@@ -4,6 +4,7 @@
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,6 +27,23 @@ def _pep517_build_requirements() -> set[str]:
     return {str(Requirement(item)) for item in pyproject["build-system"]["requires"]}
 
 
+def _pinned_base_versions(path: Path, package: str) -> set[str]:
+    versions: set[str] = set()
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        requirement = Requirement(line)
+        if requirement.name != package:
+            continue
+        versions.update(
+            Version(specifier.version).base_version
+            for specifier in requirement.specifier
+            if specifier.operator == "=="
+        )
+    return versions
+
+
 def test_empty_build_tools_mirror_pep517_without_torch():
     pep517_without_torch = {
         requirement
@@ -45,3 +63,20 @@ def test_pep517_torch_requirement_remains_platform_agnostic():
     }
 
     assert torch_requirements == {"torch==2.11.0"}
+
+
+def test_cpu_build_runtime_and_test_torch_versions_match():
+    requirement_files = (
+        ROOT / "requirements/build/cpu.txt",
+        ROOT / "requirements/cpu.txt",
+        ROOT / "requirements/test/cpu.txt",
+    )
+
+    assert {
+        path.relative_to(ROOT): _pinned_base_versions(path, "torch")
+        for path in requirement_files
+    } == {
+        Path("requirements/build/cpu.txt"): {"2.11.0"},
+        Path("requirements/cpu.txt"): {"2.11.0"},
+        Path("requirements/test/cpu.txt"): {"2.11.0"},
+    }
