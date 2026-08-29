@@ -15,13 +15,14 @@ TOOLCHAIN=$(grep '^channel' "$REPO_ROOT/rust-toolchain.toml" | sed 's/.*= *"\(.*
 # Ensure rustup and the required toolchain are available.
 if ! command -v rustup &>/dev/null; then
     echo "rustup not found, installing..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+    curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain none
     source "$HOME/.cargo/env"
 fi
 
 if ! rustup run "$TOOLCHAIN" rustc --version &>/dev/null; then
     echo "Installing Rust toolchain: $TOOLCHAIN"
-    rustup toolchain install "$TOOLCHAIN"
+    rustup toolchain install "$TOOLCHAIN" --profile minimal
 fi
 
 if [[ "${1:-}" == "--debug" ]]; then
