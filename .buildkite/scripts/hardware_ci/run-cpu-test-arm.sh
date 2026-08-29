@@ -19,7 +19,14 @@ trap remove_docker_container EXIT
 remove_docker_container
 
 # Try building the docker image
-docker build --tag cpu-test --target vllm-test -f docker/Dockerfile.cpu .
+cpu_ci_commit=$(git rev-parse --short=12 HEAD)
+cpu_ci_version="0.0.0+cpu.ci.g${cpu_ci_commit}"
+docker build \
+  --build-arg VLLM_VERSION_OVERRIDE="$cpu_ci_version" \
+  --tag cpu-test \
+  --target vllm-test \
+  -f docker/Dockerfile.cpu \
+  .
 
 # Run the image
 docker run -itd --cpuset-cpus="$CORE_RANGE" --entrypoint /bin/bash -v ~/.cache/huggingface:/root/.cache/huggingface -e HF_TOKEN --env VLLM_CPU_KVCACHE_SPACE=16 --env VLLM_CPU_CI_ENV=1 -e E2E_OMP_THREADS="$OMP_CORE_RANGE" --shm-size=4g --name cpu-test cpu-test
