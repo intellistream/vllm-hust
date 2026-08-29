@@ -48,7 +48,7 @@ start_child() {
 
 cleanup() {
     local status=${1:-0}
-    trap - EXIT INT TERM USR1
+    trap - EXIT HUP INT TERM USR1
     for process_group in "${PIDS[@]}"; do
         kill -TERM -- "-${process_group}" 2>/dev/null || true
     done
@@ -287,6 +287,7 @@ main() {
     configure_mode
     write_provenance
     trap 'cleanup $?' EXIT
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 138' USR1
     trap 'exit 143' TERM

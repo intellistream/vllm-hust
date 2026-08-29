@@ -69,3 +69,9 @@ def test_proxy_readiness_uses_an_endpoint_the_proxy_exposes() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
     assert "local readiness_path=${2:-/health}" in source
     assert 'wait_for_server "$PROXY_PORT" "/openapi.json"' in source
+
+
+def test_remote_hangup_also_runs_owned_process_cleanup() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "trap 'exit 129' HUP" in source
+    assert "trap - EXIT HUP INT TERM USR1" in source
