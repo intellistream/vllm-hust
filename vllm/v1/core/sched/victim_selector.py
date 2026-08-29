@@ -200,6 +200,31 @@ def _materialize_typed_victim_selector(
     return selector
 
 
+def _materialize_legacy_victim_selector(
+    entry_point: Any,
+    vllm_config,
+    *,
+    fail_closed: bool,
+) -> VictimSelector | None:
+    """Load one legacy entry point, optionally treating it as explicit config."""
+    try:
+        selector_class = entry_point.load()
+        factory = getattr(selector_class, "from_vllm_config", None)
+        if not callable(factory):
+            raise TypeError("selector does not expose from_vllm_config")
+        selector = factory(vllm_config)
+        if not isinstance(selector, VictimSelector):
+            raise TypeError("selector does not implement VictimSelector")
+        return selector
+    except Exception as error:
+        if fail_closed:
+            raise VictimSelectorMaterializationError(
+                "explicit legacy scheduler-policy entry point "
+                f"{entry_point.name!r} failed to initialize"
+            ) from error
+        return None
+
+
 def get_victim_selector(vllm_config) -> VictimSelector:
     """Discover and instantiate a victim selector.
 
@@ -216,19 +241,40 @@ def get_victim_selector(vllm_config) -> VictimSelector:
     if typed_component is not None:
         return _materialize_typed_victim_selector(typed_component, vllm_config)
 
+    selected_legacy_name = additional_config.get("victim_selector_plugin")
     try:
         from importlib.metadata import EntryPoints, entry_points
 
         eps: EntryPoints = entry_points(group="vllm.victim_selector")
-        for ep in eps:
-            try:
-                selector_cls = ep.load()
-                if hasattr(selector_cls, "from_vllm_config"):
-                    return selector_cls.from_vllm_config(vllm_config)
-            except Exception:
-                continue
-    except Exception:
-        pass
+    except Exception as error:
+        if selected_legacy_name is not None:
+            raise VictimSelectorMaterializationError(
+                "failed to discover explicitly selected legacy scheduler-policy "
+                f"entry point {selected_legacy_name!r}"
+            ) from error
+        return NoOpVictimSelector()
+
+    if selected_legacy_name is not None:
+        matches = tuple(ep for ep in eps if ep.name == selected_legacy_name)
+        if len(matches) != 1:
+            available = sorted(ep.name for ep in eps)
+            raise VictimSelectorMaterializationError(
+                "victim_selector_plugin must select exactly one legacy "
+                "scheduler-policy entry point: "
+                f"{selected_legacy_name!r}; available entry points: {available}"
+            )
+        selector = _materialize_legacy_victim_selector(
+            matches[0], vllm_config, fail_closed=True
+        )
+        assert selector is not None
+        return selector
+
+    for ep in eps:
+        selector = _materialize_legacy_victim_selector(
+            ep, vllm_config, fail_closed=False
+        )
+        if selector is not None:
+            return selector
 
     return NoOpVictimSelector()
 

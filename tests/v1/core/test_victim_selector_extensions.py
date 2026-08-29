@@ -107,9 +107,7 @@ def test_qualified_selection_resolves_typed_provider(
     module = SimpleNamespace(first=ExampleSelector, second=ExampleSelector)
     monkeypatch.setattr(victim_selector, "import_module", lambda name: module)
     config = SimpleNamespace(
-        additional_config={
-            "victim_selector_component": "org.example.policies/second"
-        }
+        additional_config={"victim_selector_component": "org.example.policies/second"}
     )
 
     assert isinstance(get_victim_selector(config), ExampleSelector)
@@ -151,6 +149,77 @@ def test_zero_typed_providers_preserve_legacy_discovery(
     )
 
 
+def test_explicit_legacy_name_selects_exact_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.plugins.startup.get_configured_extension_startup",
+        lambda: make_resolution(),
+    )
+    first = SimpleNamespace(name="first", load=lambda: pytest.fail("wrong provider"))
+    second = SimpleNamespace(name="second", load=lambda: ExampleSelector)
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: [first, second],
+    )
+
+    selector = get_victim_selector(
+        SimpleNamespace(additional_config={"victim_selector_plugin": "second"})
+    )
+
+    assert isinstance(selector, ExampleSelector)
+
+
+def test_unknown_explicit_legacy_name_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.plugins.startup.get_configured_extension_startup",
+        lambda: make_resolution(),
+    )
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: [SimpleNamespace(name="first", load=lambda: ExampleSelector)],
+    )
+
+    with pytest.raises(
+        VictimSelectorMaterializationError,
+        match="must select exactly one legacy",
+    ):
+        get_victim_selector(
+            SimpleNamespace(additional_config={"victim_selector_plugin": "missing"})
+        )
+
+
+def test_explicit_legacy_initialization_failure_is_not_silenced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingSelector:
+        @classmethod
+        def from_vllm_config(cls, vllm_config):
+            raise ValueError("invalid selector config")
+
+    monkeypatch.setattr(
+        "vllm.plugins.startup.get_configured_extension_startup",
+        lambda: make_resolution(),
+    )
+    entry_point = SimpleNamespace(name="failing", load=lambda: FailingSelector)
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda **kwargs: [entry_point],
+    )
+
+    with pytest.raises(
+        VictimSelectorMaterializationError,
+        match="explicit legacy.*failed to initialize",
+    ) as exc_info:
+        get_victim_selector(
+            SimpleNamespace(additional_config={"victim_selector_plugin": "failing"})
+        )
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
 def test_disable_flag_bypasses_typed_and_legacy_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -160,9 +229,7 @@ def test_disable_flag_bypasses_typed_and_legacy_providers(
     )
 
     selector = get_victim_selector(
-        SimpleNamespace(
-            additional_config={"victim_selector_plugin_disabled": True}
-        )
+        SimpleNamespace(additional_config={"victim_selector_plugin_disabled": True})
     )
 
     assert isinstance(selector, victim_selector.NoOpVictimSelector)
@@ -176,9 +243,7 @@ def test_unknown_qualified_selection_fails_closed(
         lambda: make_resolution("primary"),
     )
     config = SimpleNamespace(
-        additional_config={
-            "victim_selector_component": "org.example.policies/missing"
-        }
+        additional_config={"victim_selector_component": "org.example.policies/missing"}
     )
 
     with pytest.raises(VictimSelectorMaterializationError, match="selects no admitted"):
