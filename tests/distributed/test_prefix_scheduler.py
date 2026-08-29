@@ -255,7 +255,7 @@ def test_sync_mp_client_get_load_metrics_async():
     client.core_engines = [b"rank-2"]
     client.core_engine = client.core_engines[0]
     client.utility_results = {}
-    result = Future()
+    result: Future[dict[str, int]] = Future()
     result.set_result({"num_running_reqs": 2, "num_waiting_reqs": 1})
     client._start_utility = Mock(return_value=(1, result))
     client.utility_results[1] = result
@@ -2453,10 +2453,7 @@ def test_prefix_routing_bypass_emits_worker_fence_observation_headers():
     response_headers = dict(sent[0]["headers"])
     assert response_headers[WORKER_OBSERVED_GENERATION_HEADER.encode()] == b"9"
     assert response_headers[WORKER_OBSERVED_INCARNATION_HEADER.encode()] == b"epoch-a"
-    assert (
-        response_headers[WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER.encode()]
-        == b"4"
-    )
+    assert response_headers[WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER.encode()] == b"4"
 
 
 def test_prefix_routing_engine_fence_rejects_stale_local_generation():

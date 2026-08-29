@@ -72,12 +72,8 @@ ROUTE_SELECTED_NODE_HEADER = "x-vllm-prefix-routing-selected-node"
 ROUTE_MATCHED_TOKENS_HEADER = "x-vllm-prefix-routing-matched-tokens"
 ROUTE_GENERATION_HEADER = "x-vllm-prefix-routing-generation"
 ROUTE_WORKER_INCARNATION_HEADER = "x-vllm-prefix-routing-worker-incarnation-result"
-WORKER_OBSERVED_GENERATION_HEADER = (
-    "x-vllm-prefix-routing-worker-observed-generation"
-)
-WORKER_OBSERVED_INCARNATION_HEADER = (
-    "x-vllm-prefix-routing-worker-observed-incarnation"
-)
+WORKER_OBSERVED_GENERATION_HEADER = "x-vllm-prefix-routing-worker-observed-generation"
+WORKER_OBSERVED_INCARNATION_HEADER = "x-vllm-prefix-routing-worker-observed-incarnation"
 WORKER_OBSERVED_DATA_PARALLEL_RANK_HEADER = (
     "x-vllm-prefix-routing-worker-observed-data-parallel-rank"
 )
