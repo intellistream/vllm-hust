@@ -80,3 +80,9 @@ def test_cpu_build_runtime_and_test_torch_versions_match():
         Path("requirements/cpu.txt"): {"2.11.0"},
         Path("requirements/test/cpu.txt"): {"2.11.0"},
     }
+
+
+def test_cpu_test_image_installs_local_wheel_without_resolving_dependencies():
+    dockerfile = (ROOT / "docker/Dockerfile.cpu").read_text()
+
+    assert "uv pip install --no-deps dist/*.whl" in dockerfile
