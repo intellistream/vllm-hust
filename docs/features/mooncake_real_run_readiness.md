@@ -92,3 +92,12 @@ service occupied both GPUs and the proxy port. The attempted Mooncake processes
 were cleaned up without touching that service; the subsequent preflight
 correctly rejected both devices for insufficient free memory. This is blocked
 resource-admission evidence, not a Mooncake failure or real-online result.
+
+A later audit observed both 80 GiB A100s and the required ports free, but the
+same externally managed GLM-4 32B service automatically restarted roughly one
+minute later. The final-revision preflight then observed only 9062 MiB free on
+each device and port 18000 occupied, and again launched nothing. Other connected
+GPU hosts do not satisfy this runner's two-device local topology: the available
+A6000 hosts expose one GPU each, one host is occupied, and another has an NVML
+driver/library mismatch. Do not terminate or reuse those workloads and do not
+weaken the two-device gate merely to produce a run.
