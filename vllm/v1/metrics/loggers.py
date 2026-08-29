@@ -17,6 +17,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
+from vllm.plugins.contracts import DomainContract, ExecutionPlane
+from vllm.plugins.materialization import (
+    ExtensionComponentMaterializationError,
+    import_component_implementation,
+)
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
@@ -73,6 +78,31 @@ class StatLoggerBase(ABC):
 
 def load_stat_logger_plugin_factories() -> list[StatLoggerFactory]:
     factories: list[StatLoggerFactory] = []
+    seen_factories: set[StatLoggerFactory] = set()
+
+    # Typed stat loggers are API-plane fan-out components. Every explicitly
+    # admitted provider is materialized; one broken provider fails the domain
+    # closed instead of being silently omitted.
+    from vllm.plugins.startup import get_configured_extension_startup
+
+    typed_providers = get_configured_extension_startup().snapshot.components_for(
+        DomainContract.STAT_LOGGER_V1,
+        ExecutionPlane.API,
+    )
+    for component in typed_providers:
+        plugin_class = import_component_implementation(
+            component,
+            domain="stat logger",
+        )
+        if not isinstance(plugin_class, type) or not issubclass(
+            plugin_class, StatLoggerBase
+        ):
+            raise ExtensionComponentMaterializationError(
+                f"stat logger component {component.qualified_id!r} must resolve "
+                f"to a StatLoggerBase subclass (got {plugin_class!r})"
+            )
+        factories.append(plugin_class)
+        seen_factories.add(plugin_class)
 
     for name, plugin_class in load_plugins_by_group(STAT_LOGGER_PLUGINS_GROUP).items():
         if not isinstance(plugin_class, type) or not issubclass(
@@ -83,7 +113,11 @@ def load_stat_logger_plugin_factories() -> list[StatLoggerFactory]:
                 f"StatLoggerBase (got {plugin_class!r})."
             )
 
-        factories.append(plugin_class)
+        # A package may publish typed metadata and its legacy entry point during
+        # migration. Preserve other legacy loggers while avoiding double emits.
+        if plugin_class not in seen_factories:
+            factories.append(plugin_class)
+            seen_factories.add(plugin_class)
 
     return factories
 

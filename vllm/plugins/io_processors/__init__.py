@@ -5,11 +5,54 @@ import logging
 
 from vllm.config import VllmConfig
 from vllm.plugins import IO_PROCESSOR_PLUGINS_GROUP, load_plugins_by_group
+from vllm.plugins.contracts import DomainContract, ExecutionPlane
 from vllm.plugins.io_processors.interface import IOProcessor
+from vllm.plugins.materialization import (
+    ExtensionComponentMaterializationError,
+    import_component_implementation,
+)
 from vllm.renderers import BaseRenderer
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 logger = logging.getLogger(__name__)
+
+
+def _materialize_typed_io_processor(
+    component_id: str,
+    vllm_config: VllmConfig,
+    renderer: BaseRenderer,
+) -> IOProcessor:
+    """Materialize one explicitly qualified API-plane IO processor."""
+    from vllm.plugins.startup import get_configured_extension_startup
+
+    providers = get_configured_extension_startup().snapshot.components_for(
+        DomainContract.IO_PROCESSOR_V1,
+        ExecutionPlane.API,
+    )
+    matches = tuple(
+        provider for provider in providers if provider.qualified_id == component_id
+    )
+    if len(matches) != 1:
+        available = sorted(provider.qualified_id for provider in providers)
+        raise ExtensionComponentMaterializationError(
+            "io_processor_plugin selects no admitted API-plane IO processor "
+            f"component: {component_id!r}; available components: {available}"
+        )
+
+    implementation = import_component_implementation(matches[0], domain="IO processor")
+    if not isinstance(implementation, type) or not issubclass(
+        implementation, IOProcessor
+    ):
+        raise ExtensionComponentMaterializationError(
+            f"IO processor component {component_id!r} must resolve to an "
+            f"IOProcessor subclass (got {implementation!r})"
+        )
+    try:
+        return implementation(vllm_config, renderer)
+    except Exception as error:
+        raise ExtensionComponentMaterializationError(
+            f"IO processor component {component_id!r} failed to initialize"
+        ) from error
 
 
 def has_io_processor(
@@ -52,6 +95,15 @@ def get_io_processor(
     if model_plugin is None:
         logger.debug("No IOProcessor plugins requested by the model")
         return None
+
+    # Qualified bundle/component identities opt into the typed materializer.
+    # Unqualified names retain the legacy entry-point path unchanged.
+    if "/" in model_plugin:
+        return _materialize_typed_io_processor(
+            model_plugin,
+            vllm_config,
+            renderer,
+        )
 
     logger.debug("IOProcessor plugin to be loaded %s", model_plugin)
 
