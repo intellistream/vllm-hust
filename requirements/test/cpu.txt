@@ -1275,6 +1275,7 @@ xgrammar==0.2.3
     # via -r requirements/test/../common.txt
 xxhash==3.5.0
     # via
+    #   -r requirements/test/../common.txt
     #   datasets
     #   evaluate
 yarl==1.17.1
