@@ -246,7 +246,7 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
             FetchContent_Populate(arm_compute
                 SUBBUILD_DIR "${FETCHCONTENT_BASE_DIR}/arm_compute-subbuild"
                 SOURCE_DIR   "${FETCHCONTENT_BASE_DIR}/arm_compute-src"
-                GIT_REPOSITORY git@github.com:ARM-software/ComputeLibrary.git
+                GIT_REPOSITORY https://github.com/ARM-software/ComputeLibrary.git
                 GIT_TAG        v52.6.0
                 GIT_SHALLOW    TRUE
                 GIT_PROGRESS   TRUE
@@ -305,7 +305,7 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
             message(STATUS "aarch64 detected: using pinned oneDNN commit 9c5be1cc59e368aebf0909e6cf20f981ea61462a")
             FetchContent_Declare(
                 oneDNN
-                GIT_REPOSITORY git@github.com:oneapi-src/oneDNN.git
+                GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
                 GIT_TAG        9c5be1cc59e368aebf0909e6cf20f981ea61462a
                 GIT_PROGRESS   TRUE
                 GIT_SHALLOW    FALSE
@@ -313,7 +313,7 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
         else()
             FetchContent_Declare(
                 oneDNN
-                GIT_REPOSITORY git@github.com:oneapi-src/oneDNN.git
+                GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
                 GIT_TAG        v3.10
                 GIT_PROGRESS   TRUE
                 GIT_SHALLOW    TRUE
