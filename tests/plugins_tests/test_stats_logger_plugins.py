@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterator
 from unittest.mock import MagicMock
 
 import pytest
 from dummy_stat_logger.dummy_stat_logger import DummyStatLogger
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.plugins.contracts import (
@@ -17,9 +19,21 @@ from vllm.plugins.contracts import (
 )
 from vllm.plugins.materialization import ExtensionComponentMaterializationError
 from vllm.plugins.snapshot import ExtensionStartupSnapshot
-from vllm.plugins.startup import ExtensionStartupResolution
+from vllm.plugins.startup import (
+    ExtensionStartupResolution,
+    get_configured_extension_startup,
+)
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.metrics.loggers import load_stat_logger_plugin_factories
+
+
+@pytest.fixture(autouse=True)
+def clear_extension_startup_snapshot() -> Iterator[None]:
+    envs.disable_envs_cache()
+    get_configured_extension_startup.cache_clear()
+    yield
+    envs.disable_envs_cache()
+    get_configured_extension_startup.cache_clear()
 
 
 def typed_stat_logger_resolution(
@@ -127,6 +141,23 @@ def test_typed_and_legacy_stat_logger_migration_is_deduplicated(
     )
 
     assert load_stat_logger_plugin_factories() == [DummyStatLogger]
+
+
+def test_installed_bundle_selection_materializes_and_deduplicates_real_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    with monkeypatch.context() as m:
+        m.delenv("VLLM_EXTENSION_MANIFESTS", raising=False)
+        m.setenv(
+            "VLLM_EXTENSION_BUNDLES",
+            "org.vllm-hust.dummy-stat-logger",
+        )
+        m.setenv("VLLM_PLUGINS", "dummy_stat_logger")
+        get_configured_extension_startup.cache_clear()
+        try:
+            assert load_stat_logger_plugin_factories() == [DummyStatLogger]
+        finally:
+            get_configured_extension_startup.cache_clear()
 
 
 def test_invalid_typed_stat_logger_fails_closed(

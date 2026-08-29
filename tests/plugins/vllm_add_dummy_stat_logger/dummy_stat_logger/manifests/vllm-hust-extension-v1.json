@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "bundle_id": "org.vllm-hust.dummy-stat-logger",
+  "bundle_version": "0.1.0",
+  "host_api_range": ">=1,<2",
+  "components": [
+    {
+      "component_id": "stat-logger",
+      "contracts": ["vllm.stat_logger.v1"],
+      "execution_planes": ["api"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "dummy_stat_logger.dummy_stat_logger:DummyStatLogger",
+      "permissions": []
+    }
+  ]
+}

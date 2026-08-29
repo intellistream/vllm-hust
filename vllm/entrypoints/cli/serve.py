@@ -17,6 +17,7 @@ from vllm.entrypoints.openai.dp_supervisor import (
 )
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
+from vllm.plugins.selection import apply_cli_extension_selection
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import get_tcp_uri
@@ -148,6 +149,7 @@ class ServeSubcommand(CLISubcommand):
             uvloop.run(run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        apply_cli_extension_selection(args.extensions)
         validate_parsed_serve_args(args)
 
     def subparser_init(
@@ -162,6 +164,17 @@ class ServeSubcommand(CLISubcommand):
         )
 
         serve_parser = make_arg_parser(serve_parser)
+        serve_parser.add_argument(
+            "--extension",
+            action="append",
+            dest="extensions",
+            default=None,
+            metavar="BUNDLE_ID",
+            help=(
+                "Enable an installed vLLM-HUST extension Bundle by ID. "
+                "Repeat to enable multiple Bundles."
+            ),
+        )
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
         return serve_parser
 

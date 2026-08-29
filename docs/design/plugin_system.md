@@ -43,6 +43,49 @@ Every plugin has three parts:
 2. **Plugin name**: The name of the plugin. This is the value in the dictionary of the `entry_points` dictionary. In the example above, the plugin name is `register_dummy_model`. Plugins can be filtered by their names using the `VLLM_PLUGINS` environment variable. To load only a specific plugin, set `VLLM_PLUGINS` to the plugin name.
 3. **Plugin value**: The fully qualified name of the function or module to register in the plugin system. In the example above, the plugin value is `vllm_add_dummy_model:register`, which refers to a function named `register` in the `vllm_add_dummy_model` module.
 
+## Installed Extension Bundles
+
+vLLM-HUST Extension Bundle v1 separates package installation, static
+discovery, and runtime activation. A package registers a manifest directory
+without registering a callable:
+
+```toml
+[project.entry-points."vllm.extension_bundles"]
+"org.example.performance" = "example_plugin.manifests"
+
+[tool.setuptools.package-data]
+example_plugin = ["manifests/vllm-hust-extension-v1.json"]
+```
+
+The registered module directory must contain exactly one
+`vllm-hust-extension-v1.json` manifest. The legacy filename
+`extension-bundle-v1.json` is also accepted during migration. Discovery reads
+distribution metadata and the manifest file without calling
+`EntryPoint.load()` or importing the plugin package. Wheel `RECORD` metadata is
+authoritative for normal installs; PEP 660 editable installs use their static
+local `direct_url.json` and check only the project root and `src/` layout.
+
+Installation registers availability but does not activate behavior:
+
+```console
+uv pip install example-performance-plugin
+vllm plugin list
+vllm plugin inspect org.example.performance
+vllm plugin validate org.example.performance
+vllm serve MODEL --extension org.example.performance
+```
+
+Repeat `--extension` to select multiple compatible Bundles. A selected ID may
+come from an explicit `VLLM_EXTENSION_MANIFESTS` path or an installed static
+registration; an explicit path takes precedence for the same ID. Unset
+selection performs no installed-distribution scan. Unknown, duplicate,
+incompatible, ambiguous, malformed, or permission-denied selections fail before
+implementation import. Child processes inherit the exact ordered selection.
+
+Components requesting permissions still require the host's explicit
+`VLLM_EXTENSION_ALLOWED_PERMISSIONS` allowlist. Permission declarations are
+admission metadata and do not create an operating-system sandbox.
+
 ## Types of supported plugins
 
 - **General plugins** (with group name `vllm.general_plugins`): The primary use case for these plugins is to register custom, out-of-the-tree models into vLLM. This is done by calling `ModelRegistry.register_model` to register the model inside the plugin function. For an example of an official model plugin, see the [bart-plugin](https://github.com/vllm-project/bart-plugin) which adds support for `BartForConditionalGeneration`.

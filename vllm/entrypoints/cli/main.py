@@ -19,28 +19,45 @@ def _resolve_cli_version() -> str:
 
 
 def main():
-    import vllm.entrypoints.cli.benchmark.main
-    import vllm.entrypoints.cli.collect_env
-    import vllm.entrypoints.cli.launch
-    import vllm.entrypoints.cli.openai
-    import vllm.entrypoints.cli.run_batch
-    import vllm.entrypoints.cli.serve
-    from vllm.entrypoints.serve.utils.api_utils import (
-        VLLM_SUBCMD_PARSER_EPILOG,
-        cli_env_setup,
+    from vllm.plugins.selection import (
+        apply_cli_extension_selection,
+        extension_selection_from_argv,
     )
+
+    apply_cli_extension_selection(extension_selection_from_argv(sys.argv))
+
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    CMD_MODULES = [
-        vllm.entrypoints.cli.openai,
-        vllm.entrypoints.cli.serve,
-        vllm.entrypoints.cli.launch,
-        vllm.entrypoints.cli.benchmark.main,
-        vllm.entrypoints.cli.collect_env,
-        vllm.entrypoints.cli.run_batch,
-    ]
+    plugin_only = len(sys.argv) > 1 and sys.argv[1] == "plugin"
+    if plugin_only:
+        import vllm.entrypoints.cli.plugin
 
-    cli_env_setup()
+        cmd_modules = [vllm.entrypoints.cli.plugin]
+        parser_epilog = "Documentation: https://docs.vllm.ai"
+    else:
+        import vllm.entrypoints.cli.benchmark.main
+        import vllm.entrypoints.cli.collect_env
+        import vllm.entrypoints.cli.launch
+        import vllm.entrypoints.cli.openai
+        import vllm.entrypoints.cli.plugin
+        import vllm.entrypoints.cli.run_batch
+        import vllm.entrypoints.cli.serve
+        from vllm.entrypoints.serve.utils.api_utils import (
+            VLLM_SUBCMD_PARSER_EPILOG,
+            cli_env_setup,
+        )
+
+        cmd_modules = [
+            vllm.entrypoints.cli.openai,
+            vllm.entrypoints.cli.plugin,
+            vllm.entrypoints.cli.serve,
+            vllm.entrypoints.cli.launch,
+            vllm.entrypoints.cli.benchmark.main,
+            vllm.entrypoints.cli.collect_env,
+            vllm.entrypoints.cli.run_batch,
+        ]
+        parser_epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]")
+        cli_env_setup()
 
     # If `--omni` arg is passed to the CLI, delegate to vLLM Omni's entrypoint handling
     if "--omni" in sys.argv:
@@ -76,7 +93,7 @@ def main():
 
         parser = FlexibleArgumentParser(
             description="vLLM CLI",
-            epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
+            epilog=parser_epilog,
         )
         parser.add_argument(
             "-v",
@@ -86,7 +103,7 @@ def main():
         )
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds = {}
-        for cmd_module in CMD_MODULES:
+        for cmd_module in cmd_modules:
             new_cmds = cmd_module.cmd_init()
             for cmd in new_cmds:
                 cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)

@@ -171,7 +171,8 @@ def resolve_extension_startup(
     so malformed disabled bundles cannot silently remain in deployment config.
     No ``implementation_ref`` is imported here.
     """
-    enabled = None if enabled_bundle_ids is None else frozenset(enabled_bundle_ids)
+    normalized_enabled = _normalize_enabled_bundle_ids(enabled_bundle_ids)
+    enabled = None if normalized_enabled is None else frozenset(normalized_enabled)
     accepted: list[ExtensionBundleDescriptor] = []
     disabled: list[str] = []
     seen_bundle_ids: set[str] = set()
@@ -209,6 +210,77 @@ def resolve_extension_startup(
     )
 
 
+def _normalize_enabled_bundle_ids(
+    bundle_ids: Iterable[str] | None,
+) -> tuple[str, ...] | None:
+    if bundle_ids is None:
+        return None
+    normalized = tuple(bundle_ids)
+    if any(not isinstance(bundle_id, str) or not bundle_id for bundle_id in normalized):
+        raise ExtensionBundleAdmissionError(
+            "enabled extension bundle ids contain an empty value"
+        )
+    if len(normalized) != len(set(normalized)):
+        raise ExtensionBundleAdmissionError(
+            "enabled extension bundle ids contain duplicates"
+        )
+    return normalized
+
+
+def _configured_manifest_bundle_ids(
+    manifest_paths: Sequence[str | Path],
+) -> frozenset[str]:
+    bundle_ids: list[str] = []
+    for path in _normalize_manifest_paths(manifest_paths):
+        try:
+            bundle = load_extension_bundle_manifest(path)
+        except ValueError as error:
+            raise ExtensionBundleAdmissionError(
+                f"extension manifest {path} was rejected: {error}"
+            ) from error
+        bundle_ids.append(bundle.bundle_id)
+    return frozenset(bundle_ids)
+
+
+def resolve_configured_extension_startup(
+    manifest_paths: Sequence[str | Path],
+    *,
+    enabled_bundle_ids: Iterable[str] | None = None,
+    allowed_permissions: Iterable[ComponentPermission] = (),
+    supported_isolations: Iterable[ComponentIsolation] = (
+        ComponentIsolation.TRUSTED_IN_PROCESS,
+    ),
+    host_api_version: str = EXTENSION_HOST_API_VERSION,
+) -> ExtensionStartupResolution:
+    """Resolve explicit manifests plus explicitly selected installed Bundles.
+
+    Installed distribution metadata is consulted only when bundle IDs are
+    explicitly selected. An unset selection preserves the no-scan startup path.
+    Explicit manifest paths take precedence over installed registrations for
+    the same Bundle ID.
+    """
+    enabled = _normalize_enabled_bundle_ids(enabled_bundle_ids)
+    configured_paths = tuple(manifest_paths)
+    if enabled:
+        explicit_ids = _configured_manifest_bundle_ids(configured_paths)
+        missing_ids = tuple(
+            bundle_id for bundle_id in enabled if bundle_id not in explicit_ids
+        )
+        if missing_ids:
+            from vllm.plugins.installed import discover_installed_extension_bundles
+
+            installed = discover_installed_extension_bundles(missing_ids)
+            configured_paths += tuple(bundle.manifest_path for bundle in installed)
+
+    return resolve_extension_startup(
+        configured_paths,
+        enabled_bundle_ids=enabled,
+        allowed_permissions=allowed_permissions,
+        supported_isolations=supported_isolations,
+        host_api_version=host_api_version,
+    )
+
+
 def parse_component_permission_allowlist(
     values: Iterable[str],
 ) -> tuple[ComponentPermission, ...]:
@@ -235,14 +307,14 @@ def get_configured_extension_startup() -> ExtensionStartupResolution:
     """Resolve process startup configuration once into an immutable snapshot."""
     import vllm.envs as envs
 
-    resolution = resolve_extension_startup(
+    resolution = resolve_configured_extension_startup(
         envs.VLLM_EXTENSION_MANIFESTS,
         enabled_bundle_ids=envs.VLLM_EXTENSION_BUNDLES,
         allowed_permissions=parse_component_permission_allowlist(
             envs.VLLM_EXTENSION_ALLOWED_PERMISSIONS
         ),
     )
-    if envs.VLLM_EXTENSION_MANIFESTS:
+    if envs.VLLM_EXTENSION_MANIFESTS or envs.VLLM_EXTENSION_BUNDLES is not None:
         diagnostics = resolution.diagnostics()
         logger.info(
             "Extension startup snapshot: admitted_bundles=%s "
