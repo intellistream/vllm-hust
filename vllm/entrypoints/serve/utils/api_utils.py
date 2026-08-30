@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 _ASCEND_TORCH_PREFLIGHT_TIMEOUT_S = 20
 _ASCEND_TORCH_PREFLIGHT_CMDS = {"serve", "launch"}
 _ASCEND_EXPLICIT_BACKENDS = {"ascend", "npu"}
+_ASCEND_TORCH_PREFLIGHT_TIMEOUT_ENV = "VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S"
 
 VLLM_SUBCMD_PARSER_EPILOG = (
     "For full list:            vllm {subcmd} --help=all\n"
@@ -229,6 +230,24 @@ def _should_run_ascend_torch_preflight(argv: list[str] | None = None) -> bool:
     return _has_ascend_runtime_hints()
 
 
+def _ascend_torch_preflight_timeout_s() -> float:
+    raw_timeout = os.environ.get(_ASCEND_TORCH_PREFLIGHT_TIMEOUT_ENV, "").strip()
+    if not raw_timeout:
+        return float(_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S)
+
+    try:
+        timeout = float(raw_timeout)
+    except ValueError as exc:
+        raise SystemExit(
+            f"{_ASCEND_TORCH_PREFLIGHT_TIMEOUT_ENV} must be a positive number"
+        ) from exc
+    if timeout <= 0:
+        raise SystemExit(
+            f"{_ASCEND_TORCH_PREFLIGHT_TIMEOUT_ENV} must be a positive number"
+        )
+    return timeout
+
+
 def _format_ascend_torch_preflight_failure(
     result: subprocess.CompletedProcess[str],
 ) -> str:
@@ -270,7 +289,7 @@ def _run_ascend_torch_preflight() -> None:
         [sys.executable, "-c", probe],
         capture_output=True,
         text=True,
-        timeout=_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S,
+        timeout=_ascend_torch_preflight_timeout_s(),
         check=False,
         env=os.environ.copy(),
     )

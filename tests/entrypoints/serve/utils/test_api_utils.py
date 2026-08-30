@@ -6,6 +6,7 @@ import pytest
 import vllm.entrypoints.serve.utils.api_utils as api_utils
 from vllm.entrypoints.openai.engine.protocol import StreamOptions
 from vllm.entrypoints.serve.utils.api_utils import (
+    _ascend_torch_preflight_timeout_s,
     get_max_tokens,
     jsonify_non_default_args,
     log_non_default_args,
@@ -14,20 +15,27 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 
 
-def test_non_default_args_redact_api_keys(monkeypatch, caplog):
+def test_non_default_args_redact_api_keys(monkeypatch):
     secret = "sk-secret-that-must-not-appear"
     monkeypatch.setattr(
         api_utils,
         "get_non_default_args",
         lambda _args: {"api_key": [secret], "port": 8000},
     )
+    logged_messages: list[str] = []
+    monkeypatch.setattr(
+        api_utils.logger,
+        "info",
+        lambda message, *args, **_: logged_messages.append(message % args),
+    )
 
     serialized = jsonify_non_default_args(object())
     log_non_default_args(object())
+    logged_text = "\n".join(logged_messages)
 
     assert serialized == {"api_key": "<redacted>", "port": 8000}
-    assert secret not in caplog.text
-    assert "<redacted>" in caplog.text
+    assert secret not in logged_text
+    assert "<redacted>" in logged_text
 
 
 def test_sanitize_message():
@@ -54,6 +62,26 @@ def test_sanitize_message():
 )
 def test_should_include_usage_force_enables_continuous_usage(stream_options, expected):
     assert should_include_usage(stream_options, True) == expected
+
+
+def test_ascend_torch_preflight_timeout_uses_default(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S", raising=False)
+
+    assert _ascend_torch_preflight_timeout_s() == 20.0
+
+
+def test_ascend_torch_preflight_timeout_accepts_positive_override(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S", "120")
+
+    assert _ascend_torch_preflight_timeout_s() == 120.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+def test_ascend_torch_preflight_timeout_rejects_invalid_override(monkeypatch, value):
+    monkeypatch.setenv("VLLM_ASCEND_TORCH_PREFLIGHT_TIMEOUT_S", value)
+
+    with pytest.raises(SystemExit, match="must be a positive number"):
+        _ascend_torch_preflight_timeout_s()
 
 
 class TestGetMaxTokens:
