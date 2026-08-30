@@ -598,6 +598,39 @@ class Platform:
         pass
 
     @classmethod
+    def get_cudagraph_key_strategy(cls, vllm_config: "VllmConfig") -> Any | None:
+        """Return a pluggable cudagraph key strategy, or None.
+
+        The cudagraph dispatcher consults this hook before admitting a new
+        runtime graph key (split-batch / dual-stream replay) during the
+        startup capture window. Returning None keeps the neutral core
+        behavior: only the generic ``CUDAGraphRuntimeMetadata.is_valid()``
+        schema is enforced, and any key that cannot be captured fails closed
+        to eager execution.
+
+        The returned object must implement::
+
+            admit_runtime_key(num_tokens: int,
+                              runtime_metadata: CUDAGraphRuntimeMetadata) -> bool
+
+        Returning False (or raising) rejects the key, and dispatch fails
+        closed to ``CUDAGraphMode.NONE``. A strategy that admits a key after
+        startup capture is disabled takes over its capture lifecycle: the
+        plugin must guarantee the admitted key is captured before it is
+        replayed (e.g. first-encounter capture under an explicit temporary
+        capture window), or its wrappers must bypass to eager. Core still
+        enforces the generic schema, alignment, the runtime-key bound and
+        atomic registration.
+
+        Offset/variant construction, capture scheduling and eviction policy
+        remain owned by the platform plugin out of tree: keys that should be
+        captured during startup are registered before capture (via
+        ``CudagraphDispatcher.add_cudagraph_key``) so they are enumerated by
+        ``get_capture_descs`` and captured with the standard flow.
+        """
+        return None
+
+    @classmethod
     def _find_non_ssm_backend(
         cls, vllm_config: "VllmConfig"
     ) -> "type[AttentionBackend] | None":

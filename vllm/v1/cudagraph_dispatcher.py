@@ -1,15 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
+from typing import Any
 
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import BatchDescriptor
+from vllm.forward_context import BatchDescriptor, CUDAGraphRuntimeMetadata
 from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
 
 logger = init_logger(__name__)
+
+# Upper bound on runtime-registered keys (descriptors carrying
+# ``runtime_metadata``) per cudagraph runtime mode. A new runtime key beyond
+# this bound fails closed to eager execution instead of being admitted.
+MAX_RUNTIME_GRAPH_KEYS_PER_MODE = 64
+
+
+class _FailClosedKeyStrategy:
+    """Internal strategy that rejects every runtime key admission.
+
+    Used when the platform strategy hook fails or returns an object that does
+    not implement the documented protocol, so a broken plugin can never
+    silently widen the capture contract.
+    """
+
+    def admit_runtime_key(
+        self, num_tokens: int, runtime_metadata: CUDAGraphRuntimeMetadata
+    ) -> bool:
+        return False
 
 
 class CudagraphDispatcher:
@@ -68,6 +89,82 @@ class CudagraphDispatcher:
         )
         # Default cudagraph_mode to NONE until initialize_cudagraph_keys is called
         self.cudagraph_mode = CUDAGraphMode.NONE
+        # Runtime key admission (see _dispatch_runtime_key) may be reached
+        # concurrently (e.g. parallel replay workers); the lock keeps the
+        # bounded key registry and the admission decision atomic.
+        self._runtime_key_lock = threading.Lock()
+        self._runtime_key_cap_warned = False
+        self._runtime_key_strategy: Any | None = None
+        self._key_strategy_resolved = False
+
+    def _cudagraph_capturing_enabled(self) -> bool:
+        """Read the capture-window flag at call time.
+
+        The flag lives in ``vllm.compilation.monitor`` and is flipped to
+        False once startup capture completes. It is read dynamically (not
+        bound at import time) because it is reassigned globally.
+        """
+        from vllm.compilation.monitor import cudagraph_capturing_enabled
+
+        return cudagraph_capturing_enabled
+
+    def _resolve_key_strategy(self) -> Any | None:
+        """Resolve the platform key strategy hook once, lazily.
+
+        Returns None when the platform does not provide a strategy; core then
+        enforces only its generic ``CUDAGraphRuntimeMetadata.is_valid()``
+        schema. A hook failure or a strategy missing the documented protocol
+        resolves to an always-rejecting strategy so a broken plugin can only
+        narrow (fail closed), never widen, the capture contract.
+        """
+        if self._key_strategy_resolved:
+            return self._runtime_key_strategy
+        try:
+            from vllm.platforms import current_platform
+
+            strategy = current_platform.get_cudagraph_key_strategy(self.vllm_config)
+        except Exception:
+            logger.exception(
+                "Resolving the cudagraph key strategy failed; "
+                "runtime key admission will fail closed."
+            )
+            strategy = _FailClosedKeyStrategy()
+        if strategy is not None and not callable(
+            getattr(strategy, "admit_runtime_key", None)
+        ):
+            logger.error(
+                "Platform cudagraph key strategy %r does not implement "
+                "admit_runtime_key(num_tokens, runtime_metadata); "
+                "runtime key admission will fail closed.",
+                strategy,
+            )
+            strategy = _FailClosedKeyStrategy()
+        # Publish the strategy before the resolved flag: a concurrent reader
+        # that observes the flag must never see a stale/None strategy (which
+        # would wrongly fail closed strategy-owned keys to the neutral path).
+        self._runtime_key_strategy = strategy
+        self._key_strategy_resolved = True
+        return strategy
+
+    def _admit_runtime_key(
+        self, num_tokens: int, runtime_metadata: CUDAGraphRuntimeMetadata
+    ) -> bool:
+        """Consult the platform key strategy for platform-specific admission.
+
+        A missing strategy means core-generic admission only. A rejecting or
+        failing strategy fails closed to eager execution.
+        """
+        strategy = self._runtime_key_strategy
+        if strategy is None:
+            return True
+        try:
+            return bool(strategy.admit_runtime_key(num_tokens, runtime_metadata))
+        except Exception:
+            logger.exception(
+                "The cudagraph key strategy raised during admission; "
+                "failing closed to eager execution."
+            )
+            return False
 
     def _compute_bs_to_padded_graph_size(self) -> None:
         """Pre-compute the mapping from batch size to padded graph size."""
@@ -155,6 +252,143 @@ class CudagraphDispatcher:
             num_active_loras=num_active_loras,
         )
 
+    def _create_runtime_batch_descriptor(
+        self,
+        num_tokens: int,
+        runtime_metadata: CUDAGraphRuntimeMetadata,
+    ) -> BatchDescriptor:
+        """Create an exact descriptor for a validated runtime graph key."""
+        return BatchDescriptor(
+            num_tokens=num_tokens,
+            num_reqs=num_tokens // self.uniform_decode_query_len,
+            uniform=True,
+            runtime_metadata=runtime_metadata,
+        )
+
+    def _dispatch_runtime_key(
+        self,
+        num_tokens: int,
+        uniform_decode: bool,
+        has_lora: bool,
+        num_active_loras: int,
+        allowed_modes: AbstractSet[CUDAGraphMode],
+        runtime_metadata: CUDAGraphRuntimeMetadata,
+        allow_runtime_key_registration: bool,
+    ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+        """Dispatch an explicitly registered runtime graph key.
+
+        The key is registered only after the request is validated. Any
+        unsupported / malformed / non-opt-in request fails closed to eager
+        execution (``CUDAGraphMode.NONE``) without mutating the key registry:
+        a registered key is always a key that was explicitly admitted through
+        this gate, so backends can rely on it being safely captureable.
+
+        Capture lifecycle contract (bounded and synchronized):
+
+        - A descriptor already present in the key registry was admitted (and
+          queued for capture via ``get_capture_descs``) while capturing was
+          enabled, so returning it for replay is always safe.
+        - Without a platform key strategy (neutral core default), a
+          brand-new key is admitted only while the startup capture window is
+          open (``cudagraph_capturing_enabled`` is True). Once startup
+          capture is disabled, no new key can ever obtain a captured graph:
+          admitting one would make the wrapper attempt a runtime capture,
+          which is forbidden. Dispatch fails closed to eager and keeps the
+          metadata on the no-graph descriptor.
+        - With a platform key strategy, admission policy — and the bounded,
+          synchronized capture lifecycle it implies — is owned by the
+          plugin. A strategy-admitted key after startup capture must be
+          captured by the plugin before it is replayed (e.g. first-encounter
+          capture under an explicit temporary capture window), otherwise the
+          plugin's wrapper must bypass to eager. Core still enforces the
+          generic schema, alignment, the key bound and atomic registration.
+        - The number of runtime keys per mode is bounded by
+          ``MAX_RUNTIME_GRAPH_KEYS_PER_MODE``; a key beyond the bound fails
+          closed to eager.
+
+        Registration itself is synchronized so concurrent callers (e.g.
+        parallel replay workers) cannot exceed the bound or observe a partial
+        admission.
+        """
+        fallback = BatchDescriptor(
+            num_tokens=num_tokens,
+            runtime_metadata=runtime_metadata,
+        )
+        runtime_mode = self.cudagraph_mode.decode_mode()
+        invalid_request = (
+            not allow_runtime_key_registration
+            or not isinstance(runtime_metadata, CUDAGraphRuntimeMetadata)
+            or not runtime_metadata.is_valid()
+            or not uniform_decode
+            or has_lora
+            or num_active_loras != 0
+            or num_tokens <= 0
+            or num_tokens % self.uniform_decode_query_len != 0
+            or runtime_metadata.token_offset % self.uniform_decode_query_len != 0
+            or num_tokens // self.uniform_decode_query_len
+            > self.vllm_config.scheduler_config.max_num_seqs
+            or runtime_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE)
+            or runtime_mode not in allowed_modes
+        )
+        if invalid_request:
+            return CUDAGraphMode.NONE, fallback
+
+        descriptor = self._create_runtime_batch_descriptor(num_tokens, runtime_metadata)
+
+        # Fast path: an already-admitted key was captured (or is queued for
+        # capture) during the capture window, so replaying it is safe. Set
+        # membership is safe to read without the lock; the slow path
+        # re-checks under the lock.
+        if descriptor in self.cudagraph_keys[runtime_mode]:
+            return runtime_mode, descriptor
+
+        # Resolve the platform strategy and run its admission decision before
+        # taking the lock: the hook is plugin code, its decision is a pure
+        # function of the arguments, and neither may extend the critical
+        # section. The resolved strategy is cached on the dispatcher.
+        strategy = self._resolve_key_strategy()
+        strategy_admits = self._admit_runtime_key(num_tokens, runtime_metadata)
+
+        with self._runtime_key_lock:
+            # Re-check under the lock: a concurrent caller may have admitted
+            # the same key while the strategy was consulted.
+            if descriptor in self.cudagraph_keys[runtime_mode]:
+                return runtime_mode, descriptor
+
+            # Neutral core default (no platform strategy): a brand-new key
+            # can only be admitted while the startup capture window is open.
+            # Once capture is disabled the key could never obtain a captured
+            # graph, so fail closed to eager without mutating the registry.
+            # With a registered platform strategy, the plugin owns the
+            # admission decision and the capture lifecycle of admitted keys
+            # (see the hook contract); core keeps enforcing the generic
+            # schema, the key bound and atomic registration.
+            if not strategy_admits:
+                return CUDAGraphMode.NONE, fallback
+
+            if not self._cudagraph_capturing_enabled() and strategy is None:
+                return CUDAGraphMode.NONE, fallback
+
+            runtime_key_count = sum(
+                1
+                for desc in self.cudagraph_keys[runtime_mode]
+                if desc.runtime_metadata is not None
+            )
+            if runtime_key_count >= MAX_RUNTIME_GRAPH_KEYS_PER_MODE:
+                if not self._runtime_key_cap_warned:
+                    self._runtime_key_cap_warned = True
+                    logger.warning(
+                        "Runtime cudagraph key bound "
+                        "(MAX_RUNTIME_GRAPH_KEYS_PER_MODE=%d) reached for %s; "
+                        "further runtime keys fail closed to eager execution.",
+                        MAX_RUNTIME_GRAPH_KEYS_PER_MODE,
+                        runtime_mode.name,
+                    )
+                return CUDAGraphMode.NONE, fallback
+
+            self.add_cudagraph_key(runtime_mode, descriptor)
+            return runtime_mode, descriptor
+
     def add_cudagraph_key(
         self, runtime_mode: CUDAGraphMode, batch_descriptor: BatchDescriptor
     ):
@@ -169,6 +403,10 @@ class CudagraphDispatcher:
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
         self.cudagraph_mode = cudagraph_mode
+        # The caller may override the query length (e.g. spec decode or split
+        # replay); sync it to the instance used by descriptor building and
+        # runtime-key alignment validation.
+        self.uniform_decode_query_len = uniform_decode_query_len
 
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:
@@ -240,6 +478,8 @@ class CudagraphDispatcher:
         num_active_loras: int = 0,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
+        runtime_metadata: CUDAGraphRuntimeMetadata | None = None,
+        allow_runtime_key_registration: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -259,6 +499,18 @@ class CudagraphDispatcher:
                 valid_modes to compute allowed modes. (e.g., {FULL} for
                 features like cascade attention not supported by full
                 cudagraphs). None means no modes are excluded.
+            runtime_metadata: Opaque metadata for a runtime graph key. None
+                keeps the static dispatch path unchanged. Core validates the
+                generic schema (``is_valid``) but does not interpret
+                platform-specific ``variant`` / ``backend_tag`` values.
+            allow_runtime_key_registration: Whether a validated runtime key
+                may be registered. False fails closed to eager execution and
+                never mutates the key registry. When True, a brand-new key is
+                only admitted while the startup capture window is open; once
+                capture is disabled, dispatch fails closed to eager unless
+                the key was already admitted (and captured) beforehand, or a
+                registered platform key strategy explicitly owns its capture
+                lifecycle (see ``Platform.get_cudagraph_key_strategy``).
         """
         allowed_modes = valid_modes or CUDAGraphMode.valid_runtime_modes()
 
@@ -276,10 +528,25 @@ class CudagraphDispatcher:
             or self.cudagraph_mode == CUDAGraphMode.NONE
             or max_size is None
             or num_tokens > max_size
-            or allowed_modes <= {CUDAGraphMode.NONE}
+            or allowed_modes <= set([CUDAGraphMode.NONE])
         ):
-            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return CUDAGraphMode.NONE, BatchDescriptor(
+                num_tokens=num_tokens,
+                runtime_metadata=runtime_metadata,
+            )
 
+        if runtime_metadata is not None:
+            return self._dispatch_runtime_key(
+                num_tokens=num_tokens,
+                uniform_decode=uniform_decode,
+                has_lora=has_lora,
+                num_active_loras=num_active_loras,
+                allowed_modes=allowed_modes,
+                runtime_metadata=runtime_metadata,
+                allow_runtime_key_registration=allow_runtime_key_registration,
+            )
+
+        # Standard dispatch path
         effective_num_active_loras = num_active_loras
         if has_lora and num_active_loras > 0:
             if self.specialize_lora_count:
