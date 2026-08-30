@@ -69,6 +69,67 @@ class RequestResumed(EngineCoreEvent):
 
 
 @dataclass(frozen=True)
+class AsyncOutputCreated(EngineCoreEvent):
+    """An asynchronous model-runner output lifecycle began."""
+
+    lifecycle_id: int
+    request_ids: tuple[str, ...]
+    shape: tuple[int, ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
+class AsyncOutputCopyIssued(EngineCoreEvent):
+    """A non-blocking device-to-host output copy was issued."""
+
+    lifecycle_id: int
+    storage_id: int
+    event_id: int
+    nbytes: int
+    dispatch_ns: int
+
+
+@dataclass(frozen=True)
+class AsyncOutputCopyFailed(EngineCoreEvent):
+    """An asynchronous output copy failed before completion."""
+
+    lifecycle_id: int
+    phase: str
+
+
+@dataclass(frozen=True)
+class AsyncOutputWaitComplete(EngineCoreEvent):
+    """The readiness event for an asynchronous output completed."""
+
+    lifecycle_id: int
+    wait_ns: int
+
+
+@dataclass(frozen=True)
+class AsyncOutputMaterialized(EngineCoreEvent):
+    """An asynchronous output was materialized as Python data."""
+
+    lifecycle_id: int
+    materialization_ns: int
+
+
+@dataclass(frozen=True)
+class AsyncOutputRetained(EngineCoreEvent):
+    """An output host buffer was retained by the next input batch."""
+
+    storage_id: int
+
+
+@dataclass(frozen=True)
+class AsyncOutputConsumed(EngineCoreEvent):
+    """A retained output host buffer was consumed by an input batch."""
+
+    storage_id: int
+    wait_ns: int
+    materialization_ns: int
+
+
+@dataclass(frozen=True)
 class KVOffloadStore(EngineCoreEvent):
     """Blocks were stored to the CPU tier."""
 

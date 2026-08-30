@@ -141,6 +141,14 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.events import (
+    AsyncOutputCopyFailed,
+    AsyncOutputCopyIssued,
+    AsyncOutputCreated,
+    AsyncOutputMaterialized,
+    AsyncOutputWaitComplete,
+    EventBus,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -266,13 +274,48 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._routed_experts = routed_experts
         self._has_fault: torch.Tensor | None = None
 
+        if EventBus.enabled:
+            EventBus.emit(
+                AsyncOutputCreated(
+                    lifecycle_id=id(self),
+                    request_ids=tuple(model_runner_output.req_ids),
+                    shape=tuple(sampled_token_ids.shape),
+                    dtype=str(sampled_token_ids.dtype),
+                )
+            )
+
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
-            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
-                "cpu", non_blocking=True
-            )
+            events_enabled = EventBus.enabled
+            copy_start_ns = time.perf_counter_ns() if events_enabled else 0
+            try:
+                self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+                    "cpu", non_blocking=True
+                )
+            except Exception:
+                if events_enabled:
+                    EventBus.emit(
+                        AsyncOutputCopyFailed(
+                            lifecycle_id=id(self),
+                            phase="sampled_token_d2h",
+                        )
+                    )
+                raise
+            if events_enabled:
+                EventBus.emit(
+                    AsyncOutputCopyIssued(
+                        lifecycle_id=id(self),
+                        storage_id=self.sampled_token_ids_cpu.data_ptr(),
+                        event_id=id(self.async_copy_ready_event),
+                        nbytes=(
+                            self.sampled_token_ids_cpu.numel()
+                            * self.sampled_token_ids_cpu.element_size()
+                        ),
+                        dispatch_ns=time.perf_counter_ns() - copy_start_ns,
+                    )
+                )
             self._logprobs_tensors_cpu = (
                 self._logprobs_tensors.to_cpu_nonblocking()
                 if self._logprobs_tensors
@@ -293,7 +336,16 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         return self._synchronization_domain
 
     def synchronize(self) -> None:
+        events_enabled = EventBus.enabled
+        wait_start_ns = time.perf_counter_ns() if events_enabled else 0
         self.async_copy_ready_event.synchronize()
+        if events_enabled:
+            EventBus.emit(
+                AsyncOutputWaitComplete(
+                    lifecycle_id=id(self),
+                    wait_ns=time.perf_counter_ns() - wait_start_ns,
+                )
+            )
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
@@ -304,6 +356,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         return self.get_output_without_sync()
 
     def get_output_without_sync(self) -> ModelRunnerOutput:
+        events_enabled = EventBus.enabled
+        materialization_start_ns = time.perf_counter_ns() if events_enabled else 0
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
 
         # Release the device tensors once the copy has completed.
@@ -338,6 +392,16 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 "Fault detected in EP all2all communication: "
                 "one or more ranks timed out during dispatch/combine. "
                 f"Mask: {mask.cpu().tolist()}"
+            )
+
+        if events_enabled:
+            EventBus.emit(
+                AsyncOutputMaterialized(
+                    lifecycle_id=id(self),
+                    materialization_ns=(
+                        time.perf_counter_ns() - materialization_start_ns
+                    ),
+                )
             )
 
         return output
