@@ -7,6 +7,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 class _Scheduler:
     def __init__(self, *_args: object, **_kwargs: object) -> None:

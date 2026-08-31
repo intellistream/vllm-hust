@@ -8,6 +8,8 @@ from types import ModuleType
 
 import pytest
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 class _Scheduler:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -40,6 +42,8 @@ _POLICY_MODULE = importlib.util.module_from_spec(_POLICY_SPEC)
 sys.modules[_POLICY_NAME] = _POLICY_MODULE
 _POLICY_SPEC.loader.exec_module(_POLICY_MODULE)
 
+_ORIGINAL_SCHEDULER_MODULE = sys.modules.get("vllm.v1.core.sched.scheduler")
+_ORIGINAL_REQUEST_MODULE = sys.modules.get("vllm.v1.request")
 _SCHEDULER_STUB = ModuleType("vllm.v1.core.sched.scheduler")
 _SCHEDULER_STUB.Scheduler = _Scheduler
 sys.modules[_SCHEDULER_STUB.__name__] = _SCHEDULER_STUB
@@ -55,7 +59,17 @@ _SCHEDULER_SPEC = importlib.util.spec_from_file_location(
 )
 assert _SCHEDULER_SPEC is not None and _SCHEDULER_SPEC.loader is not None
 _SCHEDULER_MODULE = importlib.util.module_from_spec(_SCHEDULER_SPEC)
-_SCHEDULER_SPEC.loader.exec_module(_SCHEDULER_MODULE)
+try:
+    _SCHEDULER_SPEC.loader.exec_module(_SCHEDULER_MODULE)
+finally:
+    if _ORIGINAL_SCHEDULER_MODULE is None:
+        sys.modules.pop(_SCHEDULER_STUB.__name__, None)
+    else:
+        sys.modules[_SCHEDULER_STUB.__name__] = _ORIGINAL_SCHEDULER_MODULE
+    if _ORIGINAL_REQUEST_MODULE is None:
+        sys.modules.pop(_REQUEST_STUB.__name__, None)
+    else:
+        sys.modules[_REQUEST_STUB.__name__] = _ORIGINAL_REQUEST_MODULE
 
 PastFuturePolicy = _POLICY_MODULE.PastFuturePolicy
 PastFutureRequestState = _POLICY_MODULE.PastFutureRequestState

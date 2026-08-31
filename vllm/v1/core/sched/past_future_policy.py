@@ -4,11 +4,11 @@
 
 from __future__ import annotations
 
+import random
 from bisect import bisect
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-import random
-from typing import Iterable
 
 import numpy as np
 
@@ -100,7 +100,9 @@ class PastFuturePolicy:
         sampled_remaining = self._python_rng.choice(tuple(self.history_output_tokens))
         pairs.append((candidate.computed_tokens, sampled_remaining))
         peak = self._peak_tokens(pairs)
-        available = int(max_kv_tokens * (1 - self.RESERVED_FRACTION)) - retained_kv_tokens
+        available = (
+            int(max_kv_tokens * (1 - self.RESERVED_FRACTION)) - retained_kv_tokens
+        )
         return PastFutureAdmissionDecision(
             request_id=candidate.request_id,
             sampled_remaining_tokens=sampled_remaining,

@@ -364,7 +364,6 @@ class Sampler(nn.Module):
         any_penalties_or_bad_words = (
             bool(bad_words_token_ids) or not sampling_metadata.no_penalties
         )
-
         output_token_ids = sampling_metadata.output_token_ids
         if predict_bonus_token and any_penalties_or_bad_words:
             # Combine base outputs with spec tokens when speculative decoding
@@ -388,6 +387,19 @@ class Sampler(nn.Module):
 
         # Apply penalties (e.g., freq_penalties).
         logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            # Committed outputs only; spec drafts live in ``spec_token_ids``.
+            holder.update_state(
+                sampling_metadata.output_token_ids,
+                sampling_metadata.spec_token_ids,
+                repeat_indices=None,
+            )
+            logits = holder.apply_to_logits(
+                logits,
+                predict_bonus_token,
+                sampling_metadata.spec_token_ids,
+            )
         return logits
 
     @staticmethod

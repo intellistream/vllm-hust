@@ -498,6 +498,9 @@ def bind_kv_cache(
                 current_platform.is_cuda_alike()
                 or current_platform.is_xpu()
                 or current_platform.is_cpu()
+                # vLLM-Ascend applies the same flat-list binding in its
+                # official patch_bind_kv_cache compatibility shim.
+                or current_platform.device_type == "npu"
             ):
                 # We know that the GPU / CPU runner is not impacted by this
                 # case. Some test code depends on runner_kv_caches, but

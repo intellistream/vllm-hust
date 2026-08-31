@@ -48,6 +48,9 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.priority_scheduling_observer import (
+    PrioritySchedulingObserver,
+)
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -60,6 +63,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -119,9 +123,18 @@ class Scheduler(SchedulerInterface):
         self._staged_runtime_scheduler_limits: (
             dict[str, int | dict[str, int]] | None
         ) = None
+        self._startup_scheduler_reserve_full_isl = bool(
+            self.scheduler_config.scheduler_reserve_full_isl
+        )
+        self._staged_runtime_prefill_admission_guard: (
+            dict[str, bool | int | dict[str, bool]] | None
+        ) = None
         self._pending_epoch_requests: list[Request] = []
         self._native_recapture_scope_observer = (
             NativeRecaptureScopeObserver.from_environment()
+        )
+        self._priority_scheduling_observer = (
+            PrioritySchedulingObserver.from_environment()
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
@@ -228,8 +241,15 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        self.dynamic_sd_lookup: list[int] | None = None
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
+            if speculative_config.num_speculative_tokens_per_batch_size:
+                self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+                    speculative_config.num_speculative_tokens_per_batch_size,
+                    vllm_max_batch_size=self.scheduler_config.max_num_seqs,
+                    vllm_num_speculative_tokens=self.num_spec_tokens,
+                )
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -931,6 +951,13 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
+        # Dynamic speculative decoding: compute optimal K
+        num_spec_tokens_to_schedule = self.num_spec_tokens
+        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                len(num_scheduled_tokens)
+            ]
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -947,6 +974,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -967,6 +995,7 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         self._record_native_recapture_scope(scheduler_output)
+        self._record_priority_scheduling_scope(scheduler_output)
         return scheduler_output
 
     def _record_native_recapture_scope(
@@ -981,13 +1010,41 @@ class Scheduler(SchedulerInterface):
             max_num_running_reqs=self.max_num_running_reqs,
             max_num_scheduled_tokens=self.max_num_scheduled_tokens,
         )
-
     def get_native_recapture_scope_state(
         self, after_sequence: int = 0
     ) -> dict[str, Any]:
         """Return immutable copies of observed scheduler steps after a cursor."""
 
         return self._native_recapture_scope_observer.state(after_sequence)
+
+    def _record_priority_scheduling_scope(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Record queue-order evidence without retaining request content."""
+
+        scheduled_new_request_ids = [
+            request.req_id for request in scheduler_output.scheduled_new_reqs
+        ]
+        request_metadata = {
+            request_id: {
+                "priority": self.requests[request_id].priority,
+                "arrival_time": self.requests[request_id].arrival_time,
+            }
+            for request_id in scheduled_new_request_ids
+            if request_id in self.requests
+        }
+        self._priority_scheduling_observer.record(
+            policy=self.policy.value,
+            scheduled_new_request_ids=scheduled_new_request_ids,
+            request_metadata=request_metadata,
+            formed_request_ids=scheduler_output.num_scheduled_tokens,
+            config_epoch=self._runtime_config_epoch,
+        )
+
+    def get_priority_scheduling_state(self, after_sequence: int = 0) -> dict[str, Any]:
+        """Return immutable copies of priority receipts after a cursor."""
+
+        return self._priority_scheduling_observer.state(after_sequence)
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -1787,7 +1844,7 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
-            if self._staged_runtime_scheduler_limits is None:
+            if not self._has_staged_runtime_transition():
                 self._enqueue_waiting_request(request)
             else:
                 # Keep next-epoch requests outside the old epoch's batch queues.
@@ -1922,7 +1979,17 @@ class Scheduler(SchedulerInterface):
                 self._startup_max_num_scheduled_tokens
             ),
             "pending_epoch_request_count": len(self._pending_epoch_requests),
-            "transition_staged": int(self._staged_runtime_scheduler_limits is not None),
+            "transition_staged": int(self._has_staged_runtime_transition()),
+            "scheduler_limits_transition_staged": int(
+                self._staged_runtime_scheduler_limits is not None
+            ),
+            "prefill_admission_transition_staged": int(
+                self._staged_runtime_prefill_admission_guard is not None
+            ),
+            "scheduler_reserve_full_isl": int(self.scheduler_reserve_full_isl),
+            "startup_scheduler_reserve_full_isl": int(
+                self._startup_scheduler_reserve_full_isl
+            ),
         }
 
     def _validate_runtime_scheduler_limits(
@@ -1937,6 +2004,12 @@ class Scheduler(SchedulerInterface):
         # Pause-state reporting intentionally hides some queued requests. A
         # configuration transaction must instead observe the physical queues.
         return bool(self.running or self.waiting or self.skipped_waiting)
+
+    def _has_staged_runtime_transition(self) -> bool:
+        return bool(
+            self._staged_runtime_scheduler_limits is not None
+            or self._staged_runtime_prefill_admission_guard is not None
+        )
 
     def prepare_runtime_scheduler_limits(
         self,
@@ -1965,8 +2038,8 @@ class Scheduler(SchedulerInterface):
         max_num_scheduled_tokens: int,
         max_num_running_reqs: int,
     ) -> dict[str, int | dict[str, int]]:
-        if self._staged_runtime_scheduler_limits is not None:
-            raise RuntimeError("a scheduler-limit epoch transition is already staged")
+        if self._has_staged_runtime_transition():
+            raise RuntimeError("a runtime epoch transition is already staged")
         self._validate_runtime_scheduler_limits(
             max_num_scheduled_tokens, max_num_running_reqs
         )
@@ -2054,6 +2127,101 @@ class Scheduler(SchedulerInterface):
             "rollback_epoch": self._runtime_config_epoch,
             "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
             "max_num_running_reqs": self.max_num_running_reqs,
+        }
+
+    @staticmethod
+    def _validate_runtime_prefill_admission_guard(enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise ValueError("prefill admission guard must be boolean")
+
+    def prepare_runtime_prefill_admission_guard(
+        self, enabled: bool
+    ) -> dict[str, bool | int | dict[str, bool]]:
+        if self._has_runtime_transition_requests():
+            raise RuntimeError(
+                "prefill admission guard may change only at an idle epoch"
+            )
+        self._validate_runtime_prefill_admission_guard(enabled)
+        return {
+            "previous": {"scheduler_reserve_full_isl": self.scheduler_reserve_full_isl},
+            "requested": {"scheduler_reserve_full_isl": enabled},
+            "previous_epoch": self._runtime_config_epoch,
+        }
+
+    def stage_runtime_prefill_admission_guard(
+        self, enabled: bool
+    ) -> dict[str, bool | int | dict[str, bool]]:
+        if self._has_staged_runtime_transition():
+            raise RuntimeError("a runtime epoch transition is already staged")
+        self._validate_runtime_prefill_admission_guard(enabled)
+        prepared: dict[str, bool | int | dict[str, bool]] = {
+            "previous": {"scheduler_reserve_full_isl": self.scheduler_reserve_full_isl},
+            "requested": {"scheduler_reserve_full_isl": enabled},
+            "previous_epoch": self._runtime_config_epoch,
+        }
+        self._staged_runtime_prefill_admission_guard = prepared
+        return prepared
+
+    def commit_staged_runtime_prefill_admission_guard(
+        self, next_epoch: int
+    ) -> dict[str, int]:
+        prepared = self._staged_runtime_prefill_admission_guard
+        if prepared is None:
+            raise RuntimeError("no prefill-admission epoch transition is staged")
+        if self._has_runtime_transition_requests():
+            raise RuntimeError("old scheduler epoch has not drained")
+        committed = self.commit_runtime_prefill_admission_guard(prepared, next_epoch)
+        self._staged_runtime_prefill_admission_guard = None
+        committed["released_pending_requests"] = self._release_pending_epoch_requests()
+        return committed
+
+    def abort_staged_runtime_prefill_admission_guard(self) -> dict[str, int]:
+        if self._staged_runtime_prefill_admission_guard is None:
+            raise RuntimeError("no prefill-admission epoch transition is staged")
+        self._staged_runtime_prefill_admission_guard = None
+        return {
+            "config_epoch": self._runtime_config_epoch,
+            "scheduler_reserve_full_isl": int(self.scheduler_reserve_full_isl),
+            "released_pending_requests": self._release_pending_epoch_requests(),
+        }
+
+    def commit_runtime_prefill_admission_guard(
+        self,
+        prepared: dict[str, bool | int | dict[str, bool]],
+        next_epoch: int,
+    ) -> dict[str, int]:
+        if self._has_runtime_transition_requests():
+            raise RuntimeError("idle epoch was lost before prefill-admission commit")
+        if next_epoch != self._runtime_config_epoch + 1:
+            raise RuntimeError("prefill-admission epoch is stale or non-monotonic")
+        requested = prepared.get("requested")
+        if not isinstance(requested, dict):
+            raise ValueError("prepared prefill admission guard is missing")
+        enabled = requested.get("scheduler_reserve_full_isl")
+        self._validate_runtime_prefill_admission_guard(enabled)
+        self.prepare_runtime_prefill_admission_guard(enabled)
+        self.scheduler_reserve_full_isl = enabled
+        self._runtime_config_epoch = next_epoch
+        return {
+            "config_epoch": self._runtime_config_epoch,
+            "scheduler_reserve_full_isl": int(self.scheduler_reserve_full_isl),
+        }
+
+    def rollback_runtime_prefill_admission_guard(
+        self, prepared: dict[str, bool | int | dict[str, bool]]
+    ) -> dict[str, int]:
+        if self._has_runtime_transition_requests():
+            raise RuntimeError("prefill-admission rollback requires an idle epoch")
+        previous = prepared.get("previous")
+        if not isinstance(previous, dict):
+            raise ValueError("rollback prefill admission guard is missing")
+        enabled = previous.get("scheduler_reserve_full_isl")
+        self._validate_runtime_prefill_admission_guard(enabled)
+        self.scheduler_reserve_full_isl = enabled
+        self._runtime_config_epoch += 1
+        return {
+            "rollback_epoch": self._runtime_config_epoch,
+            "scheduler_reserve_full_isl": int(self.scheduler_reserve_full_isl),
         }
 
     def has_finished_requests(self) -> bool:

@@ -29,6 +29,7 @@ from vllm.sampling_params import (
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
+    ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
 
@@ -175,6 +176,15 @@ class CompletionRequest(OpenAIBaseModel):
         "token patterns, stopping only when they hit the maximum output length "
         "(e.g. 'abcdabcdabcd...' or '\\emoji \\emoji \\emoji ...'). This feature "
         "can detect such behavior and terminate early, saving time and tokens.",
+    )
+
+    thinking_token_budget: ThinkingTokenBudget = Field(
+        default=None,
+        description=(
+            "Maximum number of tokens allowed for thinking operations "
+            "(reasoning models). Non-negative integer sets the limit; "
+            "-1 means unlimited (treated as unset)."
+        ),
     )
 
     # --8<-- [end:completion-extra-params]
